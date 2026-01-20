@@ -6,6 +6,7 @@ import argparse
 import torch
 from utils import seed_setting, setup_wandb, load_raw_data, prepare_path
 from QwenModel import Qwen_Model, Qwen_Model_Small, build_qwen_tokenizer
+from QwenAttentionTrainer import QwenAttentionTrainer
 from GNNs import RGCN, RGT, SimpleHGN, HGT
 from AttentionFusion import (
     CrossAttentionFusion,
@@ -13,7 +14,6 @@ from AttentionFusion import (
     SimpleAttentionFusion,
     AdaptiveAttentionFusion
 )
-from QwenAttentionTrainer import QwenAttentionTrainer
 
 
 def parse_args():

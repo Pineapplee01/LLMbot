@@ -7,6 +7,82 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn.models import MLP
 
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Learning: https://arxiv.org/abs/2004.11362
+    [Expert Modified] Added numerical stability and divide-by-zero protection.
+    """
+    def __init__(self, temperature=0.07, base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        """
+        Args:
+            features: [batch_size, dim] or [batch_size, n_views, dim]
+            labels: [batch_size]
+            mask: [batch_size, batch_size]
+        """
+        device = features.device
+
+        # 1. 维度适配：如果输入是 [Batch, Dim]，自动升维到 [Batch, 1, Dim]
+        if len(features.shape) < 3:
+            features = features.unsqueeze(1)
+
+        batch_size = features.shape[0]
+        
+        # 2. 构造 Mask
+        if labels is not None and mask is None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        # 将多视图解绑并拼接：[Batch * Views, Dim]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+
+        # 3. 计算相似度矩阵
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        
+        # 4. 数值稳定性处理 (Log-Sum-Exp Trick)
+        # 减去最大值防止 exp 溢出
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # 5. 排除自身 (Self-Contrast masking)
+        # 将对角线（自己对比自己）的位置设为极小值或在 mask 中剔除
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # 6. 计算 Log-Prob
+        exp_logits = torch.exp(logits) * logits_mask
+        # sum(1) 是分母：所有负样本 + 除自己外的正样本 的指数和
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6) # 加 1e-6 防止 log(0)
+
+        # 7. 计算 Mean Log-Likelihood
+        # 分母是每个样本拥有的正样本数量 (Batch内同类数量 - 1)
+        # ### Expert Fix: 增加 1e-6 防止除以 0 (当 Batch 内该类只有一个样本时)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-6)
+
+        # 8. Loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
 
 class CrossAttentionFusion(nn.Module):
     """
@@ -42,6 +118,13 @@ class CrossAttentionFusion(nn.Module):
         self.gate_net = nn.Linear(hidden_dim * 2, 1)
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
+
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128)  # 128维通常对对比学习效果最好
+        )
         
         # 4. Classifier
         self.classifier = nn.Sequential(
@@ -75,17 +158,16 @@ class CrossAttentionFusion(nn.Module):
         
         h_fused = h_text + (alpha * attn_out)
         h_fused = self.norm(h_fused)
+
         h_fused = self.dropout(h_fused)
 
-        # --- THE FIX: Normalization ---
-        # Projects vectors to Unit Sphere. Struct Loss will drop from 250 -> 1.0
-        norm_fusion = F.normalize(h_fused, p=2, dim=-1)
+        contrast_feat = self.contrastive_head(h_fused)
+        contrast_feat = F.normalize(contrast_feat, dim=1)
+
+        logits = self.classifier(h_fused)
         
-        # E. Classify
-        logits = self.classifier(norm_fusion)
-        
-        # Return logits for CE Loss, norm_fusion for Structural Loss
-        return logits, norm_fusion
+        # Return logits for CE Loss, 
+        return logits, contrast_feat, alpha
 
 class BiDirectionalAttentionFusion(nn.Module):
     """

@@ -12,7 +12,7 @@ from pathlib import Path
 # Ensure we can import from local modules
 from utils import seed_setting, load_raw_data
 from GNNs import build_gnn, RGCN, RGT, SimpleHGN, HGT
-from AttentionFusion import CrossAttentionFusion
+from AttentionFusion import CrossAttentionFusion, SupConLoss
 from QwenPrecomputedTrainer import QwenPrecomputedTrainer
 
 def parse_args():
