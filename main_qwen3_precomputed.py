@@ -7,7 +7,9 @@ import wandb
 import torch
 import argparse
 import sys
+import os
 from pathlib import Path
+from sklearn.metrics import f1_score, accuracy_score
 
 # Ensure we can import from local modules
 from utils import seed_setting, load_raw_data
@@ -26,12 +28,16 @@ def parse_args():
     parser.add_argument('--embeddings_path', type=str, 
                         default='./datasets/TwiBot-20/qwen3_emb_last.pt',
                         help='Path to precomputed embeddings .pt file')
+    parser.add_argument('--num_features_dim', type=int, default=0, 
+                        help='Dimensionality of numerical features (0 if none)')
     
     # GNN Config
+    parser.add_argument('--sample', type=str, default='random',
+                        choices=['random', 'hard'])
     parser.add_argument('--gnn_type', type=str, default='RGT',
                         choices=['RGCN', 'RGT', 'SimpleHGN', 'HGT'])
     parser.add_argument('--n_layers', type=int, default=2)
-    parser.add_argument('--hidden_dim', type=int, default=256) # 256 is standard for SeGA
+    parser.add_argument('--hidden_dim', type=int, default=512) 
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--dropout', type=float, default=0.3)
     
@@ -41,18 +47,26 @@ def parse_args():
     parser.add_argument('--fusion_dropout', type=float, default=0.1)
     
     # Training Config
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--pretrain',action='store_true', default=True,
+                        help = "Whether to run Stage 1: GNN Pre-training")
+    parser.add_argument('--pretrain_epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Epochs for Stage 2 (Fusion)')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=5e-5)
     parser.add_argument('--eval_patience', type=int, default=20)
+    parser.add_argument('--ablation', action='store_true', default=False)
     
+    # SupCon Config
+    parser.add_argument('--supcon_temp', type=float, default=0.1)
+    parser.add_argument('--lambda_supcon', type=float, default=0.1)
+
     # System
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--exp_name', type=str, default='SeGA_Qwen3')
     parser.add_argument('--use_wandb', action='store_true', default=False)
     parser.add_argument('--wandb_project', type=str, default='SeGA-Experiment')
-    parser.add_argument('--ablation', action='store_true', default=False)
     
     return parser.parse_args()
 
@@ -128,14 +142,12 @@ def build_models(args, embedding_dim, num_relations, num_nodes):
     # OR embedding_dim if we pass raw features.
     # In SeGA, we pass raw 4096-dim features to the GNN, so in_channels = embedding_dim.
     gnn_config = {
-        'in_channels': embedding_dim,
-        'hidden_channels': args.hidden_dim,
-        'out_channels': args.hidden_dim, # GNN outputs context vector
-        'num_relations': num_relations,
-        'n_layers': args.n_layers,
+        'lm_input_dim': embedding_dim,
+        'gnn_hidden_dim': args.hidden_dim, # e.g. 512
+        'n_relations': num_relations,
+        'gnn_n_layers': args.n_layers,
         'dropout': args.dropout,
-        'heads': args.heads,
-        'num_nodes': num_nodes
+        'heads': args.heads
     }
     
     gnn_model = build_gnn(args.gnn_type, gnn_config)
@@ -161,15 +173,9 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # 2. Load Embeddings
-    if not args.embeddings_path:
-        raise ValueError("Embeddings path must be provided via --embeddings_path")
-        
+    # 2. Load Embedding
     print(f"Loading precomputed embeddings from {args.embeddings_path}...")
-        
     precomputed_embeddings = torch.load(args.embeddings_path, map_location='cpu', weights_only=False)
-
-
 
     # Convert to tensor if numpy
     if not isinstance(precomputed_embeddings, torch.Tensor):
@@ -184,6 +190,7 @@ def main():
     # 3. Load Graph Data
     print(f"Loading graph data from {args.dataset_path}...")
     data_dict = load_raw_data(args.dataset_path, use_GNN=True)
+
 
     if 'num_properties' in data_dict and data_dict['num_properties'] is not None:
         print(f"[Pre-Process] Raw Numerical Features Mean: {data_dict['num_properties'].mean(dim=0)}")
@@ -230,18 +237,55 @@ def main():
     print(f"  Total:             {gnn_params + fusion_params:,}")
 
     # 6. WandB
-    run = None
     if args.use_wandb:
-        run = wandb.init(
-            project=args.wandb_project,
-            name=f"{args.exp_name}_seed{args.seed}",
-            config=vars(args)
-        )
+        wandb.init(project=args.wandb_project, name=f"{args.exp_name}_seed{args.seed}", config=vars(args))
 
     # 7. Trainer Setup
     ckpt_dir = Path(f"./saved_models/{args.exp_name}")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_filepath = ckpt_dir / f"best_model_seed{args.seed}.pt"
+
+    # Stage1: GNN pretrain
+    if args.pretrain:
+        print("\n")
+        print(f"[Stage 1] Starting GNN Pre-training for {args.pretrain_epochs} epochs...")
+        
+        pretrain_ckpt_path = os.path.join(ckpt_dir, f"pretrain_gnn_seed{args.seed}.pt")
+        
+        # Init Trainer with stage='pretrain'
+        pretrainer = QwenPrecomputedTrainer(
+            precomputed_embeddings=precomputed_embeddings,
+            gnn_model=gnn_model,
+            fusion_model=fusion_model, # Passed but frozen inside
+            data_dict=data_dict,
+            device=device,
+            epochs=args.pretrain_epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            ckpt_filepath=pretrain_ckpt_path,        
+            epoch = args.pretrain_epochs,
+            supcon_temp=args.supcon_temp,
+            lambda_supcon=args.lambda_supcon,
+            pretrain=args.pretrain,
+            sample = args.sample
+        )
+        
+        pretrainer.train()
+        
+        # [CRITICAL] Load best GNN weights before Stage 2
+        print(f"✅ Stage 1 Finished. Loading best GNN weights from {pretrain_ckpt_path}")
+        checkpoint = torch.load(pretrain_ckpt_path, map_location=device)
+        gnn_model.load_state_dict(checkpoint['gnn_state_dict'])
+        
+        # Free memory
+        del pretrainer
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # Stage2: Fusion Training
+    print("\n")
+    print(f"[Stage 2] Starting SeGA Fusion Training for {args.epochs} epochs...")
+
+    final_ckpt_path = os.path.join(ckpt_dir, f"best_model_seed{args.seed}.pt")
 
     trainer = QwenPrecomputedTrainer(
         precomputed_embeddings=precomputed_embeddings,
@@ -252,13 +296,15 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        ckpt_filepath=ckpt_filepath
+        ckpt_filepath=final_ckpt_path,
+        supcon_temp=args.supcon_temp,
+        lambda_supcon=args.lambda_supcon,
+        pretrain= False,
+        sample= args.sample
     )
 
     # 8. Start Training
     best_f1 = trainer.train()
-
-    
 
     # Ensure best checkpoint exists (trainer may already have saved during training)
     # Save again to ensure file present and consistent

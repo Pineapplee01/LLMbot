@@ -2,18 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import RGCNConv, HGTConv, TransformerConv, GATConv
-from SimpleHGN import SimpleHGNConv
-from RGT import RGTLayer, SemanticAttention
 from torch_geometric.nn.models import MLP
+from RGT import RGTLayer, SemanticAttention
 
 def build_gnn(gnn_type, config):
     if gnn_type == 'RGCN':
         return RGCN(config)
     elif gnn_type == 'RGT':
         return RGT(config)
+    elif gnn_type == 'SimpleHGN':
+        return SimpleHGN(config)
     else:
         raise ValueError(f"Unknown GNN type: {gnn_type}")
-
 
 
 class RGCN(nn.Module):
@@ -162,14 +162,14 @@ class RGT(nn.Module):
         super().__init__()
         
         # Config Mapping
-        self.in_dim = config['in_channels']           # 4096 (Qwen)
-        self.hidden_dim = config['hidden_channels']   # 512
-        self.num_relations = config['num_relations']
-        self.n_layers = config['n_layers']
+        self.in_dim = config.get('lm_input_dim', 4096)           
+        self.hidden_dim = config.get('gnn_hidden_dim', 512)   
+        self.num_relations = config.get('n_relations', 2)
+        self.n_layers = config.get('gnn_n_layers', 2)
         
-        self.att_heads = config['heads']              
-        self.semantic_heads = 4                       # Default for RGT
-        self.dropout_val = config['dropout']
+        self.att_heads = config.get('heads', 8)              
+        self.semantic_heads = 4                       # RGT 标准配置
+        self.dropout_val = config.get('dropout', 0.3)
 
         # --- MODIFICATION START ---
         # Replaced their MLP with a Qwen Projector
@@ -178,6 +178,13 @@ class RGT(nn.Module):
             nn.LayerNorm(self.hidden_dim),
             nn.GELU(),
             nn.Dropout(self.dropout_val)
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_val),
+            nn.Linear(self.hidden_dim // 2, 2)
         )
         # --- MODIFICATION END ---
 

@@ -15,19 +15,23 @@ class QwenPrecomputedTrainer:
         precomputed_embeddings,  # (num_users, 4096)
         gnn_model,
         fusion_model,
+        pretrain,
         data_dict,
         device,
-        epochs=100,
-        lr=2e-3,
-        weight_decay=1e-4,
+        epochs,
+        lr,
+        weight_decay,
+        sample,
         ckpt_filepath='best_model.pt',
         supcon_temp=0.1,  # 温度系数，越小越关注 Hard Samples
         lambda_supcon=0.1, # 对比损失的权重
         **kwargs,
     ):
         self.device = device
+        self.pretrain = pretrain
         self.ckpt_filepath = Path(ckpt_filepath)
         self.epochs = epochs
+        self.sample = sample
         
         # 1. Load Embeddings & Edges
         self.embeddings = precomputed_embeddings.to(device)
@@ -47,7 +51,7 @@ class QwenPrecomputedTrainer:
         else:
             self.labels = raw_labels.long()
             
-        # 3. CRITICAL FIX: Initialize Masks as False first
+        # 3. Initialize Masks 
         self.train_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
         self.val_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
         self.test_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
@@ -93,27 +97,47 @@ class QwenPrecomputedTrainer:
         # 5. Models & Optimizer
         self.gnn = gnn_model.to(device)
         self.fusion = fusion_model.to(device)
-        
-        fusion_params = list(map(id, self.fusion.contrastive_head.parameters()))
-        base_params = filter(lambda p: id(p) not in fusion_params, 
-                             list(self.gnn.parameters()) + list(self.fusion.parameters()))
 
-        self.optimizer = torch.optim.AdamW([
-            {'params': base_params, 'lr': lr},  # 默认 1e-3
-            {'params': self.fusion.contrastive_head.parameters(), 'lr': lr * 5} # 强力驱动投影头
-        ], weight_decay=weight_decay)
-
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs)
-        
         self.criterion_cls = nn.CrossEntropyLoss()
         self.criterion_supcon = SupConLoss(temperature=supcon_temp, base_temperature=supcon_temp).to(device)
         self.lambda_supcon = lambda_supcon
+        
+        if self.pretrain:
+            print(">>> [Trainer] Mode: GNN Pre-training (Frozen Fusion)")
+            # 阶段一：只优化 GNN 的参数
+            self.optimizer = torch.optim.AdamW(
+                self.gnn.parameters(), 
+                lr=lr, 
+                weight_decay=weight_decay
+            )
+            # 冻结 Fusion 以防万一
+            for param in self.fusion.parameters():
+                param.requires_grad = False
+
+        else:
+            print(">>> [Trainer] Mode: Joint Fusion Training")
+            # 阶段二：优化 GNN + Fusion (你的原有逻辑)
+            # 确保 Fusion 解冻
+            for param in self.fusion.parameters():
+                param.requires_grad = True
+
+            fusion_params = list(map(id, self.fusion.contrastive_head.parameters()))
+            base_params = filter(lambda p: id(p) not in fusion_params, 
+                                 list(self.gnn.parameters()) + list(self.fusion.parameters()))
+
+            self.optimizer = torch.optim.AdamW([
+                {'params': base_params, 'lr': lr}, 
+                {'params': self.fusion.contrastive_head.parameters(), 'lr': lr * 5}
+            ], weight_decay=weight_decay)
+
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs)
 
         self.best_val_f1 = 0.0
         self._epoch = 0
 
 
     def train(self):
+
         # Wandb check
         if wandb.run is None:
             wandb.init(project="Qwenbot", name="SeGA_SupCon_Training")
@@ -126,7 +150,10 @@ class QwenPrecomputedTrainer:
         for epoch in range(self.epochs):
             self._epoch = epoch
             self.gnn.train()
-            self.fusion.train()
+
+            if not self.pretrain:
+                self.fusion.train()
+
             self.optimizer.zero_grad()
             
             # --- Forward Pass ---
@@ -134,10 +161,18 @@ class QwenPrecomputedTrainer:
             h_gnn = self.gnn(self.embeddings, self.edge_index, self.edge_type) if self.edge_type is not None else self.gnn(self.embeddings, self.edge_index)
 
             # 2. Fusion
-            # logits: [N, 2] -> 用于分类
-            # contrast_feat: [N, 128] (Normalized) -> 用于 SupCon
-            # alpha: [N, 1] -> 用于监控门控权重
-            logits, contrast_feat, alpha = self.fusion(lm_features=self.embeddings, gnn_features=h_gnn)
+            if self.pretrain:
+                # [阶段一] GNN 独立训练
+                # 直接调用 GNN 内部的 classifier (GNNs.py 中定义的)
+                logits = self.gnn.classifier(h_gnn)
+                
+                # Pretrain 阶段我们主要看 GNN 能不能分类，SupCon 也可以加在 h_gnn 上
+                contrast_feat = h_gnn 
+                alpha = torch.tensor([0.0]) # 占位符
+            
+            else:
+                # [阶段二] Fusion 联合训练
+                logits, contrast_feat, alpha = self.fusion(lm_features=self.embeddings, gnn_features=h_gnn)
             
             # --- Main Loss (Cross Entropy) ---
             loss_cls = self.criterion_cls(logits[self.train_nodes], self.labels[self.train_nodes])
@@ -147,21 +182,38 @@ class QwenPrecomputedTrainer:
             train_labels = self.labels[self.train_nodes]
 
             train_feats_all = F.normalize(train_feats, dim=1)
+            
+            if self.sample == 'random':
+            
+                if train_feats_all.shape[0] > 2048:
+                    perm = torch.randperm(train_feats_all.shape[0])[:2048]
+                    batch_feats = train_feats_all[perm]
+                    batch_labels = train_labels[perm]
 
-            max_supcon_samples = 2048
-            if train_feats_all.shape[0] > max_supcon_samples:
-                perm = torch.randperm(train_feats_all.shape[0])[:max_supcon_samples]
-                batch_feats = train_feats_all[perm]
-                batch_labels = train_labels[perm]
-            else:
-                batch_feats = train_feats_all
-                batch_labels = train_labels
+                else:
+                    batch_feats = train_feats_all
+                    batch_labels = train_labels
+                
+
+            elif self.sample == 'hard':
+
+                with torch.no_grad():
+
+                    sim_matrix = torch.matmul(train_feats_all, train_feats_all.T)
+                    sim_matrix.fill_diagonal_(-float('inf'))
+
+                    weights = F.softmax(sim_matrix / 0.1, dim=1)
+                    hard_indices = torch.multinomial(weights, num_samples=1).squeeze()
+                
+                batch_feats = train_feats_all[hard_indices]
+                batch_labels = train_labels[hard_indices]
 
             loss_supcon = self.criterion_supcon(batch_feats, batch_labels)
             
             # 3. Total Loss (Multi-task Learning)
             current_lambda = self.lambda_supcon if epoch >= 3 else 0.0
-            if epoch > 40 and loss_supcon > 10.0:
+            
+            if not self.pretrain and epoch > 40 and loss_supcon > 7.0:
                 current_lambda *= 0.5
             
             loss = loss_cls + (current_lambda * loss_supcon)
@@ -186,7 +238,7 @@ class QwenPrecomputedTrainer:
             wandb.log(log_dict)
             
             if epoch % 10 == 0:
-                print(f"Epoch {epoch} | CE: {loss_cls.item():.4f} | SupCon: {loss_supcon.item():.4f} | Total: {loss.item():.4f} | Val F1: {val_f1:.4f}")
+                print(f"Epoch {epoch} | CE: {loss_cls.item():.4f} | SupCon: {loss_supcon.item():.4f} | Total: {loss.item():.4f} | Val F1: {val_f1:.4f} | Val ACC: {val_acc:.4f} | Gate α: {alpha.mean().item():.4f}")
             
             # Checkpointing
             if val_f1 > self.best_val_f1:
@@ -204,7 +256,9 @@ class QwenPrecomputedTrainer:
     
     def evaluate(self, nodes):
         self.gnn.eval()
-        self.fusion.eval()
+        if not self.pretrain:
+            self.fusion.eval()
+
         with torch.no_grad():
 
             if self.edge_type is not None:
@@ -212,10 +266,14 @@ class QwenPrecomputedTrainer:
             else:
                 h_gnn = self.gnn(self.embeddings, self.edge_index)
             
-            logits, _, _ = self.fusion(self.embeddings, h_gnn)
+            if self.pretrain:
+                # 评估 GNN 自己的分类头
+                logits = self.gnn.classifier(h_gnn)
+            else:
+                # 评估 Fusion 的分类头
+                logits, _, _ = self.fusion(self.embeddings, h_gnn)
 
             preds = logits.argmax(dim=1)
-            
             y_true = self.labels[nodes].cpu().numpy()
             y_pred = preds[nodes].cpu().numpy()
             
@@ -238,6 +296,9 @@ class QwenPrecomputedTrainer:
         p = path or self.ckpt_filepath
         state = torch.load(p, map_location=self.device)
         self.gnn.load_state_dict(state['gnn_state_dict'])
-        self.fusion.load_state_dict(state['fusion_state_dict'])
+
+        if 'fusion_state_dict' in state:
+            self.fusion.load_state_dict(state['fusion_state_dict'], strict=False)
+
         self.best_val_f1 = state['best_val_f1']
         print(f"Loaded checkpoint from epoch {state['epoch']}")

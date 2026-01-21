@@ -116,6 +116,8 @@ class CrossAttentionFusion(nn.Module):
         
         # 3. Gating
         self.gate_net = nn.Linear(hidden_dim * 2, 1)
+        nn.init.constant_(self.gate_net.bias, 2.0)
+        
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -143,6 +145,17 @@ class CrossAttentionFusion(nn.Module):
         h_text = self.lm_proj(lm_features)    # [B, 4096] -> [B, 256]
         h_graph = self.gnn_proj(gnn_features) # [B, Hidden] -> [B, 256]
         
+        if self.training:
+            prob = torch.rand(1).item()
+            
+            # 30% 概率：彻底丢弃文本，纯靠 GNN (逼它学图)
+            if prob < 0.15:
+                h_text = torch.zeros_like(h_text)
+            
+            # 30% 概率：彻底丢弃图，纯靠文本 (保持文本能力)
+            elif prob < 0.30:
+                h_graph = torch.zeros_like(h_graph)
+
         # B. Prepare for Attention [Batch, Seq=1, Dim]
         query = h_text.unsqueeze(1)
         key = h_graph.unsqueeze(1)
