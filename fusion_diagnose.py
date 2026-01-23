@@ -8,7 +8,7 @@ from sklearn.metrics import silhouette_score, normalized_mutual_info_score
 from sklearn.cluster import KMeans
 
 # Import your project modules
-from utils import load_raw_data, seed_setting
+from LLMbot.utils import load_raw_data, seed_setting
 from GNNs import build_gnn
 from AttentionFusion import CrossAttentionFusion
 

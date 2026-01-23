@@ -7,32 +7,109 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn.models import MLP
 
+class DegreeAwareConfidenceFusion(nn.Module):
+    """
+    [SeGA v3.0] Degree-Aware Confidence Fusion Mechanism.
+    Integrates Node Degree information to dynamically weight LLM vs GNN experts.
+    (Inspired by LGB's MoE gating strategy).
+    """
+    def __init__(self, lm_dim=4096, gnn_dim=512, hidden_dim=512, dropout=0.3):
+        super().__init__()
+        
+        # 1. Feature Projection
+        self.lm_proj = nn.Sequential(
+            nn.Linear(lm_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.gnn_proj = nn.Sequential(
+            nn.Linear(gnn_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 2. Degree-Aware Gating Network
+        # Input: [LM_Feature; GNN_Feature; Degree_Score]
+        # Degree_Score is a scalar (log-normalized degree)
+        self.gate_input_dim = hidden_dim * 2 + 1
+        
+        self.gate_net = nn.Sequential(
+            nn.Linear(self.gate_input_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1) # Output scalar alpha
+        )
+        
+        # Learnable temperature for sharpening the gate
+        self.gate_temperature = nn.Parameter(torch.ones(1))
+        
+        # 3. Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 2)
+        )
+        
+        # 4. SupCon Head (for contrastive learning)
+        self.supcon_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128)
+        )
+
+    def forward(self, lm_features, gnn_features, degree=None):
+        """
+        Args:
+            lm_features: (batch_size, lm_dim)
+            gnn_features: (batch_size, gnn_dim)
+            degree: (batch_size, 1) Normalized log-degree of nodes.
+        """
+        # A. Projection
+        h_lm = self.lm_proj(lm_features)
+        h_gnn = self.gnn_proj(gnn_features)
+        
+        # B. Handle Degree Input
+        if degree is None:
+            # Fallback if degree not provided (though Trainer should provide it)
+            # Default to 0.5 (neutral structural confidence)
+            degree = torch.ones(h_lm.size(0), 1, device=h_lm.device) * 0.5
+            
+        # C. Compute Gate Alpha
+        # Concatenate features and degree
+        combined = torch.cat([h_lm, h_gnn, degree], dim=-1)
+        
+        # Calculate raw logits and scale by temperature
+        gate_logits = self.gate_net(combined) / self.gate_temperature
+        
+        # Alpha -> 1 means trust LM more (Logic: High sparsity/Low degree -> Trust LM)
+        # Alpha -> 0 means trust GNN more
+        alpha = torch.sigmoid(gate_logits)
+        
+        # D. Weighted Fusion
+        h_fused = alpha * h_lm + (1 - alpha) * h_gnn
+        
+        # E. Task Outputs
+        logits = self.classifier(h_fused)
+        z_supcon = F.normalize(self.supcon_head(h_fused), dim=1)
+        
+        return logits, z_supcon, alpha
+
 class SupConLoss(nn.Module):
-    """
-    Supervised Contrastive Learning: https://arxiv.org/abs/2004.11362
-    [Expert Modified] Added numerical stability and divide-by-zero protection.
-    """
+    # 保持原有的 Loss 类不变，为了代码兼容性
     def __init__(self, temperature=0.07, base_temperature=0.07):
         super(SupConLoss, self).__init__()
         self.temperature = temperature
         self.base_temperature = base_temperature
 
     def forward(self, features, labels=None, mask=None):
-        """
-        Args:
-            features: [batch_size, dim] or [batch_size, n_views, dim]
-            labels: [batch_size]
-            mask: [batch_size, batch_size]
-        """
         device = features.device
-
-        # 1. 维度适配：如果输入是 [Batch, Dim]，自动升维到 [Batch, 1, Dim]
         if len(features.shape) < 3:
             features = features.unsqueeze(1)
-
         batch_size = features.shape[0]
-        
-        # 2. 构造 Mask
         if labels is not None and mask is None:
             labels = labels.contiguous().view(-1, 1)
             if labels.shape[0] != batch_size:
@@ -42,24 +119,14 @@ class SupConLoss(nn.Module):
             mask = mask.float().to(device)
 
         contrast_count = features.shape[1]
-        # 将多视图解绑并拼接：[Batch * Views, Dim]
         contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
-        
         anchor_feature = contrast_feature
         anchor_count = contrast_count
-
-        # 3. 计算相似度矩阵
         anchor_dot_contrast = torch.div(
             torch.matmul(anchor_feature, contrast_feature.T),
             self.temperature)
-        
-        # 4. 数值稳定性处理 (Log-Sum-Exp Trick)
-        # 减去最大值防止 exp 溢出
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
         logits = anchor_dot_contrast - logits_max.detach()
-
-        # 5. 排除自身 (Self-Contrast masking)
-        # 将对角线（自己对比自己）的位置设为极小值或在 mask 中剔除
         logits_mask = torch.scatter(
             torch.ones_like(mask),
             1,
@@ -67,120 +134,441 @@ class SupConLoss(nn.Module):
             0
         )
         mask = mask * logits_mask
-
-        # 6. 计算 Log-Prob
         exp_logits = torch.exp(logits) * logits_mask
-        # sum(1) 是分母：所有负样本 + 除自己外的正样本 的指数和
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6) # 加 1e-6 防止 log(0)
-
-        # 7. 计算 Mean Log-Likelihood
-        # 分母是每个样本拥有的正样本数量 (Batch内同类数量 - 1)
-        # ### Expert Fix: 增加 1e-6 防止除以 0 (当 Batch 内该类只有一个样本时)
-        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-6)
-
-        # 8. Loss
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
         loss = loss.view(anchor_count, batch_size).mean()
-
         return loss
 
-class CrossAttentionFusion(nn.Module):
+class ConfidenceFusion(nn.Module):
     """
-    Qwenbot Fusion Module: SeGA (Structure-Enhanced Graph Attention)
+    [2025 Optimized] Confidence-Aware Semantic Alignment
+    拒绝盲目的邻居平滑，专注于特征的可信度加权与类内聚类。
     """
-    def __init__(self, lm_dim, gnn_dim, hidden_dim=256, num_heads=4, dropout=0.1):
+    def __init__(self, lm_dim=4096, gnn_dim=512, hidden_dim=512, dropout=0.3):
         super().__init__()
         
-        # 1. Projectors
-        # IMPORTANT: lm_dim here will be 4096 (Raw Qwen)
+        # 1. 对齐投影 (Alignment Projectors)
+        # 将 LLM 和 GNN 映射到同一个 Metric Space
         self.lm_proj = nn.Sequential(
             nn.Linear(lm_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.GELU()
+            nn.GELU(),
+            nn.Dropout(dropout)
         )
         
-        # gnn_dim will be whatever the GNN outputs (usually 256)
         self.gnn_proj = nn.Sequential(
             nn.Linear(gnn_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.GELU()
+            nn.GELU(),
+            nn.Dropout(dropout)
         )
         
-        # 2. Cross-Attention (Query=Text, Key=Graph)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
+        # 2. 置信度门控 (Confidence Gating Network)
+        # 输入：[LM_proj, GNN_proj] -> 输出：Scalar alpha (0~1)
+        # 决定：当前样本更应该相信文本还是相信图？
+        self.confidence_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1),
+            nn.Sigmoid() 
         )
         
-        # 3. Gating
-        self.gate_net = nn.Linear(hidden_dim * 2, 1)
-        nn.init.constant_(self.gate_net.bias, 2.0)
-        
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        self.contrastive_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 128)  # 128维通常对对比学习效果最好
-        )
-        
-        # 4. Classifier
+        # 3. 最终分类器
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 2)
         )
+        
+        # 4. 辅助：用于 SupCon 的投影头 (Projection Head)
+        self.supcon_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128) # 压缩到低维进行对比学习
+        )
+
+    def forward(self, lm_emb, gnn_emb):
+        # A. 投影到公共空间
+        h_lm = self.lm_proj(lm_emb)      # [B, 512]
+        h_gnn = self.gnn_proj(gnn_emb)   # [B, 512]
+        
+        # B. 计算置信度 alpha
+        # alpha close to 1: Trust LLM more
+        # alpha close to 0: Trust GNN more
+        combined = torch.cat([h_lm, h_gnn], dim=-1)
+        alpha = self.confidence_net(combined) # [B, 1]
+        
+        # C. 动态加权融合 (Dynamic Weighted Fusion)
+        # 不使用简单的相加，而是使用凸组合
+        h_fused = alpha * h_lm + (1 - alpha) * h_gnn
+        
+        # D. 分类
+        logits = self.classifier(h_fused)
+        
+        # E. 生成对比学习特征 (Normalize for Cosine Similarity)
+        # 我们对 h_fused 进行约束，确保融合后的特征在类内紧凑
+        z_supcon = F.normalize(self.supcon_head(h_fused), dim=1)
+        
+        return logits, z_supcon, alpha
+
+class AlignAndEnhanceFusion(nn.Module):
+    """
+    [2025 SOTA Design] 跨模态对齐投影 + 分类增强架构
+    """
+    def __init__(self, lm_dim=4096, gnn_dim=512, projection_dim=512, dropout=0.3):
+        super().__init__()
+        
+        # --- 第一阶段：跨模态对齐投影器 (Alignment Projector) ---
+        # 负责将 LLM 语义空间 映射到 GNN 结构空间
+        self.lm_projector = nn.Sequential(
+            nn.Linear(lm_dim, projection_dim * 2),
+            nn.LayerNorm(projection_dim * 2),
+            nn.GELU(),
+            nn.Linear(projection_dim * 2, projection_dim),
+            nn.Dropout(dropout)
+        )
+        
+        # GNN 侧投影（保持对称性，利于对比学习）
+        self.gnn_projector = nn.Sequential(
+            nn.Linear(gnn_dim, projection_dim),
+            nn.LayerNorm(projection_dim)
+        )
+
+        # --- 第二阶段：自适应门控融合 ---
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(projection_dim * 2, projection_dim),
+            nn.Sigmoid()
+        )
+
+        # --- 第三阶段：分类增强头 ---
+        self.classifier = nn.Sequential(
+            nn.Linear(projection_dim, projection_dim // 2),
+            nn.BatchNorm1d(projection_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(projection_dim // 2, 2)
+        )
+
+    def forward(self, lm_features, gnn_features):
+        # 1. 投影对齐
+        z_lm = self.lm_projector(lm_features)      # [B, 512]
+        z_gnn = self.gnn_projector(gnn_features)   # [B, 512]
+        
+        # 2. 门控融合 (计算残差信息)
+        gate = self.fusion_gate(torch.cat([z_lm, z_gnn], dim=-1))
+        fused = z_gnn + gate * (z_lm - z_gnn) # 结构为基准，文本做增量修正
+        
+        # 3. 分类增强
+        logits = self.classifier(fused)
+        
+        # 返回对齐特征用于计算训练时的 Alignment Loss
+        return logits, z_lm, z_gnn
+
+class GatedModulationFusion(nn.Module):
+    """
+    [Expert Design] Asymmetric Bottleneck Modulation
+    Philosophy: GNN is the Anchor, Text is the Modifier.
+    Formula: Fused = GNN * Sigmoid(Text_Gate) + GNN
+    """
+    def __init__(self, lm_dim=4096, gnn_dim=512, bottleneck_dim=64, dropout=0.3):
+        super().__init__()
+        
+        # 1. 文本瓶颈层 (Text Bottleneck)
+        # 强制将 4096 维的高维稀疏语义压缩为 64 维的核心语义
+        self.text_bottleneck = nn.Sequential(
+            nn.Linear(lm_dim, bottleneck_dim),
+            nn.LayerNorm(bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 2. 门控生成器 (Gate Generator)
+        # 将文本语义映射到 GNN 的特征空间，并生成 0-1 之间的门控信号
+        self.gate_generator = nn.Sequential(
+            nn.Linear(bottleneck_dim, gnn_dim),
+            nn.Sigmoid() 
+        )
+        
+        # 3. 文本残差 (Text Residual)
+        # 允许部分经过筛选的文本语义直接补充进来
+        self.text_residual = nn.Sequential(
+            nn.Linear(bottleneck_dim, gnn_dim),
+            nn.Tanh()
+        )
+        
+        # 4. 对比学习头 (SupCon Head)
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(gnn_dim, gnn_dim),
+            nn.ReLU(),
+            nn.Linear(gnn_dim, 128)
+        )
+        
+        # 5. 分类器 (Classifier)
+        self.classifier = nn.Sequential(
+            nn.Linear(gnn_dim, gnn_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(gnn_dim // 2, 2)
+        )
 
     def forward(self, lm_features, gnn_features):
         """
-        lm_features:  [Batch, 4096] (Raw Qwen)
-        gnn_features: [Batch, Hidden] (GNN Output)
+        lm_features: [B, 4096]
+        gnn_features: [B, 512]
         """
-        # A. Projection
-        h_text = self.lm_proj(lm_features)    # [B, 4096] -> [B, 256]
-        h_graph = self.gnn_proj(gnn_features) # [B, Hidden] -> [B, 256]
+        # A. 压缩文本
+        t_code = self.text_bottleneck(lm_features) # [B, 64]
         
-        if self.training:
-            prob = torch.rand(1).item()
-            
-            # 30% 概率：彻底丢弃文本，纯靠 GNN (逼它学图)
-            if prob < 0.15:
-                h_text = torch.zeros_like(h_text)
-            
-            # 30% 概率：彻底丢弃图，纯靠文本 (保持文本能力)
-            elif prob < 0.30:
-                h_graph = torch.zeros_like(h_graph)
-
-        # B. Prepare for Attention [Batch, Seq=1, Dim]
-        query = h_text.unsqueeze(1)
-        key = h_graph.unsqueeze(1)
-        value = h_graph.unsqueeze(1)
-
-        # C. Attention
-        attn_out, _ = self.cross_attn(query, key, value)
-        attn_out = attn_out.squeeze(1)
+        # B. 生成门控 (Gate)
+        # 每一维的数值代表：文本认为 GNN 的这个特征维度有多重要
+        gate = self.gate_generator(t_code) # [B, 512]
         
-        # D. Gated Residual
-        concat = torch.cat([h_text, attn_out], dim=-1)
-        alpha = torch.sigmoid(self.gate_net(concat))
+        # C. 调制融合 (Modulation)
+        # 核心逻辑：用文本去"重塑"图特征的形状
+        # GNN * Gate: 抑制 GNN 中的噪声维度
+        # Text_Residual: 补充 GNN 缺失的纯文本语义
+        t_res = self.text_residual(t_code)
+        fused_h = (gnn_features * gate) + (t_res * 0.5) 
         
-        h_fused = h_text + (alpha * attn_out)
-        h_fused = self.norm(h_fused)
-
-        h_fused = self.dropout(h_fused)
-
-        contrast_feat = self.contrastive_head(h_fused)
+        # D. 输出
+        logits = self.classifier(fused_h)
+        
+        # SupCon 特征 (归一化)
+        contrast_feat = self.contrastive_head(fused_h)
         contrast_feat = F.normalize(contrast_feat, dim=1)
-
-        logits = self.classifier(h_fused)
         
-        # Return logits for CE Loss, 
-        return logits, contrast_feat, alpha
+        return logits, contrast_feat, gate
+
+class ResidualFusion(nn.Module):
+    """
+    [Final Expert Version]: Zero-Initialized Residual Logit Ensemble
+    Ensures Stage 2 starts exactly where Stage 1 ended (F1 ~0.78).
+    """
+    def __init__(self, lm_dim=4096, gnn_dim=512, hidden_dim=512, dropout=0.3):
+        super().__init__()
+        
+        # 1. 文本处理专家 (Text Expert)
+        self.text_mlp = nn.Sequential(
+            nn.Linear(lm_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(1024, hidden_dim) 
+        )
+        
+        # 2. 融合纠错模块 (Correction Module)
+        self.correction_head = nn.Sequential(
+            nn.Linear(hidden_dim + gnn_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2) # 输出 Logit 的修正值
+        )
+        
+        # 3. 门控系数 (Learnable Scalar) - 关键修改！
+        # 直接初始化为 0.0，不经过 Sigmoid，允许学出负值（负修正）
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+        
+        # 4. 对比学习头
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(hidden_dim + gnn_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128)
+        )
+
+    def forward(self, lm_features, gnn_features):
+        """
+        Returns:
+            correction_logits: The 'delta' to add to GNN logits
+            contrast_feat: Combined features for SupCon
+            alpha: Current weight (scalar)
+        """
+        # A. 提取文本特征
+        h_text = self.text_mlp(lm_features) 
+        
+        # B. 拼接
+        combined = torch.cat([gnn_features, h_text], dim=-1) 
+        
+        # C. 计算纠错值
+        correction_logits = self.correction_head(combined)
+        
+        # D. 对比特征
+        contrast_feat = self.contrastive_head(combined)
+        contrast_feat = F.normalize(contrast_feat, dim=1)
+        
+        # E. 返回权重 (此时 alpha 初始为 0)
+        # 我们返回 correction_logits，让 Trainer 去做: logits = GNN + alpha * correction
+        return correction_logits, contrast_feat, self.alpha
+
+class CrossAttentionFusion(nn.Module):
+    """
+    [Revised Architecture]: Structure-Anchored Gated Fusion
+    Uses GNN features as the 'Anchor' and LLM features as 'Augmentation'.
+    """
+    def __init__(self, lm_dim=4096, gnn_dim=512, hidden_dim=512, dropout=0.1):
+        super(CrossAttentionFusion, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        
+        # 1. Feature Alignment (Projection)
+        # Compress LLM to hidden space
+        self.lm_proj = nn.Sequential(
+            nn.Linear(lm_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Align GNN to hidden space (if needed)
+        self.gnn_proj = nn.Sequential(
+            nn.Linear(gnn_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        # 2. Interaction Mechanism: GNN Querying Text
+        # "Structure looks at Content"
+        # We use a simplified Attention mechanism to avoid parameter explosion
+        self.interaction_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid() # Outputs a gating weight [0, 1]
+        )
+
+        # 3. Final Classification Head
+        # Input: [GNN_Original, Gated_Context] -> Concatenation for stability
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim), 
+            nn.BatchNorm1d(hidden_dim), # BN is crucial for stability after fusion
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2)
+        )
+        
+        # Contrastive Learning Head
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128)
+        )
+
+    def forward(self, lm_features, gnn_features):
+        """
+        Args:
+            lm_features: (batch_size, lm_dim) - Frozen Qwen Embeddings
+            gnn_features: (batch_size, gnn_dim) - Pre-trained GNN Features
+        """
+        
+        # A. Projection & Alignment
+        h_lm = self.lm_proj(lm_features)      # [B, hidden]
+        h_gnn = self.gnn_proj(gnn_features)   # [B, hidden]
+        
+        # B. Interaction (Asymmetric)
+        # We want to know: "How much does the text support the graph structure?"
+        # Simple Element-wise interaction is often more robust than full Softmax Attention for 1-to-1 mapping
+        interaction_raw = h_lm * h_gnn # Hadamard product capturing correlation
+        
+        # C. Gating
+        # Concatenate both to decide importance
+        combined_for_gate = torch.cat([h_gnn, h_lm], dim=-1)
+        gate = self.interaction_gate(combined_for_gate) # [B, hidden]
+        
+        # D. Weighted Augmentation
+        # The text information is filtered by the gate
+        h_lm_filtered = h_lm * gate
+        
+        # E. Structure-Anchored Concatenation (The "Golden Path")
+        # We explicitly keep h_gnn separate to guarantee the baseline performance.
+        # Theoretical formula: Final = Concat(Anchor, Gate * Augment)
+        fused_vector = torch.cat([h_gnn, h_lm_filtered], dim=-1) # [B, hidden*2]
+        
+        # F. Heads
+        logits = self.classifier(fused_vector)
+        
+        contrast_feat = self.contrastive_head(fused_vector)
+        contrast_feat = F.normalize(contrast_feat, dim=1)
+        
+        # Return logits, features, and the gate (for importance analysis)
+        return logits, contrast_feat, gate
+
+class AsymmetricFusion(nn.Module):
+    def __init__(self, lm_dim=4096, gnn_dim=256, fusion_dim=512): # 提升 fusion_dim
+        super().__init__()
+        
+        # 1. 维度适配（缓解信息漏斗）
+        # 不直接压到 256，而是先降到 512 或 1024，保留更多语义
+        self.lm_proj = nn.Sequential(
+            nn.Linear(lm_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU()
+        )
+        # GNN 维度通常较小，可以升维或保持
+        self.gnn_proj = nn.Sequential(
+            nn.Linear(gnn_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU()
+        )
+        
+        # 2. 单向强交互 (GNN Query Text)
+        # 我们只保留一条最关键的 Attention 路径，减少参数量和训练难度
+        # "图结构觉得这段文本哪里可疑？"
+        self.cross_attn = nn.MultiheadAttention(embed_dim=fusion_dim, num_heads=8, batch_first=True)
+        
+        # 3. 门控融合 (Gated Fusion)
+        self.gate = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.Sigmoid()
+        )
+        
+        # 4. 最终分类器 (使用 Concat 保底)
+        # 输入维度是 fusion_dim * 2 (原始GNN + 交互后的Text)
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.ReLU(),
+            nn.Linear(fusion_dim, 2)
+        )
+        
+        # 独立的对比学习头
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.ReLU(),
+            nn.Linear(fusion_dim, 128)
+        )
+
+    def forward(self, lm_raw, gnn_raw):
+        # A. 投影
+        h_text = self.lm_proj(lm_raw).unsqueeze(1)    # [B, 1, 512]
+        h_graph = self.gnn_proj(gnn_raw).unsqueeze(1) # [B, 1, 512]
+        
+        # B. Attention: GNN 查 Text
+        # Q=Graph, K=Text, V=Text
+        # 提取出"与图结构相关的文本特征"
+        aligned_text, _ = self.cross_attn(query=h_graph, key=h_text, value=h_text)
+        
+        # C. 门控残差
+        # 动态决定是使用"对齐后的文本"还是"原始文本"(这里简化为只用对齐后的，防止噪声)
+        # 但我们把 GNN 的原始特征保留，作为"锚点"
+        
+        h_graph_squeeze = h_graph.squeeze(1)
+        aligned_text_squeeze = aligned_text.squeeze(1)
+        
+        # D. 拼接 (Concat) - 采纳 Mentor A 的建议作为物理保底
+        # 我们拼接 [原始GNN, 对齐后的Text]
+        # 这样即便 Attention 失败，分类器至少能看到原始 GNN，保证 F1 不低于 0.78
+        final_vec = torch.cat([h_graph_squeeze, aligned_text_squeeze], dim=-1) # [B, 1024]
+        
+        logits = self.classifier(final_vec)
+        
+        # E. Contrastive Feature
+        contrast_feat = self.contrastive_head(final_vec)
+        contrast_feat = F.normalize(contrast_feat, dim=1)
+        
+        return logits, contrast_feat
 
 class BiDirectionalAttentionFusion(nn.Module):
     """

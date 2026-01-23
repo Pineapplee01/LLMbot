@@ -12,9 +12,9 @@ from pathlib import Path
 from sklearn.metrics import f1_score, accuracy_score
 
 # Ensure we can import from local modules
-from utils import seed_setting, load_raw_data
+from utils import semantic_structure_refinement, seed_setting, load_raw_data
 from GNNs import build_gnn, RGCN, RGT, SimpleHGN, HGT
-from AttentionFusion import CrossAttentionFusion, SupConLoss
+from AttentionFusion import DegreeAwareConfidenceFusion
 from QwenPrecomputedTrainer import QwenPrecomputedTrainer
 
 def parse_args():
@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument('--fusion_dropout', type=float, default=0.1)
     
     # Training Config
-    parser.add_argument('--pretrain',action='store_true', default=True,
+    parser.add_argument('--pretrain',action='store_true', default=False,
                         help = "Whether to run Stage 1: GNN Pre-training")
     parser.add_argument('--pretrain_epochs', type=int, default=50)
     parser.add_argument('--epochs', type=int, default=100,
@@ -154,11 +154,10 @@ def build_models(args, embedding_dim, num_relations, num_nodes):
     
     # 2. Fusion Construction (SeGA)
     # We instantiate the class directly to ensure we use the Corrected Version
-    fusion_model = CrossAttentionFusion(
+    fusion_model = ResidualFusion(
         lm_dim=embedding_dim,       # 4096
         gnn_dim=args.hidden_dim,    # 256 (Output of GNN)
         hidden_dim=args.fusion_hidden_dim, # 256
-        num_heads=args.fusion_heads,
         dropout=args.fusion_dropout
     )
     
@@ -223,10 +222,35 @@ def main():
     
     print(f"Graph Info: {num_nodes} nodes, {num_relations} relation types")
 
-    # 4. Build Models
-    gnn_model, fusion_model = build_models(
-        args, embedding_dim, num_relations, num_nodes
+    data_dict = semantic_structure_refinement(
+        data_dict, 
+        precomputed_embeddings, 
+        threshold=0.5
     )
+
+    # 4. Build Models
+    gnn_config = {
+        'lm_input_dim': embedding_dim,       # 4096 from Qwen
+        'gnn_hidden_dim': args.hidden_dim,   # 512
+        'n_relations': num_relations,        # Calculated dynamically
+        'gnn_n_layers': args.n_layers,       # 2
+        'dropout': args.dropout,             # 0.3
+        'heads': args.heads,                 # 4
+        'num_features_dim': args.num_features_dim # Numerical features dim
+    }
+    
+    # Correctly pass the string type and the config dict
+    gnn_model = build_gnn(args.gnn_type, gnn_config)
+    gnn_model = gnn_model.to(device) # Ensure it is on the correct device
+    
+    gnn_out_dim = args.hidden_dim
+    
+    fusion_model = DegreeAwareConfidenceFusion(
+        lm_dim=embedding_dim,
+        gnn_dim=gnn_config['gnn_hidden_dim'],
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout
+    ).to(device)
     
     # 5. Model Statistics
     gnn_params = sum(p.numel() for p in gnn_model.parameters())
