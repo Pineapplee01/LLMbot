@@ -7,6 +7,123 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn.models import MLP
 
+class OrthogonalityLoss(nn.Module):
+    """
+    强制 Private 特征与 Shared 特征正交，保证它们学到不一样的知识。
+    """
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, shared, private):
+        
+        # Normalize
+        shared = F.normalize(shared, dim=1)
+        private = F.normalize(private, dim=1)
+        
+        # Correlation matrix
+        correlation = torch.mm(shared.t(), private) 
+        
+        # Minimize the Frobenius norm of correlation
+        loss = torch.norm(correlation, p='fro')
+        return loss
+
+class DisentangledMetaFusion(nn.Module):
+    """
+    [SeGA v4.0] Disentangled Fusion with Metadata-Aware Gating
+    """
+    def __init__(self, lm_dim=4096, gnn_dim=512, meta_dim=3, hidden_dim=256, dropout=0.3):
+        super().__init__()
+        
+        # 1. 共享空间投影 (Shared Projectors)
+        self.lm_shared = nn.Sequential(
+            nn.Linear(lm_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU()
+        )
+        self.gnn_shared = nn.Sequential(
+            nn.Linear(gnn_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU()
+        )
+        
+        # 2. 私有空间投影 (Private Projectors)
+        # GNN 的私有特征 (拓扑结构)
+        self.gnn_private = nn.Sequential(
+            nn.Linear(gnn_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 3. Metadata 增强门控 (Context-Aware Gating)
+        # Input: [Shared_LM, Shared_GNN, Metadata]
+        self.gate_input_dim = hidden_dim * 2 + meta_dim
+        self.gate_net = nn.Sequential(
+            nn.Linear(self.gate_input_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )
+        self.gate_temperature = nn.Parameter(torch.ones(1)) # Learnable temperature
+        
+        # 4. 主分类器 (使用 Shared + Private)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim), # Shared_Mix + Private_GNN
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2)
+        )
+        
+        # 5. 辅助分类头 (Auxiliary Heads)
+        # 确保 Private GNN 特征具有判别力
+        self.aux_gnn_head = nn.Linear(hidden_dim, 2)
+        
+        # SupCon Head
+        self.supcon_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128)
+        )
+
+    def forward(self, lm_features, gnn_features, metadata=None):
+        # 处理 Metadata
+        if metadata is None:
+            # 默认填充 0
+            metadata = torch.zeros(lm_features.size(0), 3, device=lm_features.device)
+            
+        # A. 投影
+        h_lm_s = self.lm_shared(lm_features)
+        h_gnn_s = self.gnn_shared(gnn_features)
+        h_gnn_p = self.gnn_private(gnn_features)
+        
+        # B. 门控决策
+        gate_in = torch.cat([h_lm_s, h_gnn_s, metadata], dim=-1)
+        gate_logits = self.gate_net(gate_in) / self.gate_temperature
+        alpha = torch.sigmoid(gate_logits) # Alpha -> Trust LM Shared
+        
+        # C. 共享空间融合
+        h_shared = alpha * h_lm_s + (1 - alpha) * h_gnn_s
+        
+        # D. 最终特征拼接 (Shared + Private)
+        h_final = torch.cat([h_shared, h_gnn_p], dim=-1)
+        
+        # E. 输出
+        logits = self.classifier(h_final)
+        
+        # F. 辅助输出
+        aux_gnn_logits = self.aux_gnn_head(h_gnn_p)
+        z_supcon = F.normalize(self.supcon_head(h_final), dim=1)
+        
+        return {
+            "logits": logits,
+            "logits_gnn_aux": aux_gnn_logits,
+            "shared_gnn": h_gnn_s,
+            "private_gnn": h_gnn_p,
+            "shared_lm": h_lm_s, # 用于 Ortho loss 计算 (可选)
+            "alpha": alpha,
+            "z_supcon": z_supcon
+        }
+
 class DegreeAwareConfidenceFusion(nn.Module):
     """
     [SeGA v3.0] Degree-Aware Confidence Fusion Mechanism.
@@ -99,11 +216,12 @@ class DegreeAwareConfidenceFusion(nn.Module):
         return logits, z_supcon, alpha
 
 class SupConLoss(nn.Module):
-    # 保持原有的 Loss 类不变，为了代码兼容性
-    def __init__(self, temperature=0.07, base_temperature=0.07):
+    """
+    Supervised Contrastive Loss
+    """
+    def __init__(self, temperature=0.07):
         super(SupConLoss, self).__init__()
         self.temperature = temperature
-        self.base_temperature = base_temperature
 
     def forward(self, features, labels=None, mask=None):
         device = features.device
@@ -122,11 +240,14 @@ class SupConLoss(nn.Module):
         contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
         anchor_feature = contrast_feature
         anchor_count = contrast_count
+
         anchor_dot_contrast = torch.div(
             torch.matmul(anchor_feature, contrast_feature.T),
             self.temperature)
+        
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
         logits = anchor_dot_contrast - logits_max.detach()
+
         logits_mask = torch.scatter(
             torch.ones_like(mask),
             1,
@@ -136,10 +257,12 @@ class SupConLoss(nn.Module):
         mask = mask * logits_mask
         exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
         loss = loss.view(anchor_count, batch_size).mean()
         return loss
+    
 
 class ConfidenceFusion(nn.Module):
     """

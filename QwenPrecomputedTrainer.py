@@ -1,13 +1,14 @@
 import torch
 import wandb
 import numpy as np
+import pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 
 from pathlib import Path
 from utils import batch_linear_cka
 from torch_geometric.utils import degree as calc_degree
-from AttentionFusion import SupConLoss
+from AttentionFusion import SupConLoss, OrthogonalityLoss
 from sklearn.metrics import f1_score, accuracy_score
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
@@ -23,6 +24,7 @@ class QwenPrecomputedTrainer:
         epochs,
         lr,
         weight_decay,
+        metadata,
         sample,
         ckpt_filepath='best_model.pt',
         supcon_temp=0.07,  # [Expert] 设为 0.07 以增强难样本挖掘
@@ -40,6 +42,8 @@ class QwenPrecomputedTrainer:
         self.edge_index = data_dict['edge_index'].to(device)
         num_nodes = self.embeddings.shape[0]
         
+        self.metadata = metadata.to(device) if metadata is not None else None
+
         # Handle Edge Types
         self.edge_type = data_dict.get('edge_type', None)
         if self.edge_type is not None: 
@@ -74,7 +78,8 @@ class QwenPrecomputedTrainer:
         self.fusion = fusion_model.to(device)
 
         self.criterion_cls = nn.CrossEntropyLoss()
-        self.criterion_supcon = SupConLoss(temperature=supcon_temp, base_temperature=supcon_temp).to(device)
+        self.ortho_loss_fn = OrthogonalityLoss()
+        self.criterion_supcon = SupConLoss(temperature=supcon_temp).to(device)
         self.lambda_supcon = lambda_supcon
 
         # 6. Node Degrees (for sampling if needed)
@@ -82,13 +87,7 @@ class QwenPrecomputedTrainer:
         row, col = self.edge_index
         deg = calc_degree(col, num_nodes=num_nodes, dtype=torch.float)
         deg = torch.log1p(deg)
-        deg_max = deg.max()
-        deg_min = deg.min()
-        if deg_max > deg_min:
-            deg = (deg - deg_min) / (deg_max - deg_min)
-        else:
-            deg = torch.zeros_like(deg)
-
+        deg = (deg - deg.min()) / (deg.max() - deg.min() + 1e-6)
         self.node_degrees = deg.unsqueeze(1).to(device)
         
         # Differential Learning Rate
@@ -144,11 +143,14 @@ class QwenPrecomputedTrainer:
         Main training loop
         """
         for epoch in range(self.epochs):
+
             self.gnn.train()
             self.fusion.train()
+            self.optimizer.zero_grad()
             
             total_loss = 0
             gate_means = []
+
             
             for batch_nodes, batch_labels in self.dataloader:
                 self.optimizer.zero_grad()
@@ -158,11 +160,9 @@ class QwenPrecomputedTrainer:
                     h_gnn = self.gnn(self.embeddings, self.edge_index, self.edge_type)
                 else:
                     h_gnn = self.gnn(self.embeddings, self.edge_index)
-                
+            
                 batch_emb_lm = self.embeddings[batch_nodes]
                 batch_emb_gnn = h_gnn[batch_nodes]
-                
-                
                 batch_labels = batch_labels.to(self.device)
                 batch_degree = self.node_degrees[batch_nodes]
 
@@ -173,22 +173,28 @@ class QwenPrecomputedTrainer:
                     loss = self.criterion_cls(logits, batch_labels)
                 else:
                     # Stage 2: Fusion Training
-                    logits, z_supcon, alpha = self.fusion(
+                    outputs = self.fusion(
                         batch_emb_lm, 
                         batch_emb_gnn, 
-                        degree=batch_degree
                     )
+
+                    logits = outputs["logits"]
+                    logits_gnn_aux = outputs["logits_gnn_aux"]
+                    shared_gnn = outputs["shared_gnn"]
+                    private_gnn = outputs["private_gnn"]
+                    alpha = outputs["alpha"]
 
                     gate_means.append(alpha.mean().item())
 
                     loss_cls = self.criterion_cls(logits, batch_labels) 
-                    loss_supcon = self.criterion_supcon(z_supcon.unsqueeze(1), batch_labels)
+                    loss_ortho = self.ortho_loss_fn(shared_gnn, private_gnn)
+                    loss_aux = self.criterion_cls(logits_gnn_aux, batch_labels)
 
                     # 计算双重 Loss
                     loss_entropy = -(alpha * torch.log(alpha + 1e-6) + 
                                    (1 - alpha) * torch.log(1 - alpha + 1e-6)).mean()
                     
-                    loss = loss_cls + (self.lambda_supcon * loss_supcon) + (self.lambda_entropy * loss_entropy)
+                    loss = loss_cls + 0.1 * loss_ortho + 0.3 * loss_aux
                 
                 loss.backward()
                 self.optimizer.step()
@@ -234,32 +240,36 @@ class QwenPrecomputedTrainer:
         self.gnn.eval()
         self.fusion.eval()
         
-        # 1. Forward Pass
+        # 1. Full Graph Inference (GNN)
         if self.edge_type is not None:
             full_gnn_h = self.gnn(self.embeddings, self.edge_index, self.edge_type)
         else:
-            full_gnn_h = self.gnn(self.embeddings, self.edge_index)
+            full_gnn_h = self.gnn(self.embeddings, self.edge_index, None)
 
-        # --- CKA 诊断 (仅在非预训练且开启 WandB 时) ---
-        if not self.pretrain and self.use_wandb and split_name == 'val':
-            # 随机抽样计算 CKA
-            sample_idx = torch.randperm(nodes.size(0))[:512]
-            sample_nodes = nodes[sample_idx]
-            feat_lm = self.embeddings[sample_nodes]
-            feat_gnn = full_gnn_h[sample_nodes]
-            cka_score = batch_linear_cka(feat_lm, feat_gnn)
-            wandb.log({f"{split_name}/cka_score": cka_score.item()})
-
-        # 2. Inference
+        # 2. Batch Inference
         batch_emb_lm = self.embeddings[nodes]
         batch_emb_gnn = full_gnn_h[nodes]
+        
+        # [SeGA v4.0] 必须传递 None 或实际 metadata，取决于你的 Fusion 定义
+        # 如果你还没有实现 metadata 加载，这里暂时传 None，并在 Fusion 内部处理
+        
         y_true = self.labels[nodes].cpu().numpy()
 
         if self.pretrain:
             logits = self.gnn.classifier(batch_emb_gnn)
         else:
-            # Stage 2: Fusion
-            logits, _, _ = self.fusion(batch_emb_lm, batch_emb_gnn)
+            # Stage 2: Fusion (字典输出适配)
+            outputs = self.fusion(
+                batch_emb_lm, 
+                batch_emb_gnn
+            )
+            
+            # [Fix] 从字典中提取 logits
+            if isinstance(outputs, dict):
+                logits = outputs["logits"]
+            else:
+                # 兼容旧版本 (tuple)
+                logits = outputs[0]
             
         preds = logits.argmax(dim=1).cpu().numpy()
         
@@ -267,8 +277,71 @@ class QwenPrecomputedTrainer:
         acc = accuracy_score(y_true, preds)
         f1 = f1_score(y_true, preds, average='macro')
         
-        # [FIX] 必须返回两个值，以匹配 train() 中的解包操作
         return acc, f1
+
+
+    def diagnose_errors(self, nodes=None):
+        """
+        [SeGA v4.0 Diagnostic] 运行在 Test Set 上，输出错误样本的深度分析报告。
+        """
+        print("\n🔎 [Diagnostic] Starting Deep Error Analysis...")
+        if nodes is None: nodes = self.test_nodes
+        
+        self.gnn.eval(); self.fusion.eval()
+        with torch.no_grad():
+            h_gnn = self.gnn(self.embeddings, self.edge_index, self.edge_type)
+            out = self.fusion(self.embeddings, h_gnn, self.metadata)
+            
+            probs = torch.softmax(out['logits'], dim=1)
+            preds = probs.argmax(dim=1)
+            
+            # Filter Target Nodes
+            target_indices = nodes
+            target_preds = preds[target_indices]
+            target_labels = self.labels[target_indices]
+            target_alphas = out['alpha'][target_indices]
+            
+            # Find Errors
+            errors = (target_preds != target_labels)
+            error_indices = target_indices[errors]
+            
+            print(f"Total Test Nodes: {len(nodes)}")
+            print(f"Total Errors: {len(error_indices)} (Acc: {1 - len(error_indices)/len(nodes):.4f})")
+            
+            # Analysis Report
+            report = []
+            # 只分析前 10 个错误案例
+            for idx in error_indices[:10]:
+                idx_int = idx.item()
+                true_cls = "Bot" if self.labels[idx] == 1 else "Human"
+                pred_cls = "Bot" if preds[idx] == 1 else "Human"
+                prob_bot = probs[idx, 1].item()
+                gate_val = out['alpha'][idx].item() # >0.5 means leans LM
+                
+                # Metadata (归一化之前的 raw data 最好，但这里只有归一化后的)
+                # meta_vals = self.metadata[idx].cpu().numpy()
+                
+                report.append({
+                    "Node ID": idx_int,
+                    "True": true_cls,
+                    "Pred": pred_cls,
+                    "Conf (Bot)": f"{prob_bot:.2f}",
+                    "Gate (alpha)": f"{gate_val:.2f} " + ("(Trust LM)" if gate_val > 0.5 else "(Trust GNN)"),
+                    # "Meta (Norm)": meta_vals
+                })
+            
+            df = pd.DataFrame(report)
+            print("\n--- Error Case Traceback ---")
+            print(df.to_markdown(index=False))
+            
+            # Global Gate Statistics
+            print("\n--- Gate Distribution Analysis ---")
+            bots = target_labels == 1
+            humans = target_labels == 0
+            print(f"Avg Gate for Bots: {target_alphas[bots].mean():.3f}")
+            print(f"Avg Gate for Humans: {target_alphas[humans].mean():.3f}")
+            
+            return df
 
     def save_checkpoint(self, epoch=0):
         self.ckpt_filepath.parent.mkdir(parents=True, exist_ok=True)

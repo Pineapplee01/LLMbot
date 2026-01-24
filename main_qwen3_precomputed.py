@@ -12,9 +12,9 @@ from pathlib import Path
 from sklearn.metrics import f1_score, accuracy_score
 
 # Ensure we can import from local modules
-from utils import semantic_structure_refinement, seed_setting, load_raw_data
+from utils import relation_aware_knn_pruning, seed_setting, load_raw_data
 from GNNs import build_gnn, RGCN, RGT, SimpleHGN, HGT
-from AttentionFusion import DegreeAwareConfidenceFusion
+from AttentionFusion import DegreeAwareConfidenceFusion,DisentangledMetaFusion
 from QwenPrecomputedTrainer import QwenPrecomputedTrainer
 
 def parse_args():
@@ -154,7 +154,7 @@ def build_models(args, embedding_dim, num_relations, num_nodes):
     
     # 2. Fusion Construction (SeGA)
     # We instantiate the class directly to ensure we use the Corrected Version
-    fusion_model = ResidualFusion(
+    fusion_model = DisentangledMetaFusion(
         lm_dim=embedding_dim,       # 4096
         gnn_dim=args.hidden_dim,    # 256 (Output of GNN)
         hidden_dim=args.fusion_hidden_dim, # 256
@@ -165,9 +165,8 @@ def build_models(args, embedding_dim, num_relations, num_nodes):
 
 
 def main():
-    args = parse_args()
     
-    # 1. Setup
+    args = parse_args()
     seed_setting(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -222,10 +221,10 @@ def main():
     
     print(f"Graph Info: {num_nodes} nodes, {num_relations} relation types")
 
-    data_dict = semantic_structure_refinement(
+    data_dict = relation_aware_knn_pruning(
         data_dict, 
         precomputed_embeddings, 
-        threshold=0.5
+        k=10
     )
 
     # 4. Build Models
@@ -241,13 +240,12 @@ def main():
     
     # Correctly pass the string type and the config dict
     gnn_model = build_gnn(args.gnn_type, gnn_config)
-    gnn_model = gnn_model.to(device) # Ensure it is on the correct device
+    gnn_model = gnn_model.to(device) 
     
-    gnn_out_dim = args.hidden_dim
     
-    fusion_model = DegreeAwareConfidenceFusion(
+    fusion_model = DisentangledMetaFusion(
         lm_dim=embedding_dim,
-        gnn_dim=gnn_config['gnn_hidden_dim'],
+        gnn_dim=args.hidden_dim,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout
     ).to(device)
@@ -291,7 +289,8 @@ def main():
             supcon_temp=args.supcon_temp,
             lambda_supcon=args.lambda_supcon,
             pretrain=args.pretrain,
-            sample = args.sample
+            sample = args.sample,
+            metadata=None
         )
         
         pretrainer.train()
@@ -324,11 +323,14 @@ def main():
         supcon_temp=args.supcon_temp,
         lambda_supcon=args.lambda_supcon,
         pretrain= False,
+        metadata= None,
         sample= args.sample
     )
-
+    
     # 8. Start Training
     best_f1 = trainer.train()
+
+    trainer.diagnose_errors()
 
     # Ensure best checkpoint exists (trainer may already have saved during training)
     # Save again to ensure file present and consistent

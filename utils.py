@@ -7,78 +7,113 @@ import wandb
 import json
 
 from pathlib import Path
-from torch_geometric.utils import add_self_loops
+from torch_geometric.utils import add_self_loops, remove_self_loops, scatter
 
-def semantic_structure_refinement(data_dict, embeddings, threshold=0.5):
+def relation_aware_knn_pruning(data_dict, embeddings, k=5, z_score_threshold=0.0):
     """
-    [SeGA v3.0 Core] Semantic-Guided Graph Pruning (inspired by BotLGT).
-    Refines graph structure by removing edges with low semantic similarity
-    and ensuring self-loops for structural stability.
-    
-    Args:
-        data_dict (dict): Dictionary containing 'edge_index' and 'edge_type'.
-        embeddings (Tensor): Precomputed LLM embeddings [Num_Nodes, Dim].
-        threshold (float): Cosine similarity threshold for pruning.
-    
-    Returns:
-        dict: Updated data_dict with refined structure.
+    [SeGA v4.0 Core] Local Z-score/Top-K Pruning.
+    修复了 edge_type 维度爆炸的 Bug，确保边索引和边类型严格对齐。
     """
-    print(f"\n[Graph Refinement] Starting semantic pruning (Threshold={threshold})...")
+    print(f"\n[Graph Refinement] Starting Relation-Aware KNN Pruning (K={k})...")
     
     edge_index = data_dict['edge_index']
-    device = embeddings.device
-    
-    # 1. Prepare Embeddings (Move to CPU to save GPU memory during big matrix ops if needed)
-    # forcing computation on same device as embeddings
-    src_idx, dst_idx = edge_index[0], edge_index[1]
-    
-    emb_src = embeddings[src_idx]
-    emb_dst = embeddings[dst_idx]
-    
-    # 2. Compute Cosine Similarity for existing edges only
-    # Sim(A, B) = (A . B) / (|A| * |B|)
-    emb_src_norm = F.normalize(emb_src, p=2, dim=1)
-    emb_dst_norm = F.normalize(emb_dst, p=2, dim=1)
-    
-    # Element-wise dot product
-    similarity = (emb_src_norm * emb_dst_norm).sum(dim=1)
-    
-    # 3. Filter Edges
-    mask = similarity > threshold
-    pruned_edge_index = edge_index[:, mask]
-    
-    num_original = edge_index.shape[1]
-    num_kept = pruned_edge_index.shape[1]
-    num_dropped = num_original - num_kept
-    
-    print(f"[Graph Refinement] Edges processed: {num_original}")
-    print(f"[Graph Refinement] Pruned edges:    {num_dropped} ({num_dropped/num_original:.2%})")
-    
-    # 4. Handle Edge Types (if exist)
-    if 'edge_type' in data_dict and data_dict['edge_type'] is not None:
-        data_dict['edge_type'] = data_dict['edge_type'][mask]
-        # Note: If adding self-loops later, need to handle edge_type for self-loops
-        # For simplicity in RGT, usually a special relation type is assigned or it's handled implicitly.
-        # Here we preserve the alignment for RGT.
-    
-    # 5. [Crucial for Sparse Graphs] Add Self-Loops
-    # Ensures isolated nodes (after pruning) can still aggregate their own features in GNN.
-    final_edge_index, _ = add_self_loops(pruned_edge_index, num_nodes=embeddings.shape[0])
-    
-    print(f"[Graph Refinement] Final edges (with self-loops): {final_edge_index.shape[1]}")
-    
-    # Update data_dict
-    data_dict['edge_index'] = final_edge_index
-    
-    # If edge_type exists, we need to pad it for self-loops. 
-    # Usually, we assign a new relation id or 0 for self-loops.
-    # Assuming RGT handles relations, we simply extend edge_type with a default relation (e.g., 0)
-    if 'edge_type' in data_dict and data_dict['edge_type'] is not None:
-        num_self_loops = final_edge_index.shape[1] - num_kept
-        # Append relation 0 (or similar) for self-loops
-        self_loop_types = torch.zeros(num_self_loops, dtype=torch.long, device=device)
-        data_dict['edge_type'] = torch.cat([data_dict['edge_type'], self_loop_types], dim=0)
+    edge_type = data_dict['edge_type']
+    device = edge_index.device
+    num_nodes = embeddings.size(0)
 
+    # 容器用于存放筛选后的边
+    refined_edges_list = []
+    refined_types_list = []
+    
+    # 移动 Embedding 到同一设备用于计算
+    embeddings = embeddings.to(device)
+
+    mask = torch.zeros(edge_index.shape[1], dtype=torch.bool, device=device)
+
+    # 获取图中包含的所有关系类型 (通常是 0 和 1)
+    unique_relations = torch.unique(edge_type)
+
+    total_kept = 0
+    
+    for r_type in unique_relations:
+        # 1. 提取当前关系的所有边
+        # mask shape: [E_total], sub_edges shape: [2, E_rel]
+        r_mask = (edge_type == r_type)
+        r_edges = edge_index[:, r_mask]
+
+        global_indices = torch.where(r_mask)[0]
+        
+        if r_edges.shape[1] == 0:
+            continue
+            
+        src_nodes = r_edges[0]
+        dst_nodes = r_edges[1]
+        
+        # 2. 计算余弦相似度 (Element-wise)
+        emb_src = F.normalize(embeddings[src_nodes], p=2, dim=1)
+        emb_dst = F.normalize(embeddings[dst_nodes], p=2, dim=1)
+        sims = torch.sum(emb_src * emb_dst, dim=1)
+
+        
+        # 3. 执行 Top-K 筛选
+        unique_src = torch.unique(src_nodes)
+        
+        nodes_processed = 0
+        edges_kept_local = 0
+        
+        # 但考虑到 TwiBot-20 规模尚可，此循环是安全的。
+        # 如果追求极致速度，可使用 torch_scatter 或 argsort 优化。
+        for u in unique_src:
+            
+            # 找到节点 u 发出的所有边在 sub_edges 中的索引
+            loc_idx = torch.where(src_nodes == u)[0]
+            u_sims = sims[loc_idx]
+
+            k_actual = min(len(loc_idx), k)
+            vals, topk_rel_idx = torch.topk(u_sims, k_actual)
+            
+            if len(loc_idx) > 2:
+                mean = u_sims.mean()
+                std = u_sims.std()
+                
+                # 动态阈值: 必须大于均值
+                score_mask = vals > (mean + z_score_threshold * std)
+                
+                # 至少保留 1 个最好的，防止孤立
+                if score_mask.sum() == 0:
+                    score_mask[0] = True
+                
+                topk_rel_idx = topk_rel_idx[score_mask]
+
+            indices = global_indices[loc_idx[topk_rel_idx]]
+            mask[indices] = True
+            
+            nodes_processed += 1
+            edges_kept_local += len(indices)
+        
+        print(f"  - Relation {r_type.item()}: Processed {nodes_processed} nodes. Kept {edges_kept_local}/{len(global_indices)} edges.")
+
+
+    # 5. 合并所有关系的边
+    new_edge_index = edge_index[:, mask]
+    new_edge_type = edge_type[mask]
+
+    print(f"[Graph Refinement] Total Pruned: {edge_index.shape[1]} -> {new_edge_index.shape[1]}")
+    print(f"[Graph Refinement] Reduction Rate: {1 - new_edge_index.shape[1]/edge_index.shape[1]:.2%}")
+
+    # 5. 添加自环 (关键！防止 RGT 崩溃)
+    new_edge_index, new_edge_type = remove_self_loops(new_edge_index, new_edge_type)
+    new_edge_index, _ = add_self_loops(new_edge_index, num_nodes=num_nodes)
+    
+    # 补充 edge_type
+    num_self_loops = num_nodes
+    # 假设自环是类型 0 (或者你可以定义为 max_type + 1)
+    loop_types = torch.zeros(num_self_loops, dtype=torch.long, device=device)
+    new_edge_type = torch.cat([new_edge_type, loop_types], dim=0)
+    
+    data_dict['edge_index'] = new_edge_index
+    data_dict['edge_type'] = new_edge_type
+    
     return data_dict
 
 def _torch_load(path):
