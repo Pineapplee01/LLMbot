@@ -12,7 +12,7 @@ from pathlib import Path
 from sklearn.metrics import f1_score, accuracy_score
 
 # Ensure we can import from local modules
-from utils import relation_aware_knn_pruning, seed_setting, load_raw_data
+from utils import relation_aware_knn_pruning, seed_setting, load_raw_data, BadCaseAnalyzer
 from GNNs import build_gnn, RGCN, RGT, SimpleHGN, HGT
 from AttentionFusion import DegreeAwareConfidenceFusion,DisentangledMetaFusion
 from QwenPrecomputedTrainer import QwenPrecomputedTrainer
@@ -40,7 +40,10 @@ def parse_args():
     parser.add_argument('--hidden_dim', type=int, default=512) 
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--dropout', type=float, default=0.3)
-    
+    parser.add_argument('--pruning', action='store_true', default=False, help='Whether to apply neighbor pruning')
+    parser.add_argument('--neighbor', type=int, default=16,
+                        help='Number of neighbors to sample per node (for hard sampling)')
+
     # Fusion Config
     parser.add_argument('--fusion_hidden_dim', type=int, default=256)
     parser.add_argument('--fusion_heads', type=int, default=4)
@@ -67,6 +70,7 @@ def parse_args():
     parser.add_argument('--exp_name', type=str, default='SeGA_Qwen3')
     parser.add_argument('--use_wandb', action='store_true', default=False)
     parser.add_argument('--wandb_project', type=str, default='SeGA-Experiment')
+    parser.add_argument('--error_capture', action='store_true', default=True)
     
     return parser.parse_args()
 
@@ -221,11 +225,15 @@ def main():
     
     print(f"Graph Info: {num_nodes} nodes, {num_relations} relation types")
 
-    data_dict = relation_aware_knn_pruning(
-        data_dict, 
-        precomputed_embeddings, 
-        k=10
-    )
+    if args.pruning:
+
+        print(f"[Pre-Process] Applying Relation-Aware KNN Pruning with k={args.neighbor}...")
+        data_dict = relation_aware_knn_pruning(
+            data_dict, 
+            precomputed_embeddings, 
+            k=args.neighbor
+        )
+
 
     # 4. Build Models
     gnn_config = {
@@ -285,7 +293,6 @@ def main():
             lr=args.lr,
             weight_decay=args.weight_decay,
             ckpt_filepath=pretrain_ckpt_path,        
-            epoch = args.pretrain_epochs,
             supcon_temp=args.supcon_temp,
             lambda_supcon=args.lambda_supcon,
             pretrain=args.pretrain,
@@ -308,7 +315,7 @@ def main():
     print("\n")
     print(f"[Stage 2] Starting SeGA Fusion Training for {args.epochs} epochs...")
 
-    final_ckpt_path = os.path.join(ckpt_dir, f"best_model_seed{args.seed}.pt")
+    best_ckpt_path = os.path.join(ckpt_dir, f"best_model_seed{args.seed}.pt")
 
     trainer = QwenPrecomputedTrainer(
         precomputed_embeddings=precomputed_embeddings,
@@ -319,7 +326,7 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        ckpt_filepath=final_ckpt_path,
+        ckpt_filepath=best_ckpt_path,
         supcon_temp=args.supcon_temp,
         lambda_supcon=args.lambda_supcon,
         pretrain= False,
@@ -330,14 +337,13 @@ def main():
     # 8. Start Training
     best_f1 = trainer.train()
 
-    trainer.diagnose_errors()
-
     # Ensure best checkpoint exists (trainer may already have saved during training)
     # Save again to ensure file present and consistent
     try:
         trainer.save_checkpoint()
     except Exception as e:
         print(f"[Warning] save_checkpoint() raised: {e}")
+
 
     # Also write a fusion-only checkpoint that fusion_diagnose.py can load directly.
     fusion_ckpt = {
@@ -353,11 +359,39 @@ def main():
     torch.save(fusion_ckpt, fusion_ckpt_path)
     print(f"Saved fusion checkpoint for diagnosis to: {fusion_ckpt_path}")
 
+
+    if args.error_capture:
+
+        print("[Bad Case Study] STARTING FULL DATASET DIAGNOSIS")
+
+        trainer.load_checkpoint(best_ckpt_path)
+        splits = ['train', 'val', 'test']
+
+        for split in splits:
+
+            print(f"[Bad Case Study] Diagnosing errors for split: {split}")
+            df_diagnosis = trainer.diagnose_errors(split=split)
+
+            full_csv_path = ckpt_dir / f"diagnosis_{split}_seed{args.seed}.csv"
+            df_diagnosis.to_csv(full_csv_path, index=False)
+            print(f"[Bad Case Study] Full Diagnosis saved to {full_csv_path}")
+
+            # 按置信度排序
+            df_errors = df_diagnosis[df_diagnosis['is_correct_full'] == False].copy()
+            df_errors = df_errors.sort_values(by='conf_full', ascending=False)  # pyright: ignore[reportCallIssue]
+            
+            error_csv_path = ckpt_dir / f"bad_cases_{split}_seed{args.seed}.csv"
+            df_errors.to_csv(error_csv_path, index=False)
+
+            print(f"\n [Bad Case Study] Found {len(df_errors)} error samples, list saved to {error_csv_path}")
+        
+
+
     # Abation Study
     if args.ablation:
 
         print("Loading best checkpoint for Ablation Study...")
-        checkpoint = torch.load(f"{args.save_dir}/best_model_seed{args.seed}.pt")
+        checkpoint = torch.load(f"{args.ckpt_dir}/best_model_seed{args.seed}.pt")
         trainer.gnn.load_state_dict(checkpoint['gnn_state_dict'])
         trainer.fusion.load_state_dict(checkpoint['fusion_state_dict'])
         

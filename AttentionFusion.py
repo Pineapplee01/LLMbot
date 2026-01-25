@@ -263,7 +263,6 @@ class SupConLoss(nn.Module):
         loss = loss.view(anchor_count, batch_size).mean()
         return loss
     
-
 class ConfidenceFusion(nn.Module):
     """
     [2025 Optimized] Confidence-Aware Semantic Alignment
@@ -337,59 +336,6 @@ class ConfidenceFusion(nn.Module):
         z_supcon = F.normalize(self.supcon_head(h_fused), dim=1)
         
         return logits, z_supcon, alpha
-
-class AlignAndEnhanceFusion(nn.Module):
-    """
-    [2025 SOTA Design] 跨模态对齐投影 + 分类增强架构
-    """
-    def __init__(self, lm_dim=4096, gnn_dim=512, projection_dim=512, dropout=0.3):
-        super().__init__()
-        
-        # --- 第一阶段：跨模态对齐投影器 (Alignment Projector) ---
-        # 负责将 LLM 语义空间 映射到 GNN 结构空间
-        self.lm_projector = nn.Sequential(
-            nn.Linear(lm_dim, projection_dim * 2),
-            nn.LayerNorm(projection_dim * 2),
-            nn.GELU(),
-            nn.Linear(projection_dim * 2, projection_dim),
-            nn.Dropout(dropout)
-        )
-        
-        # GNN 侧投影（保持对称性，利于对比学习）
-        self.gnn_projector = nn.Sequential(
-            nn.Linear(gnn_dim, projection_dim),
-            nn.LayerNorm(projection_dim)
-        )
-
-        # --- 第二阶段：自适应门控融合 ---
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(projection_dim * 2, projection_dim),
-            nn.Sigmoid()
-        )
-
-        # --- 第三阶段：分类增强头 ---
-        self.classifier = nn.Sequential(
-            nn.Linear(projection_dim, projection_dim // 2),
-            nn.BatchNorm1d(projection_dim // 2),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout),
-            nn.Linear(projection_dim // 2, 2)
-        )
-
-    def forward(self, lm_features, gnn_features):
-        # 1. 投影对齐
-        z_lm = self.lm_projector(lm_features)      # [B, 512]
-        z_gnn = self.gnn_projector(gnn_features)   # [B, 512]
-        
-        # 2. 门控融合 (计算残差信息)
-        gate = self.fusion_gate(torch.cat([z_lm, z_gnn], dim=-1))
-        fused = z_gnn + gate * (z_lm - z_gnn) # 结构为基准，文本做增量修正
-        
-        # 3. 分类增强
-        logits = self.classifier(fused)
-        
-        # 返回对齐特征用于计算训练时的 Alignment Loss
-        return logits, z_lm, z_gnn
 
 class GatedModulationFusion(nn.Module):
     """

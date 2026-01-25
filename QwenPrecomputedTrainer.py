@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pathlib import Path
-from utils import batch_linear_cka
-from torch_geometric.utils import degree as calc_degree
+from utils import batch_linear_cka, get_stats, calculate_structural_metrics
+from torch_geometric.utils import degree as calc_degree, scatter
 from AttentionFusion import SupConLoss, OrthogonalityLoss
 from sklearn.metrics import f1_score, accuracy_score
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
@@ -208,7 +208,7 @@ class QwenPrecomputedTrainer:
             avg_gate = sum(gate_means)/len(gate_means) if len(gate_means) > 0 else 0.0
             
             # Evaluate (修复了 unpack error)
-            val_acc, val_f1 = self.evaluate(self.val_nodes, split_name='val')
+            val_acc, val_f1, error_mask = self.evaluate(self.val_nodes, split_name='val')
             
             print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f} | Gate: {avg_gate:.4f}")
             
@@ -237,6 +237,9 @@ class QwenPrecomputedTrainer:
     
     @torch.no_grad()
     def evaluate(self, nodes, split_name='val'):
+        """
+        Modified evaluate to optionally capture error indices.
+        """
         self.gnn.eval()
         self.fusion.eval()
         
@@ -249,97 +252,143 @@ class QwenPrecomputedTrainer:
         # 2. Batch Inference
         batch_emb_lm = self.embeddings[nodes]
         batch_emb_gnn = full_gnn_h[nodes]
-        
-        # [SeGA v4.0] 必须传递 None 或实际 metadata，取决于你的 Fusion 定义
-        # 如果你还没有实现 metadata 加载，这里暂时传 None，并在 Fusion 内部处理
-        
+         
         y_true = self.labels[nodes].cpu().numpy()
 
         if self.pretrain:
             logits = self.gnn.classifier(batch_emb_gnn)
         else:
             # Stage 2: Fusion (字典输出适配)
-            outputs = self.fusion(
-                batch_emb_lm, 
-                batch_emb_gnn
-            )
+            outputs = self.fusion(batch_emb_lm, batch_emb_gnn)
+            logits = outputs["logits"] if isinstance(outputs, dict) else outputs[0]
             
-            # [Fix] 从字典中提取 logits
-            if isinstance(outputs, dict):
-                logits = outputs["logits"]
-            else:
-                # 兼容旧版本 (tuple)
-                logits = outputs[0]
             
         preds = logits.argmax(dim=1).cpu().numpy()
         
-        # 3. 计算指标
+        
         acc = accuracy_score(y_true, preds)
         f1 = f1_score(y_true, preds, average='macro')
-        
-        return acc, f1
 
+        # 找出预测错误的 Local Indices (相对于 nodes 数组的索引)
+        error_mask = (preds != y_true)
+            
+        # 获取这些错误的 Global Node Indices (原始图中的 ID)
+        # nodes 是 Tensor, error_mask 是 numpy boolean array -> 需要转换一下
+        error_mask_tensor = torch.from_numpy(error_mask).bool().to(nodes.device)
+        bad_case_indices = nodes[error_mask_tensor]
+            
+        print(f"[{split_name}] Found {len(bad_case_indices)} bad cases out of {len(nodes)} samples.")
+        return acc, f1, bad_case_indices
 
-    def diagnose_errors(self, nodes=None):
+    def diagnose_errors(self, split=''):
         """
-        [SeGA v4.0 Diagnostic] 运行在 Test Set 上，输出错误样本的深度分析报告。
+        [SeGA v5.0 Ultimate Diagnostic]
+        包含: 三视图推理 + 结构特征分析 + Gate 行为分析
         """
-        print("\n🔎 [Diagnostic] Starting Deep Error Analysis...")
-        if nodes is None: nodes = self.test_nodes
+        print("\n" + "="*60)
+        print("🔬 [Diagnostic] Running Structure-Aware Analysis...")
+        print("="*60)
         
-        self.gnn.eval(); self.fusion.eval()
+        if split == 'train':
+            eval_nodes = self.train_nodes
+        elif split == 'val':
+            eval_nodes = self.val_nodes
+        elif split == 'test':
+            eval_nodes = self.test_nodes
+        else:
+            raise ValueError(f"Unknown split name: {split}")
+
+        self.gnn.eval()
+        self.fusion.eval()
+
         with torch.no_grad():
-            h_gnn = self.gnn(self.embeddings, self.edge_index, self.edge_type)
-            out = self.fusion(self.embeddings, h_gnn, self.metadata)
+            x_lm = self.embeddings
+            edge_index = self.edge_index
+            edge_type = self.edge_type
+
+            # --- Step 0: 计算全图结构特征 ---
+            log_deg, homophily = calculate_structural_metrics(x_lm, edge_index)
+
+            # --- Step A: GNN 基础特征 ---
+            if edge_type is not None:
+                h_gnn_raw = self.gnn(x_lm, edge_index, edge_type)
+            else:
+                h_gnn_raw = self.gnn(x_lm, edge_index, None)
+
+            # --- Step B: 三视图推理 ---
+
+            # 1. Full
+            out_full = self.fusion(x_lm, h_gnn_raw)
+            logits_full = out_full['logits'] if isinstance(out_full, dict) else out_full[0]
             
-            probs = torch.softmax(out['logits'], dim=1)
-            preds = probs.argmax(dim=1)
+            pred_full, conf_full, ent_full = get_stats(logits_full)
             
-            # Filter Target Nodes
-            target_indices = nodes
-            target_preds = preds[target_indices]
-            target_labels = self.labels[target_indices]
-            target_alphas = out['alpha'][target_indices]
+            # 2. Text Only (URGA 优先读取 logits_llm)
+            if isinstance(out_full, dict) and 'logits_llm' in out_full:
+                logits_text = out_full['logits_llm']
+            else:
+                h_gnn_zeros = torch.zeros_like(h_gnn_raw)
+                out_text = self.fusion(x_lm, h_gnn_zeros)
+                logits_text = out_text['logits'] if isinstance(out_text, dict) else out_text[0]
             
-            # Find Errors
-            errors = (target_preds != target_labels)
-            error_indices = target_indices[errors]
-            
-            print(f"Total Test Nodes: {len(nodes)}")
-            print(f"Total Errors: {len(error_indices)} (Acc: {1 - len(error_indices)/len(nodes):.4f})")
-            
-            # Analysis Report
-            report = []
-            # 只分析前 10 个错误案例
-            for idx in error_indices[:10]:
-                idx_int = idx.item()
-                true_cls = "Bot" if self.labels[idx] == 1 else "Human"
-                pred_cls = "Bot" if preds[idx] == 1 else "Human"
-                prob_bot = probs[idx, 1].item()
-                gate_val = out['alpha'][idx].item() # >0.5 means leans LM
+            pred_text, conf_text, ent_text = get_stats(logits_text)
                 
-                # Metadata (归一化之前的 raw data 最好，但这里只有归一化后的)
-                # meta_vals = self.metadata[idx].cpu().numpy()
+            # 3. Graph Only
+            x_lm_zeros = torch.zeros_like(x_lm)
+            out_graph = self.fusion(x_lm_zeros, h_gnn_raw)
+            logits_graph = out_graph['logits'] if isinstance(out_graph, dict) else out_graph[0]
+            
+            pred_graph, conf_graph, ent_graph = get_stats(logits_graph)
+            
+            # --- Step C: 数据收集 ---
+
+            # 提取 Gate
+            alpha_vals = torch.zeros(x_lm.shape[0])
+            if isinstance(out_full, dict) and 'alpha' in out_full:
+                alpha_vals = out_full['alpha'].squeeze()
+
+            idx = eval_nodes.cpu().numpy()
+            lbl = self.labels[eval_nodes].cpu().numpy()
+
+            data = {
+                'node_idx': idx,
+                'label': lbl,
                 
-                report.append({
-                    "Node ID": idx_int,
-                    "True": true_cls,
-                    "Pred": pred_cls,
-                    "Conf (Bot)": f"{prob_bot:.2f}",
-                    "Gate (alpha)": f"{gate_val:.2f} " + ("(Trust LM)" if gate_val > 0.5 else "(Trust GNN)"),
-                    # "Meta (Norm)": meta_vals
-                })
+                # Full Model
+                'pred_full': pred_full[eval_nodes].cpu().numpy(),
+                'conf_full': conf_full[eval_nodes].cpu().numpy(),
+                'is_correct_full': (pred_full[eval_nodes] == self.labels[eval_nodes]).cpu().numpy(),
+                
+                # Text Only
+                'pred_text': pred_text[eval_nodes].cpu().numpy(),
+                'conf_text': conf_text[eval_nodes].cpu().numpy(),
+                'is_correct_text': (pred_text[eval_nodes] == self.labels[eval_nodes]).cpu().numpy(),
+                
+                # Graph Only
+                'pred_graph': pred_graph[eval_nodes].cpu().numpy(),
+                'conf_graph': conf_graph[eval_nodes].cpu().numpy(),
+                'is_correct_graph': (pred_graph[eval_nodes] == self.labels[eval_nodes]).cpu().numpy(),
+                
+                # Analysis Metrics
+                'gate': alpha_vals[eval_nodes].cpu().numpy(),
+                'entropy': ent_full[eval_nodes].cpu().numpy(),
+                'log_degree': log_deg[eval_nodes].cpu().numpy(),
+                'homophily': homophily[eval_nodes].cpu().numpy()
+            }
+
+            df = pd.DataFrame(data)
             
-            df = pd.DataFrame(report)
-            print("\n--- Error Case Traceback ---")
-            print(df.to_markdown(index=False))
-            
-            # Global Gate Statistics
-            print("\n--- Gate Distribution Analysis ---")
-            bots = target_labels == 1
-            humans = target_labels == 0
-            print(f"Avg Gate for Bots: {target_alphas[bots].mean():.3f}")
-            print(f"Avg Gate for Humans: {target_alphas[humans].mean():.3f}")
+            conditions = [
+                (df['is_correct_text'] == False) & (df['is_correct_graph'] == True) ,
+                (df['is_correct_text'] == True)  & (df['is_correct_graph'] == False),
+                (df['is_correct_text'] == False) & (df['is_correct_graph'] == False),
+                (df['is_correct_text'] == True)  & (df['is_correct_graph'] == True)
+            ]
+            choices = ['Text', 'Graph ', 'Both ', 'Clean']
+            df['case_type'] = np.select(conditions, choices, default='Unknown')
+
+            print("\n📊 [Diagnostic Summary]")
+            print(df['case_type'].value_counts())
             
             return df
 

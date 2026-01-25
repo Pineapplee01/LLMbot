@@ -3,11 +3,176 @@ import torch.nn as nn
 import torch.nn.functional as F
 import random, os
 import numpy as np
+import pandas as pd
 import wandb
 import json
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from pathlib import Path
 from torch_geometric.utils import add_self_loops, remove_self_loops, scatter
+from torch_geometric.utils import degree as calc_degree
+
+def calculate_structural_metrics( x, edge_index):
+        """
+        [Helper] 计算节点的结构属性，用于深入诊断。
+        1. Degree (Log-normalized)
+        2. Feature Homophily (邻居语义相似度)
+        """
+        num_nodes = x.shape[0]
+        row, col = edge_index
+        
+        # --- Metric 1: Degree (入度 + 出度) ---
+        # 简单起见，我们计算无向度或总度数
+        # 如果是有向图，Bot 检测中 "In-Degree" (粉丝数) 通常更重要，这里我们算 Total
+        deg = calc_degree(col, num_nodes=num_nodes, dtype=torch.float)
+        # Log degree 用于分析更方便 (Power-law 分布)
+        log_deg = torch.log1p(deg)
+        
+        # --- Metric 2: Feature Homophily (语义同质性) ---
+        # 计算每个节点与其邻居的平均 Cosine Similarity
+        # Algorithm: Scatter Mean of CosineSim(x_src, x_dst)
+        
+        # 1. 获取边两端的特征
+        x_src = x[row]
+        x_dst = x[col]
+        
+        # 2. 计算每条边的相似度
+        edge_sim = F.cosine_similarity(x_src, x_dst, dim=1)
+        
+        # 3. 聚合到目标节点 (dst)
+        # 使用 torch_geometric.utils.scatter (如果版本旧可能在 torch_scatter)
+        # 如果没有安装 torch_scatter，可以用简单的 index_add_ 实现
+        
+        # out[i] = mean(sim(j, i)) for j in neighbors(i)
+        # 对于孤立点，结果为 0 (或者我们需要设为 1? 设为 0 表示没有邻居支持)
+        node_homophily = scatter(edge_sim, col, dim=0, dim_size=num_nodes, reduce='mean')
+        
+        return log_deg, node_homophily
+
+def get_stats(logits):
+                probs = F.softmax(logits, dim=1)
+                conf, preds = probs.max(dim=1)
+                # 计算熵 (不确定性)
+                log_probs = F.log_softmax(logits, dim=1)
+                entropy = -(probs * log_probs).sum(dim=1)
+                return preds, conf, entropy
+
+def plot_gate_vs_uncertainty(df, save_path):
+    """
+    绘制 Gate 响应曲线：检查 Gate 是否随着 Text 不确定性的增加而把权重分给 Graph
+    """
+    plt.figure(figsize=(10, 6))
+    
+    # 我们关注 Opportunity 样本，因为这些是 Gate 本应该起作用但没起作用的地方
+    sns.scatterplot(
+        data=df, 
+        x='entropy', 
+        y='gate', 
+        hue='case_type',
+        style='case_type',
+        alpha=0.7,
+        palette={'Clean':'grey', 'Opportunity (Text Fail)':'red', 'Risk (Graph Fail)':'blue', 'Hard (Both Fail)':'orange'}
+    )
+    
+    # 画出理想的趋势线（示意）或实际的回归线
+    sns.regplot(data=df, x='entropy', y='gate', scatter=False, color='black', line_kws={'linestyle':'--'}, label='Trend')
+    
+    plt.title("Diagnosis: Does Gate Respond to Text Uncertainty?")
+    plt.xlabel("Text Entropy (Higher = More Uncertain)")
+    plt.ylabel("Gate Value (Higher = Trust Text)")
+    plt.ylim(0, 1.05)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc=2)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    print(f"📊 Chart saved to {save_path}")
+
+class BadCaseAnalyzer:
+    def __init__(self, raw_data_path, node_id_map):
+        """
+        raw_data_path: 原始的 node.json 路径 (包含 description, tweets 等)
+        node_id_map: 一个 list 或 dict, 映射 model 的 index 到原始数据的 id
+                     例如: dataset.node_ids (test set ordered)
+        """
+        self.raw_data = self._load_raw_data(raw_data_path)
+        self.node_id_map = node_id_map
+        
+    def _load_raw_data(self, path):
+        # 假设是 Twibot-20 标准的 json 格式
+        print(f"Loading raw data from {path}...")
+        with open(path, 'r') as f:
+            data = json.load(f)
+        #以此建立 ID -> Data 的快速索引
+        return {item['id']: item for item in data}
+
+    def get_user_info(self, idx):
+        """获取指定测试集索引的原始用户信息"""
+        real_id = self.node_id_map[idx] # 获取真实推特ID
+        info = self.raw_data.get(real_id, {})
+        
+        return {
+            "id": real_id,
+            "label": "Bot" if info.get('label') == 'bot' else "Human",
+            "description": info.get('description', 'N/A'),
+            "tweets": info.get('tweet', [])[:3], # 只看前3条
+            "followers": info.get('public_metrics', {}).get('follower_count', 0),
+            "following": info.get('public_metrics', {}).get('following_count', 0)
+        }
+
+    def analyze(self, logits_llm, logits_gnn, labels, indices):
+        """
+        logits_llm: Tensor [N, 2]
+        logits_gnn: Tensor [N, 2]
+        labels: Tensor [N]
+        indices: 原始测试集在全集中的索引 (Global Indices)
+        """
+        preds_llm = torch.argmax(logits_llm, dim=1).cpu().numpy()
+        preds_gnn = torch.argmax(logits_gnn, dim=1).cpu().numpy()
+        targets = labels.cpu().numpy()
+        indices = indices.cpu().numpy() # 这里的 indices 是 batch 里的
+
+        # Boolean Masks
+        correct_llm = (preds_llm == targets)
+        correct_gnn = (preds_gnn == targets)
+
+        # 1. Text 错, Graph 对 (我们最希望 GNN 救回来的)
+        # "Opportunity Cases"
+        group_1_mask = (~correct_llm) & (correct_gnn)
+        
+        # 2. Graph 错, Text 对 (融合不当容易被 GNN 带偏的)
+        # "Risk Cases"
+        group_2_mask = (correct_llm) & (~correct_gnn)
+
+        # 3. 都错 (Hard Samples)
+        group_3_mask = (~correct_llm) & (~correct_gnn)
+
+        results = {
+            "group1_indices": indices[group_1_mask],
+            "group2_indices": indices[group_2_mask],
+            "group3_indices": indices[group_3_mask],
+        }
+        
+        print(f"\n=== Bad Case Statistical Overview ===")
+        print(f"Total Samples: {len(targets)}")
+        print(f"Group 1 (Text Wrong / Graph Right): {len(results['group1_indices'])} (Opportunity)")
+        print(f"Group 2 (Text Right / Graph Wrong): {len(results['group2_indices'])} (Risk)")
+        print(f"Group 3 (Both Wrong): {len(results['group3_indices'])} (Hard)")
+        print("=====================================\n")
+        
+        return results
+
+    def print_details(self, global_idx, case_type):
+        """打印单个用户的详细侦查报告"""
+        info = self.get_user_info(global_idx)
+        
+        print(f"--- [Case Type: {case_type}] ID: {info['id']} ---")
+        print(f"GT Label: {info['label']}")
+        print(f"Stats: Follower {info['followers']} | Following {info['following']}")
+        print(f"Description: {info['description']}")
+        print(f"Tweets (Sample):")
+        for i, t in enumerate(info['tweets']):
+            print(f"  [{i+1}] {t}")
+        print("--------------------------------------------------")
 
 def relation_aware_knn_pruning(data_dict, embeddings, k=5, z_score_threshold=0.0):
     """
