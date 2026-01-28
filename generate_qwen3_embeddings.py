@@ -18,13 +18,7 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score, davies_bouldin_index
 import warnings
-
-# Try importing wandb
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
+import wandb
 
 warnings.filterwarnings('ignore')
 
@@ -40,7 +34,7 @@ class Qwen3EmbeddingGenerator:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.batch_size = batch_size
         self.pooling_strategy = pooling
-        self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.use_wandb = use_wandb and wandb is not None
 
         if self.use_wandb:
             # Check if run is already initialized to avoid errors

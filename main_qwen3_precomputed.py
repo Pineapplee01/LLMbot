@@ -8,13 +8,12 @@ import torch
 import argparse
 import sys
 import os
+
 from pathlib import Path
 from sklearn.metrics import f1_score, accuracy_score
-
-# Ensure we can import from local modules
 from utils import relation_aware_knn_pruning, seed_setting, load_raw_data, BadCaseAnalyzer
 from GNNs import build_gnn, RGCN, RGT, SimpleHGN, HGT
-from AttentionFusion import DegreeAwareConfidenceFusion,DisentangledMetaFusion
+from AttentionFusion import DisentangledMetaFusion, ReliabilityAwareFusion
 from QwenPrecomputedTrainer import QwenPrecomputedTrainer
 
 def parse_args():
@@ -50,9 +49,11 @@ def parse_args():
     parser.add_argument('--fusion_dropout', type=float, default=0.1)
     
     # Training Config
-    parser.add_argument('--pretrain',action='store_true', default=False,
-                        help = "Whether to run Stage 1: GNN Pre-training")
-    parser.add_argument('--pretrain_epochs', type=int, default=50)
+    parser.add_argument('--pretrain_gnn',action='store_true', default=False,
+                        help = "Whether to run  GNN Pre-training")
+    parser.add_argument('--pretrain_llm', action='store_true', default=False,
+                        help='Whether to run Text Expert (VIB) Pre-training')
+    parser.add_argument('--pretrain_epochs', type=int, default=15)
     parser.add_argument('--epochs', type=int, default=100,
                         help='Epochs for Stage 2 (Fusion)')
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -173,10 +174,9 @@ def main():
     args = parse_args()
     seed_setting(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    
     
     # 2. Load Embedding
-    print(f"Loading precomputed embeddings from {args.embeddings_path}...")
     precomputed_embeddings = torch.load(args.embeddings_path, map_location='cpu', weights_only=False)
 
     # Convert to tensor if numpy
@@ -251,7 +251,7 @@ def main():
     gnn_model = gnn_model.to(device) 
     
     
-    fusion_model = DisentangledMetaFusion(
+    fusion_model = ReliabilityAwareFusion(
         lm_dim=embedding_dim,
         gnn_dim=args.hidden_dim,
         hidden_dim=args.hidden_dim,
@@ -274,76 +274,47 @@ def main():
     ckpt_dir = Path(f"./saved_models/{args.exp_name}")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_filepath = ckpt_dir / f"best_model_seed{args.seed}.pt"
-
-    # Stage1: GNN pretrain
-    if args.pretrain:
-        print("\n")
-        print(f"[Stage 1] Starting GNN Pre-training for {args.pretrain_epochs} epochs...")
         
-        pretrain_ckpt_path = os.path.join(ckpt_dir, f"pretrain_gnn_seed{args.seed}.pt")
-        
-        # Init Trainer with stage='pretrain'
-        pretrainer = QwenPrecomputedTrainer(
+    trainer = QwenPrecomputedTrainer(
             precomputed_embeddings=precomputed_embeddings,
             gnn_model=gnn_model,
-            fusion_model=fusion_model, # Passed but frozen inside
+            fusion_model=fusion_model, 
+            pretrain_gnn=args.pretrain_gnn,
+            pretrain_llm=args.pretrain_llm,
             data_dict=data_dict,
             device=device,
             epochs=args.pretrain_epochs,
             lr=args.lr,
-            weight_decay=args.weight_decay,
-            ckpt_filepath=pretrain_ckpt_path,        
+            weight_decay=args.weight_decay,     
             supcon_temp=args.supcon_temp,
             lambda_supcon=args.lambda_supcon,
-            pretrain=args.pretrain,
+            pretrain=args.pretrain_gnn,
+            ckpt_filepath=str(ckpt_filepath),
             sample = args.sample,
             metadata=None
-        )
-        
-        pretrainer.train()
-        
-        # [CRITICAL] Load best GNN weights before Stage 2
-        print(f"✅ Stage 1 Finished. Loading best GNN weights from {pretrain_ckpt_path}")
-        checkpoint = torch.load(pretrain_ckpt_path, map_location=device)
-        gnn_model.load_state_dict(checkpoint['gnn_state_dict'])
-        
-        # Free memory
-        del pretrainer
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-    # Stage2: Fusion Training
-    print("\n")
-    print(f"[Stage 2] Starting SeGA Fusion Training for {args.epochs} epochs...")
-
-    best_ckpt_path = os.path.join(ckpt_dir, f"best_model_seed{args.seed}.pt")
-
-    trainer = QwenPrecomputedTrainer(
-        precomputed_embeddings=precomputed_embeddings,
-        gnn_model=gnn_model,
-        fusion_model=fusion_model,
-        data_dict=data_dict,
-        device=device,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        ckpt_filepath=best_ckpt_path,
-        supcon_temp=args.supcon_temp,
-        lambda_supcon=args.lambda_supcon,
-        pretrain= False,
-        metadata= None,
-        sample= args.sample
     )
+        
+    if args.pretrain_llm:
+        trainer.pretrain_text_vib(epochs=15)
+        
+    if args.pretrain_gnn:
+        trainer.train()
+
+    vib_path = ckpt_dir / "best_text_vib.pt"
+
+    if vib_path.exists():
+        state = torch.load(vib_path, map_location=device)
+        trainer.fusion.vib.load_state_dict(state)
     
-    # 8. Start Training
+    else:
+        print("⚠️ Warning: No pre-trained Text VIB found! Fusion might suffer from Cold Start.")
+    
+    if ckpt_filepath.exists():
+        state = torch.load(ckpt_filepath, map_location=device)
+        if 'gnn_state_dict' in state:
+                trainer.gnn.load_state_dict(state['gnn_state_dict'])
+
     best_f1 = trainer.train()
-
-    # Ensure best checkpoint exists (trainer may already have saved during training)
-    # Save again to ensure file present and consistent
-    try:
-        trainer.save_checkpoint()
-    except Exception as e:
-        print(f"[Warning] save_checkpoint() raised: {e}")
-
 
     # Also write a fusion-only checkpoint that fusion_diagnose.py can load directly.
     fusion_ckpt = {
@@ -363,8 +334,7 @@ def main():
     if args.error_capture:
 
         print("[Bad Case Study] STARTING FULL DATASET DIAGNOSIS")
-
-        trainer.load_checkpoint(best_ckpt_path)
+        trainer.load_checkpoint(ckpt_filepath)
         splits = ['train', 'val', 'test']
 
         for split in splits:
@@ -385,8 +355,6 @@ def main():
 
             print(f"\n [Bad Case Study] Found {len(df_errors)} error samples, list saved to {error_csv_path}")
         
-
-
     # Abation Study
     if args.ablation:
 

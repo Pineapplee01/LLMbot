@@ -1,3 +1,4 @@
+import gc
 import torch
 import wandb
 import numpy as np
@@ -6,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pathlib import Path
-from utils import batch_linear_cka, get_stats, calculate_structural_metrics
+from utils import batch_linear_cka, get_stats, calculate_structural_metrics, analyze_uncertainty_dist
 from torch_geometric.utils import degree as calc_degree, scatter
 from AttentionFusion import SupConLoss, OrthogonalityLoss
 from sklearn.metrics import f1_score, accuracy_score
@@ -15,10 +16,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 class QwenPrecomputedTrainer:
     def __init__(
         self,
-        precomputed_embeddings,  # (num_users, 4096)
+        precomputed_embeddings, 
         gnn_model,
         fusion_model,
-        pretrain,
+        pretrain_gnn, 
+        pretrain_llm, # 仅作为标记保留
         data_dict,
         device,
         epochs,
@@ -27,53 +29,38 @@ class QwenPrecomputedTrainer:
         metadata,
         sample,
         ckpt_filepath='best_model.pt',
-        supcon_temp=0.07,  # [Expert] 设为 0.07 以增强难样本挖掘
+        supcon_temp=0.07,
         lambda_supcon=0.1, 
         **kwargs,
     ):
         self.device = device
-        self.pretrain = pretrain
+        self.pretrain_gnn = pretrain_gnn
+        self.pretrain_llm = pretrain_llm
         self.ckpt_filepath = Path(ckpt_filepath)
         self.epochs = epochs
         self.sample = sample
         
-        # 1. Load Embeddings & Edges
+        # 1. Load Data
         self.embeddings = precomputed_embeddings.to(device)
         self.edge_index = data_dict['edge_index'].to(device)
         num_nodes = self.embeddings.shape[0]
         
         self.metadata = metadata.to(device) if metadata is not None else None
-
-        # Handle Edge Types
         self.edge_type = data_dict.get('edge_type', None)
         if self.edge_type is not None: 
             self.edge_type = self.edge_type.to(device)
             
-        # 2. Handle Labels   
         raw_labels = data_dict['labels'].to(device)
-
-        # 处理 One-Hot 或 Class Index
         if raw_labels.dim() > 1 and raw_labels.shape[1] > 1:
-            print(f"[Data] Detected One-Hot Labels {raw_labels.shape}. Converting to Class Indices.")
             self.labels = raw_labels.argmax(dim=1).long()
         else:
             self.labels = raw_labels.long()
             
-        # 3. Initialize Masks 
-        self.train_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
-        self.val_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
-        self.test_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
-
-        # 4. Load Indices & masks
         self.train_nodes = data_dict['train_idx'].to(device)
-        self.test_nodes = data_dict['test_idx'].to(device)
         self.val_nodes = data_dict['valid_idx'].to(device)
-           
-        self.train_mask[self.train_nodes] = True
-        self.val_mask[self.val_nodes] = True
-        self.test_mask[self.test_nodes] = True
+        self.test_nodes = data_dict['test_idx'].to(device)
             
-        # 5. Models & Optimizer
+        # 2. Models
         self.gnn = gnn_model.to(device)
         self.fusion = fusion_model.to(device)
 
@@ -82,336 +69,398 @@ class QwenPrecomputedTrainer:
         self.criterion_supcon = SupConLoss(temperature=supcon_temp).to(device)
         self.lambda_supcon = lambda_supcon
 
-        # 6. Node Degrees (for sampling if needed)
-        num_nodes = self.embeddings.shape[0]
-        row, col = self.edge_index
-        deg = calc_degree(col, num_nodes=num_nodes, dtype=torch.float)
-        deg = torch.log1p(deg)
-        deg = (deg - deg.min()) / (deg.max() - deg.min() + 1e-6)
-        self.node_degrees = deg.unsqueeze(1).to(device)
-        
-        # Differential Learning Rate
-        if self.pretrain:
-            # Stage 1: pretraing GNN
-            self.optimizer = torch.optim.AdamW(
-                self.gnn.parameters(), lr=lr, weight_decay=weight_decay
-            )
+        # [Meta Features Containers]
+        self.entropy_gnn = None
+        self.jsd = None
+
+        # 3. Precompute Structure
+        print("[Trainer] Precomputing structural metrics...")
+        self._precompute_structure_metrics(num_nodes)
+
+        # 4. Optimizer Setup
+        # [Fix] 这里的逻辑只决定 main loop (train) 的模式：GNN 或 Fusion
+        # pretrain_llm 有自己的独立方法和优化器，不应影响主优化器的初始化
+        if self.pretrain_gnn:
+            print("[Trainer] Mode: GNN Pre-training (Stage 2)")
+            self.optimizer = torch.optim.AdamW(self.gnn.parameters(), lr=lr, weight_decay=weight_decay)
         else:
-            # Stage 2: Fusion Training
-            print(f"[Trainer] Applying Differential LR: Fusion={lr}, GNN={lr*0.01}")
+            # Fusion Mode (Stage 3)
+            print(f"[Trainer] Mode: Fusion Training (Stage 3) | Differential LR: Fusion={lr}, GNN={lr*0.01}")
             self.optimizer = torch.optim.AdamW([
-                {'params': self.fusion.parameters(), 'lr': lr},         # Fusion 全速
-                {'params': self.gnn.parameters(),    'lr': lr * 0.01}   # GNN 极低速微调
+                {'params': self.fusion.parameters(), 'lr': lr},
+                {'params': self.gnn.parameters(),    'lr': lr * 0.01}
             ], weight_decay=weight_decay)
 
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=1e-6)
-
-        self.criterion_cls = nn.CrossEntropyLoss()
-        self.criterion_supcon = SupConLoss(temperature=supcon_temp)
-        self.lambda_entropy = 0.01 
-        self.lambda_supcon = lambda_supcon
+        # Scheduler
+        if self.optimizer:
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=1e-6)
         
         self.best_val_f1 = 0.0
         self.use_wandb = wandb.run is not None
+        self._init_dataloader()
 
-        # Dataloader
+    def _precompute_structure_metrics(self, num_nodes):
+        with torch.no_grad():
+            row, col = self.edge_index
+            deg = calc_degree(col, num_nodes=num_nodes, dtype=torch.float).clamp(min=1)
+            deg_log = torch.log1p(deg)
+            self.node_degrees = ((deg_log - deg_log.min()) / (deg_log.max() - deg_log.min() + 1e-6)).unsqueeze(1)
+            
+            x_norm = F.normalize(self.embeddings, p=2, dim=1)
+            indices = torch.stack([col, row]) 
+            values = 1.0 / deg[col]
+            
+            adj_sparse = torch.sparse_coo_tensor(indices, values, (num_nodes, num_nodes)).coalesce()
+            neighbor_mean = torch.sparse.mm(adj_sparse, x_norm)
+            
+            mask_isolated = (deg == 0).unsqueeze(1)
+            neighbor_mean = torch.where(mask_isolated, x_norm, neighbor_mean)
+            neighbor_mean = F.normalize(neighbor_mean, p=2, dim=1)
+            self.homophily = (x_norm * neighbor_mean).sum(dim=1, keepdim=True).clamp(0, 1)
+        
+        torch.cuda.empty_cache()
+
+    def _init_dataloader(self):
         train_labels = self.labels[self.train_nodes].cpu().numpy()
         class_counts = np.bincount(train_labels)
-
         class_counts[class_counts == 0] = 1
-        class_weights = 1. / class_counts
-        sample_weights = class_weights[train_labels]
+        sample_weights = (1. / class_counts)[train_labels]
         
         sampler = torch.utils.data.WeightedRandomSampler(
             weights=torch.from_numpy(sample_weights).double(),
             num_samples=len(sample_weights),
             replacement=True
         )
+        train_dataset = torch.utils.data.TensorDataset(self.train_nodes, self.labels[self.train_nodes])
+        self.dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=256, sampler=sampler, drop_last=True)
 
-        train_dataset = torch.utils.data.TensorDataset(
-            self.train_nodes, self.labels[self.train_nodes]
-        )
-        self.dataloader = torch.utils.data.DataLoader(
-            train_dataset, 
-            batch_size=256, 
-            sampler=sampler, # 使用采样器
-            drop_last=True   # 丢弃最后一个不完整的batch，避免SupCon计算NaN
-        )
+    def precompute_meta_features(self):
+        """Precompute JSD and GNN Entropy before Stage 3"""
+        print("[Trainer] Precomputing Meta-Features (GNN Entropy & JSD)...")
+        self.gnn.eval()
+        self.fusion.eval()
+        
+        with torch.no_grad():
+            # 1. GNN Prob
+            if self.edge_type is not None:
+                h_gnn = self.gnn(self.embeddings, self.edge_index, self.edge_type)
+            else:
+                h_gnn = self.gnn(self.embeddings, self.edge_index)
+            
+            logits_gnn = self.gnn.classifier(h_gnn)
+            prob_gnn = F.softmax(logits_gnn, dim=1)
+            self.entropy_gnn = -torch.sum(prob_gnn * torch.log(prob_gnn + 1e-9), dim=1, keepdim=True)
+            
+            # 2. Text VIB Prob
+            logits_lm, _, _, _ = self.fusion.vib(self.embeddings)
+            prob_lm = F.softmax(logits_lm, dim=1)
+            
+            # 3. JSD
+            m = 0.5 * (prob_lm + prob_gnn)
+            kl_lm = F.kl_div(torch.log(prob_lm + 1e-9), m, reduction='none').sum(dim=1, keepdim=True)
+            kl_gnn = F.kl_div(torch.log(prob_gnn + 1e-9), m, reduction='none').sum(dim=1, keepdim=True)
+            self.jsd = 0.5 * (kl_lm + kl_gnn)
+            
+        print("[Trainer] Meta-Features computed.")
+
+    def pretrain_text_vib(self, epochs=15):
+        """[Stage 1] VIB Pre-training"""
+        print(f"\n🚀 [Stage 1] Starting Text Expert (VIB) Pre-training for {epochs} epochs...")
+        # 定义局部优化器，不影响主流程
+        optimizer = torch.optim.AdamW(self.fusion.vib.parameters(), lr=1e-3, weight_decay=1e-4)
+        best_acc = 0.0
+        lambda_vib = 1e-3 
+        
+        vib_ckpt_path = self.ckpt_filepath.parent / "best_text_vib.pt"
+
+        for epoch in range(epochs):
+            self.fusion.vib.train()
+            total_loss = 0
+            
+            for batch_nodes, batch_labels in self.dataloader:
+                optimizer.zero_grad()
+                batch_nodes, batch_labels = batch_nodes.to(self.device), batch_labels.to(self.device)
+                
+                logits, _, _, kl_loss = self.fusion.vib(self.embeddings[batch_nodes])
+                loss = self.criterion_cls(logits, batch_labels) + lambda_vib * kl_loss
+                
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            
+            val_acc = self._validate_text_only()
+            print(f"   VIB Ep {epoch+1:02d} | Loss: {total_loss/len(self.dataloader):.4f} | Val Acc: {val_acc:.4f}")
+            
+            if val_acc > best_acc:
+                best_acc = val_acc
+                torch.save(self.fusion.vib.state_dict(), vib_ckpt_path)
+
+        print(f"✅ Text Expert Finished. Best Acc: {best_acc:.4f}")
+        # 加载最好的 VIB 权重，为后续 Fusion 做准备
+        if vib_ckpt_path.exists():
+            self.fusion.vib.load_state_dict(torch.load(vib_ckpt_path))  
+
+    def _validate_text_only(self):
+        self.fusion.vib.eval()
+        preds, targets = [], []
+        with torch.no_grad():
+            emb = self.embeddings[self.val_nodes]
+            lbl = self.labels[self.val_nodes]
+            logits, _, _, _ = self.fusion.vib(emb)
+            preds.append(logits.argmax(dim=1).cpu())
+            targets.append(lbl.cpu())
+        return accuracy_score(torch.cat(targets), torch.cat(preds))
 
     def train(self):
         """
-        Main training loop
+        Handles Stage 2 (GNN Pretrain) OR Stage 3 (Fusion Train)
+        Note: Stage 1 is handled explicitly by pretrain_text_vib()
         """
-        for epoch in range(self.epochs):
+        WARMUP_EPOCHS = 5          
+        lambda_oracle = 0.5        
+        lambda_consist = 0.1       
+        margin_val = 0.2
+        lambda_vib = 1e-3
 
+        # Fusion 阶段需要元特征
+        if not self.pretrain_gnn and self.entropy_gnn is None:
+            self.precompute_meta_features()
+
+        for epoch in range(self.epochs):
             self.gnn.train()
-            self.fusion.train()
+            if not self.pretrain_gnn:
+                self.fusion.train()
+                
             self.optimizer.zero_grad()
             
             total_loss = 0
             gate_means = []
-
+            
+            curr_lambda_oracle = lambda_oracle if epoch >= WARMUP_EPOCHS else 0.0
+            curr_lambda_consist = lambda_consist if epoch >= WARMUP_EPOCHS else 0.0
             
             for batch_nodes, batch_labels in self.dataloader:
                 self.optimizer.zero_grad()
-                
-                # A. GNN Forward
+                batch_nodes, batch_labels = batch_nodes.to(self.device), batch_labels.to(self.device)
+
+                # GNN Forward
                 if self.edge_type is not None:
                     h_gnn = self.gnn(self.embeddings, self.edge_index, self.edge_type)
                 else:
                     h_gnn = self.gnn(self.embeddings, self.edge_index)
-            
-                batch_emb_lm = self.embeddings[batch_nodes]
+                
                 batch_emb_gnn = h_gnn[batch_nodes]
-                batch_labels = batch_labels.to(self.device)
-                batch_degree = self.node_degrees[batch_nodes]
 
-                # B. Forward & Loss Calculation
-                if self.pretrain:
-                    # Stage 1: Only train GNN Classifier
+                if self.pretrain_gnn:
+                    # [Stage 2] GNN Only
                     logits = self.gnn.classifier(batch_emb_gnn)
                     loss = self.criterion_cls(logits, batch_labels)
+                    loss_oracle, loss_consist, kl_loss = torch.tensor(0.), torch.tensor(0.), torch.tensor(0.)
                 else:
-                    # Stage 2: Fusion Training
+                    # [Stage 3] Fusion
+                    batch_emb_lm = self.embeddings[batch_nodes]
+                    
                     outputs = self.fusion(
-                        batch_emb_lm, 
-                        batch_emb_gnn, 
+                        lm_emb=batch_emb_lm,      
+                        gnn_emb=batch_emb_gnn,    
+                        homophily=self.homophily[batch_nodes], 
+                        degree=self.node_degrees[batch_nodes],
+                        entropy_gnn=self.entropy_gnn[batch_nodes],
+                        jsd=self.jsd[batch_nodes]
                     )
 
-                    logits = outputs["logits"]
-                    logits_gnn_aux = outputs["logits_gnn_aux"]
-                    shared_gnn = outputs["shared_gnn"]
-                    private_gnn = outputs["private_gnn"]
-                    alpha = outputs["alpha"]
-
-                    gate_means.append(alpha.mean().item())
+                    logits, alpha, kl_loss = outputs["logits"], outputs["alpha"], outputs["kl_loss"]
+                    gate_means.append(alpha[:, 0].mean().item())
 
                     loss_cls = self.criterion_cls(logits, batch_labels) 
-                    loss_ortho = self.ortho_loss_fn(shared_gnn, private_gnn)
-                    loss_aux = self.criterion_cls(logits_gnn_aux, batch_labels)
-
-                    # 计算双重 Loss
-                    loss_entropy = -(alpha * torch.log(alpha + 1e-6) + 
-                                   (1 - alpha) * torch.log(1 - alpha + 1e-6)).mean()
+                    loss_aux = 0.5 * (self.criterion_cls(outputs["logits_lm"], batch_labels) + 
+                                      self.criterion_cls(outputs["logits_gnn"], batch_labels))
                     
-                    loss = loss_cls + 0.1 * loss_ortho + 0.3 * loss_aux
+                    # Oracle Loss
+                    loss_oracle = torch.tensor(0.0, device=self.device)
+                    if curr_lambda_oracle > 0:
+                        with torch.no_grad():
+                            pred_lm = outputs["logits_lm"].argmax(dim=1)
+                            pred_gnn = outputs["logits_gnn"].argmax(dim=1)
+                            target_rank = torch.zeros_like(batch_labels, dtype=torch.float)
+                            target_rank[(pred_lm == batch_labels) & (pred_gnn != batch_labels)] = 1.0
+                            target_rank[(pred_lm != batch_labels) & (pred_gnn == batch_labels)] = -1.0
+                            loss_mask = (target_rank != 0)
+
+                        if loss_mask.sum() > 0:
+                            loss_oracle = F.margin_ranking_loss(
+                                outputs["r_lm_logits"].squeeze()[loss_mask], 
+                                outputs["r_gnn_logits"].squeeze()[loss_mask], 
+                                target_rank[loss_mask], 
+                                margin=margin_val
+                            )
+
+                    loss_consist = torch.tensor(0.0, device=self.device)
+                    if curr_lambda_consist > 0:
+                        loss_consist = self.fusion.get_structure_consistency_loss(outputs["alpha"], self.homophily[batch_nodes])
+
+                    loss = loss_cls + loss_aux + curr_lambda_oracle * loss_oracle + curr_lambda_consist * loss_consist + lambda_vib * kl_loss
                 
                 loss.backward()
                 self.optimizer.step()
                 total_loss += loss.item()
             
-            # Step Scheduler
             self.scheduler.step()
-
-            # C. Logging & Validation
+            
             avg_loss = total_loss / len(self.dataloader)
             avg_gate = sum(gate_means)/len(gate_means) if len(gate_means) > 0 else 0.0
             
-            # Evaluate (修复了 unpack error)
-            val_acc, val_f1, error_mask = self.evaluate(self.val_nodes, split_name='val')
+            val_acc, val_f1, _ = self.evaluate(self.val_nodes, split_name='val')
             
-            print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f} | Gate: {avg_gate:.4f}")
+            print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} | Val F1: {val_f1:.4f} | Gate: {avg_gate:.4f}")
             
-            if self.use_wandb:
-                log_dict = {
-                    "train/loss": avg_loss,
-                    "val/f1": val_f1,
-                    "val/acc": val_acc,
-                    "train/lr": self.scheduler.get_last_lr()[0]
-                }
-                if not self.pretrain:
-                    log_dict["train/gate_mean"] = avg_gate
-
-                    if hasattr(self.fusion, 'gate_temperature'):
-                         log_dict["train/gate_temp"] = self.fusion.gate_temperature.item()
-
-                wandb.log(log_dict)
-
-            # Save Best Model
             if val_f1 > self.best_val_f1:
                 self.best_val_f1 = val_f1
                 self.save_checkpoint(epoch)
         
         return self.best_val_f1
-    
-    
+
     @torch.no_grad()
     def evaluate(self, nodes, split_name='val'):
-        """
-        Modified evaluate to optionally capture error indices.
-        """
         self.gnn.eval()
         self.fusion.eval()
+        nodes = nodes.to(self.device)
         
-        # 1. Full Graph Inference (GNN)
         if self.edge_type is not None:
             full_gnn_h = self.gnn(self.embeddings, self.edge_index, self.edge_type)
         else:
-            full_gnn_h = self.gnn(self.embeddings, self.edge_index, None)
+            full_gnn_h = self.gnn(self.embeddings, self.edge_index)
 
-        # 2. Batch Inference
-        batch_emb_lm = self.embeddings[nodes]
         batch_emb_gnn = full_gnn_h[nodes]
-         
         y_true = self.labels[nodes].cpu().numpy()
 
-        if self.pretrain:
+        if self.pretrain_gnn:
             logits = self.gnn.classifier(batch_emb_gnn)
         else:
-            # Stage 2: Fusion (字典输出适配)
-            outputs = self.fusion(batch_emb_lm, batch_emb_gnn)
-            logits = outputs["logits"] if isinstance(outputs, dict) else outputs[0]
-            
+            if self.entropy_gnn is None: self.precompute_meta_features()
+            batch_emb_lm = self.embeddings[nodes]
+            outputs = self.fusion(
+                lm_emb=batch_emb_lm, 
+                gnn_emb=batch_emb_gnn, 
+                homophily=self.homophily[nodes], 
+                degree=self.node_degrees[nodes],
+                entropy_gnn=self.entropy_gnn[nodes],
+                jsd=self.jsd[nodes]
+            )
+            logits = outputs["logits"]
             
         preds = logits.argmax(dim=1).cpu().numpy()
-        
-        
-        acc = accuracy_score(y_true, preds)
-        f1 = f1_score(y_true, preds, average='macro')
-
-        # 找出预测错误的 Local Indices (相对于 nodes 数组的索引)
-        error_mask = (preds != y_true)
-            
-        # 获取这些错误的 Global Node Indices (原始图中的 ID)
-        # nodes 是 Tensor, error_mask 是 numpy boolean array -> 需要转换一下
-        error_mask_tensor = torch.from_numpy(error_mask).bool().to(nodes.device)
-        bad_case_indices = nodes[error_mask_tensor]
-            
-        print(f"[{split_name}] Found {len(bad_case_indices)} bad cases out of {len(nodes)} samples.")
-        return acc, f1, bad_case_indices
+        return accuracy_score(y_true, preds), f1_score(y_true, preds, average='macro'), nodes[torch.from_numpy(preds != y_true).to(self.device)]
 
     def diagnose_errors(self, split=''):
-        """
-        [SeGA v5.0 Ultimate Diagnostic]
-        包含: 三视图推理 + 结构特征分析 + Gate 行为分析
-        """
-        print("\n" + "="*60)
-        print("🔬 [Diagnostic] Running Structure-Aware Analysis...")
-        print("="*60)
+        print(f"🔬 [Diagnostic] Running Bad Case Study for {split}...")
+        eval_nodes = getattr(self, f"{split}_nodes").to(self.device)
+        # 转为 numpy 用于后续字典取值
+        eval_nodes_np = eval_nodes.cpu().numpy()
         
-        if split == 'train':
-            eval_nodes = self.train_nodes
-        elif split == 'val':
-            eval_nodes = self.val_nodes
-        elif split == 'test':
-            eval_nodes = self.test_nodes
-        else:
-            raise ValueError(f"Unknown split name: {split}")
-
-        self.gnn.eval()
-        self.fusion.eval()
+        self.gnn.eval(); self.fusion.eval()
+        if self.entropy_gnn is None: self.precompute_meta_features()
 
         with torch.no_grad():
-            x_lm = self.embeddings
-            edge_index = self.edge_index
-            edge_type = self.edge_type
-
-            # --- Step 0: 计算全图结构特征 ---
-            log_deg, homophily = calculate_structural_metrics(x_lm, edge_index)
-
-            # --- Step A: GNN 基础特征 ---
-            if edge_type is not None:
-                h_gnn_raw = self.gnn(x_lm, edge_index, edge_type)
+            if self.edge_type is not None:
+                h_gnn = self.gnn(self.embeddings, self.edge_index, self.edge_type)
             else:
-                h_gnn_raw = self.gnn(x_lm, edge_index, None)
+                h_gnn = self.gnn(self.embeddings, self.edge_index)
+            
+            # 全量推理
+            out = self.fusion(
+                lm_emb=self.embeddings, gnn_emb=h_gnn,
+                homophily=self.homophily, degree=self.node_degrees,
+                entropy_gnn=self.entropy_gnn, jsd=self.jsd
+            )
+            prob_full = F.softmax(out['logits'], dim=1)
+            
+            # 单模态推理
+            out_text, _, _, _ = self.fusion.vib(self.embeddings)
+            prob_text = F.softmax(out_text, dim=1)
+            prob_graph = F.softmax(self.gnn.classifier(h_gnn), dim=1)
 
-            # --- Step B: 三视图推理 ---
+            # [Fix] 关键修改：先从全量结果中切片，再比较
+            # 1. 提取当前 Split 对应的预测结果 (N_eval,)
+            pred_full_slice = prob_full.argmax(1)[eval_nodes].cpu().numpy()
+            pred_text_slice = prob_text.argmax(1)[eval_nodes].cpu().numpy()
+            pred_graph_slice = prob_graph.argmax(1)[eval_nodes].cpu().numpy()
+            
+            # 2. 提取当前 Split 对应的标签 (N_eval,)
+            label_slice = self.labels[eval_nodes].cpu().numpy()
 
-            # 1. Full
-            out_full = self.fusion(x_lm, h_gnn_raw)
-            logits_full = out_full['logits'] if isinstance(out_full, dict) else out_full[0]
-            
-            pred_full, conf_full, ent_full = get_stats(logits_full)
-            
-            # 2. Text Only (URGA 优先读取 logits_llm)
-            if isinstance(out_full, dict) and 'logits_llm' in out_full:
-                logits_text = out_full['logits_llm']
-            else:
-                h_gnn_zeros = torch.zeros_like(h_gnn_raw)
-                out_text = self.fusion(x_lm, h_gnn_zeros)
-                logits_text = out_text['logits'] if isinstance(out_text, dict) else out_text[0]
-            
-            pred_text, conf_text, ent_text = get_stats(logits_text)
-                
-            # 3. Graph Only
-            x_lm_zeros = torch.zeros_like(x_lm)
-            out_graph = self.fusion(x_lm_zeros, h_gnn_raw)
-            logits_graph = out_graph['logits'] if isinstance(out_graph, dict) else out_graph[0]
-            
-            pred_graph, conf_graph, ent_graph = get_stats(logits_graph)
-            
-            # --- Step C: 数据收集 ---
-
-            # 提取 Gate
-            alpha_vals = torch.zeros(x_lm.shape[0])
-            if isinstance(out_full, dict) and 'alpha' in out_full:
-                alpha_vals = out_full['alpha'].squeeze()
-
-            idx = eval_nodes.cpu().numpy()
-            lbl = self.labels[eval_nodes].cpu().numpy()
+            def get_slice(t): 
+                # 用于提取特征（如 homophily, gate 等）
+                return t[eval_nodes].cpu().numpy()
 
             data = {
-                'node_idx': idx,
-                'label': lbl,
+                'node_idx': eval_nodes_np,
+                'label': label_slice,
                 
-                # Full Model
-                'pred_full': pred_full[eval_nodes].cpu().numpy(),
-                'conf_full': conf_full[eval_nodes].cpu().numpy(),
-                'is_correct_full': (pred_full[eval_nodes] == self.labels[eval_nodes]).cpu().numpy(),
+                # Full Prediction
+                'pred_full': pred_full_slice,
+                'conf_full': get_slice(prob_full.max(1).values),
+                'is_correct_full': (pred_full_slice == label_slice), # 此时维度一致 (8278,) == (8278,)
                 
-                # Text Only
-                'pred_text': pred_text[eval_nodes].cpu().numpy(),
-                'conf_text': conf_text[eval_nodes].cpu().numpy(),
-                'is_correct_text': (pred_text[eval_nodes] == self.labels[eval_nodes]).cpu().numpy(),
+                # Text Prediction
+                'pred_text': pred_text_slice,
+                'conf_text': get_slice(prob_text.max(1).values),
+                'is_correct_text': (pred_text_slice == label_slice),
                 
-                # Graph Only
-                'pred_graph': pred_graph[eval_nodes].cpu().numpy(),
-                'conf_graph': conf_graph[eval_nodes].cpu().numpy(),
-                'is_correct_graph': (pred_graph[eval_nodes] == self.labels[eval_nodes]).cpu().numpy(),
+                # Graph Prediction
+                'pred_graph': pred_graph_slice,
+                'conf_graph': get_slice(prob_graph.max(1).values),
+                'is_correct_graph': (pred_graph_slice == label_slice),
                 
-                # Analysis Metrics
-                'gate': alpha_vals[eval_nodes].cpu().numpy(),
-                'entropy': ent_full[eval_nodes].cpu().numpy(),
-                'log_degree': log_deg[eval_nodes].cpu().numpy(),
-                'homophily': homophily[eval_nodes].cpu().numpy()
+                # Metrics
+                'sigma_text': get_slice(out['sigma_text'].squeeze()),
+                'gate': get_slice(out['alpha'][:, 0]),
+                'homophily': get_slice(self.homophily.squeeze())
             }
-
+            
             df = pd.DataFrame(data)
             
-            conditions = [
-                (df['is_correct_text'] == False) & (df['is_correct_graph'] == True) ,
-                (df['is_correct_text'] == True)  & (df['is_correct_graph'] == False),
-                (df['is_correct_text'] == False) & (df['is_correct_graph'] == False),
-                (df['is_correct_text'] == True)  & (df['is_correct_graph'] == True)
+            # 标记 Case Type
+            c = df
+            cond = [
+                (c['is_correct_text']) & (c['is_correct_graph']),
+                (c['is_correct_text']) & (~c['is_correct_graph']),
+                (~c['is_correct_text']) & (c['is_correct_graph']),
+                (~c['is_correct_text']) & (~c['is_correct_graph'])
             ]
-            choices = ['Text', 'Graph ', 'Both ', 'Clean']
-            df['case_type'] = np.select(conditions, choices, default='Unknown')
-
-            print("\n📊 [Diagnostic Summary]")
-            print(df['case_type'].value_counts())
+            df['case_type'] = np.select(cond, ['Easy', 'Text_Only', 'Graph_Only', 'Hard'], default='Unknown')
             
+            print("\n[Diagnostic Summary]")
+            print(df['case_type'].value_counts())
+            print("\n[Metric Deep Dive]")
+            print(df.groupby('case_type')[['sigma_text', 'gate', 'homophily']].mean())
             return df
 
     def save_checkpoint(self, epoch=0):
         self.ckpt_filepath.parent.mkdir(parents=True, exist_ok=True)
-        state = {
-            'epoch': epoch,
-            'gnn_state_dict': self.gnn.state_dict(),
-            # 只在 Stage 2 保存 fusion
-            'fusion_state_dict': self.fusion.state_dict() if not self.pretrain else None,
-            'best_val_f1': self.best_val_f1
-        }
+        state = {'epoch': epoch, 'best_val_f1': self.best_val_f1}
+        # 如果是 GNN 预训练模式，只存 GNN
+        if self.pretrain_gnn:
+            state['gnn_state_dict'] = self.gnn.state_dict()
+        # 否则 (Fusion模式)，存 Fusion 和 GNN (因为 GNN 可能被微调)
+        else:
+            state['gnn_state_dict'] = self.gnn.state_dict()
+            state['fusion_state_dict'] = self.fusion.state_dict()
         torch.save(state, self.ckpt_filepath)
 
     def load_checkpoint(self, path=None):
         p = path or self.ckpt_filepath
         print(f"Loading checkpoint from {p}")
         state = torch.load(p, map_location=self.device)
-        
-        self.gnn.load_state_dict(state['gnn_state_dict'])
-        
-        if not self.pretrain and state.get('fusion_state_dict') is not None:
-            print("Loading Fusion state dict...")
-            self.fusion.load_state_dict(state['fusion_state_dict'], strict=False)
-
+        if 'gnn_state_dict' in state:
+            self.gnn.load_state_dict(state['gnn_state_dict'])
+        elif 'gnn' in state: # 兼容旧key
+            self.gnn.load_state_dict(state['gnn'])
+            
+        if not self.pretrain_gnn:
+            if 'fusion_state_dict' in state:
+                print("Loading Fusion state dict...")
+                self.fusion.load_state_dict(state['fusion_state_dict'], strict=False)
+            elif 'fusion' in state:
+                self.fusion.load_state_dict(state['fusion'], strict=False)
         self.best_val_f1 = state.get('best_val_f1', 0.0)

@@ -13,6 +13,72 @@ from pathlib import Path
 from torch_geometric.utils import add_self_loops, remove_self_loops, scatter
 from torch_geometric.utils import degree as calc_degree
 
+def analyze_uncertainty_dist(df, split_name='Dataset'):
+    """
+    [SeGA Statistics] 
+    分别统计三个数据集上，不同 Case 的多模态不确定性分布。
+    """
+    
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 1000)
+    pd.set_option('display.float_format', '{:.4f}'.format)
+
+    print("\n" + "-"*80)
+    print(f"🧐 [Deep Dive] Uncertainty Distribution on {split_name.upper()} Set")
+    print("-"*(80))
+    
+    # 定义我们要观察的物理量
+    metrics = [
+        'jsd',             # 冲突度 (Conflict)
+        'entropy_text',    # 文本不确定性 (Text Uncertainty)
+        'entropy_graph',   # 图不确定性 (Graph Uncertainty)
+        'conf_text',       # 文本置信度 (Text Confidence)
+        'conf_graph',      # 图置信度 (Graph Confidence)
+        'homophily'        # 结构异常度 (Structural Anomaly)
+    ]
+    
+    # 分组计算 Mean 和 Std
+    # 这样你能看到分布的中心和离散程度
+    stats = df.groupby('case_type')[metrics].agg(['mean', 'std'])
+    
+    print(stats)
+    print("-"*(80))
+
+    # --- 自动生成专家结论 (Auto-Insight) ---
+    try:
+        # 获取 Graph_Only (Text错, Graph对) 和 Easy (都对) 的均值
+        mean_stats = df.groupby('case_type')[metrics].mean()
+        
+        if 'Graph_Only' in mean_stats.index and 'Easy' in mean_stats.index:
+            g_only = mean_stats.loc['Graph_Only']
+            easy = mean_stats.loc['Easy']
+            
+            print("\n💡 [Auto-Insight for Graph_Only Cases]")
+            
+            # 1. 检查冲突度
+            if g_only['jsd'] > easy['jsd'] * 1.5:
+                print(f"✅ High Conflict: JSD ({g_only['jsd']:.3f}) is significantly higher than Easy ({easy['jsd']:.3f}).")
+                print("   -> Conclusion: The model 'senses' the disagreement. Use JSD for gating!")
+            else:
+                print(f"⚠️ Low Conflict: JSD ({g_only['jsd']:.3f}) is similar to Easy.")
+            
+            # 2. 检查 Text 犹豫度
+            if g_only['entropy_text'] > easy['entropy_text'] * 1.5:
+                print(f"✅ Text Hesitation: Text Entropy ({g_only['entropy_text']:.3f}) is higher than Easy.")
+                print("   -> Conclusion: LLM is uncertain when it is wrong. Use Entropy for gating!")
+            else:
+                print(f"⚠️ Overconfidence: Text Entropy ({g_only['entropy_text']:.3f}) is low even when wrong.")
+                print("   -> Conclusion: LLM is hallucinating confidently.")
+
+            # 3. 检查 Graph 自信度
+            if g_only['entropy_graph'] < g_only['entropy_text']:
+                 print(f"✅ Graph Confidence: Graph is more certain (Ent={g_only['entropy_graph']:.3f}) than Text.")
+    
+    except Exception as e:
+        print(f"Could not generate insights: {e}")
+        
+    print("="*60 + "\n")
+    
 def calculate_structural_metrics( x, edge_index):
         """
         [Helper] 计算节点的结构属性，用于深入诊断。
@@ -86,6 +152,44 @@ def plot_gate_vs_uncertainty(df, save_path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     print(f"📊 Chart saved to {save_path}")
+
+class VariationalTextEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_var = nn.Linear(hidden_dim, latent_dim)
+        self.decoder = nn.Linear(latent_dim, 2) # Classification
+
+    def reparameterize(self, mu, logvar):
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        else:
+            return mu
+
+    def forward(self, x):
+        h = self.encoder(x)
+        mu = self.fc_mu(h)
+        logvar = self.fc_var(h)
+        
+        # 采样潜在变量 z
+        z = self.reparameterize(mu, logvar)
+        logits = self.decoder(z)
+        
+        # 计算 KL 散度 (作为正则项加到 Loss 里)
+        # 限制 z 接近标准正态分布，防止过拟合
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+        
+        # 返回 sigma 作为不确定性指标！
+        uncertainty = torch.exp(0.5 * logvar).mean(dim=1, keepdim=True)
+        
+        return logits, kl_loss, uncertainty
 
 class BadCaseAnalyzer:
     def __init__(self, raw_data_path, node_id_map):
