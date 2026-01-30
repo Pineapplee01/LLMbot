@@ -11,9 +11,9 @@ import os
 
 from pathlib import Path
 from sklearn.metrics import f1_score, accuracy_score
-from utils import relation_aware_knn_pruning, seed_setting, load_raw_data, BadCaseAnalyzer
+from utils import relation_aware_knn_pruning, seed_setting, load_raw_data
 from GNNs import build_gnn, RGCN, RGT, SimpleHGN, HGT
-from AttentionFusion import DisentangledMetaFusion, ReliabilityAwareFusion
+from AttentionFusion import ReliabilityAwareFusion
 from QwenPrecomputedTrainer import QwenPrecomputedTrainer
 
 def parse_args():
@@ -53,6 +53,11 @@ def parse_args():
                         help = "Whether to run  GNN Pre-training")
     parser.add_argument('--pretrain_llm', action='store_true', default=False,
                         help='Whether to run Text Expert (VIB) Pre-training')
+    parser.add_argument('--pretrain_gate', action='store_true', default=False,
+                        help='Whether to run Gating Network Pre-training')
+    parser.add_argument('--fusion', action='store_true', default=False,
+                        help='Whether to run Joint Fusion Training')
+    
     parser.add_argument('--pretrain_epochs', type=int, default=15)
     parser.add_argument('--epochs', type=int, default=100,
                         help='Epochs for Stage 2 (Fusion)')
@@ -60,6 +65,8 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=5e-5)
     parser.add_argument('--eval_patience', type=int, default=20)
     parser.add_argument('--ablation', action='store_true', default=False)
+    parser.add_argument('--lambda_avuc', type=float, default=0.1, help='Weight for AvUC calibration loss')
+    parser.add_argument('--lambda_struct', type=float, default=0.1, help='Weight for structural consistency loss')
     
     # SupCon Config
     parser.add_argument('--supcon_temp', type=float, default=0.1)
@@ -69,8 +76,7 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--exp_name', type=str, default='SeGA_Qwen3')
-    parser.add_argument('--use_wandb', action='store_true', default=False)
-    parser.add_argument('--wandb_project', type=str, default='SeGA-Experiment')
+    parser.add_argument('--wandb_project', type=str, default='Uncertainty_Gated_Fusion')
     parser.add_argument('--error_capture', action='store_true', default=True)
     
     return parser.parse_args()
@@ -159,7 +165,7 @@ def build_models(args, embedding_dim, num_relations, num_nodes):
     
     # 2. Fusion Construction (SeGA)
     # We instantiate the class directly to ensure we use the Corrected Version
-    fusion_model = DisentangledMetaFusion(
+    fusion_model = ReliabilityAwareFusion(
         lm_dim=embedding_dim,       # 4096
         gnn_dim=args.hidden_dim,    # 256 (Output of GNN)
         hidden_dim=args.fusion_hidden_dim, # 256
@@ -257,84 +263,119 @@ def main():
         hidden_dim=args.hidden_dim,
         dropout=args.dropout
     ).to(device)
-    
-    # 5. Model Statistics
-    gnn_params = sum(p.numel() for p in gnn_model.parameters())
-    fusion_params = sum(p.numel() for p in fusion_model.parameters())
-    print(f"\nModel Parameters:")
-    print(f"  GNN ({args.gnn_type}): {gnn_params:,}")
-    print(f"  SeGA Fusion:       {fusion_params:,}")
-    print(f"  Total:             {gnn_params + fusion_params:,}")
 
     # 6. WandB
-    if args.use_wandb:
-        wandb.init(project=args.wandb_project, name=f"{args.exp_name}_seed{args.seed}", config=vars(args))
+    wandb.init(project=args.wandb_project, name=f"{args.exp_name}_seed{args.seed}", config=vars(args))
 
     # 7. Trainer Setup
     ckpt_dir = Path(f"./saved_models/{args.exp_name}")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_filepath = ckpt_dir / f"best_model_seed{args.seed}.pt"
+    
+    ckpt_vib = ckpt_dir / "best_text_vib.pt"
+    ckpt_gnn = ckpt_dir / f"best_gnn_seed{args.seed}.pt"
+    ckpt_gate = ckpt_dir / f"best_gate_seed{args.seed}.pt"
+    ckpt_fusion = ckpt_dir / f"best_model_seed{args.seed}.pt"
         
     trainer = QwenPrecomputedTrainer(
-            precomputed_embeddings=precomputed_embeddings,
-            gnn_model=gnn_model,
-            fusion_model=fusion_model, 
-            pretrain_gnn=args.pretrain_gnn,
-            pretrain_llm=args.pretrain_llm,
-            data_dict=data_dict,
-            device=device,
-            epochs=args.pretrain_epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,     
-            supcon_temp=args.supcon_temp,
-            lambda_supcon=args.lambda_supcon,
-            pretrain=args.pretrain_gnn,
-            ckpt_filepath=str(ckpt_filepath),
-            sample = args.sample,
-            metadata=None
+        precomputed_embeddings=precomputed_embeddings,
+        gnn_model=gnn_model,
+        lambda_avuc=args.lambda_avuc,
+        lambda_struct=args.lambda_struct,
+        fusion_model=fusion_model, 
+        pretrain_gnn=args.pretrain_gnn,
+        pretrain_llm=args.pretrain_llm,
+        pretrain_gate= args.pretrain_gate,
+        data_dict=data_dict,
+        device=device,
+        epochs=args.pretrain_epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,     
+        supcon_temp=args.supcon_temp,
+        lambda_supcon=args.lambda_supcon,
+        pretrain=args.pretrain_gnn,
+        ckpt_filepath=str(ckpt_fusion),
+        sample = args.sample,
+        metadata=None
     )
-        
+
+    # Text Expert Pre-training  
     if args.pretrain_llm:
+        print("\n [PreTrainer] Text Expert Pre-training\n" )
+        trainer.ckpt_filepath = ckpt_vib # Point to VIB ckpt
         trainer.pretrain_text_vib(epochs=15)
-        
-    if args.pretrain_gnn:
-        trainer.train()
 
-    vib_path = ckpt_dir / "best_text_vib.pt"
-
-    if vib_path.exists():
-        state = torch.load(vib_path, map_location=device)
+    if ckpt_vib.exists():
+        print(f"Loading Text Expert from {ckpt_vib}")
+        state = torch.load(ckpt_vib, map_location=device)
         trainer.fusion.vib.load_state_dict(state)
     
-    else:
-        print("⚠️ Warning: No pre-trained Text VIB found! Fusion might suffer from Cold Start.")
-    
-    if ckpt_filepath.exists():
-        state = torch.load(ckpt_filepath, map_location=device)
+    #  GNN Pre-training
+    if args.pretrain_gnn:
+        print("\n [PreTrainer] GNN Pre-training\n" )
+        trainer.ckpt_filepath = ckpt_gnn 
+        trainer.pretrain_gnn_stage(epochs=args.pretrain_epochs)
+
+    if ckpt_gnn.exists():
+        state = torch.load(ckpt_gnn, map_location=device, weights_only=False)
         if 'gnn_state_dict' in state:
-                trainer.gnn.load_state_dict(state['gnn_state_dict'])
+            trainer.gnn.load_state_dict(state['gnn_state_dict'])
+        else: # Legacy compatibility
+            trainer.gnn.load_state_dict(state)
+    
+    # Gating Network Pre-training
+    if args.pretrain_gate:
+        print("\n [PreTrainer] Gate Warmup (Experts Frozen)\n" )
+        trainer.ckpt_filepath = ckpt_gate
+        trainer.pretrain_gate_stage(epochs=10)
+    
+    if ckpt_gate.exists():
+        print(f" Loading Pre-trained Gate from {ckpt_gate}")
+        state = torch.load(ckpt_gate, map_location=device)
+        # Load carefuly (state might contain full dict)
+        if 'fusion_state_dict' in state:
+            trainer.fusion.load_state_dict(state['fusion_state_dict'])
+        elif 'gnn_state_dict' not in state: # Assuming it's fusion state only
+             trainer.fusion.load_state_dict(state)
+    
+    # Joint Fine-tuning
+    if args.fusion:
+        print("\n [Trainer] Joint Fine-tuning \n" )
+        trainer.ckpt_filepath = ckpt_fusion
+        trainer.pretrain_gnn = False
 
-    best_f1 = trainer.train()
+        for param in trainer.gnn.parameters():
+            param.requires_grad = True
+        for param in trainer.fusion.parameters():
+            param.requires_grad = True
 
-    # Also write a fusion-only checkpoint that fusion_diagnose.py can load directly.
-    fusion_ckpt = {
-        'fusion_state_dict': trainer.fusion.state_dict(),
-        'gnn_state_dict': trainer.gnn.state_dict(),
-        'meta': {
-            'exp_name': args.exp_name,
-            'seed': args.seed,
-            'best_val_f1': float(best_f1)
-       }
-    }
-    fusion_ckpt_path = ckpt_dir / f"fusion_best_seed{args.seed}.pt"
-    torch.save(fusion_ckpt, fusion_ckpt_path)
-    print(f"Saved fusion checkpoint for diagnosis to: {fusion_ckpt_path}")
+        trainer.optimizer = torch.optim.AdamW(
+            list(trainer.gnn.parameters()) + list(trainer.fusion.parameters()),
+            lr=args.lr * 0.5, # Lower LR for fine-tuning
+            weight_decay=args.weight_decay
+        )
+
+        best_f1 = trainer.train()
+
+        # Also write a fusion-only checkpoint that fusion_diagnose.py can load directly.
+        fusion_ckpt = {
+            'fusion_state_dict': trainer.fusion.state_dict(),
+            'gnn_state_dict': trainer.gnn.state_dict(),
+            'meta': {
+                'exp_name': args.exp_name,
+                'seed': args.seed,
+                'best_val_f1': float(best_f1)
+        }
+        }
+
+        fusion_ckpt_path = ckpt_dir / f"fusion_best_seed{args.seed}.pt"
+        torch.save(fusion_ckpt, fusion_ckpt_path)
+        print(f"Saved fusion checkpoint for diagnosis to: {fusion_ckpt_path}")
 
 
     if args.error_capture:
 
         print("[Bad Case Study] STARTING FULL DATASET DIAGNOSIS")
-        trainer.load_checkpoint(ckpt_filepath)
+        trainer.load_checkpoint(ckpt_fusion)
         splits = ['train', 'val', 'test']
 
         for split in splits:

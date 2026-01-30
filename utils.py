@@ -153,6 +153,54 @@ def plot_gate_vs_uncertainty(df, save_path):
     plt.savefig(save_path, dpi=300)
     print(f"📊 Chart saved to {save_path}")
 
+class EdlLoss(nn.Module):
+    """
+    Evidential Deep Learning Loss for BotUMC
+    Objective: Minimize prediction error + Maximize uncertainty for errors
+    """
+    def __init__(self, annealing_step=10):
+        super().__init__()
+        self.epoch_num = 0
+        self.annealing_step = annealing_step
+
+    def forward(self, alpha, y):
+        # alpha: [Batch, K]
+        # y: [Batch] (Labels)
+        
+        S = torch.sum(alpha, dim=1, keepdim=True)
+        
+        # A. Bayesian Risk (Log Likelihood equivalent)
+        # L = sum(y_i * (log(S) - log(alpha_i)))
+        y_hot = F.one_hot(y, num_classes=alpha.shape[1]).float()
+        loss_nll = torch.sum(y_hot * (torch.log(S) - torch.log(alpha)), dim=1).mean()
+        
+        # B. KL Divergence Regularization
+        # Force incorrect predictions to have flat Dirichlet distribution (high uncertainty)
+        # Target alpha_tilde: [1, 1] for incorrect classes, unchanged for correct
+        alpha_tilde = y_hot + (1 - y_hot) * alpha
+        
+        # KL(Dir(alpha_tilde) || Dir(1))
+        kl = self._kl_divergence(alpha_tilde, alpha.shape[1])
+        
+        # Annealing: Gradually increase KL weight
+        annealing_coef = min(1, self.epoch_num / self.annealing_step)
+        
+        return loss_nll + annealing_coef * kl.mean()
+
+    def _kl_divergence(self, alpha, num_classes):
+        beta = torch.ones((1, num_classes), device=alpha.device)
+        S_alpha = torch.sum(alpha, dim=1, keepdim=True)
+        S_beta = torch.sum(beta, dim=1, keepdim=True)
+        
+        lnB = torch.lgamma(S_alpha) - torch.sum(torch.lgamma(alpha), dim=1, keepdim=True)
+        lnB_uni = torch.sum(torch.lgamma(beta), dim=1, keepdim=True) - torch.lgamma(S_beta)
+        
+        dg0 = torch.digamma(S_alpha)
+        dg1 = torch.digamma(alpha)
+        
+        kl = lnB + lnB_uni + torch.sum((alpha - beta) * (dg1 - dg0), dim=1, keepdim=True)
+        return kl
+
 class VariationalTextEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim):
         super().__init__()
