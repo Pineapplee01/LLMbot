@@ -238,34 +238,36 @@ class QwenPrecomputedTrainer:
             return torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
 
     def _unpack_batch(self, batch):
-        # 1. 如果是 MiniBatch 对象 (Neighbor Sampling)
         if hasattr(batch, 'n_id'): 
             n_id = batch.n_id
             batch_size = batch.batch_size
             edge_index = batch.edge_index.to(self.device)
+            edge_type = batch.edge_type.to(self.device) if batch.edge_type is not None else None
             
-            # 动态加载特征 (CPU -> GPU)
             x = self.embeddings[n_id].to(self.device)
             y = self.labels[n_id[:batch_size]].to(self.device)
             
-            return x, y, edge_index, batch_size, n_id
+            return x, y, edge_index, edge_type, batch_size, n_id
             
-        # 2. 如果是普通 Tuple (Full Graph Fallback)
         else:
             nodes, labels = batch
             nodes = nodes.to(self.device)
             
-            # 全图 Forward
-            h_all = self.gnn(self.embeddings.to(self.device), self.data_dict['edge_index'].to(self.device))
-            if isinstance(h_all, tuple): h_all = h_all[0]
+            # 全图 Forward Fallback
+            h_all = self._call_gnn(
+                self.embeddings.to(self.device), 
+                self.data_dict['edge_index'].to(self.device),
+                self.edge_type.to(self.device) if self.edge_type is not None else None
+            )
             
             x = h_all
             y = labels.to(self.device)
             edge_index = self.data_dict['edge_index'].to(self.device)
+            edge_type = self.edge_type.to(self.device) if self.edge_type is not None else None
             batch_size = nodes.size(0)
             n_id = nodes
             
-            return x, y, edge_index, batch_size, n_id
+            return x, y, edge_index, edge_type, batch_size, n_id
 
     def _setup_optimizer(self):
         """Initial optimizer setup"""
@@ -292,20 +294,43 @@ class QwenPrecomputedTrainer:
         for param in module.parameters():
             param.requires_grad = not freeze
 
+    def _call_gnn(self, x, edge_index, edge_type):
+        if edge_type is not None:
+            return self.gnn(x, edge_index, edge_type)
+        else:
+            return self.gnn(x, edge_index)
+
     def _compute_batch_consistency(self, x, edge_index, batch_size):
         """
-        利用全图 Embedding 计算结构一致性，然后取 Batch 部分
+        计算 batch 内节点的结构一致性
+        x: [num_sampled_nodes, dim] - 子图节点特征
+        edge_index: [2, num_edges] - 子图边索引（局部索引，范围 0 ~ num_sampled_nodes-1）
+        batch_size: int - 目标节点数量（前 batch_size 个节点是目标节点）
         """
-        row, col = self.edge_index
-        # 计算全图边的相似度 (E, )
+        num_nodes = x.size(0)
+        
+        # 边为空时返回默认值
+        if edge_index.size(1) == 0:
+            return torch.full((batch_size, 1), 0.5, device=x.device)
+        
+        row, col = edge_index  # 使用传入的子图边索引，而非 self.edge_index
+        
+        # 安全检查：确保索引不越界
+        valid_mask = (row < num_nodes) & (col < num_nodes) & (row >= 0) & (col >= 0)
+        if valid_mask.sum() == 0:
+            return torch.full((batch_size, 1), 0.5, device=x.device)
+        
+        row = row[valid_mask]
+        col = col[valid_mask]
+        
+        # 计算边的相似度
         edge_sim = F.cosine_similarity(x[row], x[col], dim=1)
         
-        # 聚合到节点 (N, )
-        # 归一化到 0~1: (sim + 1) / 2
-        consistency_all = scatter(edge_sim, row, dim=0, dim_size=x.size(0), reduce='mean')
-        consistency_all = (consistency_all + 1.0) / 2.0 
+        # 聚合到节点（只聚合子图内的节点）
+        consistency_all = scatter(edge_sim, row, dim=0, dim_size=num_nodes, reduce='mean')
+        consistency_all = (consistency_all + 1.0) / 2.0  # 归一化到 0~1
         
-        # 提取 Batch 对应的分数 (B, 1)
+        # 只取前 batch_size 个目标节点的一致性分数
         return consistency_all[:batch_size].unsqueeze(1)
 
     def train_epoch(self, epoch):
@@ -315,31 +340,26 @@ class QwenPrecomputedTrainer:
             return self._train_epoch_fusion(epoch)
 
     def _train_epoch_gnn(self, epoch):
+        self.gnn.train(); self.fusion.gnn_proj.train(); self.fusion.gnn_evidence_head.train()
+        total_loss = 0; steps = 0
+        if epoch == 1: print(f"⚡ Mode: GNN Expert Pre-training")
 
-        self.gnn.train()
-        self.fusion.gnn_proj.train()
-        self.fusion.gnn_evidence_head.train()
-        
-        steps = 0
-        total_loss = 0
-        
         for batch in self.dataloader:
             self.optimizer.zero_grad()
-            x, labels, edge_index, batch_size, n_id = self._unpack_batch(batch)
             
-            # --- 数据解包 ---
+            x, labels, edge_index, edge_type, batch_size, n_id = self._unpack_batch(batch)
+            
+            # [FIXED] 使用 _call_gnn 传入 edge_type
             if hasattr(batch, 'n_id'):
-                h_sub = self.gnn(x, edge_index)
+                h_sub = self._call_gnn(x, edge_index, edge_type)
                 h_gnn_target = h_sub[:batch_size]
                 feat_for_consistency = x
             else:
                 h_gnn_target = x[n_id]
                 feat_for_consistency = x
 
-            # --- 统一计算逻辑 ---
             consistency = self._compute_batch_consistency(feat_for_consistency, edge_index, batch_size)
             
-            # Evidence Head
             z_gnn = self.fusion.gnn_proj(h_gnn_target)
             logits, alpha, u, probs = self.fusion.gnn_evidence_head(z_gnn, consistency)
             
@@ -414,11 +434,11 @@ class QwenPrecomputedTrainer:
         for batch in self.dataloader:
             self.optimizer.zero_grad()
             
-            # [FIXED] 使用 _unpack_batch
-            x, labels, edge_index, batch_size, n_id = self._unpack_batch(batch)
+            x, labels, edge_index, edge_type, batch_size, n_id = self._unpack_batch(batch)
             
+            # [FIXED] 使用 _call_gnn
             if hasattr(batch, 'n_id'):
-                h_sub = self.gnn(x, edge_index)
+                h_sub = self._call_gnn(x, edge_index, edge_type)
                 h_gnn_target = h_sub[:batch_size]
                 h_lm_target = self.embeddings[n_id[:batch_size]].to(self.device)
                 feat_for_consistency = x
@@ -536,27 +556,23 @@ class QwenPrecomputedTrainer:
     # =========================================================================
 
     def evaluate(self, split='val'):
-        self.gnn.eval()
-        self.fusion.eval()
-        
-        if split == 'val': loader = self.val_loader
-        elif split == 'test': loader = self.test_loader
-        else: loader = self.dataloader
-        
+        self.gnn.eval(); self.fusion.eval()
+        loader = self.val_loader if split=='val' else (self.test_loader if split=='test' else self.dataloader)
         preds, targets = [], []
-        
         with torch.no_grad():
             for batch in loader:
-                x, labels, edge_index, batch_size, n_id = self._unpack_batch(batch)
+                x, labels, edge_index, edge_type, batch_size, n_id = self._unpack_batch(batch)
+                
+                # [FIXED] 使用 _call_gnn
                 if hasattr(batch, 'n_id'):
-                    h_sub = self.gnn(x, edge_index); h_gnn_target = h_sub[:batch_size]
+                    h_sub = self._call_gnn(x, edge_index, edge_type)
+                    h_gnn_target = h_sub[:batch_size]
                     h_lm = self.embeddings[n_id[:batch_size]].to(self.device)
                     feat_for_consistency = x
                 else:
                     h_gnn_target = x[n_id]; h_lm = self.embeddings[n_id].to(self.device); feat_for_consistency = x
                 
                 consistency = self._compute_batch_consistency(feat_for_consistency, edge_index, batch_size)
-                
                 homophily_batch = self.homophily[n_id[:batch_size]].to(self.device)
                 degrees_batch = self.node_degrees[n_id[:batch_size]].to(self.device)
 
@@ -578,9 +594,12 @@ class QwenPrecomputedTrainer:
         results = []
         with torch.no_grad():
             for batch in loader:
-                x, labels, edge_index, batch_size, n_id = self._unpack_batch(batch)
+                x, labels, edge_index, edge_type, batch_size, n_id = self._unpack_batch(batch)
+                
+                # [FIXED] 使用 _call_gnn
                 if hasattr(batch, 'n_id'):
-                    h_sub = self.gnn(x, edge_index); h_gnn_target = h_sub[:batch_size]
+                    h_sub = self._call_gnn(x, edge_index, edge_type)
+                    h_gnn_target = h_sub[:batch_size]
                     h_lm = self.embeddings[n_id[:batch_size]].to(self.device)
                     feat_for_consistency = x
                 else:
@@ -599,7 +618,6 @@ class QwenPrecomputedTrainer:
                 probs_graph = out['probs_gnn'] 
                 conf_graph, pred_graph = probs_graph.max(dim=1)
                 
-                # Use CPU for iteration
                 batch_nodes = n_id[:batch_size].cpu()
                 labels_cpu = labels.cpu()
                 
@@ -632,7 +650,7 @@ class QwenPrecomputedTrainer:
                 'node_idx': 'count', 'gate': 'mean', 'u_text': 'mean', 'u_graph': 'mean',
                 'conf_graph': 'mean', 'is_correct_full': 'mean'
             }).rename(columns={'node_idx': 'Count', 'is_correct_full': 'Fusion_Acc'})
-            print(f"\n[Diagnosis Summary] - {split.upper()}]\n{summary}")
+            print(f"\n📊 [Diagnosis Summary - {split.upper()}]\n{summary}")
         return df
 
     # =========================================================================
@@ -799,11 +817,11 @@ class QwenPrecomputedTrainer:
         
         with torch.no_grad():
             for batch in self.val_loader:
-                # [FIXED] 使用 _unpack_batch
-                x, labels, edge_index, batch_size, n_id = self._unpack_batch(batch)
+                # [FIXED] 解包 6 个值，包含 edge_type
+                x, labels, edge_index, edge_type, batch_size, n_id = self._unpack_batch(batch)
                 
                 if hasattr(batch, 'n_id'):
-                    h_sub = self.gnn(x, edge_index)
+                    h_sub = self._call_gnn(x, edge_index, edge_type)
                     h_gnn_target = h_sub[:batch_size]
                     feat_for_consistency = x
                 else:
@@ -816,8 +834,10 @@ class QwenPrecomputedTrainer:
                 
                 preds = logits.argmax(1)
                 is_correct = (preds == labels)
-                u_correct_list.extend(u[is_correct].cpu().tolist())
-                u_wrong_list.extend(u[~is_correct].cpu().tolist())
+                
+                u_flat = u.view(-1) if u.dim() > 1 else u
+                u_correct_list.extend(u_flat[is_correct].cpu().tolist())
+                u_wrong_list.extend(u_flat[~is_correct].cpu().tolist())
                 preds_list.append(preds.cpu())
                 targets_list.append(labels.cpu())
                 
@@ -831,7 +851,6 @@ class QwenPrecomputedTrainer:
         u_c_std = np.std(u_correct_list) if u_correct_list else 0.0
         u_w_std = np.std(u_wrong_list) if u_wrong_list else 0.0
 
-        
         return f1, u_c_mean, u_w_mean, u_c_std, u_w_std
 
     def pretrain_gnn_stage(self, epochs):
