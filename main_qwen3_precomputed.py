@@ -22,6 +22,9 @@ def parse_args():
     # Data
     parser.add_argument('--dataset', type=str, default='TwiBot-20',
                         choices=['TwiBot-20', 'Cresci-2015', 'Cresci-2017', 'Midterm-2018'])
+    parser.add_argument('--data_loader', type=str, default='neighbor',
+                        choices=['random', 'neighbor'])
+    parser.add_argument('--batch_size',type=int, default=1024)
     parser.add_argument('--dataset_path', type=str, default='./datasets/TwiBot-20',
                         help='Path to dataset directory')
     parser.add_argument('--embeddings_path', type=str, 
@@ -77,7 +80,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--exp_name', type=str, default='SeGA_Qwen3')
     parser.add_argument('--wandb_project', type=str, default='Uncertainty_Gated_Fusion')
-    parser.add_argument('--error_capture', action='store_true', default=True)
+    parser.add_argument('--error_capture', action='store_true', default=False)
     
     return parser.parse_args()
 
@@ -231,6 +234,10 @@ def main():
     
     print(f"Graph Info: {num_nodes} nodes, {num_relations} relation types")
 
+
+    # wandb
+    wandb.init(project=args.wandb_project, name=f"{args.exp_name}_seed{args.seed}", config=vars(args))
+
     if args.pruning:
 
         print(f"[Pre-Process] Applying Relation-Aware KNN Pruning with k={args.neighbor}...")
@@ -264,9 +271,6 @@ def main():
         dropout=args.dropout
     ).to(device)
 
-    # 6. WandB
-    wandb.init(project=args.wandb_project, name=f"{args.exp_name}_seed{args.seed}", config=vars(args))
-
     # 7. Trainer Setup
     ckpt_dir = Path(f"./saved_models/{args.exp_name}")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -295,6 +299,8 @@ def main():
         pretrain=args.pretrain_gnn,
         ckpt_filepath=str(ckpt_fusion),
         sample = args.sample,
+        dataloader=args.data_loader,
+        batch_size=args.batch_size,
         metadata=None
     )
 
@@ -306,7 +312,7 @@ def main():
 
     if ckpt_vib.exists():
         print(f"Loading Text Expert from {ckpt_vib}")
-        state = torch.load(ckpt_vib, map_location=device)
+        state = torch.load(ckpt_vib, map_location=device,weights_only=False)
         trainer.fusion.vib.load_state_dict(state)
     
     #  GNN Pre-training
@@ -324,13 +330,13 @@ def main():
     
     # Gating Network Pre-training
     if args.pretrain_gate:
-        print("\n [PreTrainer] Gate Warmup (Experts Frozen)\n" )
+        print("\n [PreTrainer] Gate Warmup \n" )
         trainer.ckpt_filepath = ckpt_gate
         trainer.pretrain_gate_stage(epochs=10)
     
     if ckpt_gate.exists():
         print(f" Loading Pre-trained Gate from {ckpt_gate}")
-        state = torch.load(ckpt_gate, map_location=device)
+        state = torch.load(ckpt_gate, map_location=device, weights_only=False)
         # Load carefuly (state might contain full dict)
         if 'fusion_state_dict' in state:
             trainer.fusion.load_state_dict(state['fusion_state_dict'])

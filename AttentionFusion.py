@@ -8,38 +8,45 @@ import torch.nn.functional as F
 import math
 
 from torch_geometric.nn.models import MLP
+from torch_geometric.utils import scatter
 
 class EvidentialGraphHead(nn.Module):
-    """
-    [NEW] 图模态的证据分类头 (替换原有的 Linear + Softmax)
-    """
     def __init__(self, input_dim, num_classes=2):
         super().__init__()
         self.proj = nn.Linear(input_dim, input_dim)
-        # Evidence Layer: 输出非负的证据
         self.evidence_layer = nn.Linear(input_dim, num_classes)
         
-    def forward(self, x):
+        # 可学习的缩放参数
+        self.evidence_scale = nn.Parameter(torch.tensor(2.0))
+        
+    def forward(self, x, consistency=None):
+        """
+        x: [Batch, Dim]
+        consistency: [Batch, 1] 结构一致性分数 (预计算好)
+        """
         # 1. 特征变换
-        x = F.relu(self.proj(x))
+        h = F.relu(self.proj(x))
         
-        # 2. 获取证据 (Softplus + 缩放)
-        # 缩放因子 10.0 用于防止证据过小，与文本模态保持一致
-        evidence = F.softplus(self.evidence_layer(x)) * 10.0
+        # 2. 原始证据 (Learnable Scale)
+        raw_evidence = F.softplus(self.evidence_layer(h)) * F.softplus(self.evidence_scale)
         
-        # 3. 计算 Dirichlet 参数
+        # 3. 结构一致性校准
+        if consistency is not None:
+            # consistency 越低(冲突)，证据越被抑制
+            evidence = raw_evidence * consistency 
+        else:
+            evidence = raw_evidence
+            
+        # 4. EDL 计算
         alpha = evidence + 1
-        
-        # 4. 计算不确定性
         S = torch.sum(alpha, dim=1, keepdim=True)
-        K = alpha.shape[1]
-        uncertainty = K / S
+        uncertainty = 2.0 / S
         
-        # 5. 计算用于分类的 Logits (基于期望概率)
-        prob = alpha / S
-        logits = torch.log(prob + 1e-9)
+        # 5. 计算期望概率和 Logits (用于辅助 Loss)
+        probs = alpha / S
+        logits = torch.log(probs + 1e-9)
         
-        return logits, alpha, uncertainty
+        return logits, alpha, uncertainty, probs
 
 class VariationalTextAdapter(nn.Module):
     """
@@ -71,8 +78,11 @@ class VariationalTextAdapter(nn.Module):
         self.register_buffer('logvar_min', torch.tensor(-10.0))
         self.register_buffer('logvar_max', torch.tensor(0.0))
 
+        self.classifier = nn.Linear(latent_dim, num_classes)
+
         # Evidence head for DST uncertainty
         self.evidence_layer = nn.Linear(latent_dim, num_classes)
+        self.evidence_scale = nn.Parameter(torch.tensor(2.0))
         
         # Decoder (improved)
         self.decoder = nn.Sequential(
@@ -82,42 +92,33 @@ class VariationalTextAdapter(nn.Module):
             nn.Linear(hidden_dim // 2, 2)
         )
 
-    def forward(self, x):
+    def forward(self, x, num_samples=10):
         
         # VIB Encode
         h = self.encoder(x)
         mu = self.fc_mu(h)
         logvar_raw = self.fc_logvar(h)
         logvar = torch.clamp(logvar_raw, self.logvar_min, self.logvar_max)
+        std = torch.exp(0.5 * logvar)
         
         # Reparameterization
-        std = torch.exp(0.5 * logvar)
         if self.training:
-            eps = torch.randn_like(std)
-            z = mu + eps * std
+            z_samples = mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(x.size(0), num_samples, mu.size(1), device=x.device)
+            logits_samples = self.classifier(z_samples) 
+            logits = torch.mean(logits_samples, dim=1)
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
         else:
             z = mu
+            logits = self.classifier(z)
+            kl_loss = torch.tensor(0.0, device=x.device)
         
         # DST Evidence Process
-        evidence_scale = 10.0
-        evidence = F.softplus(self.evidence_layer(z)) 
-        alpha = evidence * evidence_scale + 1
-
-        # Epistemic Uncertainty
+        evidence = F.softplus(logits) * F.softplus(self.evidence_scale)
+        alpha = evidence + 1
         S = torch.sum(alpha, dim=1, keepdim=True)
-        K = alpha.shape[1]
-        uncertainty = K / S
-
-        uncertainty = uncertainty ** 0.5
-
-        # Auxiliary Outputs
-        probs = alpha / S
-        logits = torch.log(probs + 1e-9)
-
-        # VIB KL Loss (Regularization)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+        uncertainty = 2.0 / S
         
-        return logits, z, alpha, uncertainty, kl_loss
+        return logits, mu, alpha, uncertainty, kl_loss
 
 class ReliabilityAwareFusion(nn.Module):
     def __init__(self, lm_dim, gnn_dim, hidden_dim, dropout=0.3):
@@ -134,12 +135,9 @@ class ReliabilityAwareFusion(nn.Module):
             nn.Dropout(0.1) # Optional: slight noise to prevent overfitting
         )
 
-        self.gnn_classifier = nn.Linear(hidden_dim, 2)
         self.gnn_evidence_head = EvidentialGraphHead(hidden_dim, num_classes=2)
         
         # 3. Meta Features & Gate
-        # [Critical] 确保这里的维度与下方 compute_conflict_aware_metadata 返回的一致
-        # 当前我们使用 5 个特征: u_text, entropy_gnn, homophily, jsd, conf_gap
         self.meta_dim = 5  
         self.meta_bn = nn.BatchNorm1d(self.meta_dim)
         
@@ -162,9 +160,7 @@ class ReliabilityAwareFusion(nn.Module):
             nn.Linear(hidden_dim, 2)
         )
 
-    def compute_conflict_aware_metadata(self, logits_lm, logits_gnn, u_text, homophily, degree):
-        prob_lm = F.softmax(logits_lm, dim=1)
-        prob_gnn = F.softmax(logits_gnn, dim=1)
+    def compute_conflict_aware_metadata(self, prob_lm, prob_gnn, u_text, homophily, degree):
         
         # JSD Calculation
         m = 0.5 * (prob_lm + prob_gnn)
@@ -174,36 +170,32 @@ class ReliabilityAwareFusion(nn.Module):
         
         # Graph Entropy
         entropy_gnn = -torch.sum(prob_gnn * torch.log(prob_gnn + 1e-9), dim=1, keepdim=True) / 0.693
-        
-        # Confidence Gap
         conf_lm = prob_lm.max(dim=1, keepdim=True).values
         conf_gnn = prob_gnn.max(dim=1, keepdim=True).values
         conf_gap = conf_lm - conf_gnn
         
         # Construct Feature Vector (Dim = 5)
         meta_features = torch.cat([
-            u_text,          # Text Uncertainty
-            entropy_gnn,     # Graph Uncertainty
-            homophily,       # Structural Reliability
-            jsd,             # Conflict
-            conf_gap         # Relative Confidence
+            u_text, entropy_gnn, homophily, jsd, conf_gap
         ], dim=1)
         
         return meta_features
 
-    def forward(self, lm_emb, gnn_emb, homophily, degree, **kwargs):
+    def forward(self, lm_emb, gnn_emb, homophily, degree, consistency, **kwargs):
         # 1. Text Forward
         logits_lm, z_text, alpha_text, uncertainty_text, kl_loss_tensor = self.vib(lm_emb)
+        probs_lm = F.softmax(logits_lm, dim=1)
         
         # 2. GNN Forward
         z_gnn = self.gnn_proj(gnn_emb)
-        logits_gnn, alpha_gnn, u_graph_evidential = self.gnn_evidence_head(z_gnn)
+
+        logits_gnn, alpha_gnn, u_graph_evidential, probs_gnn = self.gnn_evidence_head(z_gnn, consistency)
         
         # 3. Meta Features
         with torch.no_grad():
             meta_features = self.compute_conflict_aware_metadata(
-                logits_lm.detach(), 
-                logits_gnn.detach(), 
+                probs_lm.detach(), 
+                probs_gnn.detach(), 
                 uncertainty_text.detach(), 
                 homophily, 
                 degree
@@ -223,13 +215,14 @@ class ReliabilityAwareFusion(nn.Module):
         return {
             "logits": logits,
             "logits_lm": logits_lm,
-            "logits_gnn": logits_gnn,
+            "logits_gnn": logits_gnn,     # 用于辅助分类 Loss
+            "probs_gnn": probs_gnn,       # 用于分析
             "gate_value": beta,
             "u_text": uncertainty_text,
-            "u_graph": u_graph_evidential, # [FIXED] 返回真实值供分析
+            "u_graph": u_graph_evidential,# 真实的结构感知不确定性
             "meta_features": meta_features,
             "alpha_text": alpha_text,
-            "alpha_gnn": alpha_gnn,        # [NEW] 必须返回给 Trainer 计算 Loss
+            "alpha_gnn": alpha_gnn,       # 用于 EDL Loss
             "kl_loss": kl_loss_tensor
         }
 
