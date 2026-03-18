@@ -47,16 +47,20 @@ def compute_feature_homophily(x, edge_index):
     return homophily.unsqueeze(1)
 
 
-def compute_directed_structural_features(edge_index, num_nodes, x):
+def compute_directed_structural_features(edge_index, num_nodes, x=None):
     """
-    Compute 5-dim per-node structural features (direction-aware).
+    Compute 5-dim per-node structural features (direction-aware, graph-native).
 
     Returns [N, 5] tensor:
-        0: in_log_degree   (z-normed)
-        1: out_log_degree  (z-normed)
-        2: total_log_degree (z-normed)
-        3: sym_homophily   (undirected cosine similarity with neighbors)
-        4: graph_missing   (1.0 if total degree == 0)
+        0: in_log_degree      (z-normed)
+        1: out_log_degree     (z-normed)
+        2: total_log_degree   (z-normed)
+        3: neighbor_deg_var   (normalized variance of neighbor degrees — pure topology)
+        4: graph_missing      (1.0 if total degree == 0)
+
+    Note: Feature 3 is intentionally graph-native (no text embedding dependency)
+    to avoid "text-contaminated" graph reliability signals.
+    The `x` parameter is accepted for backward compatibility but NOT used.
     """
     row, col = edge_index  # row -> source, col -> target
 
@@ -73,28 +77,38 @@ def compute_directed_structural_features(edge_index, num_nodes, x):
     out_log_degree = _znorm_log(out_deg)
     total_log_degree = _znorm_log(total_deg)
 
-    # ── Symmetric homophily (undirected) ──
-    # Treat all edges as undirected: aggregate both directions
+    # ── Neighbor degree variance (pure topology, no embedding) ──
+    # For each node, compute variance of its neighbors' total degrees.
+    # High variance → heterogeneous neighborhood → less reliable graph signal.
     sym_edge = torch.cat([edge_index, edge_index.flip(0)], dim=1)
-    sym_edge = torch.unique(sym_edge, dim=1)  # deduplicate
+    sym_edge = torch.unique(sym_edge, dim=1)
     sym_row, sym_col = sym_edge
-    x_norm = F.normalize(x, p=2, dim=-1)
-    edge_sim = (x_norm[sym_row] * x_norm[sym_col]).sum(dim=-1)
-    sym_homophily = scatter(
-        edge_sim, sym_col, dim=0, dim_size=num_nodes, reduce='mean',
-    ).unsqueeze(1)
+
+    neighbor_deg = total_deg[sym_row]  # degree of each neighbor
+    # Mean neighbor degree per node
+    neighbor_deg_mean = scatter(
+        neighbor_deg, sym_col, dim=0, dim_size=num_nodes, reduce='mean',
+    )
+    # Variance = E[(x - mean)^2]
+    neighbor_deg_sq_diff = (neighbor_deg - neighbor_deg_mean[sym_col]) ** 2
+    neighbor_deg_var = scatter(
+        neighbor_deg_sq_diff, sym_col, dim=0, dim_size=num_nodes, reduce='mean',
+    )
+    # Normalize to [0, 1] range via log1p + z-norm
+    ndv = torch.log1p(neighbor_deg_var)
+    neighbor_deg_var_normed = ((ndv - ndv.mean()) / (ndv.std() + 1e-6)).unsqueeze(1)
 
     # ── Graph missing (total degree == 0) ──
     graph_missing = (total_deg == 0).float().unsqueeze(1)
 
     feats = torch.cat([
         in_log_degree, out_log_degree, total_log_degree,
-        sym_homophily, graph_missing,
+        neighbor_deg_var_normed, graph_missing,
     ], dim=1)  # [N, 5]
 
     print(f"[StructFeats] in_deg range: [{in_deg.min():.0f}, {in_deg.max():.0f}] | "
           f"out_deg range: [{out_deg.min():.0f}, {out_deg.max():.0f}] | "
-          f"sym_homophily mean: {sym_homophily.mean():.4f} | "
+          f"neighbor_deg_var mean: {neighbor_deg_var.mean():.4f} | "
           f"isolated: {graph_missing.sum().int().item()}")
 
     return feats
@@ -228,49 +242,50 @@ def analyze_uncertainty_dist(df, split_name='Dataset'):
     print("="*60 + "\n")
     
 def calculate_structural_metrics( x, edge_index):
-        """
-        [Helper] 计算节点的结构属性，用于深入诊断。
-        1. Degree (Log-normalized)
-        2. Feature Homophily (邻居语义相似度)
-        """
-        num_nodes = x.shape[0]
-        row, col = edge_index
-        
-        # --- Metric 1: Degree (入度 + 出度) ---
-        # 简单起见，我们计算无向度或总度数
-        # 如果是有向图，Bot 检测中 "In-Degree" (粉丝数) 通常更重要，这里我们算 Total
-        deg = calc_degree(col, num_nodes=num_nodes, dtype=torch.float)
-        # Log degree 用于分析更方便 (Power-law 分布)
-        log_deg = torch.log1p(deg)
-        
-        # --- Metric 2: Feature Homophily (语义同质性) ---
-        # 计算每个节点与其邻居的平均 Cosine Similarity
-        # Algorithm: Scatter Mean of CosineSim(x_src, x_dst)
-        
-        # 1. 获取边两端的特征
-        x_src = x[row]
-        x_dst = x[col]
-        
-        # 2. 计算每条边的相似度
-        edge_sim = F.cosine_similarity(x_src, x_dst, dim=1)
-        
-        # 3. 聚合到目标节点 (dst)
-        # 使用 torch_geometric.utils.scatter (如果版本旧可能在 torch_scatter)
-        # 如果没有安装 torch_scatter，可以用简单的 index_add_ 实现
-        
-        # out[i] = mean(sim(j, i)) for j in neighbors(i)
-        # 对于孤立点，结果为 0 (或者我们需要设为 1? 设为 0 表示没有邻居支持)
-        node_homophily = scatter(edge_sim, col, dim=0, dim_size=num_nodes, reduce='mean')
-        
-        return log_deg, node_homophily
+    """
+    [Helper] 计算节点的结构属性，用于深入诊断。
+    1. Degree (Log-normalized)
+    2. Feature Homophily (邻居语义相似度)
+    """
+    num_nodes = x.shape[0]
+    row, col = edge_index
+    
+    # --- Metric 1: Degree (入度 + 出度) ---
+    # 简单起见，我们计算无向度或总度数
+    # 如果是有向图，Bot 检测中 "In-Degree" (粉丝数) 通常更重要，这里我们算 Total
+    deg = calc_degree(col, num_nodes=num_nodes, dtype=torch.float)
+    # Log degree 用于分析更方便 (Power-law 分布)
+    log_deg = torch.log1p(deg)
+    
+    # --- Metric 2: Feature Homophily (语义同质性) ---
+    # 计算每个节点与其邻居的平均 Cosine Similarity
+    # Algorithm: Scatter Mean of CosineSim(x_src, x_dst)
+    
+    # 1. 获取边两端的特征
+    x_src = x[row]
+    x_dst = x[col]
+    
+    # 2. 计算每条边的相似度
+    edge_sim = F.cosine_similarity(x_src, x_dst, dim=1)
+    
+    # 3. 聚合到目标节点 (dst)
+    # 使用 torch_geometric.utils.scatter (如果版本旧可能在 torch_scatter)
+    # 如果没有安装 torch_scatter，可以用简单的 index_add_ 实现
+    
+    # out[i] = mean(sim(j, i)) for j in neighbors(i)
+    # 对于孤立点，结果为 0 (或者我们需要设为 1? 设为 0 表示没有邻居支持)
+    node_homophily = scatter(edge_sim, col, dim=0, dim_size=num_nodes, reduce='mean')
+    
+    return log_deg, node_homophily
 
 def get_stats(logits):
-                probs = F.softmax(logits, dim=1)
-                conf, preds = probs.max(dim=1)
-                # 计算熵 (不确定性)
-                log_probs = F.log_softmax(logits, dim=1)
-                entropy = -(probs * log_probs).sum(dim=1)
-                return preds, conf, entropy
+
+    probs = F.softmax(logits, dim=1)
+    conf, preds = probs.max(dim=1)
+    # 计算熵 (不确定性)
+    log_probs = F.log_softmax(logits, dim=1)
+    entropy = -(probs * log_probs).sum(dim=1)
+    return preds, conf, entropy
 
 def plot_gate_vs_uncertainty(df, save_path):
     """

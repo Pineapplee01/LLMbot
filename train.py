@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, TensorDataset
-from utils import EdlLoss, compute_ece, compute_brier, compute_nll, compute_aurc
+from utils import compute_ece, compute_brier, compute_nll, compute_aurc
 
 
 # ── MiniBatch ─────────────────────────────────────────────────────────────────
@@ -243,7 +243,7 @@ class RACEBotTrainer:
                         'in_log_degree': sf[i, 0].item(),
                         'out_log_degree': sf[i, 1].item(),
                         'total_log_degree': sf[i, 2].item(),
-                        'sym_homophily': sf[i, 3].item(),
+                        'neighbor_deg_var': sf[i, 3].item(),
                         'graph_missing': sf[i, 4].item(),
                     })
 
@@ -363,7 +363,7 @@ class RACEBotTrainer:
                         'in_log_degree': sf[i, 0].item(),
                         'out_log_degree': sf[i, 1].item(),
                         'total_log_degree': sf[i, 2].item(),
-                        'sym_homophily': sf[i, 3].item(),
+                        'neighbor_deg_var': sf[i, 3].item(),
                         'graph_missing': sf[i, 4].item(),
                     })
 

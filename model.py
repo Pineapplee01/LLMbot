@@ -144,7 +144,8 @@ class GraphEvidenceEncoder(nn.Module):
 class GraphReliabilityHead(nn.Module):
     """
     Graph-native structural reliability estimator.
-    Input: [in_log_deg, out_log_deg, total_log_deg, sym_homophily, graph_missing]
+    Input: [in_log_deg, out_log_deg, total_log_deg, neighbor_deg_var, graph_missing]
+    All features are pure topology — no text embedding dependency.
     Output: r_graph in [0, 1]
     """
     def __init__(self, in_dim=5, hid_dim=32):
