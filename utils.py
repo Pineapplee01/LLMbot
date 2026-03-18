@@ -14,6 +14,19 @@ from torch_geometric.utils import add_self_loops, remove_self_loops, scatter
 from torch_geometric.utils import degree as calc_degree
 
 
+def weighted_belief_fusion(alpha_list, weight_list, eps=1e-8, num_classes=2):
+    """
+    带权重的 WBF 融合 (适用于路由后文本层的融合)
+    alpha_list: List of [B, K]
+    weight_list: List of [B, 1] (经过路由归一化的权重 pi)
+    """
+    evidences = [a - 1.0 for a in alpha_list]
+    fused_evidence = torch.zeros_like(evidences[0])
+    
+    for w, e in zip(weight_list, evidences):
+        fused_evidence += w * e
+        
+    return fused_evidence + 1.0
 
 def compute_feature_homophily(x, edge_index):
     """
@@ -32,6 +45,60 @@ def compute_feature_homophily(x, edge_index):
     homophily = scatter(edge_sim, col, dim=0, dim_size=x.size(0), reduce='mean')
     
     return homophily.unsqueeze(1)
+
+
+def compute_directed_structural_features(edge_index, num_nodes, x):
+    """
+    Compute 5-dim per-node structural features (direction-aware).
+
+    Returns [N, 5] tensor:
+        0: in_log_degree   (z-normed)
+        1: out_log_degree  (z-normed)
+        2: total_log_degree (z-normed)
+        3: sym_homophily   (undirected cosine similarity with neighbors)
+        4: graph_missing   (1.0 if total degree == 0)
+    """
+    row, col = edge_index  # row -> source, col -> target
+
+    # ── Directed degrees ──
+    in_deg = calc_degree(col, num_nodes=num_nodes, dtype=torch.float)
+    out_deg = calc_degree(row, num_nodes=num_nodes, dtype=torch.float)
+    total_deg = in_deg + out_deg
+
+    def _znorm_log(deg):
+        ld = torch.log1p(deg)
+        return ((ld - ld.mean()) / (ld.std() + 1e-6)).unsqueeze(1)
+
+    in_log_degree = _znorm_log(in_deg)
+    out_log_degree = _znorm_log(out_deg)
+    total_log_degree = _znorm_log(total_deg)
+
+    # ── Symmetric homophily (undirected) ──
+    # Treat all edges as undirected: aggregate both directions
+    sym_edge = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+    sym_edge = torch.unique(sym_edge, dim=1)  # deduplicate
+    sym_row, sym_col = sym_edge
+    x_norm = F.normalize(x, p=2, dim=-1)
+    edge_sim = (x_norm[sym_row] * x_norm[sym_col]).sum(dim=-1)
+    sym_homophily = scatter(
+        edge_sim, sym_col, dim=0, dim_size=num_nodes, reduce='mean',
+    ).unsqueeze(1)
+
+    # ── Graph missing (total degree == 0) ──
+    graph_missing = (total_deg == 0).float().unsqueeze(1)
+
+    feats = torch.cat([
+        in_log_degree, out_log_degree, total_log_degree,
+        sym_homophily, graph_missing,
+    ], dim=1)  # [N, 5]
+
+    print(f"[StructFeats] in_deg range: [{in_deg.min():.0f}, {in_deg.max():.0f}] | "
+          f"out_deg range: [{out_deg.min():.0f}, {out_deg.max():.0f}] | "
+          f"sym_homophily mean: {sym_homophily.mean():.4f} | "
+          f"isolated: {graph_missing.sum().int().item()}")
+
+    return feats
+
 
 def load_weights(target_module, state_dict, module_name="Module"):
     """
@@ -70,49 +137,13 @@ def load_weights(target_module, state_dict, module_name="Module"):
         print(f"  ❌ [{module_name}] Failed to match any keys. Target keys example: {list(target_keys)[:3]}")
         return False
 
-class AvUCLoss(nn.Module):
-    """
-    [Rigorous] Accuracy vs Uncertainty Calibration Loss
-    来源于论文: "Accuracy versus Uncertainty Calibration in Deep Learning"
-    作用: 这是一个可微的排序损失，它不强制 S 的绝对值，
-         而是强制: P(correct | confident) > P(correct | uncertain)
-    """
-    def __init__(self, beta=1.0):
-        super().__init__()
-        self.beta = beta
-
-    def forward(self, logits, labels, uncertainty):
-        """
-        logits: [Batch, Num_Classes]
-        labels: [Batch]
-        uncertainty: [Batch] (EDL计算出的 u)
-        """
-        probs = F.softmax(logits, dim=1)
-        # 获取模型对真实类别的预测概率
-        true_probs = torch.gather(probs, 1, labels.unsqueeze(1)).squeeze(1)
-        
-        # 定义两个组的 Log 概率
-        # 1. 精确且自信 (Accurate & Certain) -> 我们希望这部分多
-        # 2. 错误且不确定 (Inaccurate & Uncertain) -> 我们希望这部分多
-        
-        # 这里的 confidence 定义为 (1 - uncertainty)
-        confidence = 1.0 - uncertainty
-        
-        # 理想状态指示器 (Indicator)
-        # 这是一个软化的 Indicator，避免使用硬性的 int(correct)
-        # 使得梯度可以传播
-        pred_acc = true_probs # 越高越好
-        
-        # AvU Loss 定义:
-        # 我们希望 maximize: (Acc * Conf) + ((1-Acc) * (1-Conf))
-        # 等价于 minimize: - log( ... )
-        
-        avu = (pred_acc * confidence) + ((1 - pred_acc) * (1 - confidence))
-        
-        # 使用 Log 形式增强数值稳定性
-        loss_avuc = -torch.log(avu + 1e-10).mean()
-        
-        return loss_avuc
+def jsd_probs(p, q, eps=1e-8):
+    p = p.clamp(min=eps)
+    q = q.clamp(min=eps)
+    m = 0.5 * (p + q)
+    kl_pm = F.kl_div(m.log(), p, reduction="none").sum(dim=1, keepdim=True)
+    kl_qm = F.kl_div(m.log(), q, reduction="none").sum(dim=1, keepdim=True)
+    return 0.5 * (kl_pm + kl_qm)
 
 def kl_divergence_dirichlet(alpha, num_classes=2):
     ones = torch.ones([1, num_classes], dtype=torch.float32, device=alpha.device)
@@ -856,3 +887,83 @@ class SupConLoss(nn.Module):
         loss = loss.view(anchor_count, batch_size).mean()
 
         return loss
+
+
+# ── Calibration Metrics ───────────────────────────────────────────────────────
+
+def compute_ece(probs: torch.Tensor, labels: torch.Tensor,
+                n_bins: int = 15) -> float:
+    """
+    Expected Calibration Error (ECE).
+
+    Args:
+        probs  : [N, K] predicted class probabilities
+        labels : [N]    ground-truth class indices
+    Returns:
+        ece : float in [0, 1]
+    """
+    confs, preds = probs.max(dim=1)
+    correct = preds.eq(labels).float()
+
+    bin_boundaries = torch.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
+        mask = (confs > lo) & (confs <= hi)
+        if mask.sum() == 0:
+            continue
+        bin_acc = correct[mask].mean().item()
+        bin_conf = confs[mask].mean().item()
+        ece += mask.float().mean().item() * abs(bin_acc - bin_conf)
+    return ece
+
+
+def compute_brier(probs: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Brier Score (lower is better).
+
+    Args:
+        probs  : [N, K]
+        labels : [N]
+    """
+    y_one_hot = F.one_hot(labels, num_classes=probs.size(1)).float()
+    return ((probs - y_one_hot) ** 2).sum(dim=1).mean().item()
+
+
+def compute_nll(probs: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Negative Log-Likelihood (lower is better).
+
+    Args:
+        probs  : [N, K]
+        labels : [N]
+    """
+    log_probs = torch.log(probs.clamp(min=1e-8))
+    nll = F.nll_loss(log_probs, labels)
+    return nll.item()
+
+
+def compute_aurc(confs: torch.Tensor, correctness: torch.Tensor) -> float:
+    """
+    Area Under the Risk-Coverage curve (lower is better).
+
+    Selective prediction: sort by descending confidence, compute cumulative
+    risk = 1 − accuracy at each coverage level, then integrate.
+
+    Args:
+        confs       : [N] confidence scores
+        correctness : [N] 1.0 if correct, 0.0 if incorrect
+    """
+    n = confs.size(0)
+    if n == 0:
+        return 0.0
+    order = confs.argsort(descending=True)
+    sorted_correct = correctness[order]
+
+    cum_correct = sorted_correct.cumsum(0)
+    coverages = torch.arange(1, n + 1, dtype=torch.float)
+    risks = 1.0 - cum_correct / coverages  # risk at each coverage level
+
+    # Trapezoidal integration over [0, 1] coverage range
+    aurc = risks.mean().item()
+    return aurc

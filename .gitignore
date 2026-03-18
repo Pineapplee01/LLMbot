@@ -15,7 +15,7 @@
 !GNNs.py
 !RGT.py
 !utils.py
-!generate_qwen3_embeddings.py
+!precompute.py
 !__init__.py
 
 # 可选：如果你也想上传 llmbot 包中的 trainer 等核心文件，可取消下面注释并按需添加文件

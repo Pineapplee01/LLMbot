@@ -15,44 +15,92 @@ def build_gnn(gnn_type, config):
     else:
         raise ValueError(f"Unknown GNN type: {gnn_type}")
 
+class BaseGraphEncoder(nn.Module):
+    """强制契约：所有图编码器必须返回节点嵌入，并暴露输出维度"""
+    @property
+    def out_dim(self) -> int:
+        raise NotImplementedError
+    
+    def forward(self, x, edge_index, edge_type=None):
+        raise NotImplementedError
 
-class RGCN(nn.Module):
+class RGCN(BaseGraphEncoder):
     def __init__(self, model_config):
         super().__init__()
         self.hidden_dim = model_config['gnn_hidden_dim']
+        self._out_dim = self.hidden_dim
         self.n_layers = model_config['gnn_n_layers']
-        self.convs = nn.ModuleList([])
+        
+        self.activation_name = model_config.get('activation', 'relu').lower()
+        self.activation = F.relu if self.activation_name == 'relu' else F.elu
+        
         self.linear_in = nn.Linear(model_config['lm_input_dim'], self.hidden_dim)
-  
-        for i in range(self.n_layers):
-            self.convs.append(RGCNConv(self.hidden_dim, self.hidden_dim, model_config['n_relations']))
-
-        self.dropout = nn.Dropout(model_config['dropout'])
         
-        self.activation_name = model_config['activation'].lower()
-        if self.activation_name == 'leakyrelu':
-            self.activation = nn.LeakyReLU()
-        elif self.activation_name == 'relu':
-            self.activation = nn.ReLU()
-        elif self.activation_name == 'elu':
-            self.activation = nn.ELU()
-        else:
-            raise ValueError('Please choose activation function from "leakyrelu", "relu" or "elu".')
+        # 🚨 [核心修复]: 删除了错误的提前调用，只保留合法初始化
+        self.convs = nn.ModuleList([
+            RGCNConv(self.hidden_dim, self.hidden_dim, model_config['n_relations'])
+            for _ in range(self.n_layers)
+        ])
         
-        self.linear_pool = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.linear_out = nn.Linear(self.hidden_dim, 2)
+        self.dropout = nn.Dropout(model_config.get('dropout', 0.3))
 
-    def forward(self, x, edge_index, edge_type):
+    @property
+    def out_dim(self) -> int:
+        return self._out_dim
+
+    def forward(self, x, edge_index, edge_type=None):
         x = self.linear_in(x)
-        x = self.dropout(x)
-        for i in range(self.n_layers):
-            x = self.convs[i](x, edge_index, edge_type)
+        for conv in self.convs:
+            x = conv(x, edge_index, edge_type)
             x = self.activation(x)
-        x = self.linear_pool(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        return self.linear_out(x)
+            x = self.dropout(x)
+        return x 
+
+class RGT(BaseGraphEncoder):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_dim = config.get('gnn_hidden_dim', 512)
+        # 🚨 [核心修复]: 补充 out_dim 契约，防止 main.py 提取时崩溃
+        self._out_dim = self.hidden_dim
+        self.n_layers = config.get('gnn_n_layers', 2)
+        self.num_relations = config['n_relations']
+        
+        self.activation = F.relu
+        self.input_proj = nn.Linear(config['lm_input_dim'], self.hidden_dim)
+        
+        self.convs = nn.ModuleList()
+        for _ in range(self.n_layers):
+            self.convs.append(RGTLayer(
+                in_size=self.hidden_dim,
+                out_size=self.hidden_dim,
+                num_edge_type=self.num_relations,
+                layer_num_heads=config.get('heads', 4),
+                semantic_head=config.get('heads', 4),
+                dropout=config.get('dropout', 0.3),
+            ))
+
+    @property
+    def out_dim(self) -> int:
+        return self._out_dim
+
+    def prepare_data_for_RGT(self, edge_index, edge_type):
+        edge_index_list = []
+        for i in range(self.num_relations):
+            mask = (edge_type == i)
+            sub_edges = edge_index[:, mask]
+            if sub_edges.size(1) == 0:
+                sub_edges = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+            edge_index_list.append(sub_edges)
+        return edge_index_list
     
+    def forward(self, x, edge_index, edge_type=None):
+        x = self.input_proj(x)
+        edge_index_list = self.prepare_data_for_RGT(edge_index, edge_type)
+        
+        for i in range(self.n_layers):
+            x = self.convs[i](x, edge_index_list)
+            x = self.activation(x)
+        return x   
 
 
 class SimpleHGN(nn.Module):
@@ -102,8 +150,6 @@ class SimpleHGN(nn.Module):
 
         return self.linear_out(x)
     
-
-
 class HGT(nn.Module):
     def __init__(self, model_config):
         super().__init__()
@@ -153,87 +199,7 @@ class HGT(nn.Module):
         x = self.dropout(x)
         x = self.activation(x)
 
-        return self.linear_out(x)
-    
-
-
-class RGT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        
-        # Config Mapping
-        self.in_dim = config.get('lm_input_dim', 4096)           
-        self.hidden_dim = config.get('gnn_hidden_dim', 512)   
-        self.num_relations = config.get('n_relations', 2)
-        self.n_layers = config.get('gnn_n_layers', 2)
-        
-        self.att_heads = config.get('heads', 8)              
-        self.semantic_heads = 4                       # RGT 标准配置
-        self.dropout_val = config.get('dropout', 0.3)
-
-        # --- MODIFICATION START ---
-        # Replaced their MLP with a Qwen Projector
-        self.input_proj = nn.Sequential(
-            nn.Linear(self.in_dim, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(self.dropout_val)
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(self.dropout_val),
-            nn.Linear(self.hidden_dim // 2, 2)
-        )
-        # --- MODIFICATION END ---
-
-        self.convs = nn.ModuleList()
-        for i in range(self.n_layers):
-            self.convs.append(
-                RGTLayer(
-                    num_edge_type=self.num_relations,
-                    in_size=self.hidden_dim,
-                    out_size=self.hidden_dim,
-                    layer_num_heads=self.att_heads,
-                    semantic_head=self.semantic_heads,
-                    dropout=self.dropout_val
-                )
-            )
-
-        self.activation = nn.ELU()
-        
-        # --- MODIFICATION: Removed self.linear_out (Classifier) ---
-
-    def prepare_data_for_RGT(self, edge_index, edge_type):
-        """Splits master edge_index into list of edge_indices per relation."""
-        edge_index_list = []
-        for i in range(self.num_relations):
-            mask = (edge_type == i)
-            if mask.sum() > 0:
-                sub_edges = edge_index[:, mask]
-            else:
-                # Handle empty relations safely
-                sub_edges = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
-            edge_index_list.append(sub_edges)
-        return edge_index_list
-    
-    def forward(self, x, edge_index, edge_type):
-        # 1. Project Qwen
-        x = self.input_proj(x)
-        
-        # 2. Prepare Heterogeneous Data
-        edge_index_list = self.prepare_data_for_RGT(edge_index, edge_type)
-        
-        # 3. RGT Layers
-        for i in range(self.n_layers):
-            x = self.convs[i](x, edge_index_list)
-            x = self.activation(x)
-            
-        # 4. Return Embedding (For Fusion)
-        return x
-    
-    
+        return self.linear_out(x)  
 
 class GAT(nn.Module):
     def __init__(self, config):
