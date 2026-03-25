@@ -10,13 +10,17 @@
 
 # 白名单：允许上传的核心源码文件（按需调整）
 !main.py
+!main_text.py
 !model.py
 !train.py
+!text_model.py
+!text_train.py
 !GNNs.py
 !RGT.py
 !utils.py
 !precompute.py
 !__init__.py
+!code/*.py
 
 # 可选：如果你也想上传 llmbot 包中的 trainer 等核心文件，可取消下面注释并按需添加文件
 # !llmbot/__init__.py

@@ -1,6 +1,13 @@
 """
 text_model.py
-Text-only classifier wrapper around text heads.
+Text-only classifier wrapper around the text heads defined in `model.py`.
+
+Paper-facing baselines:
+- `semantic` + plain CE corresponds to `g1_plain`
+- `vib_edl` corresponds to `g6_vib_edl`
+
+Other branch types remain available for appendix-style comparisons, but they
+are not part of the primary deployed multimodal path.
 """
 
 import torch
@@ -30,6 +37,8 @@ class TextOnlyClassifier(nn.Module):
     ):
         super().__init__()
         self.text_branch_type = text_branch_type
+        # `semantic` is the default baseline family. `vib_edl` is the stronger
+        # uncertainty-aware appendix baseline used in g6/g7.
         if text_branch_type == "vib_edl":
             self.text_branch = TextVIBEDLHead(
                 in_dim=in_dim,

@@ -1,8 +1,16 @@
 """
 main.py
-Unified entrypoint for:
-1) Full LM+Graph training (RACE-Bot-D3F)
-2) Standalone Text-only training and experiment matrix
+Unified entrypoint for the current `code/` research surface.
+
+Active paths:
+1. Stage 2 full LM+Graph training via `RACEBotD3F`
+2. Text-only baselines and matrix runs built on the same `q_final` embedding
+
+Important scope decision:
+- Stage 1 multi-layer extraction lives in `precompute.py`.
+- The deployed Stage 2 path in this file consumes only `q_final`.
+- Multi-layer routing and fragility proxies are treated as diagnostic evidence,
+  not as a required runtime dependency of the active Stage 2 trainer.
 """
 
 import argparse
@@ -36,7 +44,11 @@ def parse_args():
 
     # Text-only switches
     parser.add_argument("--text", action="store_true", help="Run standalone text-only classifier")
-    parser.add_argument("--text_run_matrix", action="store_true", help="Run text-only experiment matrix (g1-g7)")
+    parser.add_argument(
+        "--text_run_matrix",
+        action="store_true",
+        help="Run the text-only experiment matrix (primary focus: g1_plain and g6_vib_edl)",
+    )
     parser.add_argument(
         "--text_loss_mode",
         type=str,
@@ -229,6 +241,8 @@ def parse_args():
 
 
 def _load_emb(path):
+    # The active pipeline accepts a single final-layer tensor. The helper keeps
+    # loading logic tolerant to saved lists/ndarrays produced by older runs.
     raw = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(raw, torch.Tensor):
         raw = torch.tensor(raw)
@@ -355,6 +369,8 @@ def main():
     seed_setting_fn(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    # Stage 2 begins from a precomputed final-layer embedding tensor. Any
+    # multi-layer evidence produced in Stage 1 is treated as analysis-only.
     print("Loading final-layer embeddings...")
     q_final = _load_emb(args.q_final_path)
     in_dim = q_final.size(1)
@@ -367,6 +383,8 @@ def main():
         labels = labels.argmax(dim=1)
     labels = labels.long()
 
+    # Graph-side reliability is estimated from topology-only features so that
+    # the graph branch is not "contaminated" by text-derived reliability cues.
     print("Computing structural features...")
     struct_feats = compute_structural_fn(data_dict["edge_index"], int(q_final.size(0)), q_final)
 
@@ -400,6 +418,10 @@ def main():
 
     # ----------------------------------------------------------------------
     # Text-only branch
+    #
+    # This is the baseline/ablation surface. `g1_plain` and `g6_vib_edl`
+    # are the main paper-facing baselines; other variants remain executable
+    # as appendix-style comparisons.
     # ----------------------------------------------------------------------
     if args.text:
         num_classes = int(labels.max().item()) + 1
@@ -414,6 +436,8 @@ def main():
             )
 
         if args.text_run_matrix:
+            # Matrix mode reuses one dataset contract and one embedding source,
+            # then sweeps baseline families under controlled seed handling.
             num_seeds = int(max(1, args.text_num_seeds))
             seeds = [int(args.text_seed_start + i) for i in range(num_seeds)]
             print(f"Running text matrix for seeds: {seeds}")
@@ -529,11 +553,18 @@ def main():
 
     # ----------------------------------------------------------------------
     # Full LM+Graph branch
+    #
+    # This is the deployed multimodal mainline:
+    # `q_final` -> text branch, graph encoder, topology-only reliability head,
+    # then reliability-aware fusion inside `RACEBotD3F`.
     # ----------------------------------------------------------------------
     from model import RACEBotD3F
     from train import RACEBotTrainer
     from torch_geometric.data import Data
 
+    # `x` and `q_final` intentionally share the same tensor today: the graph
+    # encoder reads the final-layer representation as node features, while the
+    # text branch reads the same representation directly for semantic evidence.
     data = Data(
         x=q_final,
         q_final=q_final,

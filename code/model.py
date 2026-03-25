@@ -1,14 +1,17 @@
 """
 model.py
-RACE-Bot-D3F Model Components
+Model definitions for the active `code/` pipeline.
 
-Modules:
-  - TextCandidateEvidence     (ablation: multilayer evidence routing)
-  - TextFinalSemanticHead     (main: final-layer calibrated text branch)
-  - GraphEvidenceEncoder      (RGCN + LayerNorm + residual)
-  - GraphReliabilityHead      (graph-native structural reliability)
-  - D3FFusion                 (reliability-aware routing + residual T)
-  - RACEBotD3F                (full model)
+Active modules:
+- `TextFinalSemanticHead`: final-layer text evidence head
+- `GraphEvidenceEncoder`: graph evidence head over the social graph
+- `GraphReliabilityHead`: topology-only graph reliability estimator
+- `D3FFusion`: reliability-aware evidence fusion
+- `RACEBotD3F`: deployed multimodal wrapper
+
+Inactive modules:
+- The older multi-layer routing branch is preserved below as an inert snapshot
+  for reference only. It is not instantiated by `main.py` or `RACEBotD3F`.
 """
 
 import torch
@@ -41,6 +44,10 @@ def jsd_probs(p, q, eps=1e-8):
 
 
 # ── [ablation] Multilayer evidence routing ────────────────────────────────────
+# Legacy / inactive snapshot:
+# The next string preserves the historical multi-layer routing code without
+# leaving it on the importable execution path.
+LEGACY_TEXT_CANDIDATE_EVIDENCE = r'''
 class TextCandidateEvidence(nn.Module):
     def __init__(self, layer_ids=('22', '30', '36'), in_dim=4096,
                  hid_dim=256, num_classes=2, topk=2):
@@ -87,6 +94,7 @@ class TextCandidateEvidence(nn.Module):
         weight_list = [pi_norm[:, i:i+1] for i in range(len(self.layer_ids))]
         alpha_t = weighted_belief_fusion(alpha_list, weight_list, num_classes=self.num_classes)
         return {"alpha_text": alpha_t, "u_route": u_r, "route_weight": pi_norm}
+'''
 
 
 # ── Final-layer text branch ──────────────────────────────────────────────────
@@ -116,9 +124,12 @@ class TextFinalSemanticHead(nn.Module):
         temp_scale = float(cfg_text.get('temp_scale', 1.0))
         conc_scale = float(cfg_text.get('concentration_scale', 1.0))
 
+        # Semantic path learns the decision boundary on top of `q_final`.
         h_sem = self.semantic_adapter(final_feat)
         logits = self.classifier(h_sem)
 
+        # Uncertainty path predicts calibration controls separately so the
+        # semantic logits and uncertainty signal can be analyzed independently.
         h_unc = self.uncertainty_adapter(final_feat)
         temp = min_temp + temp_scale * F.softplus(self.temperature_head(h_unc))
         logits_cal = logits / temp
@@ -179,6 +190,7 @@ class TextClasswiseEvidenceHead(nn.Module):
 
 
 class TextVIBEDLHead(nn.Module):
+    """Appendix baseline used by the g6/g7 VIB-EDL text-only experiments."""
     def __init__(self, in_dim=4096, hid_dim=256, latent_dim=256, num_classes=2, dropout=0.1):
         super().__init__()
         self.num_classes = num_classes
@@ -241,6 +253,7 @@ class TextVIBEDLHead(nn.Module):
 
 
 # ── Graph evidence encoder (RGCN + LN + residual) ────────────────────────────
+# Active graph branch: converts graph neighborhoods into graph evidence.
 class GraphEvidenceEncoder(nn.Module):
     """Two-layer RGCN with LayerNorm, residual connection, configurable params."""
     def __init__(self, in_dim, hid_dim, num_classes=2,
@@ -273,6 +286,7 @@ class GraphEvidenceEncoder(nn.Module):
 
 
 # ── Graph reliability head ────────────────────────────────────────────────────
+# Active reliability branch: topology-only gate for graph trust.
 class GraphReliabilityHead(nn.Module):
     """
     Graph-native structural reliability estimator.
@@ -295,6 +309,7 @@ class GraphReliabilityHead(nn.Module):
 
 
 # ── D3F Fusion (reliability-aware routing) ────────────────────────────────────
+# Active fusion block used by the deployed multimodal path.
 class D3FFusion(nn.Module):
     """
     Dependency-Discounted Directional Fusion with reliability-aware routing.
@@ -333,15 +348,16 @@ class D3FFusion(nn.Module):
         u_t = self.num_classes / S_t
         u_g = self.num_classes / S_g
 
-        # (a) Sample-level dependency coefficient
+        # (a) Estimate how redundant the two modalities already are.
         O_tg = (p_t * p_g).sum(dim=1, keepdim=True)
         rho = torch.clamp(self.lambda_dep * O_tg, min=0.0, max=1.0)
 
-        # (b) Dependency discount on evidence
+        # (b) Discount duplicated evidence and gate graph evidence with
+        # node-wise graph reliability.
         e_t_d = (1.0 - 0.5 * rho) * e_t
         e_g_d = r_graph * (1.0 - 0.5 * rho) * e_g   # r_graph gates evidence
 
-        # (c) Reliability-aware trust weighting
+        # (c) Convert certainty and reliability into fusion weights.
         trust_t = (1.0 - u_t) * p_t
         trust_g = r_graph * (1.0 - u_g) * p_g        # r_graph gates trust
         w_t = trust_t / (trust_t + trust_g + eps)
@@ -369,6 +385,7 @@ class D3FFusion(nn.Module):
 
 
 # ── Full model ────────────────────────────────────────────────────────────────
+# Deployed multimodal wrapper used by `main.py`.
 class RACEBotD3F(nn.Module):
     """
     RACE-Bot-D3F: Risk-Aware Calibrated Evidence with
@@ -395,20 +412,21 @@ class RACEBotD3F(nn.Module):
         bsz = batch.batch_size
         seed_idx = torch.arange(bsz, device=batch.x.device)
 
-        # 1. Text branch (final-layer only)
+        # 1. Text branch: semantic evidence from the final-layer embedding.
         text_out = self.text_branch(batch.q_final[:bsz], cfg_text)
         alpha_t = text_out["alpha_text"]
         u_text = text_out["u_text"]
 
-        # 2. Graph branch
+        # 2. Graph branch: contextual evidence from the sampled neighborhood.
         alpha_g = self.graph_branch(
             batch.x, batch.edge_index, batch.edge_type, seed_idx,
         )
 
-        # 3. Graph reliability from structural features
+        # 3. Reliability branch: topology-only gate for graph evidence.
         r_graph = self.reliability_head(batch.struct_feats[:bsz])
 
-        # 4. Reliability-aware fusion
+        # 4. Fusion branch: combine text evidence, graph evidence, and graph
+        # reliability into the final Dirichlet prediction.
         fusion_out = self.fusion(alpha_t, alpha_g, u_text, r_graph)
 
         fusion_out.update({

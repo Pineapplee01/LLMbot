@@ -1,10 +1,15 @@
 """
 train.py
-Training Pipeline for RACE-Bot-D3F
-  - TextFinalSemanticHead (final-layer calibrated text branch)
-  - GraphEvidenceEncoder  (RGCN + LayerNorm + residual)
-  - GraphReliabilityHead  (graph-native structural reliability)
-  - D3FFusion             (reliability-aware routing + residual T)
+Training loop for the deployed multimodal mainline.
+
+This file documents the active Stage 2 protocol:
+- neighbor-sampled graph mini-batches
+- final-layer text evidence + graph evidence + graph reliability
+- fused / text / graph auxiliary losses
+- validation-based checkpointing followed by post-hoc calibration
+
+It intentionally does not revive the legacy staged framework preserved
+elsewhere in the repository.
 """
 
 import json
@@ -14,6 +19,7 @@ import wandb
 import torch.nn.functional as F
 from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Dict, Tuple
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, TensorDataset
 from utils import compute_ece, compute_brier, compute_nll, compute_aurc
@@ -150,6 +156,9 @@ class RACEBotTrainer:
         )
 
         sizes = neighbor_sizes or [10, 10]
+        # The full trainer still uses one validation surface for model
+        # selection and post-hoc temperature fitting. That behavior is kept
+        # intact in this cleanup pass; the goal here is code-lineage clarity.
         self.train_loader = NeighborSampler(
             data, sizes=sizes, batch_size=batch_size,
             input_nodes=data_dict['train_idx'], shuffle=True,
@@ -181,6 +190,9 @@ class RACEBotTrainer:
             loss_text  = r_edl_loss(out['alpha_text'],  labels)
             loss_graph = r_edl_loss(out['alpha_graph'], labels)
 
+            # The fused head is the primary objective; text and graph branch
+            # losses remain as stabilizing auxiliaries so each modality keeps a
+            # supervised evidence signal during joint training.
             loss = (loss_fused
                     + self.cfg['loss']['lambda_text']  * loss_text
                     + self.cfg['loss']['lambda_graph'] * loss_graph)
@@ -228,7 +240,9 @@ class RACEBotTrainer:
             stats['temperature'].extend(out['temperature'].squeeze().cpu().tolist())
             stats['rho'].extend(out['rho'].squeeze().cpu().tolist())
 
-            # Per-node records for analysis
+            # Per-node diagnostics are the bridge to the paper's failure-mode
+            # analysis: each record keeps prediction, confidence, uncertainty,
+            # conflict, and topology statistics for the same node.
             if save_per_node:
                 n_ids = batch.n_id[:bsz].cpu().tolist()
                 sf = batch.struct_feats[:bsz].cpu()
@@ -306,6 +320,10 @@ class RACEBotTrainer:
         """
         Learn a single post-hoc temperature on the validation set
         (model frozen). Returns the optimal T scalar.
+
+        This calibration step sits after checkpoint selection and is kept as-is
+        here because the current task is cleanup/commentary, not protocol
+        redesign.
         """
         logits, labels = self._collect_logits(self.val_loader)
         T_param = torch.nn.Parameter(torch.ones(1))
@@ -437,6 +455,8 @@ class RACEBotTrainer:
                 f"C: {val.get('conflict', 0):.3f}"
             )
 
+            # Checkpoint selection is reliability-aware: F1 leads, while ECE
+            # and AURC penalize accurate-but-poorly-calibrated models.
             if score > best_score:
                 best_score = score
                 torch.save(

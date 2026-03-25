@@ -1,7 +1,13 @@
 """
 text_eval_report.py
 Aggregate multi-seed text-only matrix outputs into calibration/risk tables
-and branch-selection report.
+and branch-selection reports.
+
+Primary reading convention:
+- `g1_plain` is the main probability baseline
+- `g6_vib_edl` is the main uncertainty-aware baseline for risk analysis
+- other groups are auxiliary or appendix comparisons derived from the same
+  text-only experiment surface
 """
 
 from __future__ import annotations
@@ -19,6 +25,9 @@ import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 
+# Report selection first decides which post-hoc probability view represents a
+# group (raw / TS / Platt / Beta), then decides which uncertainty-like source
+# best supports selective-risk analysis inside that chosen family.
 PRIMARY_SELECTION_OUTPUTS = ("raw", "ts", "platt", "beta")
 RISK_INTERNAL_SOURCES = ("conf_unc", "u_text", "combined_unc_legacy", "combined_unc_monotone")
 
@@ -597,7 +606,9 @@ def _build_branch_selection_report(
     risk_rows: List[Dict],
     seed_runs: List[Dict],
 ) -> Dict:
-    # Probability branch: g1 vs g9 (primary: NLL, secondary: ECE/Brier)
+    # Probability branch:
+    # Prefer the simpler `g1_plain` unless the classwise alternative shows a
+    # seed-paired test NLL win after per-seed validation-based output selection.
     g_prob_a, g_prob_b = "g1_plain", "g9_classwise_decoupled"
     out_a, src_a = _resolve_seedwise_outputs(
         cal_val_rows,
@@ -623,7 +634,9 @@ def _build_branch_selection_report(
     else:
         selected_prob = g_prob_a  # simplicity tie-break
 
-    # Risk branch: compare uncertainty sources within g6 raw backbone.
+    # Risk branch:
+    # Hold the backbone fixed at `g6_vib_edl/raw`, then ask which uncertainty
+    # source best supports selective-risk ranking.
     risk_backbone = "g6_vib_edl"
     risk_output = "raw"
     source_rows = [
@@ -664,7 +677,9 @@ def _build_branch_selection_report(
     elif incremental_deltas["combined_unc_legacy"]["delta_aurc_vs_conf_unc"]["significant"] and incremental_deltas["combined_unc_legacy"]["delta_aurc_vs_conf_unc"]["mean"] < 0:
         selected_risk_source = "combined_unc_legacy"
 
-    # Auxiliary post-hoc view check: raw g6 vs calibrated g7 are not independent models.
+    # Auxiliary post-hoc view check:
+    # raw g6 and calibrated g7 are two views of the same backbone, so this is
+    # reported as a consistency check rather than a backbone comparison.
     g_risk_view_a, g_risk_view_b = "g6_vib_edl", "g7_vib_edl_ts"
     risk_group_rows_a = _extract_group_rows(seed_runs, g_risk_view_a)
     risk_group_rows_b = _extract_group_rows(seed_runs, g_risk_view_b)

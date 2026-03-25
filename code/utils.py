@@ -1,3 +1,17 @@
+"""
+utils.py
+
+Shared helpers for the active `code/` pipeline.
+
+The current mainline uses this file for three things:
+- dataset loading (`load_raw_data`)
+- topology-only structural features for Stage 2
+- evaluation metrics such as ECE / Brier / NLL / AURC
+
+The file also still contains older research utilities. Those helpers are left
+in place for continuity, but the active path is the one described above.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,9 +72,12 @@ def compute_directed_structural_features(edge_index, num_nodes, x=None):
         3: neighbor_deg_var   (normalized variance of neighbor degrees — pure topology)
         4: graph_missing      (1.0 if total degree == 0)
 
-    Note: Feature 3 is intentionally graph-native (no text embedding dependency)
-    to avoid "text-contaminated" graph reliability signals.
-    The `x` parameter is accepted for backward compatibility but NOT used.
+    Note:
+    - Feature 3 is intentionally graph-native (no text embedding dependency)
+      to avoid "text-contaminated" graph reliability signals.
+    - The `x` parameter is accepted for backward compatibility but NOT used.
+    - These features are the active Stage 2 reliability inputs; fragility
+      proxies from Stage 1 are not currently injected here.
     """
     row, col = edge_index  # row -> source, col -> target
 
@@ -663,6 +680,10 @@ def load_raw_data(dataset_path, use_GNN=True):
         ✅ edge_type.pt    -> Edge types [16908] (binary: 0 or 1)
         ✅ norm_user_text.json -> User text content
     
+    Active consumers:
+        - `precompute.py`: loads text + graph metadata for Stage 1 diagnostics
+        - `main.py`: loads the same node ordering contract for Stage 2
+
     Raises:
         FileNotFoundError: If dataset path cannot be resolved
         FileNotFoundError: If required data files are missing

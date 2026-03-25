@@ -1,15 +1,18 @@
 """
-precompute_stage1_twibot20_llm_safe_final_v2.py
+precompute.py
 
-Stage 1: Multi-Layer Extraction & Sample-Level Fragility Validation
-Paper Component: "Figure 1: Motivation" & "Sample-Level Routing Justification"
+Stage 1 diagnostic pipeline for the current repository.
 
-V2 Upgrades (MLOps & Robustness):
-1. Comprehensive Tagging & Isolated Directories: Prevents artifact overwriting.
-2. Fast Clustering: Stratified sampling for Silhouette/DB to avoid O(N^2) bottlenecks.
-3. Safe Perturbation: Ensures minimum token retention (prevents empty string collapse).
-4. Auto-Reset Stats: Truncation stats are strictly bound to their respective runs.
-5. Manifest Generation: Outputs manifest.json for seamless Stage-2 integration.
+What this file is responsible for:
+- extract multi-layer LLM embeddings from normalized user text
+- measure layer-level linear-probe quality and fragility proxies
+- write analysis artifacts under `stage1_artifacts/<run_tag>/`
+
+What this file is not responsible for:
+- it does not train the deployed Stage 2 model directly
+- the active Stage 2 path currently consumes only the final-layer tensor,
+  while the remaining Stage 1 outputs act as motivation, diagnostics, and
+  future-method hooks
 """
 
 import argparse
@@ -323,6 +326,9 @@ def run_evidence_pipeline(
         X_c = emb_clean[layer].float().numpy()
         
         # --- A. Leakage-Free Linear Probe ---
+        # Validation accuracy is the selection-facing signal. Test accuracy is
+        # still emitted as an audit/report field in the current artifact
+        # surface, but it is not consumed by the active Stage 2 trainer.
         X_train, y_train = X_c[train_idx], labels[train_idx]
         X_valid, y_valid = X_c[valid_idx], labels[valid_idx]
         X_test,  y_test  = X_c[test_idx],  labels[test_idx]
@@ -365,7 +371,8 @@ def run_evidence_pipeline(
             "mean_fragility_prompt": float(frag_prompt.mean())
         })
 
-    # Output files routing directly to the isolated out_dir
+    # Output files are analysis artifacts. Stage 2 uses the final-layer
+    # embedding tensor, while the CSV/PT side products remain diagnostic.
     with open(out_dir / "layer_evidence.csv", 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
         writer.writeheader(); writer.writerows(metrics)
@@ -405,6 +412,8 @@ def main():
     args = parse_args()
     base_path = Path(args.dataset_path)
 
+    # Each Stage 1 run is isolated so that different prompt/pooling/dtype
+    # choices can be compared without overwriting previous diagnostic outputs.
     # [MLOps] Generate robust run tag & directory
     layers_str = args.layers.replace(",", "-")
     run_tag = f"pool_{args.pooling}_ins_{args.instruction_mode}_deb_{int(args.prompt_debias)}_pad_{args.padding_side}_dt_{args.dtype}_len_{args.max_length}_sd_{args.seed}_L_{layers_str}"
@@ -429,6 +438,8 @@ def main():
         target_layers=args.layers, seed=args.seed, run_tag=run_tag, use_wandb=(not args.no_wandb)
     )
 
+    # `clean` embeddings are the canonical Stage 1 outputs. `perturb` and
+    # `prompt_off` are auxiliary conditions used only to score fragility.
     emb_clean = gen.generate_embeddings(texts, node_ids=node_ids, mode="clean")
     emb_perturb = gen.generate_embeddings(texts, node_ids=node_ids, mode="perturb")
     emb_prompt_off = gen.generate_embeddings(texts, node_ids=node_ids, mode="prompt_off")

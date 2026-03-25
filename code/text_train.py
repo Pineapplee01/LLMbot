@@ -1,6 +1,13 @@
 """
 text_train.py
-Standalone trainer for TextOnlyClassifier.
+Standalone trainer for the text-only baseline surface.
+
+Primary baselines to keep in mind while reading this file:
+- `g1_plain`: final semantic head with standard logits/probability output
+- `g6_vib_edl`: VIB + EDL baseline used for stronger uncertainty analysis
+
+The remaining matrix groups are retained as appendix-style ablations so they
+can still be reproduced without being mistaken for the repository's mainline.
 """
 
 from __future__ import annotations
@@ -261,6 +268,9 @@ class TextTrainer:
         n = int(valid_idx.numel())
         if n < 2:
             raise ValueError("valid_idx must contain at least 2 samples for valid_ckpt/valid_cal split.")
+        # Text-only experiments intentionally split validation into checkpoint
+        # selection and post-hoc calibration subsets. This is the cleaner
+        # protocol already used by the baseline matrix.
         generator = torch.Generator(device="cpu")
         generator.manual_seed(int(split_seed))
         perm = torch.randperm(n, generator=generator)
@@ -1090,7 +1100,14 @@ def run_text_experiment_matrix(
 
     Base models are trained once (g1/g3/g4/g6). Calibrated legacy views
     (g2/g5/g7) are synthesized from the corresponding base checkpoint.
+
+    Reading guide:
+    - `g1_plain` is the primary probability baseline.
+    - `g6_vib_edl` is the primary uncertainty-aware baseline.
+    - Classwise variants and derived TS views are appendix comparisons.
     """
+    # Base groups define train-once backbones. The paper-facing emphasis is on
+    # `g1_plain` and `g6_vib_edl`; the others remain reproducible side studies.
     base_groups = [
         {
             "id": "g1_plain",
@@ -1141,6 +1158,9 @@ def run_text_experiment_matrix(
             "eval_prob_source": "alpha",
         },
     ]
+    # Derived groups are post-hoc views built from the base checkpoints above.
+    # They should be read as calibration/reporting variants, not independent
+    # architectural mainlines.
     derived_groups = {
         "g1_plain": [
             {

@@ -1,3 +1,13 @@
+"""
+LEGACY / INACTIVE MODULE
+
+This file contains historical alternative graph encoders. The active Stage 2
+pipeline does not import it; `model.py` provides the deployed graph branch.
+
+The original source is wrapped below as an inert snapshot for reference.
+"""
+
+LEGACY_SOURCE = r'''
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -221,3 +231,4 @@ class GAT(nn.Module):
         x = F.elu(x)
         x = self.conv2(x, edge_index)
         return x    
+'''

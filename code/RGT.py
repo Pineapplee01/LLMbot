@@ -1,3 +1,13 @@
+"""
+LEGACY / INACTIVE MODULE
+
+This file contains a historical relation-aware transformer layer preserved for
+reference. It is not imported by the active `main.py` / `model.py` path.
+
+The original source is wrapped below as an inert snapshot for reference.
+"""
+
+LEGACY_SOURCE = r'''
 import torch
 import torch.nn as nn
 from torch_geometric.nn import TransformerConv
@@ -102,3 +112,4 @@ class RGTLayer(nn.Module):
             
         # 3. Aggregate Relations using Node-wise Attention
         return self.semantic_attention(semantic_embeddings)
+'''
