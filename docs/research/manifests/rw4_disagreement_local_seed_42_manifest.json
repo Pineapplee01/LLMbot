@@ -1,0 +1,23 @@
+{
+  "experiment_id": "rw4_disagreement_local_seed_42",
+  "commit_hash": "unknown_legacy_run_commit; wrapper_commit:b1c118a295ed89f10e9faea959dda63b45a8619e",
+  "task_name": "B2 modification vs same-trigger deferral mechanism evidence",
+  "dataset_name": "TwiBot-20",
+  "dataset_version": "legacy-local-canonical-assumed; checksum not captured",
+  "split_id": "",
+  "split_description": "Legacy split counts captured in split_manifest.json: train_core=8278, valid_ckpt=946, valid_cal=710, valid_router=709, test=1183; split indices are stored in LLMbot/saved_artifacts/rw4_disagreement_local/seed_42/split_indices.pt.",
+  "preprocessing_version": "legacy dual-router pipeline; exact preprocessing commit not captured",
+  "model_name": "rw4_disagreement_local dual-router",
+  "model_version_or_date": "legacy artifact wrapped on 2026-04-23; original run date not captured",
+  "prompt_or_template_version": "none",
+  "config_path": "LLMbot/saved_artifacts/rw4_disagreement_local/seed_42/resolved_runtime_config.json",
+  "seed_list": [
+    42
+  ],
+  "command": "unknown_legacy_command:not_captured; this manifest wraps existing rw4_disagreement_local seed_42 artifacts only",
+  "hardware_or_runtime_notes": "Legacy run hardware and runtime were not captured in the artifact set; metrics paths reference a prior G:\\Research\\LMBot workspace.",
+  "metrics_output_path": "LLMbot/saved_artifacts/rw4_disagreement_local/seed_42/metrics.json",
+  "artifact_output_path": "LLMbot/saved_artifacts/rw4_disagreement_local/seed_42",
+  "baseline_reference": "same_trigger_defer_baseline_seed_42",
+  "notes": "Single-seed legacy artifact wrapper for auditability. Final-test metrics include f1=0.7603052747698057 and accuracy=0.7641589180050719; disagreement-slice metrics include f1=0.5881175636277678 over n=264. This manifest does not make the result claim-complete because original command, original commit, runtime, rerun stability, and formal reviewer checklist status are missing."
+}

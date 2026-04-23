@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(scp -P 10011 root@172.31.106.108:workspace/LMbot/parser_args.py \"g:/Research/LMBot/LMBot/parser_args.py\")",
+      "Bash(ssh root@172.31.106.108 -p 10011 \"echo '=== seed 1 pretrain ===' && ls -la workspace/LMbot/TwiBot-20_seed_1/checkpoints/LM_pretrain/ && ls -la workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/ && echo '=== seed 1 LM ckpt ===' && ls -la workspace/LMbot/TwiBot-20_seed_1/checkpoints/LM/\")",
+      "Bash(ssh root@172.31.106.108 -p 10011 'cd workspace/LMbot && for s in 1 2 3 4 5; do:*)",
+      "Bash(ssh root@172.31.106.108 -p 10011 'cd workspace/LMbot && python -c \":*)",
+      "Bash(ssh root@172.31.106.108 -p 10011 'grep -E \"Iter:|GNN Test|LM Test|Pretrain Test|seed|End:\" /root/workspace/LMbot/nohup_rgt_5seed.log')",
+      "Bash(pip install:*)",
+      "Bash(python analyze_regime.py)",
+      "Bash(scp -P 10011 \"g:/Research/LMBot/LMBot/analyze_regime.py\" root@172.31.106.108:/root/workspace/LMbot/)",
+      "Bash(scp -P 10011 \"g:/Research/LMBot/LMBot/diagnose_gnn.py\" \"g:/Research/LMBot/LMBot/build_failure_regime_table.py\" \"g:/Research/LMBot/LMBot/analyze_regime.py\" root@172.31.106.108:/root/workspace/LMbot/)",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && cd /root/workspace/LMbot && echo \"=== Step 1: GNN v2 \\(full-graph\\) ===\" && python diagnose_gnn.py --seeds 1,2,3,4,5 --device 0 2>&1 | grep -E \"^\\(=|  |Diagnosing|GNN v2\\)\"')",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && cd /root/workspace/LMbot && echo \"=== Step 2: Regime Table v2 ===\" && python build_failure_regime_table.py --seeds 1,2,3,4,5 2>&1 && echo \"=== Step 3: Analysis v2 ===\" && python analyze_regime.py 2>&1')",
+      "Bash(scp -P 10011 \"g:/Research/LMBot/LMBot/build_failure_regime_table.py\" root@172.31.106.108:/root/workspace/LMbot/)",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && cd /root/workspace/LMbot && python build_failure_regime_table.py --seeds 1,2,3,4,5 2>&1 && echo \"=== Analysis v2 ===\" && python analyze_regime.py 2>&1')",
+      "Bash(scp -P 10011 root@172.31.106.108:/root/workspace/LMbot/TwiBot-20_RGT_seed___TRACKED_VAR__/diagnostics/regime_table_test.csv __TRACKED_VAR__/)",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && cd /root/workspace/LMbot && python action_outcome_table.py --seeds 1,2,3,4,5 --device 0 --alphas 0.05,0.1,0.2,0.3,0.5 2>&1 | grep -v \"^  \\\\\\(0\\\\|  \\\\\\(lin\\\\|  \\\\\\(gat\\\\|  \\\\\\(att\\\\|  \\\\\\(sem\\\\|  \\\\\\)\\\\|pkg_\\\\|UserW\"')",
+      "Bash(python3)",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && python -c \":*)",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && cd /root/workspace/LMbot && python run_diagnostic_baselines.py --seeds 1,2,3,4,5 --device 0 2>&1')",
+      "Bash(scp -P 10011 root@172.31.106.108:/root/workspace/LMbot/diagnostic_baselines_test.csv root@172.31.106.108:/root/workspace/LMbot/calibration_risk_comparison.csv \"g:/Research/LMBot/LMBot/results_rgt/\")",
+      "Bash(ssh root@172.31.106.108 -p 10011 'grep -E \"Start:|End:|Iter:|GNN training|Best GNN\" /root/workspace/LMbot/nohup_rgt_5seed.log | head -20')",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && cd /root/workspace/LMbot && echo \"=== Step 1: Edge Scoring ===\" && python edge_scorer.py --seeds 1,2,3,4,5 --device 0 2>&1 && echo \"=== Step 2: Graph Preprocessing ===\" && python preprocess_graph.py --seeds 1,2,3,4,5 2>&1')",
+      "Bash(ssh root@172.31.106.108 -p 10011 'source /root/mambaforge/etc/profile.d/conda.sh && conda activate lmbot && cd /root/workspace/LMbot && nohup python run_graph_preprocess_baselines.py --seeds 1,2,3,4,5 --device 0 > nohup_graph_preprocess.log 2>&1 & echo \"PID: $!\"')",
+      "Bash(ssh root@172.31.106.108 -p 10011 'tail -30 /root/workspace/LMbot/nohup_graph_preprocess.log 2>/dev/null && echo \"---PROCESS---\" && ps aux | grep \"python run_graph\" | grep -v grep | head -1')",
+      "Bash(find /g/Research/LMBot -type f -name \"*.py\" -exec grep -l \"class.*RGCN\\\\|class.*BotRGCN\" {} \\\\;)",
+      "Bash(find /g/Research/LMBot -type f -name \"*.py\" -exec grep -l \"RGCNConv\\\\|RelationalGraphConv\" {} \\\\;)",
+      "Read(//tmp/**)",
+      "Bash(python3 -c ':*)",
+      "Bash(python3 -c \"f=open\\(r'C:\\\\Users\\\\p\\\\.claude\\\\plans\\\\clever-cooking-metcalfe-agent-ac5ba09e4b982a610.md','w'\\);f.write\\('# Plan\\\\ntest\\\\n'\\);f.close\\(\\);print\\('ok'\\)\")",
+      "Bash(python -c \"f=open\\('C:/Users/p/.claude/plans/clever-cooking-metcalfe-agent-ac5ba09e4b982a610.md','w'\\);f.write\\('# Plan test\\\\n'\\);f.close\\(\\);print\\('ok'\\)\")"
+    ],
+    "additionalDirectories": [
+      "g:\\Research\\LMBot\\LMBot",
+      "\\tmp"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{"source":"idea:001","target":"gap:G1","type":"addresses_gap"}
+{"source":"idea:001","target":"gap:G5","type":"addresses_gap"}
+{"source":"idea:002","target":"gap:G1","type":"addresses_gap"}
+{"source":"idea:003","target":"gap:G1","type":"addresses_gap"}
+{"source":"idea:003","target":"gap:G5","type":"addresses_gap"}
+{"source":"claim:C1","target":"gap:G5","type":"supports"}
+{"source":"claim:C2","target":"idea:001","type":"supports"}
+{"source":"claim:C3","target":"idea:001","type":"supports"}
+{"source":"exp:kill_tests_b2_b3","target":"claim:C4","type":"supports"}
+{"source":"exp:kill_tests_b2_b3","target":"claim:C5","type":"supports"}
+{"source":"exp:kill_tests_b2_b3","target":"claim:C6","type":"supports"}
+{"source":"exp:kill_tests_b2_b3","target":"claim:C7","type":"supports"}
+{"source":"exp:confidence_fallback","target":"claim:C2","type":"supports"}
+{"source":"claim:C5","target":"claim:C2","type":"extends","note":"repair beats deferral, which itself beats routing"}
+{"source":"claim:C4","target":"gap:G5","type":"addresses_gap","note":"disagreement trigger identifies when NOT to trust graph"}
+{"source":"claim:C5","target":"gap:G1","type":"addresses_gap","note":"propagation repair is targeted, not one-size-fits-all"}
+{"source":"exp:lmbot_gnn_lm_baselines","target":"claim:C1","type":"supports","note":"GNN F1=0.8732, LM F1=0.8756 as reference baselines"}
+{"source":"exp:lmbot_rgt_baseline","target":"claim:C1","type":"supports","note":"RGT GNN F1=0.8619, RGCN GNN F1=0.8723 on unified split"}
+{"source":"exp:failure_regime_diagnostics_v2","target":"claim:C1","type":"supports","note":"degree-stratified errors, prior-defined regime enrichment 1.84x"}
+{"source":"exp:failure_regime_diagnostics_v2","target":"claim:C4","type":"supports","note":"matched-budget: entropy+disagree AUROC=0.820, disagree top-5% prec=49.8%"}
+{"source":"exp:failure_regime_diagnostics_v2","target":"claim:C8","type":"supports","note":"LM rescue 30% on graph_missing vs 18% elsewhere"}
+{"source":"claim:C8","target":"gap:G1","type":"addresses_gap","note":"different regimes show different action preferences"}

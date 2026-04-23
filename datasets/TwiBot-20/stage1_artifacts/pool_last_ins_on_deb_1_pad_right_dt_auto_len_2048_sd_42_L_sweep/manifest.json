@@ -1,0 +1,44 @@
+{
+    "run_tag": "pool_last_ins_on_deb_1_pad_right_dt_auto_len_2048_sd_42_L_sweep",
+    "base_path": "/root/workspace/QwenBot/datasets/TwiBot-20",
+    "artifact_dir": "/root/workspace/QwenBot/datasets/TwiBot-20/stage1_artifacts/pool_last_ins_on_deb_1_pad_right_dt_auto_len_2048_sd_42_L_sweep",
+    "layers_available": [
+        "18",
+        "20",
+        "22",
+        "24",
+        "26",
+        "28",
+        "30",
+        "32",
+        "34",
+        "-1"
+    ],
+    "layer_mapping_index": {
+        "18": 0,
+        "20": 1,
+        "22": 2,
+        "24": 3,
+        "26": 4,
+        "28": 5,
+        "30": 6,
+        "32": 7,
+        "34": 8,
+        "-1": 9
+    },
+    "config": {
+        "dataset_path": "./datasets/TwiBot-20",
+        "model_path": "Qwen/Qwen3-Embedding-8B",
+        "batch_size": 8,
+        "layers": "sweep",
+        "pooling": "last",
+        "instruction_mode": "on",
+        "prompt_debias": true,
+        "max_length": 2048,
+        "padding_side": "right",
+        "dtype": "auto",
+        "device": "cuda",
+        "seed": 42,
+        "no_wandb": false
+    }
+}

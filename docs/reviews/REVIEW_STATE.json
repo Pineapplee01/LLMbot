@@ -1,0 +1,13 @@
+{
+  "round": 4,
+  "threadId": "019d8fb9-7815-7cc2-a82b-638452564385",
+  "status": "completed",
+  "last_score": 4.0,
+  "last_verdict": "weak reject — needs 3 experiments for 6/10",
+  "pending_experiments": [
+    "3-seed unified main table (TwiBot-20)",
+    "Controller necessity ablation (3A vs 2A)",
+    "TwiBot-22 transfer OR soft vs hard repair"
+  ],
+  "timestamp": "2026-04-15T23:00:00"
+}

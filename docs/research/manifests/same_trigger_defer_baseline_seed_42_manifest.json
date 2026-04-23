@@ -1,0 +1,23 @@
+{
+  "experiment_id": "same_trigger_defer_baseline_seed_42",
+  "commit_hash": "unknown_legacy_run_commit; wrapper_commit:b1c118a295ed89f10e9faea959dda63b45a8619e",
+  "task_name": "B2 same-trigger deferral baseline comparator",
+  "dataset_name": "TwiBot-20",
+  "dataset_version": "legacy-local-canonical-assumed; checksum not captured",
+  "split_id": "",
+  "split_description": "Legacy comparator artifact records n_test=1183 and disagreement_coverage=29.078615188598633 in trigger_analysis.json; exact split index file was not captured in this artifact root.",
+  "preprocessing_version": "legacy same-trigger deferral post-hoc baseline; exact preprocessing commit not captured",
+  "model_name": "same_trigger_defer_baseline",
+  "model_version_or_date": "legacy artifact wrapped on 2026-04-23; original run date not captured",
+  "prompt_or_template_version": "none",
+  "config_path": "LLMbot/saved_artifacts/same_trigger_defer_baseline/seed_42/results.json",
+  "seed_list": [
+    42
+  ],
+  "command": "unknown_legacy_command:not_captured; this manifest wraps existing same_trigger_defer_baseline seed_42 artifacts only",
+  "hardware_or_runtime_notes": "Legacy run hardware and runtime were not captured in the artifact set.",
+  "metrics_output_path": "LLMbot/saved_artifacts/same_trigger_defer_baseline/seed_42/results.json",
+  "artifact_output_path": "LLMbot/saved_artifacts/same_trigger_defer_baseline/seed_42",
+  "baseline_reference": "none; this record is the deferral baseline comparator for rw4_disagreement_local_seed_42",
+  "notes": "Single-seed legacy baseline wrapper for auditability. Global test metrics include f1=0.7444491800024522 and accuracy=0.7497886728655959; disagreement-slice metrics include f1=0.43242669280405127 over n=344. No separate config, original command, original commit, runtime, or split-index artifact was captured in this artifact root; config_path points to the legacy result payload because that is the available source for tau_best and tau_sweep."
+}

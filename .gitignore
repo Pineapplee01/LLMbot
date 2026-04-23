@@ -1,0 +1,102 @@
+# GitHub-friendly ignore policy for the research workspace.
+#
+# Track source, governance docs, scripts, manifests, and lightweight metadata.
+# Do not track raw datasets, generated results, checkpoints, caches, secrets, or
+# nested repository metadata. Use docs/research/ manifests or reports to make
+# generated evidence reviewable.
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+
+# Environments and local secrets
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+.envrc
+conda-meta/
+sega_env/
+LLMbot/sega_env/
+*.pem
+*.key
+*.token
+
+# Logs, temporary files, and local app state
+*.log
+logs/
+wandb/
+*/wandb/
+tmp/
+*/tmp/
+temp/
+*/temp/
+*.tmp
+*.temp
+nul
+ck --full
+.cache/
+*.cache
+.claude/worktrees/
+.aris/
+.remember/
+
+# IDE and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local Git recovery folders and nested repository metadata
+.git.broken/
+.git.corrupt/
+**/.git/
+
+# Raw datasets and generated evidence zones
+datasets/**
+results/**
+LLMbot/saved_artifacts/**
+LLMbot/checkpoints/**
+LLMbot/tmp_checkpoints/**
+LLMbot/saved_models/**
+LLMbot/tmp/**
+LMBot/results_*/**
+LMBot/datasets/**
+
+# Keep lightweight dataset metadata visible when intentionally added.
+!datasets/**/
+!datasets/**/*.md
+!datasets/**/*.txt
+!datasets/**/README*
+!datasets/**/readme*
+!datasets/**/manifest.json
+
+# ML binaries, checkpoints, and large/generated artifact formats
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.onnx
+*.bin
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
