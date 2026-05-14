@@ -1,0 +1,13 @@
+{
+  "phase": "done",
+  "round": 5,
+  "cycle": "v8",
+  "threadId": "019e1507-3c62-7651-98d7-4a9921fb8c62",
+  "last_score": 8.63,
+  "last_verdict": "REVISE",
+  "status": "completed",
+  "timestamp": "2026-05-09T07:25:00",
+  "anchor_source": "research.md + user 7-stage pipeline directive",
+  "supersedes": "v7 EQC cycle",
+  "notes": "v8 cycle completed at MAX_ROUNDS=5. Final 8.63/10 REVISE; NONE drift; all structural blockers resolved. Reviewer: 'Remaining gap is empirical, not structural. Proposal polishing won't move further.' Final method = Stage-5 4-tuple protocol (schema + Q_66/Q_33 bucketization + canonical PPR-sim ordering + 512-token budget). CQ≥9 requires the 9-variant Block-E + Block-CT results to come out positive; pre-committed fallback contractions in place."
+}

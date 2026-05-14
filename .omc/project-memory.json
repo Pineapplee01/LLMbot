@@ -1,0 +1,235 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1778401736002,
+  "projectRoot": "g:\\Research\\BotDetection",
+  "techStack": {
+    "languages": [],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "scripts"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "botbr": {
+      "path": "botbr",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1778401735979,
+      "keyFiles": [
+        "BOTBR_FRAMEWORK_SUMMARY.md",
+        "BOTBR_LOCAL_SETUP.md",
+        "Dataset.py",
+        "MGTAB-GNN.py",
+        "MGTAB_models.py"
+      ]
+    },
+    "codex_tmp_write_test": {
+      "path": "codex_tmp_write_test",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1778401735979,
+      "keyFiles": []
+    },
+    "datasets": {
+      "path": "datasets",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1778401735980,
+      "keyFiles": []
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 4,
+      "lastAccessed": 1778401735980,
+      "keyFiles": [
+        "ARCHITECTURE.md",
+        "CONVENTIONS.md",
+        "README.md",
+        "RELATED_WORK.md"
+      ]
+    },
+    "HyperScan": {
+      "path": "HyperScan",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1778401735981,
+      "keyFiles": [
+        "LICENSE",
+        "PROJECT_CONTEXT_SUMMARY.md",
+        "README.md",
+        "requirements.txt"
+      ]
+    },
+    "idea-stage": {
+      "path": "idea-stage",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1778401735981,
+      "keyFiles": [
+        "IDEA_REPORT.md",
+        "PAPER_CHARTER.md"
+      ]
+    },
+    "LLMbot": {
+      "path": "LLMbot",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1778401735981,
+      "keyFiles": [
+        "main.py",
+        "README.md"
+      ]
+    },
+    "LMBot": {
+      "path": "LMBot",
+      "purpose": null,
+      "fileCount": 41,
+      "lastAccessed": 1778401735982,
+      "keyFiles": [
+        "action_outcome_table.py",
+        "AGENTS.md",
+        "analyze_regime.py",
+        "baseline_calibration.py",
+        "baseline_cs.py"
+      ]
+    },
+    "local_experiment_artifacts": {
+      "path": "local_experiment_artifacts",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1778401735982,
+      "keyFiles": []
+    },
+    "refine-logs": {
+      "path": "refine-logs",
+      "purpose": null,
+      "fileCount": 24,
+      "lastAccessed": 1778401735983,
+      "keyFiles": [
+        "EXPERIMENT_PLAN.md",
+        "EXPERIMENT_TRACKER.md",
+        "FINAL_PROPOSAL.md",
+        "PHASE0_ENV_VALIDATION.md",
+        "PHASE1_REGIME_SUMMARY.md"
+      ]
+    },
+    "results": {
+      "path": "results",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1778401735983,
+      "keyFiles": []
+    },
+    "rewrite_pipeline": {
+      "path": "rewrite_pipeline",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1778401735983,
+      "keyFiles": [
+        "config.py",
+        "data_loader.py",
+        "evaluator.py",
+        "graph_trainer.py",
+        "rewrite_engine.py"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 4,
+      "lastAccessed": 1778401735984,
+      "keyFiles": [
+        "check_changed_scope.sh",
+        "run_research_gate.sh",
+        "validate_filenames.py",
+        "verify_experiment_manifest.py"
+      ]
+    },
+    "SEBot": {
+      "path": "SEBot",
+      "purpose": null,
+      "fileCount": 10,
+      "lastAccessed": 1778401735984,
+      "keyFiles": [
+        "heatmap.png",
+        "LICENSE",
+        "main_mgtab.py",
+        "main_twibot20.py",
+        "model.png"
+      ]
+    },
+    "tmp": {
+      "path": "tmp",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1778401735985,
+      "keyFiles": []
+    },
+    "tmp2oqhgqu3": {
+      "path": "tmp2oqhgqu3",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1778401735985,
+      "keyFiles": []
+    },
+    "tools": {
+      "path": "tools",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1778401735985,
+      "keyFiles": [
+        "remote_gpu_smoke_test.ps1"
+      ]
+    },
+    "LLMbot\\data": {
+      "path": "LLMbot\\data",
+      "purpose": "Data files",
+      "fileCount": 5,
+      "lastAccessed": 1778401735987,
+      "keyFiles": [
+        "graph_rewrite.py",
+        "loader.py",
+        "precompute.py"
+      ]
+    },
+    "LLMbot\\models": {
+      "path": "LLMbot\\models",
+      "purpose": "Data models",
+      "fileCount": 5,
+      "lastAccessed": 1778401735988,
+      "keyFiles": [
+        "graph_model.py",
+        "racebot.py",
+        "router.py"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}

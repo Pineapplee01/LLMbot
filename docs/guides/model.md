@@ -1,16 +1,16 @@
-﻿# Model Guide - LLMbot Baseline Mainline
+# Model Guide - LLMbot Root Mainline
 
-Updated: 2026-04-23
-Scope: current default pipeline in `LLMbot/baseline/core`
+Updated: 2026-05-14
+Scope: current default pipeline in `LLMbot/`
 
 ## Overview
 
-The current default model story in the `LLMbot/` tree is the baseline pipeline in `baseline/core`.
+The current default model story in the `LLMbot/` tree is the root mainline pipeline.
 
 - `main.py` parses `--stage` and iterates over `--seeds`.
 - `legacy_distill` is the default onboarding and reproduction stage.
 - `--use_GNN` switches the legacy path from LM -> MLP distillation to LM + GNN + MLP distillation.
-- `LLMbot/code/` remains historical and experimental rather than the default model surface.
+- `LLMbot/baseline/` and `LLMbot/code/` are deprecated legacy/reference surfaces rather than the default model surface.
 
 ```mermaid
 graph LR
@@ -25,9 +25,9 @@ graph LR
 
 ## Mainline Modules
 
-### `baseline/core/parser_args.py`
+### `parser_args.py`
 
-Defines the baseline CLI contract.
+Defines the active CLI contract.
 
 Key onboarding flags:
 - `--stage legacy_distill`
@@ -36,7 +36,7 @@ Key onboarding flags:
 - `--use_GNN`
 - `--GNN_model botrgcn|rgcn|rgt|hgt|simplehgn|gatv2`
 
-### `baseline/core/main.py`
+### `main.py`
 
 Controls the execution flow.
 
@@ -46,18 +46,18 @@ Controls the execution flow.
 - Iterates over every seed from `--seeds`
 - Dispatches to legacy distillation or `StageRunner`
 
-### `baseline/core/trainer.py`
+### `trainer.py`
 
 Implements the training surfaces.
 
 - `run_legacy_graph_seed(...)` handles the graph-backed legacy path
 - `LM_Trainer` handles the text branch
 - `MLP_Trainer` handles the distilled classifier branch
-- `StageRunner` covers structured estimator, semantic, repair, selector, backbone-stress, and appendix stages
+- `StageRunner` covers structured estimator, semantic, repair, selector, backbone-stress, appendix, and EQC v8 stages
 
 ## Recommended Commands
 
-Run from `LLMbot/baseline/core`.
+Run from `LLMbot/`.
 
 ```bash
 # Legacy distillation without GNN
@@ -77,14 +77,10 @@ python main.py \
 
 ## Dataset Resolution
 
-From `baseline/core`, the loader checks these locations in order:
+From `LLMbot/`, the loader starts from the active mainline context and configured dataset paths.
 
-1. `./datasets/<dataset>`
-2. `../datasets/<dataset>`
-3. `LLMbot/datasets/<dataset>`
-
-Keep that working-directory assumption in docs and onboarding material.
+Document commands with that working-directory assumption so dataset lookup behavior stays aligned.
 
 ## Historical Surface
 
-`LLMbot/code/` is preserved for the D3F experimental line, exploratory scripts, and historical reference. It is no longer the default model guide entrypoint.
+`LLMbot/baseline/` and `LLMbot/code/` are preserved for legacy/reference context until deletion. They are no longer the default model guide entrypoint.

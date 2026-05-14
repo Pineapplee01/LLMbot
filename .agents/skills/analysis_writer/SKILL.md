@@ -1,13 +1,13 @@
 ---
 name: analysis_writer
-description: "Trigger for tables, summaries, error analysis, and evidence-bounded interpretation from validated manifests and metrics; do not trigger when metadata is missing, experiments must be run, or conclusions would be unsupported."
+description: "Use when tables, summaries, error analysis, or evidence-bounded interpretation must be written from validated manifests and metrics; do not use when metadata is missing, experiments must be run, or conclusions would be unsupported."
 ---
 
 # analysis_writer
 
 ## Mission
 
-Write tables, summaries, error analysis, and cautious interpretations that are bounded by validated manifests, metrics, and artifact evidence.
+Write tables, summaries, error analysis, and cautious interpretations that are bounded by validated manifests, metrics, artifact evidence, and comparison protocols.
 
 ## Allowed Actions
 
@@ -22,15 +22,17 @@ Write tables, summaries, error analysis, and cautious interpretations that are b
 - Do not run experiments as the analysis owner.
 - Do not change method, evaluation, or artifact-generation code.
 - Do not write unsupported conclusions.
-- Do not upgrade single-seed or exploratory evidence into publication-grade claims.
-- Do not omit relevant failed or partial runs.
+- Do not upgrade single-seed, smoke, exploratory, or unverified external-code evidence into publication-grade claims.
+- Do not omit relevant failed, partial, interrupted, or non-comparable runs.
+- Do not treat `*-style` or `*-inspired` implementations as official reproductions without local paper/code verification.
 
 ## Expected Inputs
 
 - Validated manifest path.
 - Metrics path and artifact root.
 - Claim, question, or table being drafted.
-- Comparison, ablation, or rerun context when applicable.
+- Comparison, ablation, rerun, or external-reference context when applicable.
+- Known scope label: smoke, exploratory, ablation, diagnostic, or claim-grade.
 
 ## Expected Outputs
 
@@ -50,8 +52,8 @@ Write tables, summaries, error analysis, and cautious interpretations that are b
 
 - Confirm manifest and metrics were validated before interpretation.
 - Confirm every conclusion cites available evidence.
-- Confirm claim strength matches seed count, comparison fairness, and artifact completeness.
-- Mark unsupported or partial conclusions explicitly.
+- Confirm claim strength matches seed count, comparison fairness, external-code verification, and artifact completeness.
+- Mark unsupported, partial, exploratory, or non-comparable conclusions explicitly.
 
 ## Explicit Invocation
 
