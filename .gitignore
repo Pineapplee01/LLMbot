@@ -1,41 +1,48 @@
-# 备份用：如果需要恢复，请先复制此文件到其他位置
-# 忽略所有文件
+# LLMbot root-mainline tracking policy.
+#
+# The root mainline lives directly under LLMbot/. Deprecated legacy
+# directories such as baseline/ and code/ are intentionally not re-included
+# here; handle archival/deletion in a separate explicit task.
+
 *
-
-# 但不要忽略目录（保持目录结构）
 !*/
-
-# 保留 .gitignore 本身
 !.gitignore
 
-# 白名单：允许上传的核心源码文件（按需调整）
+# Root mainline docs and governance.
+!AGENTS.md
+!README.md
+
+# Root mainline modules.
 !main.py
-!main_text.py
-!model.py
-!train.py
-!text_model.py
-!text_train.py
+!parser_args.py
+!trainer.py
+!estimators.py
+!operators.py
+!model_building.py
+!subgroups.py
 !GNNs.py
 !RGT.py
-!utils.py
-!precompute.py
-!__init__.py
-!code/*.py
+!LM.py
+!SimpleHGN.py
+!dataloader.py
+!llm_evidence_refiner.py
 
-# 可选：如果你也想上传 llmbot 包中的 trainer 等核心文件，可取消下面注释并按需添加文件
-# !llmbot/__init__.py
-# !llmbot/Trainer.py
-# !llmbot/base_trainer.py
-# !llmbot/losses.py
-# !llmbot/main.py
+# Deprecated legacy surfaces stay ignored unless a future task explicitly
+# rewrites this policy for archival or deletion.
+baseline/
+code/
+models/
+trainers/
+evaluation/
+data/
+utils/
 
-# 永远忽略这些大型/临时项
-llmbot/
-sega/
-sega_env/
-wandb/
+# Generated or heavyweight artifacts.
+checkpoints/
+saved_artifacts/
 saved_models/
-saved_models/checkpoints/
+wandb/
+tmp/
 __pycache__/
 *.pyc
 *.pt
