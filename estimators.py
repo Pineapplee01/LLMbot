@@ -1,3 +1,4 @@
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -2402,7 +2403,7 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
         self,
         alpha=0.20,
         rho_grid=((0.1, 0.0), (0.2, 0.0), (0.1, 0.1), (0.2, 0.1)),
-        temperatures=(None,),
+        temperatures=(None, 0.5, 1.0),
         budgets=RESIDUAL_RISK_PAPER_BUDGETS,
     ):
         super().__init__(alpha=alpha, graph_smoothing=0.0, budgets=budgets)
@@ -2414,6 +2415,18 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
         self.nonconformity_scores_ = None
         self.ego2_metadata_ = {}
         self.tune_summary = {}
+        self.split_metadata_ = {}
+        self.direction_mode = "incoming"
+        self.relation_mode = "agnostic"
+
+    @staticmethod
+    def _index_sha256(indices):
+        arr = np.asarray(indices, dtype=np.int64).reshape(-1)
+        digest = hashlib.sha256()
+        digest.update(str(tuple(arr.shape)).encode("utf-8"))
+        digest.update(str(arr.dtype).encode("utf-8"))
+        digest.update(arr.tobytes())
+        return digest.hexdigest()
 
     def _valid_rho_grid(self):
         grid = []
@@ -2425,7 +2438,15 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
             grid.append((float(rho1), float(rho2)))
         return grid or [(0.0, 0.0)]
 
-    def _directed_incoming_hop_rows(self, edge_index, num_nodes):
+    def _directed_hop_rows(
+        self,
+        edge_index,
+        num_nodes,
+        edge_type=None,
+        edge_weight=None,
+        direction_mode="incoming",
+        relation_mode="agnostic",
+    ):
         hop1 = [dict() for _ in range(num_nodes)]
         if edge_index is None:
             return hop1, [dict() for _ in range(num_nodes)]
@@ -2434,10 +2455,45 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
             raise ValueError("gnn_2hop_conformal expects edge_index shaped [2, num_edges].")
         src, dst = edge_np
         valid = (src >= 0) & (src < num_nodes) & (dst >= 0) & (dst < num_nodes)
-        for s, d in zip(src[valid], dst[valid]):
-            if int(s) != int(d):
-                row = hop1[int(d)]
-                row[int(s)] = row.get(int(s), 0.0) + 1.0
+        src = src[valid]
+        dst = dst[valid]
+        if edge_weight is None:
+            weights = np.ones(src.shape[0], dtype=np.float64)
+        else:
+            weights_all = _to_numpy(edge_weight).astype(np.float64).reshape(-1)
+            weights = weights_all[valid]
+        if edge_type is None:
+            types = np.zeros(src.shape[0], dtype=np.int64)
+        else:
+            types_all = _to_numpy(edge_type).astype(np.int64).reshape(-1)
+            types = types_all[valid]
+
+        direction_mode = str(direction_mode or "incoming").lower()
+        relation_mode = str(relation_mode or "agnostic").lower()
+        if direction_mode not in {"incoming", "outgoing", "undirected"}:
+            raise ValueError(f"Unsupported gnn_2hop_conformal direction_mode: {direction_mode}")
+        if relation_mode not in {"agnostic", "typed_normalized"}:
+            raise ValueError(f"Unsupported gnn_2hop_conformal relation_mode: {relation_mode}")
+
+        relation_norm = {}
+        if relation_mode == "typed_normalized":
+            for rel in np.unique(types):
+                relation_norm[int(rel)] = float(np.clip(weights[types == rel].sum(), 1e-12, None))
+
+        def add_edge(center, neighbor, rel, weight):
+            if int(center) == int(neighbor):
+                return
+            value = float(weight)
+            if relation_mode == "typed_normalized":
+                value = value / relation_norm.get(int(rel), 1.0)
+            row = hop1[int(center)]
+            row[int(neighbor)] = row.get(int(neighbor), 0.0) + value
+
+        for s, d, rel, weight in zip(src, dst, types, weights):
+            if direction_mode in {"incoming", "undirected"}:
+                add_edge(d, s, rel, weight)
+            if direction_mode in {"outgoing", "undirected"}:
+                add_edge(s, d, rel, weight)
         hop2 = [dict() for _ in range(num_nodes)]
         for node_idx, row in enumerate(hop1):
             two_hop = hop2[node_idx]
@@ -2448,15 +2504,37 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
                     two_hop[source] = two_hop.get(source, 0.0) + first_count * second_count
         return hop1, hop2
 
-    def _row_normalized_sparse_mean(self, scores, row_counts, center_idx):
+    def _row_normalized_sparse_mean(self, scores, row_counts, center_idx, node_repr=None, temperature=None):
         if not row_counts:
             return scores[center_idx], 0, 0.0
         ids = np.asarray(sorted(row_counts.keys()), dtype=np.int64)
         weights = np.asarray([row_counts[int(idx)] for idx in ids], dtype=np.float64)
+        if node_repr is not None and temperature is not None:
+            repr_np = np.asarray(node_repr, dtype=np.float64)
+            center_vec = repr_np[int(center_idx)]
+            neighbor_vecs = repr_np[ids]
+            center_norm = np.linalg.norm(center_vec)
+            neighbor_norm = np.linalg.norm(neighbor_vecs, axis=1)
+            denom = np.clip(center_norm * neighbor_norm, 1e-12, None)
+            cosine = np.matmul(neighbor_vecs, center_vec) / denom
+            sim_weight = np.exp(np.clip(cosine / max(float(temperature), 1e-8), -50.0, 50.0))
+            weights = weights * sim_weight
         weights = weights / np.clip(weights.sum(), 1e-12, None)
         return np.sum(scores[ids] * weights[:, None], axis=0), int(ids.size), float(weights.max())
 
-    def _ego2_nonconformity(self, posterior, edge_index=None, node_repr=None, rho1=0.0, rho2=0.0, temperature=None):
+    def _ego2_nonconformity(
+        self,
+        posterior,
+        edge_index=None,
+        edge_type=None,
+        node_repr=None,
+        edge_weight=None,
+        rho1=0.0,
+        rho2=0.0,
+        temperature=None,
+        direction_mode="incoming",
+        relation_mode="agnostic",
+    ):
         posterior = np.asarray(posterior, dtype=np.float64)
         scores = 1.0 - posterior
         num_nodes = int(scores.shape[0])
@@ -2468,7 +2546,19 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
                 "max_hop2_weight": [0.0 for _ in range(num_nodes)],
             }
             return scores, metadata
-        hop1_rows, hop2_rows = self._directed_incoming_hop_rows(edge_index, num_nodes)
+        repr_np = None
+        if node_repr is not None and temperature is not None:
+            repr_np = _to_numpy(node_repr).astype(np.float64)
+            if repr_np.ndim != 2 or repr_np.shape[0] != num_nodes:
+                raise ValueError("gnn_2hop_conformal node_repr must be shaped [num_nodes, dim].")
+        hop1_rows, hop2_rows = self._directed_hop_rows(
+            edge_index,
+            num_nodes,
+            edge_type=edge_type,
+            edge_weight=edge_weight,
+            direction_mode=direction_mode,
+            relation_mode=relation_mode,
+        )
         aggregated = np.zeros_like(scores, dtype=np.float64)
         hop1_count = []
         hop2_count = []
@@ -2479,11 +2569,15 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
                 scores,
                 hop1_rows[node_idx],
                 node_idx,
+                node_repr=repr_np,
+                temperature=temperature,
             )
             hop2_mean, h2_count, h2_max = self._row_normalized_sparse_mean(
                 scores,
                 hop2_rows[node_idx],
                 node_idx,
+                node_repr=repr_np,
+                temperature=temperature,
             )
             local_rho1 = float(rho1) if h1_count else 0.0
             local_rho2 = float(rho2) if h2_count else 0.0
@@ -2518,33 +2612,69 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
                 labels = [int(np.argmin(scores[row_idx]))]
             prediction_sets.append(labels)
         set_size = np.asarray([len(labels) for labels in prediction_sets], dtype=np.float32)
+        sorted_scores = np.sort(scores, axis=1)
         pred_labels = scores.argmin(axis=1)
         pred_label_score = scores[np.arange(scores.shape[0]), pred_labels]
         coverage_margin = threshold - pred_label_score
+        if scores.shape[1] > 1:
+            nonconformity_gap = sorted_scores[:, 1] - sorted_scores[:, 0]
+        else:
+            nonconformity_gap = np.ones(scores.shape[0], dtype=np.float64)
         max_extra = max(float(self.num_classes or scores.shape[1]) - 1.0, 1.0)
         size_risk = (set_size - 1.0) / max_extra
         finite_margin = np.clip(coverage_margin, 0.0, None)
         margin_risk = 1.0 - np.clip(finite_margin / max(threshold, 1e-8), 0.0, 1.0)
         abstain_risk = np.clip(0.70 * size_risk + 0.30 * margin_risk, 0.0, 1.0).astype(np.float32)
+        order = np.lexsort((-pred_label_score, nonconformity_gap, coverage_margin, -set_size))
+        router_score = np.zeros(scores.shape[0], dtype=np.float32)
+        if order.size > 1:
+            router_score[order] = np.linspace(1.0, 0.0, num=order.size, dtype=np.float32)
+        elif order.size == 1:
+            router_score[order[0]] = 1.0
         return {
             "prediction_sets": prediction_sets,
             "set_size": set_size.astype(np.int64).tolist(),
             "pred_label_score": pred_label_score.astype(np.float32),
             "coverage_margin": coverage_margin.astype(np.float32),
+            "nonconformity_gap": nonconformity_gap.astype(np.float32),
             "abstain_risk": abstain_risk,
+            "router_score": router_score.astype(np.float32),
+            "router_priority_components": {
+                "set_size": set_size.astype(np.int64).tolist(),
+                "coverage_margin": coverage_margin.astype(np.float32),
+                "nonconformity_gap": nonconformity_gap.astype(np.float32),
+                "pred_label_score": pred_label_score.astype(np.float32),
+                "ordering": "larger_set_size_then_smaller_margin_then_smaller_gap_then_larger_pred_label_score",
+            },
         }
 
-    def _choose_hyperparameters(self, posterior, labels_np, tune_idx_np, cal_idx_np, edge_index=None, node_repr=None):
+    def _choose_hyperparameters(
+        self,
+        posterior,
+        labels_np,
+        tune_idx_np,
+        cal_idx_np,
+        edge_index=None,
+        edge_type=None,
+        node_repr=None,
+        edge_weight=None,
+        direction_mode="incoming",
+        relation_mode="agnostic",
+    ):
         best = None
         for rho1, rho2 in self._valid_rho_grid():
             for temperature in self.temperatures:
                 scores, _ = self._ego2_nonconformity(
                     posterior,
                     edge_index=edge_index,
+                    edge_type=edge_type,
                     node_repr=node_repr,
+                    edge_weight=edge_weight,
                     rho1=rho1,
                     rho2=rho2,
                     temperature=temperature,
+                    direction_mode=direction_mode,
+                    relation_mode=relation_mode,
                 )
                 threshold = self._threshold_for(scores, labels_np, cal_idx_np)
                 if tune_idx_np.size:
@@ -2580,6 +2710,19 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
         cal_idx_np = _valid_index_array(kwargs.get("cal_idx", val_idx_np), labels_np.shape[0])
         if cal_idx_np.size == 0:
             raise ValueError("gnn_2hop_conformal requires a non-empty conformal calibration split.")
+        edge_weight = kwargs.get("edge_weight", None)
+        direction_mode = str(kwargs.get("direction_mode", "incoming")).lower()
+        relation_mode = str(kwargs.get("relation_mode", "agnostic")).lower()
+        self.direction_mode = direction_mode
+        self.relation_mode = relation_mode
+        self.split_metadata_ = {
+            "tune_count": int(tune_idx_np.size),
+            "calibration_count": int(cal_idx_np.size),
+            "tune_idx_sha256": self._index_sha256(tune_idx_np),
+            "cal_idx_sha256": self._index_sha256(cal_idx_np),
+            "tune_cal_disjoint": bool(set(tune_idx_np.tolist()).isdisjoint(set(cal_idx_np.tolist()))),
+            **dict(kwargs.get("tune_cal_split_metadata", {})),
+        }
         self.num_classes = int(posterior.shape[1])
         best = self._choose_hyperparameters(
             posterior,
@@ -2587,7 +2730,11 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
             tune_idx_np,
             cal_idx_np,
             edge_index=edge_index,
+            edge_type=edge_type,
             node_repr=node_repr,
+            edge_weight=edge_weight,
+            direction_mode=direction_mode,
+            relation_mode=relation_mode,
         )
         self.rho1 = float(best["rho1"])
         self.rho2 = float(best["rho2"])
@@ -2596,10 +2743,14 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
         self.nonconformity_scores_, self.ego2_metadata_ = self._ego2_nonconformity(
             posterior,
             edge_index=edge_index,
+            edge_type=edge_type,
             node_repr=node_repr,
+            edge_weight=edge_weight,
             rho1=self.rho1,
             rho2=self.rho2,
             temperature=self.temperature,
+            direction_mode=direction_mode,
+            relation_mode=relation_mode,
         )
         self.tune_summary = dict(best)
         self.tune_summary.pop("selection_key", None)
@@ -2613,12 +2764,20 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
             "rho1": float(self.rho1),
             "rho2": float(self.rho2),
             "temperature": self.temperature,
+            "snaps_similarity_used": bool(node_repr is not None and self.temperature is not None),
+            "similarity_temperature": self.temperature,
+            "similarity_source": "GNN node_repr from SimTeG-style GNN" if node_repr is not None else None,
             "aggregation_hops": 2,
             "score_contract": "class_conditional_2hop_nonconformity",
             "graph_context_used": edge_index is not None,
             "embedding_context_used": node_repr is not None and self.temperature is not None,
+            "direction_mode": direction_mode,
+            "relation_mode": relation_mode,
+            "edge_weight_used": edge_weight is not None,
             "lm_gnn_disagreement_used": False,
             "prediction_set_contract": "gnn_2hop_conformal_prediction_set_v1",
+            "risk_score_contract": "lexicographic_conformal_priority_v1",
+            "abstain_risk_role": "legacy_compatibility_not_main_router",
             "test_labels_used_for_threshold": False,
             "rewriter_outcome_used_for_threshold": False,
             "llm_output_used": False,
@@ -2628,8 +2787,11 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
                 "Uses GNN-side posterior and local 2-hop nonconformity aggregation; does not claim "
                 "exchangeability after graph rewriting and does not use LM-GNN disagreement as a main signal."
             ),
-            "feature_similarity_channel_status": "not_used_in_main_v1; SNAPS KNN channel is reserved for ablation",
+            "feature_similarity_channel_status": (
+                "active_when_temperature_is_not_null; similarity is an aggregation weight, not edge reliability"
+            ),
             "hyperparameter_selection": dict(self.tune_summary),
+            "tune_cal_split_metadata": dict(self.split_metadata_),
         }
         self.calibration_metadata = dict(self.fit_summary)
         self.val_threshold = None
@@ -2640,25 +2802,33 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
         scores, _ = self._ego2_nonconformity(
             posterior,
             edge_index=edge_index,
+            edge_type=edge_type,
             node_repr=node_repr,
+            edge_weight=kwargs.get("edge_weight", None),
             rho1=self.rho1,
             rho2=self.rho2,
             temperature=self.temperature,
+            direction_mode=kwargs.get("direction_mode", self.direction_mode),
+            relation_mode=kwargs.get("relation_mode", self.relation_mode),
         )
-        return self._prediction_set_payload_from_scores(scores)["abstain_risk"]
+        return self._prediction_set_payload_from_scores(scores)["router_score"]
 
     def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
         posterior = self._posterior(logits=logits, probs=probs)
         scores, ego2_metadata = self._ego2_nonconformity(
             posterior,
             edge_index=edge_index,
+            edge_type=edge_type,
             node_repr=node_repr,
+            edge_weight=kwargs.get("edge_weight", None),
             rho1=self.rho1,
             rho2=self.rho2,
             temperature=self.temperature,
+            direction_mode=kwargs.get("direction_mode", self.direction_mode),
+            relation_mode=kwargs.get("relation_mode", self.relation_mode),
         )
         payload = self._prediction_set_payload_from_scores(scores)
-        risk_score = payload["abstain_risk"].astype(np.float32)
+        risk_score = payload["router_score"].astype(np.float32)
         labels_np = _labels_to_numpy(labels)
         preds = posterior.argmax(axis=1)
         wrong = (preds != labels_np).astype(np.int32)
@@ -2682,7 +2852,10 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
             "set_size": payload["set_size"],
             "pred_label_score": payload["pred_label_score"],
             "coverage_margin": payload["coverage_margin"].astype(np.float32),
-            "abstain_risk": risk_score,
+            "nonconformity_gap": payload["nonconformity_gap"].astype(np.float32),
+            "abstain_risk": payload["abstain_risk"].astype(np.float32),
+            "router_score": risk_score,
+            "router_priority_components": payload["router_priority_components"],
             "ego2_metadata": ego2_metadata,
             "thresholds": {
                 "validation_risk_threshold": float(self.val_threshold),

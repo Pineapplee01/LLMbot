@@ -1,41 +1,34 @@
-# LLMbot root-mainline tracking policy.
+# LLMbot active-mainline tracking policy.
 #
-# The root mainline lives directly under LLMbot/. Deprecated legacy
-# directories such as baseline/ and code/ are intentionally not re-included
-# here; handle archival/deletion in a separate explicit task.
+# Only root-level Python/Markdown files and utils/ are eligible for normal
+# commits. Legacy surfaces, package directories, generated artifacts, caches,
+# and model weights stay ignored unless a future task explicitly changes this
+# policy.
 
+# Ignore everything by default.
 *
+
+# Allow directory traversal so later allow rules can match nested paths.
 !*/
+
+# Keep this policy file tracked.
 !.gitignore
 
-# Root mainline docs and governance.
-!AGENTS.md
-!README.md
+# Active mainline files at LLMbot/ root only.
+!/*.py
+!/*.md
 
-# Root mainline modules.
-!main.py
-!parser_args.py
-!trainer.py
-!estimators.py
-!operators.py
-!model_building.py
-!subgroups.py
-!GNNs.py
-!RGT.py
-!LM.py
-!SimpleHGN.py
-!dataloader.py
-!llm_evidence_refiner.py
+# Active utility package.
+!utils/
+!utils/**
 
-# Deprecated legacy surfaces stay ignored unless a future task explicitly
-# rewrites this policy for archival or deletion.
+# Deprecated or non-synced code surfaces.
 baseline/
 code/
 models/
 trainers/
 evaluation/
 data/
-utils/
 
 # Generated or heavyweight artifacts.
 checkpoints/
@@ -44,6 +37,13 @@ saved_models/
 wandb/
 tmp/
 __pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
 *.pt
 *.pth
+*.pkl
+*.ckpt
+*.safetensors
+*.npy
+*.npz

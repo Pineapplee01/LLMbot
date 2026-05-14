@@ -23,6 +23,7 @@ from model_building import (
 from dataloader import build_LM_dataloader, build_GNN_dataloader, build_MLP_dataloader
 import os
 import json
+import hashlib
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -1900,6 +1901,62 @@ class StageRunner:
             "gnn_2hop_conformal",
         }
 
+    @staticmethod
+    def _index_sha256(idx):
+        arr = np.asarray(idx, dtype=np.int64).reshape(-1)
+        digest = hashlib.sha256()
+        digest.update(str(tuple(arr.shape)).encode("utf-8"))
+        digest.update(str(arr.dtype).encode("utf-8"))
+        digest.update(arr.tobytes())
+        return digest.hexdigest()
+
+    def _split_valid_tune_cal(self, labels):
+        labels_np = _labels_to_index(labels).detach().cpu().numpy()
+        valid_idx = _idx_numpy(self.data["valid_idx"]).astype(np.int64)
+        valid_idx = valid_idx[(valid_idx >= 0) & (valid_idx < labels_np.shape[0])]
+        rng = np.random.default_rng(int(self.seed))
+        tune_parts = []
+        cal_parts = []
+        fallback = False
+        for class_id in sorted(np.unique(labels_np[valid_idx]).astype(int).tolist()) if valid_idx.size else []:
+            class_idx = valid_idx[labels_np[valid_idx] == int(class_id)]
+            class_idx = np.asarray(class_idx, dtype=np.int64)
+            rng.shuffle(class_idx)
+            if class_idx.size < 2:
+                fallback = True
+                continue
+            split = class_idx.size // 2
+            tune_parts.append(np.sort(class_idx[:split]))
+            cal_parts.append(np.sort(class_idx[split:]))
+        if not tune_parts or not cal_parts:
+            fallback = True
+        tune_idx = np.sort(np.concatenate(tune_parts)) if tune_parts else np.asarray([], dtype=np.int64)
+        cal_idx = np.sort(np.concatenate(cal_parts)) if cal_parts else np.asarray([], dtype=np.int64)
+        if fallback or tune_idx.size == 0 or cal_idx.size == 0:
+            ordered = np.sort(valid_idx)
+            tune_idx = ordered[::2]
+            cal_idx = ordered[1::2]
+            if tune_idx.size == 0 and ordered.size:
+                tune_idx = ordered[:1]
+            if cal_idx.size == 0 and ordered.size > 1:
+                cal_idx = ordered[1:]
+            elif cal_idx.size == 0:
+                cal_idx = ordered[:1]
+        metadata = {
+            "split_policy": "label_stratified_50_50_valid_split",
+            "split_fallback": bool(fallback),
+            "split_seed": int(self.seed),
+            "valid_count": int(valid_idx.size),
+            "tune_count": int(tune_idx.size),
+            "calibration_count": int(cal_idx.size),
+            "valid_idx_sha256": self._index_sha256(valid_idx),
+            "tune_idx_sha256": self._index_sha256(tune_idx),
+            "cal_idx_sha256": self._index_sha256(cal_idx),
+            "tune_cal_disjoint": bool(set(tune_idx.tolist()).isdisjoint(set(cal_idx.tolist()))),
+            "test_labels_used_for_threshold": False,
+        }
+        return torch.tensor(tune_idx, dtype=torch.long), torch.tensor(cal_idx, dtype=torch.long), metadata
+
     def _router_budgets(self):
         return parse_budget_list(getattr(self.args, "risk_budgets", None) or getattr(self.args, "router_budgets", None), default=RESIDUAL_RISK_PAPER_BUDGETS)
 
@@ -2334,16 +2391,20 @@ class StageRunner:
         labels = gnn_outputs.get("labels")
         if labels is None:
             labels = torch.tensor(self.labels, dtype=torch.long)
+        tune_idx, cal_idx, split_metadata = self._split_valid_tune_cal(labels)
         estimator.fit(
             logits=gnn_outputs.get("logits"),
             probs=gnn_outputs.get("prob"),
             labels=labels,
             train_idx=self.data["train_idx"],
             val_idx=self.data["valid_idx"],
+            tune_idx=tune_idx,
+            cal_idx=cal_idx,
             edge_index=self.data["edge_index"],
             edge_type=self.data["edge_type"],
             node_repr=gnn_outputs.get("node_repr"),
             budgets=budgets,
+            tune_cal_split_metadata=split_metadata,
         )
         risk_manifest = estimator.build_manifest(
             logits=gnn_outputs.get("logits"),
@@ -2369,6 +2430,7 @@ class StageRunner:
                 "post-hoc prediction-set quality gate; no learned router head, no LLM output, "
                 "and no LM-GNN disagreement signal"
             ),
+            "tune_cal_split_metadata": split_metadata,
         }
         return self._bundle_from_risk_manifest(estimator_mode, risk_manifest)
 
