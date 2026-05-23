@@ -1,8 +1,9 @@
-﻿import importlib.util
+import importlib.util
 import torch
 from torch.nn import CrossEntropyLoss, KLDivLoss
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from sklearn.metrics import f1_score, accuracy_score
 import numpy as np
@@ -49,12 +50,9 @@ from subgroups import build_subgroup_manifests
 from utils import load_distilled_knowledge, prepare_path, read_json
 from subgroups import structural_features
 from estimators import (
-    CalibratedMultiViewResidualRouter,
-    CalibratedResidualRiskHardNodeSelector,
-    FINAL_OUTPUT_RANKER_BUDGETS,
-    GETSStylePostHocResidualRiskSelector,
     GlanceForContextResidualRiskSelector,
     RESIDUAL_RISK_PAPER_BUDGETS,
+    build_glance_for_context_router_features,
     build_probe_features,
     fit_temperature_scaling,
     paired_bootstrap_residual_risk_delta,
@@ -89,6 +87,8 @@ FORMAL_STAGE_GATES = {
     "selector_matrix": ["gnnguard_local", "cs_conditional_supporting"],
     "positioning_matrix": ["gnnguard_local", "cs_conditional_supporting"],
     "backbone_stress": ["gnnguard_local", "cs_conditional_supporting"],
+    "local_conformal_prune_diag": [],
+    "glance_joint_router_refine": [],
 }
 
 
@@ -185,6 +185,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
     raw_features = feature_bundle["raw_features"]
     feature_manifest = feature_bundle["feature_manifest"]
     projector_state = feature_bundle["projector_state"]
+    refine_request = _graph_refine_request(args)
     labels = _labels_to_index(data["labels"])
     if features.shape[0] != labels.numel():
         raise ValueError(f"G0 feature rows ({features.shape[0]}) must match labels ({labels.numel()}).")
@@ -196,8 +197,32 @@ def train_frozen_g0(args, seed, data, experiment_root):
     x_projected = features.to(device)
     x_raw = raw_features.to(device)
     y = labels.to(device)
-    edge_index = data["edge_index"].to(device)
-    edge_type = data["edge_type"].to(device)
+    edge_index = data["edge_index"]
+    edge_type = data["edge_type"]
+    graph_refine_stats = None
+    if refine_request["mode"] != "none":
+        edge_index, edge_type, graph_refine_stats = _directional_relation_aware_prune(
+            edge_index=edge_index,
+            edge_type=edge_type,
+            raw_features=raw_features,
+            budget=refine_request["budget"],
+            mode=refine_request["mode"],
+            seed=seed,
+            labels=labels,
+        )
+        write_torch(out_dir / "pruned_edge_index.pt", edge_index)
+        write_torch(out_dir / "pruned_edge_type.pt", edge_type)
+        write_json(out_dir / "graph_refine_stats.json", graph_refine_stats)
+    else:
+        for stale_path in (
+            out_dir / "pruned_edge_index.pt",
+            out_dir / "pruned_edge_type.pt",
+            out_dir / "graph_refine_stats.json",
+        ):
+            if stale_path.exists():
+                stale_path.unlink()
+    edge_index = edge_index.to(device)
+    edge_type = edge_type.to(device)
     train_idx = _idx_tensor(data["train_idx"]).to(device)
     valid_idx = _idx_tensor(data["valid_idx"]).to(device)
 
@@ -329,6 +354,16 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 "num_nodes": int(labels.numel()),
                 "labels_sha256": tensor_sha256(data["labels"]),
             },
+            **(
+                {
+                    "graph_refine": {
+                        **graph_refine_stats,
+                        "embedding_source": feature_manifest.get("path"),
+                    }
+                }
+                if graph_refine_stats is not None
+                else {}
+            ),
         },
     )
     return load_frozen_g0(experiment_root)
@@ -366,6 +401,216 @@ def _requested_feature_path(args):
     return str(Path(path)) if path else None
 
 
+def _graph_refine_request(args):
+    mode = str(getattr(args, "graph_refine_mode", "none") or "none").lower()
+    budget = float(getattr(args, "graph_refine_budget", 0.0) or 0.0)
+    if mode == "none":
+        return {
+            "mode": "none",
+            "budget": 0.0,
+            "degree_guard_enabled": False,
+            "oracle_uses_labels": False,
+            "diagnostic_only": False,
+        }
+    if mode not in {
+        "directional_relation_aware_prune",
+        "directional_relation_aware_random_prune",
+        "directional_relation_aware_oracle_prune",
+        "directional_relation_aware_oracle_prune_no_hetero_priority",
+    }:
+        raise ValueError(f"Unknown graph_refine_mode: {mode}")
+    if not (0.0 < budget < 1.0):
+        raise ValueError(
+            "graph_refine_budget must be in (0, 1) when --graph_refine_mode is not none."
+        )
+    return {
+        "mode": mode,
+        "budget": budget,
+        "degree_guard_enabled": True,
+        "oracle_uses_labels": mode in {
+            "directional_relation_aware_oracle_prune",
+            "directional_relation_aware_oracle_prune_no_hetero_priority",
+        },
+        "diagnostic_only": mode in {
+            "directional_relation_aware_oracle_prune",
+            "directional_relation_aware_oracle_prune_no_hetero_priority",
+        },
+        "hetero_priority": mode == "directional_relation_aware_oracle_prune",
+    }
+
+
+def _directional_relation_aware_prune(edge_index, edge_type, raw_features, budget, mode, seed=None, labels=None):
+    edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+    edge_type_cpu = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+    raw_features_cpu = raw_features.detach().cpu().float() if torch.is_tensor(raw_features) else torch.tensor(raw_features, dtype=torch.float32)
+
+    if edge_index_cpu.dim() != 2 or edge_index_cpu.size(0) != 2:
+        raise ValueError("edge_index must be shaped [2, num_edges] for directional_relation_aware_prune.")
+    if edge_type_cpu.numel() != edge_index_cpu.size(1):
+        raise ValueError("edge_type must align with edge_index for directional_relation_aware_prune.")
+    if raw_features_cpu.dim() != 2:
+        raise ValueError("raw_features must be a 2D tensor for directional_relation_aware_prune.")
+    if mode in {
+        "directional_relation_aware_oracle_prune",
+        "directional_relation_aware_oracle_prune_no_hetero_priority",
+    }:
+        if labels is None:
+            raise ValueError("labels are required for directional_relation_aware_oracle_prune variants.")
+        labels_cpu = labels.detach().cpu().long() if torch.is_tensor(labels) else torch.tensor(labels, dtype=torch.long)
+        if labels_cpu.dim() == 2:
+            labels_cpu = labels_cpu.argmax(dim=1)
+        labels_cpu = labels_cpu.view(-1)
+    else:
+        labels_cpu = None
+
+    num_nodes = int(raw_features_cpu.size(0))
+    num_edges_before = int(edge_index_cpu.size(1))
+    oracle_uses_labels = mode in {
+        "directional_relation_aware_oracle_prune",
+        "directional_relation_aware_oracle_prune_no_hetero_priority",
+    }
+    hetero_priority = mode == "directional_relation_aware_oracle_prune"
+    diagnostic_only = oracle_uses_labels
+    if mode == "directional_relation_aware_random_prune":
+        score_source = "random_per_relation_seeded"
+    elif oracle_uses_labels:
+        score_source = "oracle_heterophily_then_raw_semantic_cosine" if hetero_priority else "oracle_raw_semantic_cosine"
+    else:
+        score_source = "raw_semantic_cosine"
+    if num_edges_before == 0:
+        stats = {
+            "mode": mode,
+            "budget_requested": float(budget),
+            "budget_achieved_global": 0.0,
+            "budget_achieved_by_relation": {},
+            "num_edges_before": 0,
+            "num_edges_after": 0,
+            "num_edges_pruned": 0,
+            "mean_cos_pruned": None,
+            "mean_cos_kept": None,
+            "isolated_in_nodes_after": int(num_nodes),
+            "isolated_out_nodes_after": int(num_nodes),
+            "degree_guard_enabled": True,
+            "score_source": score_source,
+            "oracle_uses_labels": oracle_uses_labels,
+            "diagnostic_only": diagnostic_only,
+            "hetero_priority": hetero_priority,
+        }
+        return edge_index_cpu.contiguous(), edge_type_cpu.contiguous(), stats
+
+    normalized = F.normalize(raw_features_cpu, p=2, dim=1, eps=1e-12)
+    src = edge_index_cpu[0]
+    dst = edge_index_cpu[1]
+    cosine = (normalized[src] * normalized[dst]).sum(dim=1)
+    prune_score = 1.0 - cosine
+    heterophilic = None
+    if labels_cpu is not None:
+        heterophilic = (labels_cpu[src] != labels_cpu[dst]).to(torch.long)
+
+    keep_mask = torch.ones(num_edges_before, dtype=torch.bool)
+    out_degree = torch.bincount(src, minlength=num_nodes).to(torch.long)
+    in_degree = torch.bincount(dst, minlength=num_nodes).to(torch.long)
+    relation_stats = {}
+    rng = np.random.default_rng(int(seed)) if mode == "directional_relation_aware_random_prune" else None
+
+    for relation_id in sorted(int(rel) for rel in edge_type_cpu.unique().tolist()):
+        relation_indices = torch.nonzero(edge_type_cpu == relation_id, as_tuple=False).view(-1)
+        relation_total = int(relation_indices.numel())
+        target_prune = int(math.floor(float(budget) * relation_total))
+        pruned_in_relation = 0
+        if target_prune > 0 and relation_total > 0:
+            if mode == "directional_relation_aware_random_prune":
+                relation_positions = relation_indices.numpy().copy()
+                rng.shuffle(relation_positions)
+                ordered = torch.tensor(relation_positions, dtype=torch.long)
+            elif mode in {
+                "directional_relation_aware_oracle_prune",
+                "directional_relation_aware_oracle_prune_no_hetero_priority",
+            }:
+                relation_hetero = heterophilic[relation_indices]
+                relation_scores = prune_score[relation_indices]
+                if hetero_priority:
+                    priority = torch.stack((relation_hetero.float(), relation_scores), dim=1)
+                    ordered_ids = sorted(
+                        range(relation_total),
+                        key=lambda idx: (
+                            float(priority[idx, 0].item()),
+                            float(priority[idx, 1].item()),
+                        ),
+                        reverse=True,
+                    )
+                else:
+                    ordered_ids = sorted(
+                        range(relation_total),
+                        key=lambda idx: float(relation_scores[idx].item()),
+                        reverse=True,
+                    )
+                ordered = relation_indices[torch.tensor(ordered_ids, dtype=torch.long)]
+            else:
+                relation_scores = prune_score[relation_indices]
+                ordered = relation_indices[torch.argsort(relation_scores, descending=True)]
+            for edge_pos in ordered.tolist():
+                u = int(src[edge_pos])
+                v = int(dst[edge_pos])
+                if out_degree[u] <= 1 or in_degree[v] <= 1:
+                    continue
+                keep_mask[edge_pos] = False
+                out_degree[u] -= 1
+                in_degree[v] -= 1
+                pruned_in_relation += 1
+                if pruned_in_relation >= target_prune:
+                    break
+        achieved = float(pruned_in_relation / relation_total) if relation_total else 0.0
+        relation_stats[str(relation_id)] = {
+            "num_edges_before": relation_total,
+            "num_edges_pruned": int(pruned_in_relation),
+            "budget_requested": float(budget),
+            "budget_achieved": achieved,
+        }
+
+    pruned_edge_index = edge_index_cpu[:, keep_mask].contiguous()
+    pruned_edge_type = edge_type_cpu[keep_mask].contiguous()
+    num_edges_after = int(pruned_edge_index.size(1))
+    num_edges_pruned = int((~keep_mask).sum().item())
+    mean_cos_pruned = float(cosine[~keep_mask].mean().item()) if num_edges_pruned else None
+    mean_cos_kept = float(cosine[keep_mask].mean().item()) if num_edges_after else None
+    isolated_in_nodes_after = int((in_degree == 0).sum().item())
+    isolated_out_nodes_after = int((out_degree == 0).sum().item())
+    stats = {
+        "mode": mode,
+        "budget_requested": float(budget),
+        "budget_achieved_global": (float(num_edges_pruned) / float(num_edges_before)) if num_edges_before else 0.0,
+        "budget_achieved_by_relation": relation_stats,
+        "num_edges_before": num_edges_before,
+        "num_edges_after": num_edges_after,
+        "num_edges_pruned": num_edges_pruned,
+        "mean_cos_pruned": mean_cos_pruned,
+        "mean_cos_kept": mean_cos_kept,
+        "isolated_in_nodes_after": isolated_in_nodes_after,
+        "isolated_out_nodes_after": isolated_out_nodes_after,
+        "degree_guard_enabled": True,
+        "score_source": score_source,
+        "oracle_uses_labels": oracle_uses_labels,
+        "diagnostic_only": diagnostic_only,
+    }
+    return pruned_edge_index, pruned_edge_type, stats
+
+
+def _resolve_optional_graph_override_paths(args):
+    edge_index_path = getattr(args, "external_graph_edge_index_path", None)
+    edge_type_path = getattr(args, "external_graph_edge_type_path", None)
+    if not edge_index_path and not edge_type_path:
+        return None
+    if not edge_index_path or not edge_type_path:
+        raise MissingFrozenArtifactError(
+            "Both --external_graph_edge_index_path and --external_graph_edge_type_path are required together."
+        )
+    return {
+        "edge_index_path": Path(edge_index_path),
+        "edge_type_path": Path(edge_type_path),
+    }
+
+
 def _existing_g0_matches_request(args, manifest):
     if manifest.get("contract") != FROZEN_G0_CONTRACT:
         return False
@@ -393,6 +638,23 @@ def _existing_g0_matches_request(args, manifest):
             return False
         if float(peft_manifest.get("alpha", -1.0)) != float(getattr(args, "peft_alpha", 16.0)):
             return False
+
+    refine_request = _graph_refine_request(args)
+    refine_manifest = manifest.get("graph_refine")
+    if refine_request["mode"] == "none":
+        return refine_manifest in (None, {}, {"mode": "none"})
+    if not isinstance(refine_manifest, dict):
+        return False
+    if str(refine_manifest.get("mode", "")).lower() != refine_request["mode"]:
+        return False
+    if not math.isclose(float(refine_manifest.get("budget_requested", -1.0)), float(refine_request["budget"]), rel_tol=0.0, abs_tol=1e-12):
+        return False
+    if bool(refine_manifest.get("degree_guard_enabled", False)) != bool(refine_request["degree_guard_enabled"]):
+        return False
+    if bool(refine_manifest.get("oracle_uses_labels", False)) != bool(refine_request["oracle_uses_labels"]):
+        return False
+    if bool(refine_manifest.get("diagnostic_only", False)) != bool(refine_request["diagnostic_only"]):
+        return False
     return True
 
 
@@ -1248,6 +1510,489 @@ def _classification_metrics_from_logits(logits, labels, idx):
     return scores
 
 
+def _infer_embedding_source_identity(path):
+    path = Path(path)
+    stem = path.stem.lower()
+    name = path.name.lower()
+    token = f"{stem} {name}"
+    if "qwen" in token:
+        return {
+            "semantic_backbone": "qwen_cached",
+            "lm_model": "qwen_cached",
+            "source_identity": "qwen_cached_embedding",
+        }
+    if "roberta" in token:
+        return {
+            "semantic_backbone": "roberta_finetuned",
+            "lm_model": "roberta-f",
+            "source_identity": "roberta_finetuned_embedding",
+        }
+    return {
+        "semantic_backbone": "external_embedding_unknown",
+        "lm_model": "external_embedding_unknown",
+        "source_identity": "external_embedding_unknown",
+    }
+
+
+def _directional_neighbor_views(semantic_embeddings, edge_index, edge_type):
+    x_sem = semantic_embeddings.detach().cpu().float()
+    num_nodes = int(x_sem.shape[0])
+    zero = torch.zeros_like(x_sem)
+    zero_counts = np.zeros(num_nodes, dtype=np.int64)
+    if edge_index is None or edge_type is None:
+        return {
+            "ego": x_sem,
+            "following": zero.clone(),
+            "follower": zero.clone(),
+            "count_following": zero_counts.copy(),
+            "count_follower": zero_counts.copy(),
+            "has_following": zero_counts.copy(),
+            "has_follower": zero_counts.copy(),
+        }
+    edge_index_t = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+    edge_type_t = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+    if edge_index_t.dim() != 2 or edge_index_t.size(0) != 2:
+        raise ValueError("edge_index must be shaped [2, num_edges] for directional semantic views.")
+    if edge_type_t.numel() != edge_index_t.size(1):
+        raise ValueError("edge_type must align with edge_index for directional semantic views.")
+
+    src = edge_index_t[0].numpy()
+    dst = edge_index_t[1].numpy()
+    rel = edge_type_t.numpy()
+    following_bucket = [[] for _ in range(num_nodes)]
+    follower_bucket = [[] for _ in range(num_nodes)]
+    for s, d, r in zip(src.tolist(), dst.tolist(), rel.tolist()):
+        if not (0 <= s < num_nodes and 0 <= d < num_nodes):
+            continue
+        if int(r) == 1:
+            following_bucket[s].append(d)
+        elif int(r) == 0:
+            follower_bucket[d].append(s)
+
+    def _pool(bucket):
+        view_tensor = torch.zeros_like(x_sem)
+        count_arr = np.zeros(num_nodes, dtype=np.int64)
+        has_arr = np.zeros(num_nodes, dtype=np.int64)
+        for node_idx in range(num_nodes):
+            neighbors = sorted(set(int(n) for n in bucket[node_idx] if int(n) != node_idx))
+            count_arr[node_idx] = len(neighbors)
+            has_arr[node_idx] = 1 if neighbors else 0
+            if neighbors:
+                view_tensor[node_idx] = x_sem[torch.tensor(neighbors, dtype=torch.long)].mean(dim=0)
+        return view_tensor, count_arr, has_arr
+
+    following_view, count_following, has_following = _pool(following_bucket)
+    follower_view, count_follower, has_follower = _pool(follower_bucket)
+    return {
+        "ego": x_sem,
+        "following": following_view,
+        "follower": follower_view,
+        "count_following": count_following,
+        "count_follower": count_follower,
+        "has_following": has_following,
+        "has_follower": has_follower,
+    }
+
+
+def _weighted_directional_neighbor_views(semantic_embeddings, edge_index, edge_type, include_2hop=False):
+    x_sem = semantic_embeddings.detach().cpu().float()
+    num_nodes = int(x_sem.shape[0])
+    zero = torch.zeros_like(x_sem)
+    zero_counts = np.zeros(num_nodes, dtype=np.int64)
+    if edge_index is None or edge_type is None:
+        outputs = {
+            "ego": x_sem,
+            "in_rel0": zero.clone(),
+            "in_rel1": zero.clone(),
+            "out_rel0": zero.clone(),
+            "out_rel1": zero.clone(),
+            "count_in_rel0": zero_counts.copy(),
+            "count_in_rel1": zero_counts.copy(),
+            "count_out_rel0": zero_counts.copy(),
+            "count_out_rel1": zero_counts.copy(),
+            "has_in_rel0": zero_counts.copy(),
+            "has_in_rel1": zero_counts.copy(),
+            "has_out_rel0": zero_counts.copy(),
+            "has_out_rel1": zero_counts.copy(),
+            "count_1hop": zero_counts.copy(),
+            "count_2hop": zero_counts.copy(),
+        }
+        if include_2hop:
+            for key in ("in_rel0_2hop", "in_rel1_2hop", "out_rel0_2hop", "out_rel1_2hop"):
+                outputs[key] = zero.clone()
+                outputs[f"count_{key}"] = zero_counts.copy()
+                outputs[f"has_{key}"] = zero_counts.copy()
+        return outputs
+    base_views = _directional_neighbor_views(semantic_embeddings, edge_index, edge_type)
+    edge_index_t = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+    edge_type_t = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+    src = edge_index_t[0].numpy()
+    dst = edge_index_t[1].numpy()
+    rel = edge_type_t.numpy()
+    rel_buckets = {
+        "in_rel0": [[] for _ in range(num_nodes)],
+        "in_rel1": [[] for _ in range(num_nodes)],
+        "out_rel0": [[] for _ in range(num_nodes)],
+        "out_rel1": [[] for _ in range(num_nodes)],
+    }
+    for s, d, r in zip(src.tolist(), dst.tolist(), rel.tolist()):
+        if not (0 <= s < num_nodes and 0 <= d < num_nodes):
+            continue
+        if int(r) == 0:
+            rel_buckets["in_rel0"][d].append(s)
+            rel_buckets["out_rel0"][s].append(d)
+        elif int(r) == 1:
+            rel_buckets["in_rel1"][d].append(s)
+            rel_buckets["out_rel1"][s].append(d)
+
+    def _pool(bucket):
+        view_tensor = torch.zeros_like(x_sem)
+        count_arr = np.zeros(num_nodes, dtype=np.int64)
+        has_arr = np.zeros(num_nodes, dtype=np.int64)
+        for node_idx in range(num_nodes):
+            neighbors = sorted(set(int(n) for n in bucket[node_idx] if int(n) != node_idx))
+            count_arr[node_idx] = len(neighbors)
+            has_arr[node_idx] = 1 if neighbors else 0
+            if neighbors:
+                view_tensor[node_idx] = x_sem[torch.tensor(neighbors, dtype=torch.long)].mean(dim=0)
+        return view_tensor, count_arr, has_arr
+
+    outputs = dict(base_views)
+    for key in ("in_rel0", "in_rel1", "out_rel0", "out_rel1"):
+        view_tensor, count_arr, has_arr = _pool(rel_buckets[key])
+        outputs[key] = view_tensor
+        outputs[f"count_{key}"] = count_arr
+        outputs[f"has_{key}"] = has_arr
+    outputs["count_1hop"] = np.asarray(
+        [len(set(rel_buckets["in_rel0"][i]) | set(rel_buckets["in_rel1"][i]) | set(rel_buckets["out_rel0"][i]) | set(rel_buckets["out_rel1"][i])) for i in range(num_nodes)],
+        dtype=np.int64,
+    )
+    outputs["count_2hop"] = zero_counts.copy()
+    if include_2hop:
+        for key in ("in_rel0", "in_rel1", "out_rel0", "out_rel1"):
+            parent_bucket = rel_buckets[key]
+            view_tensor = torch.zeros_like(x_sem)
+            count_arr = np.zeros(num_nodes, dtype=np.int64)
+            has_arr = np.zeros(num_nodes, dtype=np.int64)
+            for node_idx in range(num_nodes):
+                n1 = sorted(set(int(n) for n in parent_bucket[node_idx] if int(n) != node_idx))
+                n1_set = set(n1)
+                n2 = set()
+                for neigh in n1:
+                    for cand in parent_bucket[neigh]:
+                        cand = int(cand)
+                        if cand == node_idx or cand in n1_set:
+                            continue
+                        n2.add(cand)
+                neighbors = sorted(n2)
+                count_arr[node_idx] = len(neighbors)
+                has_arr[node_idx] = 1 if neighbors else 0
+                if neighbors:
+                    view_tensor[node_idx] = x_sem[torch.tensor(neighbors, dtype=torch.long)].mean(dim=0)
+            outputs[f"{key}_2hop"] = view_tensor
+            outputs[f"count_{key}_2hop"] = count_arr
+            outputs[f"has_{key}_2hop"] = has_arr
+    return outputs
+
+
+def _semantic_view_count_lookup(semantic_views, key, default_key=None):
+    if key in semantic_views:
+        return semantic_views[key]
+    if default_key is not None and default_key in semantic_views:
+        return semantic_views[default_key]
+    first_value = next(iter(semantic_views.values()))
+    return np.zeros_like(first_value[:, 0].detach().cpu().numpy(), dtype=np.int64)
+
+
+def _direct_embedding_manifest(path):
+    identity = _infer_embedding_source_identity(path)
+    return {
+        "contract": "direct_embedding_fallback_v2",
+        "status": "completed_external_embedding",
+        "embeddings_path": str(Path(path)),
+        "source": "direct_embedding_path",
+        **identity,
+    }
+
+
+class GlanceRefinerMLP(nn.Module):
+    """GLANCE-inspired post-hoc refiner over frozen GNN + semantic embeddings."""
+
+    def __init__(self, input_dim, hidden_dim=128, activation="leakyrelu", dropout=0.1):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act = nn.LeakyReLU()
+        elif activation == "relu":
+            act = nn.ReLU()
+        elif activation == "elu":
+            act = nn.ELU()
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.net = nn.Sequential(
+            nn.Linear(int(input_dim), int(hidden_dim)),
+            act,
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 2),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class DirectionalGatedGlanceRefinerMLP(nn.Module):
+    """Directional strict refiner with optional global semantic-view gates."""
+
+    def __init__(
+        self,
+        z_gnn_dim,
+        semantic_dim,
+        use_presence_features=False,
+        activation="leakyrelu",
+        dropout=0.1,
+    ):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act = nn.LeakyReLU()
+        elif activation == "relu":
+            act = nn.ReLU()
+        elif activation == "elu":
+            act = nn.ELU()
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.z_gnn_dim = int(z_gnn_dim)
+        self.semantic_dim = int(semantic_dim)
+        self.use_presence_features = bool(use_presence_features)
+        self.presence_dim = 4 if self.use_presence_features else 0
+        self.view_gates = nn.Parameter(torch.zeros(3, dtype=torch.float32))
+        input_dim = self.z_gnn_dim + self.semantic_dim * 3 + self.presence_dim
+        self.net = nn.Sequential(
+            nn.Linear(int(input_dim), 128),
+            act,
+            nn.Dropout(float(dropout)),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, z_gnn, semantic_views, presence_features=None):
+        gates = torch.sigmoid(self.view_gates).to(z_gnn.device)
+        gated_views = [
+            semantic_views[0] * gates[0],
+            semantic_views[1] * gates[1],
+            semantic_views[2] * gates[2],
+        ]
+        parts = [z_gnn] + gated_views
+        if self.use_presence_features:
+            if presence_features is None:
+                raise ValueError("presence_features is required when use_presence_features=True")
+            parts.append(presence_features)
+        x = torch.cat(parts, dim=1)
+        return self.net(x)
+
+
+class WeightedDirectionalGlanceRefinerMLP(nn.Module):
+    """Node-conditioned weighted directional refiner with fixed-width projected views."""
+
+    def __init__(
+        self,
+        z_gnn_dim,
+        semantic_dim,
+        view_count,
+        structural_dim=4,
+        proj_dim=128,
+        hidden_dim=128,
+        activation="leakyrelu",
+        dropout=0.1,
+    ):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act_factory = nn.LeakyReLU
+        elif activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "elu":
+            act_factory = nn.ELU
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.z_gnn_dim = int(z_gnn_dim)
+        self.semantic_dim = int(semantic_dim)
+        self.view_count = int(view_count)
+        self.proj_dim = int(proj_dim)
+        self.structural_dim = int(structural_dim)
+        self.view_projectors = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.semantic_dim, self.proj_dim),
+                    act_factory(),
+                    nn.Dropout(float(dropout)),
+                )
+                for _ in range(self.view_count)
+            ]
+        )
+        gate_input_dim = self.z_gnn_dim + self.proj_dim + self.structural_dim
+        self.gate_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(gate_input_dim, int(hidden_dim)),
+                    act_factory(),
+                    nn.Dropout(float(dropout)),
+                    nn.Linear(int(hidden_dim), 1),
+                )
+                for _ in range(self.view_count)
+            ]
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(self.z_gnn_dim + self.proj_dim + self.structural_dim, int(hidden_dim)),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 2),
+        )
+
+    def forward(self, z_gnn, semantic_views, structural_features):
+        projected = [projector(semantic_views[idx]) for idx, projector in enumerate(self.view_projectors)]
+        gate_inputs = []
+        for proj in projected:
+            gate_inputs.append(torch.cat([z_gnn, proj, structural_features], dim=1))
+        gate_logits = torch.cat([head(inp) for head, inp in zip(self.gate_heads, gate_inputs)], dim=1)
+        gate_weights = torch.softmax(gate_logits, dim=1)
+        fused = torch.zeros_like(projected[0])
+        for idx, proj in enumerate(projected):
+            fused = fused + proj * gate_weights[:, idx : idx + 1]
+        x = torch.cat([z_gnn, fused, structural_features], dim=1)
+        logits = self.classifier(x)
+        return logits, gate_weights
+
+
+class RelationAwareSemanticFusionMLP(nn.Module):
+    """Project and fuse relation-aware semantic views before final classification."""
+
+    def __init__(self, z_gnn_dim, semantic_dim, view_count, structural_dim=8, proj_dim=128, activation="leakyrelu", dropout=0.1):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act_factory = nn.LeakyReLU
+        elif activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "elu":
+            act_factory = nn.ELU
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.view_count = int(view_count)
+        self.proj_dim = int(proj_dim)
+        self.z_gnn_dim = int(z_gnn_dim)
+        self.semantic_dim = int(semantic_dim)
+        self.structural_dim = int(structural_dim)
+        self.view_projectors = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.semantic_dim, self.proj_dim),
+                    act_factory(),
+                    nn.Dropout(float(dropout)),
+                )
+                for _ in range(self.view_count)
+            ]
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(self.z_gnn_dim + self.view_count * self.proj_dim + self.structural_dim, 128),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, z_gnn, semantic_views, structural_features):
+        projected = []
+        for idx, projector in enumerate(self.view_projectors):
+            projected.append(projector(semantic_views[idx]))
+        fused_semantic = torch.cat(projected, dim=1)
+        x = torch.cat([z_gnn, fused_semantic, structural_features], dim=1)
+        return self.classifier(x)
+
+
+class MultiSourceRelationAwareSemanticFusionMLP(nn.Module):
+    """Project and fuse an ordered list of semantic views before final classification."""
+
+    def __init__(self, z_gnn_dim, semantic_dims, structural_dim=8, proj_dim=128, activation="leakyrelu", dropout=0.1):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act_factory = nn.LeakyReLU
+        elif activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "elu":
+            act_factory = nn.ELU
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.semantic_dims = [int(item) for item in semantic_dims]
+        self.view_count = int(len(self.semantic_dims))
+        self.proj_dim = int(proj_dim)
+        self.z_gnn_dim = int(z_gnn_dim)
+        self.structural_dim = int(structural_dim)
+        self.view_projectors = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(int(view_dim), self.proj_dim),
+                    act_factory(),
+                    nn.Dropout(float(dropout)),
+                )
+                for view_dim in self.semantic_dims
+            ]
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(self.z_gnn_dim + self.view_count * self.proj_dim + self.structural_dim, 128),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, z_gnn, semantic_views, structural_features):
+        projected = []
+        for idx, projector in enumerate(self.view_projectors):
+            projected.append(projector(semantic_views[idx]))
+        fused_semantic = torch.cat(projected, dim=1)
+        x = torch.cat([z_gnn, fused_semantic, structural_features], dim=1)
+        return self.classifier(x)
+
+
+def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, device):
+    batch_idx = batch_idx.to(device=device)
+    feature_kind = refiner_features.get("feature_kind") if isinstance(refiner_features, dict) else None
+    if feature_kind in {"directional_gated", "directional_weighted_gated", "directional_weighted_projected"}:
+        return {
+            "z_gnn": refiner_features["z_gnn"][batch_idx].to(device),
+            "semantic_views": [view[batch_idx].to(device) for view in refiner_features["semantic_views"]],
+            **(
+                {"presence_features": refiner_features["presence_features"][batch_idx].to(device)}
+                if "presence_features" in refiner_features
+                else {}
+            ),
+            **(
+                {"structural_features": refiner_features["structural_features"][batch_idx].to(device)}
+                if "structural_features" in refiner_features
+                else {}
+            ),
+        }
+    if semantic_view_mode in {"relation_aware_1hop", "relation_aware_1hop_2hop"} and feature_kind == "relation_projected":
+        return {
+            "z_gnn": refiner_features["z_gnn"][batch_idx].to(device),
+            "semantic_views": [view[batch_idx].to(device) for view in refiner_features["semantic_views"]],
+            "structural_features": refiner_features["structural_features"][batch_idx].to(device),
+        }
+    return refiner_features[batch_idx].to(device)
+
+
+class GlanceRouterLinear(nn.Module):
+    """Single-layer GLANCE-style router over cheap node-wise routing features."""
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.linear = nn.Linear(int(input_dim), 1)
+
+    def forward(self, x):
+        logits = self.linear(x).squeeze(-1)
+        prob = torch.sigmoid(logits)
+        return logits, prob
+
+
 def _select_semantic_train_idx(train_idx, limit, seed):
     train_idx = _as_long_cpu_tensor(train_idx)
     if int(limit or 0) <= 0 or int(limit) >= int(train_idx.numel()):
@@ -1743,14 +2488,1376 @@ class StageRunner:
     def ensure_backbone_context(self):
         if self.base_context is not None:
             return self.base_context
-        frozen = load_frozen_g0(self.experiment_root)
+        external_root = getattr(self.args, "external_frozen_g0_root", None)
+        frozen_root = Path(external_root) if external_root else self.experiment_root
+        frozen = load_frozen_g0(frozen_root)
+        self._validate_external_frozen_g0(frozen, frozen_root)
         gnn_outputs = frozen["outputs"]
+        graph_bundle = self._resolve_stage_graph_bundle(frozen_root, frozen)
+        self.data["edge_index"] = graph_bundle["edge_index"]
+        self.data["edge_type"] = graph_bundle["edge_type"]
         self.base_context = {
             "frozen_g0": frozen,
             "runtime_dir": frozen["dir"],
             "gnn_outputs": gnn_outputs,
+            "source_experiment_root": str(frozen_root),
+            "graph_bundle": graph_bundle,
         }
         return self.base_context
+
+    def _validate_external_frozen_g0(self, frozen, frozen_root):
+        manifest = frozen.get("manifest", {}) or {}
+        node_manifest = manifest.get("node_id_manifest", {}) or {}
+        split_manifest = manifest.get("split_provenance", {}) or {}
+        current_labels_sha = tensor_sha256(self.data["labels"])
+        if int(node_manifest.get("num_nodes", -1)) != int(len(self.labels)):
+            raise MissingFrozenArtifactError(
+                f"External frozen_g0 at {frozen_root} has num_nodes={node_manifest.get('num_nodes')} "
+                f"but current dataset has {len(self.labels)}."
+            )
+        if node_manifest.get("labels_sha256") and str(node_manifest.get("labels_sha256")) != str(current_labels_sha):
+            raise MissingFrozenArtifactError(
+                f"External frozen_g0 at {frozen_root} has mismatched label hash."
+            )
+        expected_split = split_provenance(self.data)
+        for split_name in ("train", "valid", "test"):
+            current = expected_split.get(split_name, {})
+            external = split_manifest.get(split_name, {})
+            if external.get("size") is not None and int(external.get("size")) != int(current.get("size", -1)):
+                raise MissingFrozenArtifactError(
+                    f"External frozen_g0 at {frozen_root} has mismatched {split_name} size."
+                )
+            if external.get("sha256") and str(external.get("sha256")) != str(current.get("sha256")):
+                raise MissingFrozenArtifactError(
+                    f"External frozen_g0 at {frozen_root} has mismatched {split_name} split hash."
+                )
+        backbone = str(manifest.get("backbone", "")).lower()
+        requested_backbone = str(getattr(self.args, "GNN_model", "")).lower()
+        if backbone and requested_backbone and backbone != requested_backbone:
+            raise MissingFrozenArtifactError(
+                f"External frozen_g0 at {frozen_root} uses backbone={backbone}, "
+                f"but the current run requests backbone={requested_backbone}."
+            )
+
+    def _resolve_stage_graph_bundle(self, frozen_root, frozen):
+        override_paths = _resolve_optional_graph_override_paths(self.args)
+        if override_paths is not None:
+            edge_index_path = override_paths["edge_index_path"]
+            edge_type_path = override_paths["edge_type_path"]
+            if not edge_index_path.exists() or not edge_type_path.exists():
+                raise MissingFrozenArtifactError(
+                    "External graph override paths must both exist before graph-aware refiner stages can run."
+                )
+            edge_index = safe_torch_load(edge_index_path, map_location="cpu")
+            edge_type = safe_torch_load(edge_type_path, map_location="cpu")
+            source = "explicit_external_graph_paths"
+            source_root = str(edge_index_path.parent)
+        else:
+            frozen_dir = Path(frozen["dir"])
+            pruned_edge_index_path = frozen_dir / "pruned_edge_index.pt"
+            pruned_edge_type_path = frozen_dir / "pruned_edge_type.pt"
+            if pruned_edge_index_path.exists() and pruned_edge_type_path.exists():
+                edge_index = safe_torch_load(pruned_edge_index_path, map_location="cpu")
+                edge_type = safe_torch_load(pruned_edge_type_path, map_location="cpu")
+                source = "frozen_g0_pruned_graph"
+                source_root = str(frozen_dir)
+            else:
+                edge_index = self.data.get("edge_index")
+                edge_type = self.data.get("edge_type")
+                source = "dataset_original_graph"
+                source_root = str(frozen_root)
+
+        if edge_index is None or edge_type is None:
+            raise MissingFrozenArtifactError("Graph-aware stage requires edge_index and edge_type.")
+        edge_index = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        if edge_index.dim() != 2 or edge_index.size(0) != 2:
+            raise MissingFrozenArtifactError("Resolved graph edge_index must have shape [2, num_edges].")
+        if edge_type.numel() != edge_index.size(1):
+            raise MissingFrozenArtifactError("Resolved graph edge_type must align with edge_index.")
+        return {
+            "edge_index": edge_index.contiguous(),
+            "edge_type": edge_type.contiguous(),
+            "source": source,
+            "source_root": source_root,
+        }
+
+    def _active_graph_tensors(self):
+        context = self.ensure_backbone_context()
+        graph_bundle = context.get("graph_bundle", {})
+        edge_index = graph_bundle.get("edge_index")
+        edge_type = graph_bundle.get("edge_type")
+        if edge_index is None or edge_type is None:
+            raise MissingFrozenArtifactError("Active graph bundle is missing edge tensors.")
+        return edge_index, edge_type
+
+    def _load_semantic_finetune_artifact(self):
+        stage_dir = self.experiment_root / "stages" / "semantic_finetune"
+        manifest_path = stage_dir / "manifest.json"
+        embeddings_path = stage_dir / "embeddings.pt"
+        outputs_path = stage_dir / "outputs.pt"
+        if not manifest_path.exists() or not embeddings_path.exists() or not outputs_path.exists():
+            fallback_path = getattr(self.args, "emb_path", None) or getattr(self.args, "g0_feature_path", None)
+            if not fallback_path:
+                fallback_path = self.data.get("dataset_path", Path(".")) / "finetuned_roberta_embeddings_iter_2_seed1.pt"
+            fallback_path = Path(fallback_path)
+            if not fallback_path.exists():
+                raise MissingFrozenArtifactError(
+                    "Stage 'glance_oracle_refine' requires semantic_finetune artifacts or an explicit "
+                    "RoBERTa embedding tensor. Run --stage semantic_finetune --semantic_backbone roberta_finetuned "
+                    "first, or pass --emb_path /path/to/finetuned_roberta_embeddings_*.pt."
+                )
+            embeddings = safe_torch_load(fallback_path, map_location="cpu")
+            if not torch.is_tensor(embeddings) or embeddings.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"Fallback semantic embedding at {fallback_path} must be a 2D tensor."
+                )
+            if int(embeddings.shape[0]) != int(len(self.labels)):
+                raise MissingFrozenArtifactError(
+                    "Fallback semantic embedding does not align with the current dataset node count."
+                )
+            return {
+                "dir": fallback_path.parent,
+                "manifest": _direct_embedding_manifest(fallback_path),
+                "embeddings": embeddings.detach().cpu().float(),
+                "outputs": None,
+            }
+        manifest = read_json(manifest_path, default={}) or {}
+        semantic_backbone = str(manifest.get("semantic_backbone", "")).lower()
+        if semantic_backbone not in {"roberta_finetuned", "roberta-f"}:
+            raise MissingFrozenArtifactError(
+                "glance_oracle_refine requires semantic_finetune artifacts produced by "
+                "--semantic_backbone roberta_finetuned."
+            )
+        embeddings = safe_torch_load(embeddings_path, map_location="cpu")
+        outputs = safe_torch_load(outputs_path, map_location="cpu")
+        if not torch.is_tensor(embeddings) or embeddings.dim() != 2:
+            raise MissingFrozenArtifactError(
+                f"semantic_finetune embeddings at {embeddings_path} must be a 2D tensor."
+            )
+        if int(embeddings.shape[0]) != int(len(self.labels)):
+            raise MissingFrozenArtifactError(
+                "semantic_finetune embeddings do not align with the current dataset node count."
+            )
+        return {
+            "dir": stage_dir,
+            "manifest": manifest,
+            "embeddings": embeddings.detach().cpu().float(),
+            "outputs": outputs,
+        }
+
+    def _load_glance_semantic_source_bundle(self):
+        emb_path = getattr(self.args, "emb_path", None) or getattr(self.args, "g0_feature_path", None)
+        if not emb_path:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine requires --emb_path pointing to a cached semantic embedding tensor. "
+                "The strict paper-text-aligned stage no longer infers semantic_finetune artifacts implicitly."
+            )
+        emb_path = Path(emb_path)
+        if not emb_path.exists():
+            raise MissingFrozenArtifactError(
+                f"glance_joint_router_refine could not find the requested semantic embedding tensor at {emb_path}."
+            )
+        embeddings = safe_torch_load(emb_path, map_location="cpu")
+        if isinstance(embeddings, dict):
+            for key in ("embeddings", "features", "x"):
+                if key in embeddings:
+                    embeddings = embeddings[key]
+                    break
+        if not torch.is_tensor(embeddings):
+            embeddings = torch.tensor(embeddings)
+        embeddings = embeddings.detach().cpu().float()
+        if embeddings.dim() != 2:
+            raise MissingFrozenArtifactError(
+                f"glance_joint_router_refine expects --emb_path to contain a 2-D tensor, got {tuple(embeddings.shape)}."
+            )
+        if int(embeddings.shape[0]) != int(len(self.labels)):
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine semantic embeddings do not align with the current dataset node count."
+            )
+        primary = {
+            "dir": emb_path.parent,
+            "manifest": _direct_embedding_manifest(emb_path),
+            "embeddings": embeddings,
+            "outputs": None,
+        }
+        bundle = {
+            "mode": "single_source",
+            "primary": primary,
+            "secondary": None,
+            "sources": [primary],
+        }
+        return bundle
+
+    def _strict_glance_train_idx(self, train_idx, cap=3000):
+        train_idx = np.asarray(train_idx, dtype=np.int64).reshape(-1)
+        cap = int(cap)
+        if cap <= 0 or train_idx.size <= cap:
+            return train_idx
+        rng = np.random.default_rng(int(self.seed))
+        selected = np.sort(rng.choice(train_idx, size=cap, replace=False))
+        return selected.astype(np.int64)
+
+    def _strict_glance_original_node_features(self):
+        context = self.ensure_backbone_context()
+        frozen_manifest = context["frozen_g0"].get("manifest", {}) or {}
+        feature_manifest = frozen_manifest.get("feature_manifest", {}) or {}
+        checkpoint = safe_torch_load(context["frozen_g0"]["checkpoint_path"], map_location="cpu")
+        input_pipeline = checkpoint.get("input_pipeline", {}) if isinstance(checkpoint, dict) else {}
+        checkpoint_feature_manifest = input_pipeline.get("feature_manifest", {}) or {}
+        feature_path = checkpoint_feature_manifest.get("path") or feature_manifest.get("path")
+        if not feature_path:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine requires frozen_g0 to record an original node-feature path. "
+                "The current frozen_g0 artifact does not contain input_pipeline.feature_manifest.path."
+            )
+        feature_path = Path(feature_path)
+        if not feature_path.exists():
+            raise MissingFrozenArtifactError(
+                f"glance_joint_router_refine could not read the frozen_g0 original node features at {feature_path}."
+            )
+        raw_features = safe_torch_load(feature_path, map_location="cpu")
+        if isinstance(raw_features, dict):
+            for key in ("embeddings", "features", "x"):
+                if key in raw_features:
+                    raw_features = raw_features[key]
+                    break
+        if not torch.is_tensor(raw_features):
+            raw_features = torch.tensor(raw_features)
+        raw_features = raw_features.detach().cpu().float()
+        if raw_features.dim() != 2:
+            raise MissingFrozenArtifactError(
+                f"glance_joint_router_refine expects original node features to be 2-D, got {tuple(raw_features.shape)}."
+            )
+        if int(raw_features.shape[0]) != int(len(self.labels)):
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine original node features do not align with the current dataset node count."
+            )
+        return {
+            "features": raw_features,
+            "path": str(feature_path),
+            "feature_manifest": checkpoint_feature_manifest or feature_manifest,
+        }
+
+    def _strict_glance_backbone_input_features(self):
+        context = self.ensure_backbone_context()
+        checkpoint = safe_torch_load(context["frozen_g0"]["checkpoint_path"], map_location="cpu")
+        input_pipeline = checkpoint.get("input_pipeline", {}) if isinstance(checkpoint, dict) else {}
+        feature_manifest = input_pipeline.get("feature_manifest", {}) or context["frozen_g0"].get("manifest", {}).get("feature_manifest", {})
+        feature_args = SimpleNamespace(**vars(self.args))
+        feature_path = feature_manifest.get("path")
+        if feature_path:
+            feature_args.emb_path = str(feature_path)
+            feature_args.g0_feature_path = str(feature_path)
+        if feature_manifest.get("projected_dim") is not None:
+            feature_args.phase_a_project_dim = int(feature_manifest["projected_dim"])
+        if feature_manifest.get("projector") is not None:
+            feature_args.phase_a_projector = str(feature_manifest["projector"])
+        feature_args.peft = False
+        feature_bundle = resolve_g0_feature_bundle(feature_args, self.data)
+        projected = feature_bundle["features"].detach().cpu().float()
+        raw = feature_bundle["raw_features"].detach().cpu().float()
+        input_adapter_payload = checkpoint.get("input_adapter", {}) if isinstance(checkpoint, dict) else {}
+        if bool(input_adapter_payload.get("enabled", False)):
+            adapter_config = input_adapter_payload.get("config", {}) or {}
+            adapter_state = input_adapter_payload.get("state_dict")
+            if adapter_state is None:
+                raise MissingFrozenArtifactError(
+                    "glance_joint_router_refine expected frozen_g0 checkpoint.pt to include input_adapter.state_dict when input_adapter.enabled is true."
+                )
+            adapter = PhaseAInputAdapter(
+                raw_dim=int(raw.shape[1]),
+                projected_dim=int(projected.shape[1]),
+                rank=int(adapter_config.get("rank", 8)),
+                alpha=float(adapter_config.get("alpha", 16.0)),
+            )
+            adapter.load_state_dict(adapter_state)
+            adapter.eval()
+            with torch.no_grad():
+                projected = adapter(projected, raw).detach().cpu().float()
+        return projected
+
+    def _fit_strict_glance_q_probs(self, node_features, train_idx, valid_idx):
+        train_idx = np.asarray(train_idx, dtype=np.int64).reshape(-1)
+        valid_idx = np.asarray(valid_idx, dtype=np.int64).reshape(-1)
+        if train_idx.size == 0:
+            raise MissingFrozenArtifactError("glance_joint_router_refine requires a non-empty strict train split for Q fitting.")
+        x_all = node_features.detach().cpu().float().numpy()
+        y_all = np.asarray(self.labels, dtype=np.int64)
+        scaler = StandardScaler()
+        x_train = scaler.fit_transform(x_all[train_idx])
+        x_full = scaler.transform(x_all)
+        classes = np.unique(y_all[train_idx])
+        if classes.size < 2:
+            q_probs = np.zeros((x_all.shape[0], 2), dtype=np.float32)
+            q_probs[:, int(classes[0])] = 1.0
+            classifier_payload = {
+                "type": "constant",
+                "class": int(classes[0]),
+            }
+        else:
+            clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=int(self.seed))
+            clf.fit(x_train, y_all[train_idx])
+            q_probs = clf.predict_proba(x_full).astype(np.float32)
+            fixed = np.zeros((x_all.shape[0], 2), dtype=np.float32)
+            for col, cls in enumerate(getattr(clf, "classes_", [0, 1])):
+                fixed[:, int(cls)] = q_probs[:, col]
+            q_probs = fixed
+            classifier_payload = {
+                "type": "logistic_regression",
+                "classes": [int(item) for item in getattr(clf, "classes_", [0, 1])],
+                "coef": getattr(clf, "coef_", np.zeros((1, x_train.shape[1]))).tolist(),
+                "intercept": getattr(clf, "intercept_", np.zeros(1)).tolist(),
+            }
+        q_logits = torch.log(torch.tensor(q_probs, dtype=torch.float32).clamp_min(1e-8))
+        temperature = 1.0
+        if valid_idx.size > 0 and len(np.unique(y_all[valid_idx])) > 1:
+            temperature = fit_temperature_scaling(q_logits[valid_idx], y_all[valid_idx])
+        q_probs_cal = torch.softmax(q_logits / float(temperature), dim=1).detach().cpu().float()
+        return {
+            "q_probs": q_probs_cal,
+            "temperature": float(temperature),
+            "classifier": classifier_payload,
+            "scaler": {
+                "mean": scaler.mean_.tolist(),
+                "scale": scaler.scale_.tolist(),
+            },
+            "train_count": int(train_idx.size),
+            "valid_count": int(valid_idx.size),
+        }
+
+    def _strict_glance_mc_dropout_uncertainty(self, node_features):
+        context = self.ensure_backbone_context()
+        checkpoint = safe_torch_load(context["frozen_g0"]["checkpoint_path"], map_location="cpu")
+        model_state = checkpoint.get("model") if isinstance(checkpoint, dict) else None
+        model_config = dict((checkpoint.get("model_config") or {})) if isinstance(checkpoint, dict) else {}
+        if not model_state or not model_config:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine requires frozen_g0 checkpoint.pt to include model weights and model_config for MC-dropout uncertainty."
+            )
+        device = self.device
+        edge_index, edge_type = self._active_graph_tensors()
+        edge_index = edge_index.to(device)
+        edge_type = edge_type.to(device)
+        x = node_features.detach().cpu().float().to(device)
+        mc_config = dict(model_config)
+        mc_config["device"] = device
+        model = build_GNN_model(mc_config)
+        model.load_state_dict(model_state)
+        model.to(device)
+        logits_list = []
+        with torch.no_grad():
+            for _ in range(5):
+                model.train()
+                outputs = model.forward_outputs(x, edge_index, edge_type)
+                logits_list.append(outputs["logits"].detach().cpu().float())
+        logits_stack = torch.stack(logits_list, dim=0)
+        probs_stack = torch.softmax(logits_stack, dim=2)
+        uncertainty = probs_stack.var(dim=0).sum(dim=1).detach().cpu().float()
+        return {
+            "uncertainty": uncertainty,
+            "num_passes": 5,
+            "source": "mc_dropout",
+            "logits_shape": [int(item) for item in logits_stack.shape],
+        }
+
+    def _build_strict_glance_router_features(self, logits_gnn, p_gnn, z_gnn, original_node_features, q_bundle, mc_bundle):
+        edge_index, edge_type = self._active_graph_tensors()
+        num_nodes = int(z_gnn.shape[0])
+        if int(original_node_features.shape[0]) != num_nodes:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine strict router features require original node features aligned with z_gnn."
+            )
+        q_probs = q_bundle["q_probs"].detach().cpu().float()
+        if int(q_probs.shape[0]) != num_nodes:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine strict router features require q_probs aligned with z_gnn."
+            )
+        uncertainty = mc_bundle["uncertainty"].detach().cpu().float().reshape(-1)
+        if int(uncertainty.numel()) != num_nodes:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine strict router features require one MC-dropout uncertainty value per node."
+            )
+
+        total_degree = np.zeros(num_nodes, dtype=np.float32)
+        relative_degree = np.ones(num_nodes, dtype=np.float32)
+        soft_homophily = np.zeros(num_nodes, dtype=np.float32)
+        if edge_index is not None:
+            edge_index_t = edge_index.detach().cpu().long()
+            if edge_index_t.dim() != 2 or edge_index_t.size(0) != 2:
+                raise MissingFrozenArtifactError("Strict GLANCE router expects edge_index shaped [2, num_edges].")
+            src = edge_index_t[0].numpy()
+            dst = edge_index_t[1].numpy()
+            neighbors = [[] for _ in range(num_nodes)]
+            degree = np.zeros(num_nodes, dtype=np.float32)
+            for s, d in zip(src.tolist(), dst.tolist()):
+                if 0 <= s < num_nodes and 0 <= d < num_nodes:
+                    degree[s] += 1.0
+                    degree[d] += 1.0
+                    neighbors[s].append(d)
+                    neighbors[d].append(s)
+            total_degree = degree
+            for node_idx, nbs in enumerate(neighbors):
+                if not nbs:
+                    continue
+                denom = np.sqrt(total_degree[np.asarray(nbs, dtype=np.int64)] + 1.0)
+                relative_degree[node_idx] = float(np.mean(np.sqrt(total_degree[node_idx] + 1.0) / denom))
+                neighbor_probs = q_probs[torch.tensor(nbs, dtype=torch.long)]
+                soft_homophily[node_idx] = float((q_probs[node_idx] * neighbor_probs.mean(dim=0)).sum().item())
+
+        log_total_degree = np.log1p(total_degree).astype(np.float32)
+        z_gnn_np = z_gnn.detach().cpu().numpy().astype(np.float32)
+        node_features_np = original_node_features.detach().cpu().numpy().astype(np.float32)
+        uncertainty_np = uncertainty.numpy().astype(np.float32).reshape(-1, 1)
+        homophily_np = np.clip(soft_homophily.astype(np.float32), 0.0, 1.0).reshape(-1, 1)
+        degree_np = np.column_stack(
+            [
+                log_total_degree.reshape(-1, 1),
+                np.nan_to_num(relative_degree, nan=1.0, posinf=1.0, neginf=1.0).astype(np.float32).reshape(-1, 1),
+            ]
+        ).astype(np.float32)
+        strict_features = np.concatenate(
+            [z_gnn_np, uncertainty_np, homophily_np, node_features_np, degree_np],
+            axis=1,
+        ).astype(np.float32)
+        selected_names = (
+            [f"z_gnn_{dim:03d}" for dim in range(z_gnn_np.shape[1])]
+            + ["mc_dropout_uncertainty", "soft_local_homophily"]
+            + [f"node_feature_{dim:03d}" for dim in range(node_features_np.shape[1])]
+            + ["log_total_degree", "relative_degree"]
+        )
+        return {
+            "features": strict_features,
+            "feature_names": selected_names,
+            "full_feature_bundle": {
+                "feature_family": "paper_text_strict_glance_router",
+                "used_edge_type": edge_type is not None,
+                "used_q_probs": True,
+                "used_mc_dropout_uncertainty": True,
+            },
+        }
+
+    def _glance_refiner_source_stage(self):
+        source = str(getattr(self.args, "glance_refiner_source", "oracle")).lower()
+        if source == "oracle":
+            return "glance_oracle_refine"
+        if source == "full_graph":
+            return "glance_full_graph_refine"
+        raise ValueError(f"Unsupported --glance_refiner_source: {source}")
+
+    def _load_glance_refiner_artifact(self):
+        stage_name = self._glance_refiner_source_stage()
+        manifest = self._require_stage_json(stage_name, "manifest")
+        metrics = self._require_stage_json(stage_name, "metrics")
+        outputs = self._require_stage_tensor(stage_name, "outputs")
+        checkpoint = self._require_stage_tensor(stage_name, "checkpoint")
+        per_node_rows = self._require_stage_jsonl(stage_name, "per_node_test")
+        analysis_summary = self._read_stage_json(stage_name, "analysis_summary")
+        return {
+            "stage_name": stage_name,
+            "manifest": manifest,
+            "metrics": metrics,
+            "outputs": outputs,
+            "checkpoint": checkpoint,
+            "per_node_rows": per_node_rows,
+            "analysis_summary": analysis_summary,
+        }
+
+    def _oracle_wrong_node_masks(self, base_pred):
+        base_pred = np.asarray(base_pred, dtype=np.int64).reshape(-1)
+        wrong = base_pred != self.labels
+        return {
+            "train": wrong & self.train_mask,
+            "valid": wrong & self.val_mask,
+            "test": wrong & self.test_mask,
+            "all": wrong,
+        }
+
+    def _build_k_hop_semantic_views(self, semantic_embeddings, edge_index):
+        x_sem = semantic_embeddings.detach().cpu().float()
+        num_nodes = int(x_sem.shape[0])
+        if edge_index is None:
+            zero = torch.zeros_like(x_sem)
+            counts = np.zeros(num_nodes, dtype=np.int64)
+            return {
+                "ego": x_sem,
+                "hop1": zero.clone(),
+                "hop2": zero.clone(),
+                "count_1hop": counts.copy(),
+                "count_2hop": counts.copy(),
+            }
+
+        edge_index_t = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        if edge_index_t.dim() != 2 or edge_index_t.size(0) != 2:
+            raise ValueError("edge_index must be shaped [2, num_edges] for glance_oracle_refine.")
+        if edge_index_t.numel() == 0:
+            zero = torch.zeros_like(x_sem)
+            counts = np.zeros(num_nodes, dtype=np.int64)
+            return {
+                "ego": x_sem,
+                "hop1": zero.clone(),
+                "hop2": zero.clone(),
+                "count_1hop": counts.copy(),
+                "count_2hop": counts.copy(),
+            }
+
+        src = edge_index_t[0].numpy()
+        dst = edge_index_t[1].numpy()
+        neighbors_in = [[] for _ in range(num_nodes)]
+        for s, d in zip(src.tolist(), dst.tolist()):
+            if 0 <= s < num_nodes and 0 <= d < num_nodes:
+                neighbors_in[d].append(s)
+
+        hop1 = torch.zeros_like(x_sem)
+        hop2 = torch.zeros_like(x_sem)
+        count_1hop = np.zeros(num_nodes, dtype=np.int64)
+        count_2hop = np.zeros(num_nodes, dtype=np.int64)
+
+        for node_idx in range(num_nodes):
+            n1 = sorted(set(int(n) for n in neighbors_in[node_idx] if int(n) != node_idx))
+            count_1hop[node_idx] = len(n1)
+            if n1:
+                hop1[node_idx] = x_sem[torch.tensor(n1, dtype=torch.long)].mean(dim=0)
+
+            n1_set = set(n1)
+            n2 = set()
+            for neigh in n1:
+                for cand in neighbors_in[neigh]:
+                    cand = int(cand)
+                    if cand == node_idx or cand in n1_set:
+                        continue
+                    n2.add(cand)
+            n2 = sorted(n2)
+            count_2hop[node_idx] = len(n2)
+            if n2:
+                hop2[node_idx] = x_sem[torch.tensor(n2, dtype=torch.long)].mean(dim=0)
+
+        return {
+            "ego": x_sem,
+            "hop1": hop1,
+            "hop2": hop2,
+            "count_1hop": count_1hop,
+            "count_2hop": count_2hop,
+        }
+
+    def _build_relation_aware_1hop_semantic_views(self, semantic_embeddings, edge_index, edge_type, include_2hop=False):
+        x_sem = semantic_embeddings.detach().cpu().float()
+        num_nodes = int(x_sem.shape[0])
+        zero = torch.zeros_like(x_sem)
+        zero_counts = np.zeros(num_nodes, dtype=np.int64)
+        if edge_index is None or edge_type is None:
+            return {
+                "ego": x_sem,
+                "in_rel0": zero.clone(),
+                "in_rel1": zero.clone(),
+                "out_rel0": zero.clone(),
+                "out_rel1": zero.clone(),
+                "in_rel0_2hop": zero.clone(),
+                "in_rel1_2hop": zero.clone(),
+                "out_rel0_2hop": zero.clone(),
+                "out_rel1_2hop": zero.clone(),
+                "count_in_rel0": zero_counts.copy(),
+                "count_in_rel1": zero_counts.copy(),
+                "count_out_rel0": zero_counts.copy(),
+                "count_out_rel1": zero_counts.copy(),
+                "count_in_rel0_2hop": zero_counts.copy(),
+                "count_in_rel1_2hop": zero_counts.copy(),
+                "count_out_rel0_2hop": zero_counts.copy(),
+                "count_out_rel1_2hop": zero_counts.copy(),
+                "has_in_rel0": zero_counts.copy(),
+                "has_in_rel1": zero_counts.copy(),
+                "has_out_rel0": zero_counts.copy(),
+                "has_out_rel1": zero_counts.copy(),
+                "has_in_rel0_2hop": zero_counts.copy(),
+                "has_in_rel1_2hop": zero_counts.copy(),
+                "has_out_rel0_2hop": zero_counts.copy(),
+                "has_out_rel1_2hop": zero_counts.copy(),
+                "count_1hop": zero_counts.copy(),
+                "count_2hop": zero_counts.copy(),
+            }
+
+        edge_index_t = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type_t = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        if edge_index_t.dim() != 2 or edge_index_t.size(0) != 2:
+            raise ValueError("edge_index must be shaped [2, num_edges] for relation-aware semantic views.")
+        if edge_type_t.numel() != edge_index_t.size(1):
+            raise ValueError("edge_type must align with edge_index for relation-aware semantic views.")
+
+        src = edge_index_t[0].numpy()
+        dst = edge_index_t[1].numpy()
+        rel = edge_type_t.numpy()
+        buckets = {
+            "in_rel0": [[] for _ in range(num_nodes)],
+            "in_rel1": [[] for _ in range(num_nodes)],
+            "out_rel0": [[] for _ in range(num_nodes)],
+            "out_rel1": [[] for _ in range(num_nodes)],
+        }
+        for s, d, r in zip(src.tolist(), dst.tolist(), rel.tolist()):
+            if not (0 <= s < num_nodes and 0 <= d < num_nodes):
+                continue
+            if int(r) == 0:
+                buckets["in_rel0"][d].append(s)
+                buckets["out_rel0"][s].append(d)
+            elif int(r) == 1:
+                buckets["in_rel1"][d].append(s)
+                buckets["out_rel1"][s].append(d)
+
+        outputs = {"ego": x_sem}
+        union_1hop = [set() for _ in range(num_nodes)]
+        for key in ("in_rel0", "in_rel1", "out_rel0", "out_rel1"):
+            view_tensor = torch.zeros_like(x_sem)
+            count_arr = np.zeros(num_nodes, dtype=np.int64)
+            has_arr = np.zeros(num_nodes, dtype=np.int64)
+            for node_idx in range(num_nodes):
+                neighbors = sorted(set(int(n) for n in buckets[key][node_idx] if int(n) != node_idx))
+                union_1hop[node_idx].update(neighbors)
+                count_arr[node_idx] = len(neighbors)
+                has_arr[node_idx] = 1 if neighbors else 0
+                if neighbors:
+                    view_tensor[node_idx] = x_sem[torch.tensor(neighbors, dtype=torch.long)].mean(dim=0)
+            outputs[key] = view_tensor
+            outputs[f"count_{key}"] = count_arr
+            outputs[f"has_{key}"] = has_arr
+        outputs["count_1hop"] = np.asarray([len(item) for item in union_1hop], dtype=np.int64)
+        outputs["count_2hop"] = zero_counts.copy()
+        if include_2hop:
+            key_map = {
+                "in_rel0_2hop": "in_rel0",
+                "in_rel1_2hop": "in_rel1",
+                "out_rel0_2hop": "out_rel0",
+                "out_rel1_2hop": "out_rel1",
+            }
+            union_2hop = [set() for _ in range(num_nodes)]
+            for key, parent_key in key_map.items():
+                view_tensor = torch.zeros_like(x_sem)
+                count_arr = np.zeros(num_nodes, dtype=np.int64)
+                has_arr = np.zeros(num_nodes, dtype=np.int64)
+                parent_bucket = buckets[parent_key]
+                for node_idx in range(num_nodes):
+                    n1 = sorted(set(int(n) for n in parent_bucket[node_idx] if int(n) != node_idx))
+                    n1_set = set(n1)
+                    n2 = set()
+                    for neigh in n1:
+                        for cand in parent_bucket[neigh]:
+                            cand = int(cand)
+                            if cand == node_idx or cand in n1_set:
+                                continue
+                            n2.add(cand)
+                    neighbors = sorted(n2)
+                    union_2hop[node_idx].update(neighbors)
+                    count_arr[node_idx] = len(neighbors)
+                    has_arr[node_idx] = 1 if neighbors else 0
+                    if neighbors:
+                        view_tensor[node_idx] = x_sem[torch.tensor(neighbors, dtype=torch.long)].mean(dim=0)
+                outputs[key] = view_tensor
+                outputs[f"count_{key}"] = count_arr
+                outputs[f"has_{key}"] = has_arr
+            outputs["count_2hop"] = np.asarray([len(item) for item in union_2hop], dtype=np.int64)
+        return outputs
+
+    def _train_glance_refiner(self, model, train_features, train_labels, valid_features, valid_labels):
+        train_features = train_features.detach().cpu().float()
+        valid_features = valid_features.detach().cpu().float()
+        train_labels = train_labels.detach().cpu().long()
+        valid_labels = valid_labels.detach().cpu().long()
+
+        if train_features.size(0) == 0:
+            raise ValueError(f"{self.args.stage} requires at least one train node.")
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(getattr(self.args, "lr_LM", 1e-5)),
+            weight_decay=float(getattr(self.args, "weight_decay_LM", 0.01)),
+        )
+        batch_size = max(min(int(getattr(self.args, "batch_size_LM", 32)), int(train_features.size(0))), 1)
+        loader = DataLoader(TensorDataset(train_features, train_labels), batch_size=batch_size, shuffle=True)
+        max_epochs = max(int(getattr(self.args, "LM_pretrain_epochs", 5)), 1)
+        patience = max(int(getattr(self.args, "LM_eval_patience", 20)), 1)
+
+        best_state = None
+        best_metrics = None
+        best_score = (-1.0, float("inf"))
+        wait = 0
+        train_losses = []
+
+        model.to(self.device)
+        for epoch in range(max_epochs):
+            model.train()
+            epoch_losses = []
+            for batch_x, batch_y in loader:
+                batch_x = batch_x.to(self.device)
+                batch_y = batch_y.to(self.device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(batch_x)
+                loss = F.cross_entropy(logits, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_losses.append(float(loss.detach().cpu().item()))
+            train_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+            train_losses.append(train_loss)
+
+            model.eval()
+            with torch.no_grad():
+                train_logits = model(train_features.to(self.device)).cpu()
+                if valid_features.size(0) > 0:
+                    valid_logits = model(valid_features.to(self.device)).cpu()
+                else:
+                    valid_logits = torch.empty((0, 2), dtype=torch.float32)
+            train_metrics = _classification_metrics_from_logits(train_logits, train_labels.cpu(), torch.arange(train_labels.numel()))
+            if valid_features.size(0) > 0:
+                valid_metrics = _classification_metrics_from_logits(valid_logits, valid_labels.cpu(), torch.arange(valid_labels.numel()))
+                current_score = (float(valid_metrics["macro_f1"]), -float(valid_metrics["loss"]))
+            else:
+                valid_metrics = {"loss": float("inf"), "accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0}
+                current_score = (float(train_metrics["macro_f1"]), -float(train_metrics["loss"]))
+
+            if current_score > best_score:
+                best_score = current_score
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                best_metrics = {
+                    "epoch": epoch + 1,
+                    "train": train_metrics,
+                    "valid": valid_metrics,
+                    "train_loss": train_loss,
+                }
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+        if best_state is None:
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            best_metrics = {
+                "epoch": 0,
+                "train": _classification_metrics_from_logits(
+                    model(train_features.to(self.device)).detach().cpu(),
+                    train_labels.cpu(),
+                    torch.arange(train_labels.numel()),
+                ),
+                "valid": {"loss": float("inf"), "accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": int(valid_labels.numel())},
+                "train_loss": 0.0,
+            }
+
+        model.load_state_dict(best_state)
+        model.to("cpu")
+        return model, {
+            "best_epoch": int(best_metrics["epoch"]),
+            "train_losses": train_losses,
+            "best_train": best_metrics["train"],
+            "best_valid": best_metrics["valid"],
+            "hidden_dim": 128,
+            "dropout": 0.1,
+            "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+        }
+
+    @staticmethod
+    def _refiner_bucket_summary(rows, key):
+        buckets = {
+            "0": lambda x: x == 0,
+            "1": lambda x: x == 1,
+            "2-5": lambda x: 2 <= x <= 5,
+            "6-10": lambda x: 6 <= x <= 10,
+            "11+": lambda x: x >= 11,
+        }
+        result = {}
+        for name, fn in buckets.items():
+            subset = [row for row in rows if fn(int(row[key]))]
+            if not subset:
+                continue
+            base_wrong = sum(1 for row in subset if row["was_wrong_base"])
+            fixed = sum(1 for row in subset if row["was_wrong_base"] and not row["is_wrong_final"])
+            base_correct = sum(1 for row in subset if not row["was_wrong_base"])
+            broken = sum(1 for row in subset if (not row["was_wrong_base"]) and row["is_wrong_final"])
+            result[name] = {
+                "count": int(len(subset)),
+                "base_wrong": int(base_wrong),
+                "fixed": int(fixed),
+                "fix_rate": float(fixed / base_wrong) if base_wrong else None,
+                "base_correct": int(base_correct),
+                "broken": int(broken),
+                "break_rate": float(broken / base_correct) if base_correct else None,
+            }
+        return result
+
+    def _build_refiner_analysis_summary(self, per_node_rows, mode_name):
+        rows = list(per_node_rows)
+        base_wrong = [row for row in rows if row["was_wrong_base"]]
+        base_correct = [row for row in rows if not row["was_wrong_base"]]
+        fixed = [row for row in base_wrong if not row["is_wrong_final"]]
+        still_wrong = [row for row in base_wrong if row["is_wrong_final"]]
+        broken = [row for row in base_correct if row["is_wrong_final"]]
+        preserved = [row for row in base_correct if not row["is_wrong_final"]]
+        changed = [row for row in rows if row["base_pred"] != row["final_pred"]]
+        routed = [row for row in rows if bool(row.get("routed", True))]
+        routed_wrong = [row for row in routed if row["was_wrong_base"]]
+        routed_correct = [row for row in routed if not row["was_wrong_base"]]
+        routed_fixed = [row for row in routed_wrong if not row["is_wrong_final"]]
+        routed_broken = [row for row in routed_correct if row["is_wrong_final"]]
+
+        def _avg(items, key):
+            if not items:
+                return 0.0
+            return float(sum(float(row[key]) for row in items) / len(items))
+
+        directional_bucket_analysis = None
+        if rows and any(
+            any(key in row for key in ("has_following", "has_follower", "neighbor_count_following", "neighbor_count_follower"))
+            for row in rows
+        ):
+            directional_bucket_analysis = {}
+            directional_buckets = {
+                "no_directional_neighbors": lambda row: (int(row.get("has_following", 0)) == 0) and (int(row.get("has_follower", 0)) == 0),
+                "following_only": lambda row: (int(row.get("has_following", 0)) == 1) and (int(row.get("has_follower", 0)) == 0),
+                "follower_only": lambda row: (int(row.get("has_following", 0)) == 0) and (int(row.get("has_follower", 0)) == 1),
+                "both_present": lambda row: (int(row.get("has_following", 0)) == 1) and (int(row.get("has_follower", 0)) == 1),
+            }
+            for name, fn in directional_buckets.items():
+                subset = [row for row in rows if fn(row)]
+                base_wrong_subset = [row for row in subset if row["was_wrong_base"]]
+                base_correct_subset = [row for row in subset if not row["was_wrong_base"]]
+                fixed_subset = [row for row in base_wrong_subset if not row["is_wrong_final"]]
+                broken_subset = [row for row in base_correct_subset if row["is_wrong_final"]]
+                directional_bucket_analysis[name] = {
+                    "count": int(len(subset)),
+                    "base_wrong": int(len(base_wrong_subset)),
+                    "fixed": int(len(fixed_subset)),
+                    "fix_rate": float(len(fixed_subset) / len(base_wrong_subset)) if base_wrong_subset else None,
+                    "base_correct": int(len(base_correct_subset)),
+                    "broken": int(len(broken_subset)),
+                    "break_rate": float(len(broken_subset) / len(base_correct_subset)) if base_correct_subset else None,
+                }
+
+        return {
+            "mode": mode_name,
+            "total_test_nodes": int(len(rows)),
+            "base_wrong_count": int(len(base_wrong)),
+            "base_correct_count": int(len(base_correct)),
+            "fixed_count": int(len(fixed)),
+            "still_wrong_count": int(len(still_wrong)),
+            "broken_count": int(len(broken)),
+            "preserved_correct_count": int(len(preserved)),
+            "improved_count": int(len(fixed)),
+            "degraded_count": int(len(broken)),
+            "net_gain": int(len(fixed) - len(broken)),
+            "changed_prediction_count": int(len(changed)),
+            "unchanged_prediction_count": int(len(rows) - len(changed)),
+            "wrong_node_fix_rate": float(len(fixed) / len(base_wrong)) if base_wrong else 0.0,
+            "correct_node_break_rate": float(len(broken) / len(base_correct)) if base_correct else 0.0,
+            "wrong_nodes_changed_rate": float(sum(1 for row in base_wrong if row["base_pred"] != row["final_pred"]) / len(base_wrong)) if base_wrong else 0.0,
+            "correct_nodes_changed_rate": float(sum(1 for row in base_correct if row["base_pred"] != row["final_pred"]) / len(base_correct)) if base_correct else 0.0,
+            "routed_count": int(len(routed)),
+            "routed_wrong_count": int(len(routed_wrong)),
+            "routed_correct_count": int(len(routed_correct)),
+            "routed_wrong_coverage": float(len(routed_wrong) / len(base_wrong)) if base_wrong else 0.0,
+            "routed_wrong_precision": float(len(routed_wrong) / len(routed)) if routed else 0.0,
+            "conditional_fix_rate_on_selected_wrong": float(len(routed_fixed) / len(routed_wrong)) if routed_wrong else 0.0,
+            "conditional_break_rate_on_selected_correct": float(len(routed_broken) / len(routed_correct)) if routed_correct else 0.0,
+            "avg_neighbor_counts": {
+                "fixed": {
+                    "hop1": _avg(fixed, "neighbor_count_1hop"),
+                    "hop2": _avg(fixed, "neighbor_count_2hop"),
+                },
+                "still_wrong": {
+                    "hop1": _avg(still_wrong, "neighbor_count_1hop"),
+                    "hop2": _avg(still_wrong, "neighbor_count_2hop"),
+                },
+                "broken": {
+                    "hop1": _avg(broken, "neighbor_count_1hop"),
+                    "hop2": _avg(broken, "neighbor_count_2hop"),
+                },
+                "preserved": {
+                    "hop1": _avg(preserved, "neighbor_count_1hop"),
+                    "hop2": _avg(preserved, "neighbor_count_2hop"),
+                },
+            },
+            "bucket_analysis": {
+                "neighbor_count_1hop": self._refiner_bucket_summary(rows, "neighbor_count_1hop"),
+                "neighbor_count_2hop": self._refiner_bucket_summary(rows, "neighbor_count_2hop"),
+            },
+            "directional_bucket_analysis": directional_bucket_analysis,
+            "examples": {
+                "fixed": fixed[:10],
+                "broken": broken[:10],
+            },
+        }
+
+    @staticmethod
+    def _budget_row_score(row, count_key="routed_count"):
+        return (
+            float(row.get("delta_macro_f1", 0.0)),
+            int(row.get("net", 0)),
+            -int(row.get(count_key, row.get("routed_count", 0))),
+        )
+
+    def _select_best_budget_row(self, rows, count_key="routed_count"):
+        if not rows:
+            return None, None, {}
+        best_row = max(rows, key=lambda item: self._budget_row_score(item, count_key))
+        rows_by_key = {str(self._budget_key(item["budget"])): item for item in rows}
+        best_key = str(self._budget_key(best_row["budget"]))
+        return best_row, best_key, rows_by_key
+
+    @staticmethod
+    def _standardize_glance_router_features(feature_matrix, fit_idx):
+        feature_matrix = np.asarray(feature_matrix, dtype=np.float32)
+        if feature_matrix.ndim != 2:
+            raise ValueError("GLANCE router feature matrix must be 2-D.")
+        fit_idx = np.asarray(fit_idx, dtype=np.int64).reshape(-1)
+        fit_matrix = feature_matrix[fit_idx] if fit_idx.size else feature_matrix
+        scaler = StandardScaler()
+        scaler.fit(fit_matrix)
+        scaled = scaler.transform(feature_matrix).astype(np.float32)
+        scaled = np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.tensor(scaled, dtype=torch.float32), {
+            "mean": scaler.mean_.tolist(),
+            "scale": scaler.scale_.tolist(),
+        }
+
+    @staticmethod
+    def _iter_glance_batches(idx, batch_size, shuffle=False, seed=0):
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        if idx.size == 0:
+            return
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive for GLANCE routing batches.")
+        if shuffle:
+            rng = np.random.default_rng(int(seed))
+            idx = idx[rng.permutation(idx.size)]
+        for start in range(0, idx.size, int(batch_size)):
+            yield idx[start : start + int(batch_size)]
+
+    @staticmethod
+    def _glance_training_top_k(batch_size, epoch_index, decay_factor=0.5):
+        batch_size = max(int(batch_size), 1)
+        k_start = batch_size
+        k_end = max(int(round(batch_size / 4.0)), 1)
+        value = k_end + (k_start - k_end) * (float(decay_factor) ** int(epoch_index))
+        return max(min(int(round(value)), batch_size), 1)
+
+    def _apply_glance_joint_policy(
+        self,
+        router_model,
+        refiner_model,
+        router_features,
+        refiner_features,
+        base_logits,
+        base_prob,
+        base_pred,
+        split_idx,
+        batch_size,
+        top_k,
+    ):
+        split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
+        final_logits = base_logits.clone()
+        final_prob = base_prob.clone()
+        final_pred = base_pred.clone()
+        routed_mask = torch.zeros(base_pred.numel(), dtype=torch.bool)
+        router_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        if split_idx.size == 0:
+            return {
+                "logits": final_logits,
+                "prob": final_prob,
+                "pred": final_pred,
+                "routed_mask": routed_mask,
+                "router_prob": router_prob_all,
+                "routed_count": 0,
+            }
+
+        router_model.eval()
+        refiner_model.eval()
+        router_device = next(router_model.parameters()).device
+        refiner_device = next(refiner_model.parameters()).device
+        with torch.no_grad():
+            for batch_idx_np in self._iter_glance_batches(split_idx, batch_size, shuffle=False):
+                batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
+                _, batch_prob = router_model(router_features[batch_idx].to(router_device))
+                batch_prob = batch_prob.detach().cpu()
+                router_prob_all[batch_idx] = batch_prob
+                k = min(max(int(top_k), 1), int(batch_idx.numel()))
+                routed_rel = torch.topk(batch_prob, k=k, largest=True, sorted=False).indices
+                routed_idx = batch_idx[routed_rel]
+                routed_mask[routed_idx] = True
+                ref_logits = refiner_model(refiner_features[routed_idx].to(refiner_device)).cpu()
+                final_logits[routed_idx] = ref_logits
+                final_prob[routed_idx] = torch.softmax(ref_logits, dim=1)
+                final_pred[routed_idx] = ref_logits.argmax(dim=1)
+
+        return {
+            "logits": final_logits,
+            "prob": final_prob,
+            "pred": final_pred,
+            "routed_mask": routed_mask,
+            "router_prob": router_prob_all,
+            "routed_count": int(routed_mask[torch.tensor(split_idx, dtype=torch.long)].sum().item()),
+        }
+
+    @staticmethod
+    def _parse_float_candidate_csv(raw_value, default_values):
+        if raw_value is None:
+            return tuple(float(item) for item in default_values)
+        tokens = [token.strip() for token in str(raw_value).split(",") if token.strip()]
+        if not tokens:
+            return tuple(float(item) for item in default_values)
+        return tuple(float(token) for token in tokens)
+
+    @staticmethod
+    def _parse_int_candidate_csv(raw_value, default_values):
+        if raw_value is None:
+            return tuple(int(item) for item in default_values)
+        tokens = [token.strip() for token in str(raw_value).split(",") if token.strip()]
+        if not tokens:
+            return tuple(int(item) for item in default_values)
+        return tuple(int(token) for token in tokens)
+
+    def _build_glance_joint_per_node_rows(
+        self,
+        split_idx,
+        pred_gnn,
+        final_pred,
+        labels_np,
+        routed_mask,
+        router_prob,
+        semantic_views,
+        mode_name,
+    ):
+        split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
+        rows = []
+        final_pred_np = final_pred.detach().cpu().numpy().astype(np.int64)
+        pred_gnn_np = pred_gnn.detach().cpu().numpy().astype(np.int64)
+        routed_mask_np = routed_mask.detach().cpu().numpy().astype(bool)
+        router_prob_np = router_prob.detach().cpu().numpy().astype(np.float32)
+        count_1hop = semantic_views.get("count_1hop")
+        count_2hop = semantic_views.get("count_2hop")
+        if count_1hop is None:
+            count_1hop = semantic_views.get("count_following")
+        if count_2hop is None:
+            count_2hop = semantic_views.get("count_follower")
+        for node_idx in split_idx.tolist():
+            rows.append({
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn_np[node_idx]),
+                "final_pred": int(final_pred_np[node_idx]),
+                "label": int(labels_np[node_idx]),
+                "routed": bool(routed_mask_np[node_idx]),
+                "router_prob": float(router_prob_np[node_idx]),
+                "was_wrong_base": bool(pred_gnn_np[node_idx] != labels_np[node_idx]),
+                "is_wrong_final": bool(final_pred_np[node_idx] != labels_np[node_idx]),
+                "neighbor_count_1hop": int(count_1hop[node_idx]) if count_1hop is not None else 0,
+                "neighbor_count_2hop": int(count_2hop[node_idx]) if count_2hop is not None else 0,
+                "neighbor_count_following": int(semantic_views["count_following"][node_idx]) if "count_following" in semantic_views else 0,
+                "neighbor_count_follower": int(semantic_views["count_follower"][node_idx]) if "count_follower" in semantic_views else 0,
+                "has_following": int(semantic_views["has_following"][node_idx]) if "has_following" in semantic_views else 0,
+                "has_follower": int(semantic_views["has_follower"][node_idx]) if "has_follower" in semantic_views else 0,
+            })
+        return {
+            "rows": rows,
+            "analysis": self._build_refiner_analysis_summary(rows, mode_name),
+        }
+
+    def _train_glance_joint_candidate(
+        self,
+        *,
+        labels_t,
+        labels_np,
+        train_idx,
+        valid_idx,
+        test_idx,
+        logits_gnn,
+        p_gnn,
+        pred_gnn,
+        router_features,
+        refiner_features,
+        semantic_views,
+        activation,
+        batch_size,
+        max_epochs,
+        patience,
+        decay_factor,
+        entropy_weight,
+        router_weight,
+        learning_rate,
+        weight_decay,
+        beta,
+        eval_top_k,
+    ):
+        candidate_seed = int(self.seed) * 100000 + int(round(float(beta) * 1000)) * 10 + int(eval_top_k)
+        torch.manual_seed(candidate_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(candidate_seed)
+        np.random.seed(candidate_seed % (2**32 - 1))
+        router_model = GlanceRouterLinear(input_dim=int(router_features.shape[1]))
+        refiner_model = GlanceRefinerMLP(
+            input_dim=int(refiner_features.shape[1]),
+            hidden_dim=128,
+            activation=activation,
+            dropout=0.1,
+        )
+        router_model.to(self.device)
+        refiner_model.to(self.device)
+        optimizer = torch.optim.AdamW(
+            list(router_model.parameters()) + list(refiner_model.parameters()),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+        best_state = None
+        best_epoch_summary = None
+        best_score = (-1.0, float("inf"))
+        wait = 0
+        epoch_history = []
+
+        for epoch in range(max_epochs):
+            router_model.train()
+            refiner_model.train()
+            train_loss_history = []
+            train_pred_history = []
+            train_route_history = []
+            train_k = self._glance_training_top_k(
+                batch_size,
+                epoch,
+                decay_factor=decay_factor,
+            )
+
+            for batch_idx_np in self._iter_glance_batches(
+                train_idx,
+                batch_size,
+                shuffle=True,
+                seed=int(self.seed) * 1000 + int(epoch) + int(round(float(beta) * 1000)) + int(eval_top_k),
+            ):
+                batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
+                batch_router_x = router_features[batch_idx].to(self.device)
+                batch_refiner = refiner_features[batch_idx].to(self.device)
+                batch_labels = labels_t[batch_idx].to(self.device)
+                batch_base_logits = logits_gnn[batch_idx].to(self.device)
+                batch_base_loss = F.cross_entropy(
+                    batch_base_logits,
+                    batch_labels,
+                    reduction="none",
+                ).detach()
+
+                _, route_prob = router_model(batch_router_x)
+                k = min(max(int(train_k), 1), int(batch_idx.numel()))
+                routed_rel = torch.topk(route_prob, k=k, largest=True, sorted=False).indices
+                routed_mask = torch.zeros(batch_labels.size(0), dtype=torch.bool, device=self.device)
+                routed_mask[routed_rel] = True
+
+                routed_labels = batch_labels[routed_mask]
+                if int(routed_labels.numel()) > 0:
+                    routed_refiner_logits = refiner_model(batch_refiner[routed_mask])
+                    routed_refiner_loss = F.cross_entropy(
+                        routed_refiner_logits,
+                        routed_labels,
+                        reduction="none",
+                    )
+                else:
+                    routed_refiner_loss = torch.empty((0,), device=self.device)
+                refiner_loss = batch_base_loss.detach().clone()
+                refiner_loss[routed_mask] = routed_refiner_loss
+                pred_loss = (
+                    batch_base_loss[~routed_mask].sum()
+                    + routed_refiner_loss.sum()
+                ) / float(batch_labels.size(0))
+
+                routed_reward = batch_base_loss - refiner_loss.detach() - float(beta)
+                non_routed_reward = -batch_base_loss
+                reward = torch.where(routed_mask, routed_reward, non_routed_reward).detach()
+                action_prob = torch.where(
+                    routed_mask,
+                    route_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6),
+                    (1.0 - route_prob).clamp_min(1e-6).clamp_max(1.0 - 1e-6),
+                )
+                entropy = -(
+                    route_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6) * torch.log(route_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6))
+                    + (1.0 - route_prob).clamp_min(1e-6).clamp_max(1.0 - 1e-6)
+                    * torch.log((1.0 - route_prob).clamp_min(1e-6).clamp_max(1.0 - 1e-6))
+                ).mean()
+                route_loss = (-(reward * torch.log(action_prob)).mean()) - float(entropy_weight) * entropy
+                total_loss = pred_loss + float(router_weight) * route_loss
+
+                optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
+                optimizer.step()
+
+                train_loss_history.append(float(total_loss.detach().cpu().item()))
+                train_pred_history.append(float(pred_loss.detach().cpu().item()))
+                train_route_history.append(float(route_loss.detach().cpu().item()))
+
+            router_model.to("cpu")
+            refiner_model.to("cpu")
+            valid_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                valid_idx,
+                batch_size,
+                eval_top_k,
+            )
+            valid_metrics = _classification_metrics_from_logits(
+                valid_outputs["logits"],
+                labels_t,
+                torch.tensor(valid_idx, dtype=torch.long),
+            )
+            valid_metrics["routed_count"] = int(valid_outputs["routed_count"])
+            valid_metrics["query_rate"] = float(valid_outputs["routed_count"] / max(int(valid_idx.size), 1))
+
+            epoch_summary = {
+                "epoch": int(epoch + 1),
+                "beta": float(beta),
+                "eval_top_k": int(eval_top_k),
+                "train_top_k": int(train_k),
+                "avg_total_loss": float(np.mean(train_loss_history)) if train_loss_history else 0.0,
+                "avg_pred_loss": float(np.mean(train_pred_history)) if train_pred_history else 0.0,
+                "avg_route_loss": float(np.mean(train_route_history)) if train_route_history else 0.0,
+                "valid": valid_metrics,
+            }
+            epoch_history.append(epoch_summary)
+            current_score = (float(valid_metrics["macro_f1"]), -float(valid_metrics["loss"]))
+            if current_score > best_score:
+                best_score = current_score
+                best_state = {
+                    "router": {key: value.detach().cpu().clone() for key, value in router_model.state_dict().items()},
+                    "refiner": {key: value.detach().cpu().clone() for key, value in refiner_model.state_dict().items()},
+                }
+                best_epoch_summary = epoch_summary
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+            router_model.to(self.device)
+            refiner_model.to(self.device)
+
+        if best_state is None or best_epoch_summary is None:
+            raise MissingFrozenArtifactError("glance_joint_router_refine failed to produce a valid checkpoint.")
+
+        router_model.load_state_dict(best_state["router"])
+        refiner_model.load_state_dict(best_state["refiner"])
+        router_model.to("cpu")
+        refiner_model.to("cpu")
+
+        train_outputs = self._apply_glance_joint_policy(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            train_idx,
+            batch_size,
+            eval_top_k,
+        )
+        valid_outputs = self._apply_glance_joint_policy(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            valid_idx,
+            batch_size,
+            eval_top_k,
+        )
+        test_outputs = self._apply_glance_joint_policy(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            test_idx,
+            batch_size,
+            eval_top_k,
+        )
+
+        train_metrics = _classification_metrics_from_logits(
+            train_outputs["logits"],
+            labels_t,
+            torch.tensor(train_idx, dtype=torch.long),
+        )
+        valid_metrics = _classification_metrics_from_logits(
+            valid_outputs["logits"],
+            labels_t,
+            torch.tensor(valid_idx, dtype=torch.long),
+        )
+        test_metrics = _classification_metrics_from_logits(
+            test_outputs["logits"],
+            labels_t,
+            torch.tensor(test_idx, dtype=torch.long),
+        )
+        for split_metrics, split_outputs, split_idx in (
+            (train_metrics, train_outputs, train_idx),
+            (valid_metrics, valid_outputs, valid_idx),
+            (test_metrics, test_outputs, test_idx),
+        ):
+            split_metrics["routed_count"] = int(split_outputs["routed_count"])
+            split_metrics["query_rate"] = float(split_outputs["routed_count"] / max(int(split_idx.size), 1))
+
+        train_rows = self._build_glance_joint_per_node_rows(
+            train_idx,
+            pred_gnn,
+            train_outputs["pred"],
+            labels_np,
+            train_outputs["routed_mask"],
+            train_outputs["router_prob"],
+            semantic_views,
+            "glance_joint_router_refine_train",
+        )
+        valid_rows = self._build_glance_joint_per_node_rows(
+            valid_idx,
+            pred_gnn,
+            valid_outputs["pred"],
+            labels_np,
+            valid_outputs["routed_mask"],
+            valid_outputs["router_prob"],
+            semantic_views,
+            "glance_joint_router_refine_valid",
+        )
+        test_rows = self._build_glance_joint_per_node_rows(
+            test_idx,
+            pred_gnn,
+            test_outputs["pred"],
+            labels_np,
+            test_outputs["routed_mask"],
+            test_outputs["router_prob"],
+            semantic_views,
+            "glance_joint_router_refine_test",
+        )
+        return {
+            "beta": float(beta),
+            "eval_top_k": int(eval_top_k),
+            "best_epoch": int(best_epoch_summary["epoch"]),
+            "router_state": best_state["router"],
+            "refiner_state": best_state["refiner"],
+            "learned_view_gates": None,
+            "fit_summary": {
+                "best_epoch": int(best_epoch_summary["epoch"]),
+                "epoch_history": epoch_history,
+                "selected_train": train_metrics,
+                "selected_valid": valid_metrics,
+                "selected_test": test_metrics,
+                "router_weight": float(router_weight),
+                "entropy_weight": float(entropy_weight),
+                "eval_top_k": int(eval_top_k),
+            },
+            "train_outputs": train_outputs,
+            "valid_outputs": valid_outputs,
+            "test_outputs": test_outputs,
+            "train_metrics": train_metrics,
+            "valid_metrics": valid_metrics,
+            "test_metrics": test_metrics,
+            "train_rows": train_rows,
+            "valid_rows": valid_rows,
+            "test_rows": test_rows,
+        }
 
     def _base_artifact_bundle(self):
         code_provenance = capture_code_metadata(Path(__file__).resolve().parents[2])
@@ -1793,6 +3900,16 @@ class StageRunner:
                 f"Run --stage {stage_name} first; strict stages never recompute upstream artifacts."
             )
         return safe_torch_load(path, map_location="cpu")
+
+    def _require_stage_jsonl(self, stage_name, filename):
+        path = self.experiment_root / "stages" / stage_name / f"{filename}.jsonl"
+        if not path.exists():
+            raise MissingFrozenArtifactError(
+                f"Stage '{self.args.stage}' requires frozen dependency {path}. "
+                f"Run --stage {stage_name} first; strict stages never recompute upstream artifacts."
+            )
+        with open(path, "r", encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
 
     def _load_vertical_minimal_dependency(self):
         return {
@@ -1876,27 +3993,95 @@ class StageRunner:
 
     def _router_requested(self):
         estimator_mode = str(getattr(self.args, "estimator_mode", "none")).lower()
-        return (
-            estimator_mode
-            in {
-                "calibrated_multiview_router",
-                "calibrated_residual_risk_selector",
-                "glance_for_context_residual_risk_selector",
-            }
-            or str(getattr(self.args, "router_mode", "off")).lower() == "multiview"
-        )
-
-    def _final_output_ranker_requested(self):
-        return str(getattr(self.args, "estimator_mode", "none")).lower() == "final_output_ranker"
-
-    def _dual_posterior_ranker_requested(self):
-        return str(getattr(self.args, "estimator_mode", "none")).lower() == "dual_posterior_ranker"
+        return estimator_mode == "glance_for_context_residual_risk_selector"
 
     def _login_uncertainty_router_requested(self):
         return str(getattr(self.args, "estimator_mode", "none")).lower() == "login_uncertainty_router"
 
+    def _login_uncertainty_aux_root(self, stage_dir):
+        return ensure_dir(Path(stage_dir) / "aux_login_uncertainty_runs")
+
+    def _build_or_load_login_uncertainty_logits_list(self, stage_dir):
+        aux_root = self._login_uncertainty_aux_root(stage_dir)
+        context = self.ensure_backbone_context()
+        frozen_manifest = context["frozen_g0"].get("manifest", {})
+        feature_manifest = frozen_manifest.get("feature_manifest", {})
+        feature_path = feature_manifest.get("path")
+        projected_dim = feature_manifest.get("projected_dim")
+        projector = feature_manifest.get("projector")
+        peft_manifest = feature_manifest.get("peft", {})
+        drop_out_list = [0.5, 0.5, 0.5, 0.5, 0.5]
+        logits_list = []
+        aux_runs = []
+        force_retrain = bool(getattr(self.args, "force_retrain_backbone", False))
+        for run_idx, dropout in enumerate(drop_out_list):
+            run_root = ensure_dir(aux_root / f"run_{run_idx}")
+            aux_args = SimpleNamespace(**vars(self.args))
+            aux_args.GNN_dropout = float(dropout)
+            aux_args.force_retrain_backbone = force_retrain
+            if feature_path:
+                aux_args.emb_path = str(feature_path)
+                aux_args.g0_feature_path = str(feature_path)
+            if projected_dim is not None:
+                aux_args.phase_a_project_dim = int(projected_dim)
+            if projector is not None:
+                aux_args.phase_a_projector = str(projector)
+            aux_args.peft = bool(peft_manifest.get("enabled", False))
+            if aux_args.peft:
+                aux_args.peft_rank = int(peft_manifest.get("rank", getattr(self.args, "peft_rank", 8)))
+                aux_args.peft_alpha = float(peft_manifest.get("alpha", getattr(self.args, "peft_alpha", 16.0)))
+            train_seed = int(self.seed) * 100 + int(run_idx)
+            had_existing = (run_root / "frozen" / "g0" / "manifest.json").exists() and not force_retrain
+            frozen = build_or_load_frozen_g0(aux_args, train_seed, self.data, run_root)
+            logits = frozen["outputs"].get("logits")
+            if logits is None or not torch.is_tensor(logits) or logits.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"LOGIN uncertainty aux run {run_idx} under {run_root} did not produce full-node logits."
+                )
+            logits_list.append(logits.detach().cpu().float())
+            aux_runs.append(
+                {
+                    "run_index": int(run_idx),
+                    "dropout": float(dropout),
+                    "training_seed": int(train_seed),
+                    "source": "existing_frozen_g0" if had_existing else "trained_frozen_g0",
+                    "root": str(run_root),
+                    "frozen_g0_dir": str(frozen["dir"]),
+                    "manifest_path": str(Path(frozen["dir"]) / "manifest.json"),
+                    "outputs_path": str(Path(frozen["dir"]) / "outputs.pt"),
+                    "checkpoint_path": str(Path(frozen["dir"]) / "checkpoint.pt"),
+                    "selection_metrics_path": str(Path(frozen["dir"]) / "selection_metrics.json"),
+                    "selection_metrics": frozen.get("selection_metrics", {}),
+                }
+            )
+        logits_stack = torch.stack(logits_list, dim=0)
+        aux_manifest = {
+            "contract": "login_uncertainty_aux_runs_v1",
+            "official_repo_path": r"G:\Research\BotDetection\LOGIN_init",
+            "official_submodule_scope": "node_selection_uncertainty_only",
+            "official_drop_out_list": list(drop_out_list),
+            "official_pl_rate": 0.1,
+            "run_count": int(len(drop_out_list)),
+            "run_shape": [int(item) for item in logits_stack.shape],
+            "dataset": str(getattr(self.args, "dataset", "unknown")),
+            "gnn_backbone": str(getattr(self.args, "GNN_model", "unknown")),
+            "feature_path": str(feature_path or getattr(self.args, "emb_path", getattr(self.args, "g0_feature_path", "")) or ""),
+            "split_provenance": split_provenance(self.data),
+            "force_retrain_backbone": force_retrain,
+            "local_seed_policy": "base_seed_x100_plus_run_idx_for_independent_aux_training",
+            "note": (
+                "Official LOGIN uncertainty code trains five GNNs inside one loop. "
+                "Local LLMbot reproduction uses deterministic seed offsets so the five aux runs remain independent "
+                "while preserving the same dataset split, backbone family, and input features."
+            ),
+            "runs": aux_runs,
+        }
+        return logits_stack, aux_manifest
+
     def _graph_conformal_estimator_requested(self):
         return str(getattr(self.args, "estimator_mode", "none")).lower() in {
+            "msp_ts",
+            "posthoc_calibrated_ranker",
             "graph_conformal_set_estimator",
             "gnn_2hop_conformal",
         }
@@ -1957,11 +4142,113 @@ class StageRunner:
         }
         return torch.tensor(tune_idx, dtype=torch.long), torch.tensor(cal_idx, dtype=torch.long), metadata
 
+    @staticmethod
+    def _split_metrics_from_outputs(outputs, labels_np, valid_mask, test_mask):
+        pred = outputs.get("pred")
+        if pred is None:
+            raise MissingFrozenArtifactError("Expected outputs.pt to include 'pred' for local_conformal_prune_diag.")
+        pred_np = pred.detach().cpu().numpy().astype(np.int64) if torch.is_tensor(pred) else np.asarray(pred, dtype=np.int64)
+        labels_np = np.asarray(labels_np, dtype=np.int64)
+        return {
+            "valid": _score_all(labels_np[valid_mask], pred_np[valid_mask]) if valid_mask.any() else {"accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0},
+            "test": _score_all(labels_np[test_mask], pred_np[test_mask]) if test_mask.any() else {"accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0},
+            "pred": pred_np,
+        }
+
+    @staticmethod
+    def _degree_arrays(edge_index, num_nodes):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        src = edge_index_cpu[0]
+        dst = edge_index_cpu[1]
+        out_degree = torch.bincount(src, minlength=int(num_nodes)).cpu().numpy().astype(np.int64)
+        in_degree = torch.bincount(dst, minlength=int(num_nodes)).cpu().numpy().astype(np.int64)
+        return in_degree, out_degree
+
+    @staticmethod
+    def _remove_edge_at_position(edge_index, edge_type, edge_pos):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type_cpu = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        keep_mask = torch.ones(edge_index_cpu.size(1), dtype=torch.bool)
+        keep_mask[int(edge_pos)] = False
+        return edge_index_cpu[:, keep_mask].contiguous(), edge_type_cpu[keep_mask].contiguous()
+
+    @staticmethod
+    def _pruned_graph_from_removed_positions(edge_index, edge_type, removed_positions):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type_cpu = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        if not removed_positions:
+            return edge_index_cpu.contiguous(), edge_type_cpu.contiguous()
+        keep_mask = torch.ones(edge_index_cpu.size(1), dtype=torch.bool)
+        keep_mask[torch.tensor(sorted(int(pos) for pos in removed_positions), dtype=torch.long)] = False
+        return edge_index_cpu[:, keep_mask].contiguous(), edge_type_cpu[keep_mask].contiguous()
+
+    def _fit_local_conformal_router(self, logits_gnn, prob_gnn, labels_t, edge_index, edge_type, node_repr):
+        train_idx = _idx_tensor(self.data["train_idx"])
+        valid_idx = _idx_tensor(self.data["valid_idx"])
+        test_idx = _idx_tensor(self.data["test_idx"])
+        tune_idx, cal_idx, split_metadata = self._split_valid_tune_cal(labels_t)
+        estimator = build_estimator("gnn_2hop_conformal")
+        routed_budget = 0.10
+        estimator.fit(
+            logits_gnn,
+            prob_gnn,
+            labels_t,
+            train_idx=train_idx,
+            val_idx=valid_idx,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+            tune_idx=tune_idx,
+            cal_idx=cal_idx,
+            tune_cal_split_metadata=split_metadata,
+            budgets=[routed_budget],
+            direction_mode="incoming",
+            relation_mode="agnostic",
+        )
+        risk_manifest = estimator.build_manifest(
+            logits_gnn,
+            prob_gnn,
+            labels_t,
+            val_idx=valid_idx,
+            test_idx=test_idx,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+            budgets=[routed_budget],
+            direction_mode="incoming",
+            relation_mode="agnostic",
+        )
+        q_score = np.asarray(risk_manifest.get("router_score"), dtype=np.float32)
+        threshold = float((risk_manifest.get("thresholds") or {}).get("validation_risk_threshold", float("inf")))
+        routed_mask = q_score >= (threshold - 1e-12)
+        return {
+            "estimator": estimator,
+            "risk_manifest": risk_manifest,
+            "q_score": q_score,
+            "threshold": threshold,
+            "routed_mask": routed_mask,
+            "routed_budget": routed_budget,
+            "tune_idx": tune_idx,
+            "cal_idx": cal_idx,
+            "split_metadata": split_metadata,
+        }
+
+    def _rerun_frozen_g0_with_edge_override(self, stage_dir, run_name, edge_index, edge_type):
+        rerun_root = ensure_dir(Path(stage_dir) / "reruns" / run_name)
+        rerun_args = SimpleNamespace(**vars(self.args))
+        rerun_args.stage = "frozen_g0"
+        rerun_args.requested_stage = "frozen_g0"
+        rerun_args.force_retrain_backbone = True
+        rerun_args.graph_refine_mode = "none"
+        rerun_args.graph_refine_budget = 0.0
+        rerun_args.external_frozen_g0_root = None
+        rerun_data = dict(self.data)
+        rerun_data["edge_index"] = edge_index.detach().cpu().long()
+        rerun_data["edge_type"] = edge_type.detach().cpu().long()
+        return build_or_load_frozen_g0(rerun_args, self.seed, rerun_data, rerun_root)
+
     def _router_budgets(self):
         return parse_budget_list(getattr(self.args, "risk_budgets", None) or getattr(self.args, "router_budgets", None), default=RESIDUAL_RISK_PAPER_BUDGETS)
-
-    def _final_output_ranker_budgets(self):
-        return parse_budget_list(getattr(self.args, "risk_budgets", None) or getattr(self.args, "router_budgets", None), default=FINAL_OUTPUT_RANKER_BUDGETS)
 
     def _router_oof_dir(self):
         return Path(self.experiment_root) / "frozen" / "router_oof"
@@ -1974,7 +4261,7 @@ class StageRunner:
         outputs_path = oof_dir / "outputs.pt"
         if not manifest_path.exists() or not outputs_path.exists():
             raise MissingFrozenArtifactError(
-                "calibrated_multiview_router requires frozen train-split OOF artifacts under "
+                "glance_for_context_residual_risk_selector requires frozen train-split OOF artifacts under "
                 f"{oof_dir}. Expected manifest.json and outputs.pt; direct train correctness is not allowed."
             )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2025,7 +4312,7 @@ class StageRunner:
             return existing
         if bool(getattr(self.args, "claim_grade", False)):
             raise MissingFrozenArtifactError(
-                "claim_grade dual_posterior_ranker requires frozen/lm_only_head artifacts; "
+                "claim_grade GLANCE context selector requires frozen/lm_only_head artifacts; "
                 "implicit upstream recompute is disallowed."
             )
 
@@ -2120,7 +4407,7 @@ class StageRunner:
         write_json(out_dir / "manifest.json", manifest)
         return {"manifest": manifest, "outputs": outputs, "dir": out_dir, "source": "derived_from_frozen_g0_feature_manifest"}
 
-    def _build_multiview_router_bundle(self, gats_bundle):
+    def _build_glance_context_router_bundle(self, gats_bundle):
         oof = self._load_router_oof_artifact()
         lm_bundle = self._build_or_load_lm_only_head()
         context = self.ensure_backbone_context()
@@ -2129,47 +4416,18 @@ class StageRunner:
         gnn_prob_cal = gats_outputs.get("prob_graph_cal", gnn_outputs["prob"]).detach().cpu().float()
         lm_prob_cal = lm_bundle["outputs"].get("prob_cal", lm_bundle["outputs"]["prob"]).detach().cpu().float()
         budgets = self._router_budgets()
-        estimator_mode = str(getattr(self.args, "estimator_mode", "calibrated_multiview_router")).lower()
-        risk_variant = getattr(self.args, "risk_variant", None) or getattr(self.args, "router_variant", "router_4_view_ensemble")
-        risk_variant_key = str(risk_variant).lower()
-        selector_modes = {"calibrated_residual_risk_selector", "glance_for_context_residual_risk_selector"}
-        if estimator_mode in selector_modes:
-            if estimator_mode == "glance_for_context_residual_risk_selector" or risk_variant_key in {
-                "glance_for_context",
-                "glance_residual_risk_selector",
-                "glance_router",
-            }:
-                estimator = GlanceForContextResidualRiskSelector(
-                    budgets=budgets,
-                    training_objective=getattr(self.args, "glance_training_objective", "residual_error"),
-                    llm_query_cost=getattr(self.args, "glance_llm_query_cost", 0.2),
-                )
-                paper_identity = "GLANCE-inspired Node-Aware Residual-Risk Selector"
-            elif risk_variant_key in {"gets_posthoc", "posthoc_gets", "gets_style_posthoc"}:
-                estimator = GETSStylePostHocResidualRiskSelector(risk_variant=risk_variant, budgets=budgets)
-                paper_identity = "Calibrated Residual-Risk Hard-Node Selector"
-            else:
-                estimator = CalibratedResidualRiskHardNodeSelector(
-                    risk_variant=risk_variant,
-                    lambda_rank=getattr(self.args, "router_lambda_rank", 0.2),
-                    rank_margin=getattr(self.args, "router_rank_margin", 0.1),
-                    budgets=budgets,
-                )
-                paper_identity = "Calibrated Residual-Risk Hard-Node Selector"
-            artifact_mode = estimator_mode
-        else:
-            estimator = CalibratedMultiViewResidualRouter(
-                variant=getattr(self.args, "router_variant", "router_4_view_ensemble"),
-                lambda_rank=getattr(self.args, "router_lambda_rank", 0.2),
-                rank_margin=getattr(self.args, "router_rank_margin", 0.1),
-                budgets=budgets,
-            )
-            artifact_mode = "calibrated_multiview_router"
-            paper_identity = "legacy calibrated multi-view residual-risk selector"
-        if estimator_mode in selector_modes:
-            legacy_variant = getattr(estimator, "variant", str(risk_variant))
-        else:
-            legacy_variant = getattr(self.args, "router_variant", "router_4_view_ensemble")
+        estimator_mode = str(getattr(self.args, "estimator_mode", "none")).lower()
+        if estimator_mode != "glance_for_context_residual_risk_selector":
+            raise ValueError(f"Unsupported router estimator mode after cleanup: {estimator_mode}")
+        estimator = GlanceForContextResidualRiskSelector(
+            budgets=budgets,
+            training_objective=getattr(self.args, "glance_training_objective", "residual_error"),
+            llm_query_cost=getattr(self.args, "glance_llm_query_cost", 0.2),
+        )
+        paper_identity = "GLANCE-inspired Node-Aware Residual-Risk Selector"
+        artifact_mode = estimator_mode
+        glance_variant = "glance_for_context"
+        legacy_variant = getattr(estimator, "variant", str(glance_variant))
         oof_outputs = oof["outputs"]
         estimator.fit(
             logits=torch.log(oof_outputs["gnn_prob_cal"].float().clamp_min(1e-8)),
@@ -2200,8 +4458,8 @@ class StageRunner:
             **risk_manifest.get("calibration_metadata", {}),
             "source": artifact_mode,
             "paper_identity": paper_identity,
-            "risk_variant": str(risk_variant),
-            "legacy_router_variant": str(legacy_variant),
+            "glance_variant": str(glance_variant),
+            "glance_legacy_variant": str(legacy_variant),
             "lm_only_head_manifest": str(self._lm_only_head_dir() / "manifest.json"),
             "router_oof_manifest": str(self._router_oof_dir() / "manifest.json"),
         }
@@ -2220,9 +4478,9 @@ class StageRunner:
             "variant": str(legacy_variant),
         }
         router_manifest = {
-            "contract": "calibrated_multiview_residual_router_v1",
-            "estimator_mode": "calibrated_multiview_router",
-            "router_mode": "multiview",
+            "contract": "glance_context_residual_router_v1",
+            "estimator_mode": artifact_mode,
+            "router_mode": "off",
             "variant": str(legacy_variant),
             "training_label": "z_i = 1[base_gnn_prediction != y_i]",
             "target": "Stage 1 base detector failure probability",
@@ -2245,38 +4503,37 @@ class StageRunner:
             "router_checkpoint.pt": estimator.state_dict_payload(),
             "lm_only_head_manifest": lm_bundle["manifest"],
         }
-        if artifact_mode in {"calibrated_residual_risk_selector", "glance_for_context_residual_risk_selector"}:
-            selector_manifest = {
-                "contract": "calibrated_residual_risk_hard_node_selector_v1",
-                "paper_name": paper_identity,
-                "estimator_mode": artifact_mode,
-                "risk_variant": str(risk_variant),
-                "legacy_router_variant": str(legacy_variant),
-                "training_label": "z_i = 1[base_gnn_prediction != y_i]",
-                "target": "P(Stage1 prediction is wrong | Stage1 outputs/features)",
-                "training_objective": estimator.training_summary.get("training_objective", "residual_error"),
-                "target_semantics": estimator.training_summary.get("target_semantics", "1[Stage1 prediction != y]"),
-                "input_boundary": estimator.training_summary.get("forbidden_inputs_audit", {}),
-                "oof_required": True,
-                "oof_folds": int(getattr(self.args, "router_oof_folds", 5)),
-                "screening_only": True,
-                "diagnosis_or_action": False,
-                "positioning": "calibration/ranking selector; not a Stage 3 action router",
-                "view_names": estimator.training_summary.get(
-                    "feature_family",
-                    ["calibrated_prediction", "semantic_graph_disagreement", "graph_context_consistency"],
-                ),
+        selector_manifest = {
+            "contract": "glance_context_residual_risk_selector_v1",
+            "paper_name": paper_identity,
+            "estimator_mode": artifact_mode,
+            "glance_variant": str(glance_variant),
+            "glance_legacy_variant": str(legacy_variant),
+            "training_label": "z_i = 1[base_gnn_prediction != y_i]",
+            "target": "P(Stage1 prediction is wrong | Stage1 outputs/features)",
+            "training_objective": estimator.training_summary.get("training_objective", "residual_error"),
+            "target_semantics": estimator.training_summary.get("target_semantics", "1[Stage1 prediction != y]"),
+            "input_boundary": estimator.training_summary.get("forbidden_inputs_audit", {}),
+            "oof_required": True,
+            "oof_folds": int(getattr(self.args, "router_oof_folds", 5)),
+            "screening_only": True,
+            "diagnosis_or_action": False,
+            "positioning": "GLANCE-inspired calibration/ranking selector; not a Stage 3 action router",
+            "view_names": estimator.training_summary.get(
+                "feature_family",
+                ["calibrated_prediction", "semantic_graph_disagreement", "graph_context_consistency"],
+            ),
+        }
+        router_artifacts.update(
+            {
+                "residual_risk_selector_manifest": selector_manifest,
+                "residual_risk_selector_metrics": router_metrics,
+                "residual_risk_scores.pt": torch.tensor(risk_manifest["risk_score"], dtype=torch.float32),
+                "residual_risk_view_weights.pt": estimator.last_view_weights if estimator.last_view_weights is not None else torch.empty(0),
+                "residual_risk_view_scores.pt": estimator.last_view_scores if estimator.last_view_scores is not None else torch.empty(0),
+                "residual_risk_selector_checkpoint.pt": estimator.state_dict_payload(),
             }
-            router_artifacts.update(
-                {
-                    "residual_risk_selector_manifest": selector_manifest,
-                    "residual_risk_selector_metrics": router_metrics,
-                    "residual_risk_scores.pt": torch.tensor(risk_manifest["risk_score"], dtype=torch.float32),
-                    "residual_risk_view_weights.pt": estimator.last_view_weights if estimator.last_view_weights is not None else torch.empty(0),
-                    "residual_risk_view_scores.pt": estimator.last_view_scores if estimator.last_view_scores is not None else torch.empty(0),
-                    "residual_risk_selector_checkpoint.pt": estimator.state_dict_payload(),
-                }
-            )
+        )
         return bundle, router_artifacts, router_budget_rows
 
     @staticmethod
@@ -2287,20 +4544,13 @@ class StageRunner:
                 return value
         return None
 
-    def _build_login_uncertainty_router_bundle(self):
+    def _build_login_uncertainty_router_bundle(self, stage_dir):
         context = self.ensure_backbone_context()
         frozen = context["frozen_g0"]
         gnn_outputs = context["gnn_outputs"]
         budgets = self._router_budgets()
         estimator = build_estimator("login_uncertainty_router")
-        mc_dropout_logits = self._first_available_tensor(
-            gnn_outputs,
-            ("mc_dropout_logits", "dropout_logits", "logits_mc", "mc_logits"),
-        )
-        mc_dropout_probs = self._first_available_tensor(
-            gnn_outputs,
-            ("mc_dropout_probs", "dropout_probs", "prob_mc", "mc_probs"),
-        )
+        logits_list, aux_runs_manifest = self._build_or_load_login_uncertainty_logits_list(stage_dir)
         labels = torch.tensor(self.labels, dtype=torch.long)
         estimator.fit(
             logits=gnn_outputs.get("logits"),
@@ -2309,8 +4559,8 @@ class StageRunner:
             train_idx=self.data["train_idx"],
             val_idx=self.data["valid_idx"],
             test_idx=self.data["test_idx"],
-            mc_dropout_logits=mc_dropout_logits,
-            mc_dropout_probs=mc_dropout_probs,
+            logits_list=logits_list,
+            budgets=budgets,
         )
         risk_manifest = estimator.build_manifest(
             logits=gnn_outputs.get("logits"),
@@ -2318,8 +4568,7 @@ class StageRunner:
             labels=labels,
             val_idx=self.data["valid_idx"],
             test_idx=self.data["test_idx"],
-            mc_dropout_logits=mc_dropout_logits,
-            mc_dropout_probs=mc_dropout_probs,
+            logits_list=logits_list,
             budgets=budgets,
         )
         frozen_manifest = frozen.get("manifest", {})
@@ -2327,8 +4576,8 @@ class StageRunner:
         risk_manifest["calibration_metadata"] = {
             **risk_manifest.get("calibration_metadata", {}),
             "source": "login_uncertainty_router",
-            "paper_identity": "LOGIN-style Uncertainty Hard-Node Router",
-            "paper_identity_risk": "medium_until_official_code_verified",
+            "paper_identity": "LOGIN_init Node-Selection Uncertainty Router",
+            "paper_identity_risk": "uncertainty_submodule_only",
             "promotion_rule": "ablation_only_never_canonical",
             "simteg_like_input": "phase_a_cached_semantic_embedding_to_frozen_gnn",
             "semantic_source": feature_manifest.get("source", "unknown"),
@@ -2337,29 +4586,60 @@ class StageRunner:
             "gnn_backbone": frozen_manifest.get("backbone", getattr(self.args, "GNN_model", "unknown")),
             "frozen_g0_manifest": str(Path(frozen["dir"]) / "manifest.json"),
             "split_provenance": frozen_manifest.get("split_provenance", {}),
-            "mc_dropout_available": bool(estimator.mc_dropout_available),
-            "official_code_verified": False,
-            "official_code_source": "https://github.com/QiaoYRan/LOGIN_init",
-            "official_code_verification_note": "Repository URL was provided, but implementation files were not locally available in this run.",
+            "official_code_verified": True,
+            "official_repo_path": r"G:\Research\BotDetection\LOGIN_init",
+            "official_submodule_scope": "node_selection_uncertainty_only",
+            "official_formula": "var(stack(logits_list), dim=0).sum(dim=1)",
+            "official_selection_contract": "global_topk_by_pl_rate",
+            "official_drop_out_list": [0.5, 0.5, 0.5, 0.5, 0.5],
+            "official_pl_rate": 0.1,
+            "full_LOGIN_loop": False,
+            "prompt_llm": False,
+            "feature_update": False,
+            "edge_pruning": False,
+            "analysis_reference_posterior_source": "frozen_g0_current_run",
+            "best_index_unused": True,
+            "auxiliary_budget_analysis": True,
+            "auxiliary_runs_manifest_path": str(Path(stage_dir) / "login_uncertainty_aux_runs.json"),
+            "logits_list_shape": [int(item) for item in logits_list.shape],
         }
         bundle = self._bundle_from_risk_manifest("login_uncertainty_router", risk_manifest)
         test_idx = _idx_numpy(self.data["test_idx"])
         probs = gnn_outputs["prob"].detach().cpu()
         wrong = (probs.argmax(dim=1).numpy() != self.labels).astype(np.int32)
         risk_score = np.asarray(risk_manifest["risk_score"], dtype=np.float32)
+        official_pl_mask = np.asarray(risk_manifest.get("official_pl_mask", np.zeros(len(self.labels), dtype=bool)), dtype=bool)
         login_budget_rows = router_budget_curve(wrong[test_idx], risk_score[test_idx], budgets=budgets)
+        official_test_mask = official_pl_mask & self.test_mask
+        official_test_selected = int(official_test_mask.sum())
+        base_wrong_total = int(wrong[test_idx].sum())
+        official_wrong_hits = int(wrong[official_test_mask].sum()) if official_test_selected else 0
+        official_precision = float(official_wrong_hits / official_test_selected) if official_test_selected else 0.0
+        random_error_rate = float(wrong[test_idx].mean()) if test_idx.size else 0.0
+        official_error_recall = float(official_wrong_hits / base_wrong_total) if base_wrong_total else 0.0
+        official_lift = float(official_precision / random_error_rate) if random_error_rate > 0 else 0.0
         login_metrics = {
             "validation": risk_manifest.get("validation_metrics", {}),
             "test": risk_manifest.get("test_metrics", {}),
             "budget_curve": login_budget_rows,
-            "mc_dropout_available": bool(estimator.mc_dropout_available),
-            "official_code_verified": False,
+            "official_selection": {
+                "selection_contract": "global_topk_by_pl_rate",
+                "pl_rate": 0.1,
+                "global_selected_count": int(official_pl_mask.sum()),
+                "test_selected_count": official_test_selected,
+                "test_wrong_hits": official_wrong_hits,
+                "test_error_recall": official_error_recall,
+                "test_precision": official_precision,
+                "test_lift": official_lift,
+            },
+            "official_code_verified": True,
+            "auxiliary_budget_analysis": True,
         }
         login_manifest = {
-            "contract": "login_uncertainty_router_v1",
+            "contract": "login_uncertainty_router_v2",
             "estimator_mode": "login_uncertainty_router",
-            "target": "Stage 1 base detector failure probability",
-            "training_label": "z_i = 1[base_gnn_prediction != y_i]",
+            "target": "official_LOGIN_init_uncertainty_score",
+            "training_label": "none_official_logit_variance_selector",
             "input_boundary": risk_manifest["calibration_metadata"].get("input_boundary", {}),
             "simteg_like_input": "phase_a_cached_semantic_embedding_to_frozen_gnn",
             "semantic_source": risk_manifest["calibration_metadata"].get("semantic_source"),
@@ -2367,19 +4647,34 @@ class StageRunner:
             "screening_only": True,
             "diagnosis_or_action": False,
             "llm_call": False,
-            "login_scope": "hard_node_selection_only",
-            "mc_dropout_available": bool(estimator.mc_dropout_available),
-            "official_code_verified": False,
-            "official_code_source": "https://github.com/QiaoYRan/LOGIN_init",
-            "official_code_verification_note": "Repository URL was provided, but implementation files were not locally available in this run.",
+            "login_scope": "node_selection_uncertainty_only",
+            "official_code_verified": True,
+            "official_repo_path": r"G:\Research\BotDetection\LOGIN_init",
+            "official_submodule_scope": "node_selection_uncertainty_only",
+            "official_formula": "var(stack(logits_list), dim=0).sum(dim=1)",
+            "official_selection_contract": "global_topk_by_pl_rate",
+            "official_drop_out_list": [0.5, 0.5, 0.5, 0.5, 0.5],
+            "official_pl_rate": 0.1,
+            "full_LOGIN_loop": False,
+            "prompt_llm": False,
+            "feature_update": False,
+            "edge_pruning": False,
+            "auxiliary_budget_analysis": True,
+            "analysis_reference_posterior_source": "frozen_g0_current_run",
+            "best_index_unused": True,
             "frozen_g0_manifest": str(Path(frozen["dir"]) / "manifest.json"),
             "budgets": [float(item) for item in budgets],
+            "official_pl_mask_count": int(official_pl_mask.sum()),
+            "official_pl_mask_test_count": official_test_selected,
         }
         login_artifacts = {
             "login_router_manifest": login_manifest,
             "login_router_metrics": login_metrics,
             "login_router_scores.pt": torch.tensor(risk_score, dtype=torch.float32),
             "login_router_checkpoint.pt": estimator.state_dict_payload(),
+            "login_uncertainty_logits_list.pt": logits_list.detach().cpu().float(),
+            "login_uncertainty_official_mask.pt": torch.tensor(official_pl_mask, dtype=torch.bool),
+            "login_uncertainty_aux_runs": aux_runs_manifest,
         }
         return bundle, login_artifacts, login_budget_rows
 
@@ -2392,17 +4687,21 @@ class StageRunner:
         if labels is None:
             labels = torch.tensor(self.labels, dtype=torch.long)
         tune_idx, cal_idx, split_metadata = self._split_valid_tune_cal(labels)
+        scalar_only = estimator_mode == "posthoc_calibrated_ranker"
+        edge_index = None if scalar_only else self.data["edge_index"]
+        edge_type = None if scalar_only else self.data["edge_type"]
+        node_repr = None if scalar_only else gnn_outputs.get("node_repr")
         estimator.fit(
             logits=gnn_outputs.get("logits"),
             probs=gnn_outputs.get("prob"),
             labels=labels,
             train_idx=self.data["train_idx"],
-            val_idx=self.data["valid_idx"],
+            val_idx=cal_idx if estimator_mode == "msp_ts" else self.data["valid_idx"],
             tune_idx=tune_idx,
             cal_idx=cal_idx,
-            edge_index=self.data["edge_index"],
-            edge_type=self.data["edge_type"],
-            node_repr=gnn_outputs.get("node_repr"),
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
             budgets=budgets,
             tune_cal_split_metadata=split_metadata,
         )
@@ -2412,9 +4711,9 @@ class StageRunner:
             labels=labels,
             val_idx=self.data["valid_idx"],
             test_idx=self.data["test_idx"],
-            edge_index=self.data["edge_index"],
-            edge_type=self.data["edge_type"],
-            node_repr=gnn_outputs.get("node_repr"),
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
             budgets=budgets,
         )
         risk_manifest["calibration_metadata"] = {
@@ -2430,7 +4729,10 @@ class StageRunner:
                 "post-hoc prediction-set quality gate; no learned router head, no LLM output, "
                 "and no LM-GNN disagreement signal"
             ),
-            "tune_cal_split_metadata": split_metadata,
+            "tune_cal_split_metadata": {
+                **dict(risk_manifest.get("calibration_metadata", {}).get("tune_cal_split_metadata", {})),
+                **split_metadata,
+            },
         }
         return self._bundle_from_risk_manifest(estimator_mode, risk_manifest)
 
@@ -2500,10 +4802,14 @@ class StageRunner:
         return {"stage": self.args.stage, "best_mode": requested_mode}
 
     def _run_login_uncertainty_router_matrix(self, stage_dir, base_bundle):
-        risk_bundle, login_artifacts, login_budget_rows = self._build_login_uncertainty_router_bundle()
+        risk_bundle, login_artifacts, login_budget_rows = self._build_login_uncertainty_router_bundle(stage_dir)
         context = self.ensure_backbone_context()
         base_pred = context["gnn_outputs"]["pred"].detach().cpu().numpy()
-        triggered_mask = self._validation_frozen_high_mask(risk_bundle) & self.test_mask
+        official_pl_mask = np.asarray(
+            risk_bundle["risk_manifest"].get("official_pl_mask", np.zeros(len(self.labels), dtype=bool)),
+            dtype=bool,
+        )
+        triggered_mask = official_pl_mask & self.test_mask
         budgets = self._router_budgets()
         metrics_payload, budget_curve = self._build_metrics_payload(
             risk_bundle,
@@ -2511,7 +4817,15 @@ class StageRunner:
             base_pred,
             self.test_mask,
             triggered_mask,
-            extra_metrics={"best_p_proxy": "login_uncertainty_router"},
+            extra_metrics={
+                "best_p_proxy": "login_uncertainty_router",
+                "selection_contract": "official_global_topk_by_pl_rate",
+                "official_pl_rate": 0.1,
+                "official_selected_count_global": int(official_pl_mask.sum()),
+                "official_selected_count_test": int(triggered_mask.sum()),
+                "auxiliary_budget_analysis": True,
+                "official_selection": login_artifacts["login_router_metrics"]["official_selection"],
+            },
             budgets=budgets,
         )
         paper_bundle = self._build_stage2_paper_report(
@@ -2521,28 +4835,30 @@ class StageRunner:
             budgets,
         )
         claim_boundary = {
-            "official_code_verified": False,
-            "official_code_source": "https://github.com/QiaoYRan/LOGIN_init",
-            "implementation_status": "paper_faithful_uncertainty_router_without_official_code_parity",
-            "allowed_use": "engineering_ablation_and_smoke_only",
+            "official_code_verified": True,
+            "official_repo_path": r"G:\Research\BotDetection\LOGIN_init",
+            "official_submodule_scope": "node_selection_uncertainty_only",
+            "implementation_status": "official_uncertainty_module_reproduction_only",
+            "allowed_use": "official_node_selection_uncertainty_module_plus_local_auxiliary_budget_analysis",
             "forbidden_claims": [
-                "official_LOGIN_reproduction",
+                "full_LOGIN_reproduction",
                 "full_LOGIN_loop",
-                "SOTA_or_paper_claim",
                 "LLM_feedback_or_graph_refinement_effect",
+                "best_index_prompt_llm_feature_update_edge_pruning_reproduction",
             ],
         }
-        paper_bundle["report"]["claim_status"] = "ablation_only_official_login_code_unverified"
+        paper_bundle["report"]["claim_status"] = "official_uncertainty_module_only_not_full_login_reproduction"
         paper_bundle["report"]["claim_boundary"] = claim_boundary
-        paper_bundle["acceptance_gate"]["claim_status"] = "ablation_only_official_login_code_unverified"
+        paper_bundle["acceptance_gate"]["claim_status"] = "official_uncertainty_module_only_not_full_login_reproduction"
         paper_bundle["acceptance_gate"]["claim_boundary"] = claim_boundary
         self._write_stage2_paper_artifacts(stage_dir, paper_bundle)
         metrics_payload["stage2_acceptance_gate"] = paper_bundle["acceptance_gate"]
         metrics_payload["stage2_claim_status"] = paper_bundle["report"]["claim_status"]
         notes = [
-            "claim tested: LOGIN-style uncertainty hard-node selection from frozen Phase A GNN posterior",
-            "scope: screening only; no LLM call, no semantic feature update, no graph rewrite, no GNN retrain",
-            "official LOGIN_init code status: not locally verified in this run",
+            "claim tested: official LOGIN_init uncertainty node-selection submodule only",
+            "official formula: variance over five independently trained GNN logits, summed over class dimension",
+            "scope: selection only; prompt_LLM, feature update, edge pruning, and full LOGIN loop remain out of scope",
+            "budget_curve.csv and validation threshold are auxiliary local analysis outputs, not the official LOGIN selection contract",
         ]
         self._write_stage_outputs(
             stage_dir,
@@ -2702,217 +5018,6 @@ class StageRunner:
             "probe_features": probe_features,
         }
 
-    def _bundle_from_final_output_ranker_manifest(self, risk_manifest, mode="final_output_ranker"):
-        return {
-            "metadata": mode_metadata(mode),
-            "risk_manifest": risk_manifest,
-        }
-
-    def _ranked_budget_mask(self, risk_score, eval_mask, budget):
-        risk_score = np.asarray(risk_score, dtype=np.float32)
-        eval_mask = np.asarray(eval_mask, dtype=bool)
-        candidate_idx = np.flatnonzero(eval_mask)
-        mask = np.zeros_like(eval_mask, dtype=bool)
-        if candidate_idx.size == 0:
-            return mask
-        ranked_idx = candidate_idx[np.argsort(-risk_score[candidate_idx])]
-        k = min(max(int(candidate_idx.size * float(budget)), 1), candidate_idx.size)
-        mask[ranked_idx[:k]] = True
-        return mask
-
-    def _build_final_output_candidate_manifest(self, risk_manifest, final_outputs, budgets):
-        risk_score = np.asarray(risk_manifest["risk_score"], dtype=np.float32)
-        probs = final_outputs.get("prob")
-        if probs is None:
-            probs = torch.softmax(final_outputs["logits"].float(), dim=1)
-        probs_np = probs.detach().cpu().numpy()
-        pred_np = final_outputs.get("pred")
-        if pred_np is None:
-            pred_np = probs.argmax(dim=1)
-        pred_np = pred_np.detach().cpu().numpy()
-        candidate_idx = np.flatnonzero(self.test_mask)
-        ranked_idx = candidate_idx[np.argsort(-risk_score[candidate_idx])] if candidate_idx.size else np.asarray([], dtype=np.int64)
-        candidate_sets = {}
-        for budget in budgets:
-            budget_key = f"top_{int(round(float(budget) * 100))}pct"
-            k = min(max(int(candidate_idx.size * float(budget)), 1), candidate_idx.size) if candidate_idx.size else 0
-            selected = ranked_idx[:k]
-            candidate_sets[budget_key] = {
-                "budget": float(budget),
-                "selected_count": int(selected.size),
-                "node_ids": [int(item) for item in selected.tolist()],
-                "risk_scores": [float(risk_score[item]) for item in selected.tolist()],
-                "final_predictions": [int(pred_np[item]) for item in selected.tolist()],
-                "final_confidences": [float(probs_np[item].max()) for item in selected.tolist()],
-            }
-        return {
-            "contract": "final_output_candidate_manifest_v1",
-            "estimator_mode": "final_output_ranker",
-            "canonical_stage2": True,
-            "candidate_source": "stage1_final_outputs",
-            "budget_scope": "test_mask",
-            "budgets": [float(item) for item in budgets],
-            "ranking_key": "risk_score_desc",
-            "ranked_node_ids": [int(item) for item in ranked_idx.tolist()],
-            "candidate_sets": candidate_sets,
-            "input_boundary": risk_manifest.get("calibration_metadata", {}).get("input_boundary", {}),
-            "screening_only": True,
-            "diagnosis_or_action": False,
-        }
-
-    def _build_final_output_ranker_bundle(self, final_outputs):
-        budgets = self._final_output_ranker_budgets()
-        estimator = build_estimator("final_output_ranker")
-        labels = final_outputs.get("labels")
-        if labels is None:
-            labels = torch.tensor(self.labels, dtype=torch.long)
-        estimator.fit(
-            logits=final_outputs.get("logits"),
-            probs=final_outputs.get("prob"),
-            labels=labels,
-            train_idx=self.data["train_idx"],
-            val_idx=self.data["valid_idx"],
-        )
-        risk_manifest = estimator.build_manifest(
-            logits=final_outputs.get("logits"),
-            probs=final_outputs.get("prob"),
-            labels=labels,
-            val_idx=self.data["valid_idx"],
-            test_idx=self.data["test_idx"],
-            budgets=budgets,
-        )
-        risk_manifest["calibration_metadata"] = {
-            **risk_manifest.get("calibration_metadata", {}),
-            "source": "final_output_ranker",
-            "canonical_stage2": True,
-            "canonical_budgets": [float(item) for item in budgets],
-        }
-        ranker_manifest = {
-            "contract": "final_output_ranker_v1",
-            "estimator_mode": "final_output_ranker",
-            "canonical_stage2": True,
-            "target": "Stage 1 base detector residual failure screening",
-            "method_positioning": "GETS-inspired calibrated residual-risk ranking, not a GETS router or Graph-MoE router",
-            "training_label": "z_i = 1[stage1_final_prediction != y_i]",
-            "screening_only": True,
-            "diagnosis_or_action": False,
-            "budgets": [float(item) for item in budgets],
-            "input_boundary": risk_manifest["calibration_metadata"].get("input_boundary", {}),
-            "calibration_metadata": risk_manifest["calibration_metadata"],
-        }
-        candidate_manifest = self._build_final_output_candidate_manifest(risk_manifest, final_outputs, budgets)
-        return (
-            self._bundle_from_final_output_ranker_manifest(risk_manifest),
-            ranker_manifest,
-            candidate_manifest,
-            torch.tensor(risk_manifest["risk_score"], dtype=torch.float32),
-        )
-
-    def _build_dual_posterior_candidate_manifest(self, risk_manifest, final_outputs, lm_probs, budgets):
-        risk_score = np.asarray(risk_manifest["risk_score"], dtype=np.float32)
-        probs = final_outputs.get("prob")
-        if probs is None:
-            probs = torch.softmax(final_outputs["logits"].float(), dim=1)
-        probs_np = probs.detach().cpu().numpy()
-        lm_probs_np = lm_probs.detach().cpu().numpy()
-        pred_np = final_outputs.get("pred")
-        if pred_np is None:
-            pred_np = probs.argmax(dim=1)
-        pred_np = pred_np.detach().cpu().numpy()
-        lm_pred_np = lm_probs.argmax(dim=1).detach().cpu().numpy()
-        candidate_idx = np.flatnonzero(self.test_mask)
-        ranked_idx = candidate_idx[np.argsort(-risk_score[candidate_idx])] if candidate_idx.size else np.asarray([], dtype=np.int64)
-        candidate_sets = {}
-        for budget in budgets:
-            budget_key = f"top_{int(round(float(budget) * 100))}pct"
-            k = min(max(int(candidate_idx.size * float(budget)), 1), candidate_idx.size) if candidate_idx.size else 0
-            selected = ranked_idx[:k]
-            candidate_sets[budget_key] = {
-                "budget": float(budget),
-                "selected_count": int(selected.size),
-                "node_ids": [int(item) for item in selected.tolist()],
-                "risk_scores": [float(risk_score[item]) for item in selected.tolist()],
-                "final_predictions": [int(pred_np[item]) for item in selected.tolist()],
-                "final_confidences": [float(probs_np[item].max()) for item in selected.tolist()],
-                "lm_only_predictions": [int(lm_pred_np[item]) for item in selected.tolist()],
-                "lm_only_confidences": [float(lm_probs_np[item].max()) for item in selected.tolist()],
-            }
-        return {
-            "contract": "dual_posterior_candidate_manifest_v1",
-            "estimator_mode": "dual_posterior_ranker",
-            "canonical_stage2": False,
-            "candidate_source": "stage1_final_outputs_plus_lm_only_posterior",
-            "budget_scope": "test_mask",
-            "budgets": [float(item) for item in budgets],
-            "ranking_key": "risk_score_desc",
-            "ranked_node_ids": [int(item) for item in ranked_idx.tolist()],
-            "candidate_sets": candidate_sets,
-            "input_boundary": risk_manifest.get("calibration_metadata", {}).get("input_boundary", {}),
-            "screening_only": True,
-            "diagnosis_or_action": False,
-        }
-
-    def _build_dual_posterior_ranker_bundle(self, final_outputs):
-        budgets = self._final_output_ranker_budgets()
-        lm_bundle = self._build_or_load_lm_only_head()
-        lm_outputs = lm_bundle["outputs"]
-        lm_probs = lm_outputs.get("prob_cal", lm_outputs.get("prob"))
-        if lm_probs is None:
-            raise MissingFrozenArtifactError("dual_posterior_ranker requires frozen/lm_only_head outputs with prob_cal or prob.")
-        lm_probs = lm_probs.detach().cpu().float()
-        estimator = build_estimator("dual_posterior_ranker")
-        labels = final_outputs.get("labels")
-        if labels is None:
-            labels = torch.tensor(self.labels, dtype=torch.long)
-        estimator.fit(
-            logits=final_outputs.get("logits"),
-            probs=final_outputs.get("prob"),
-            labels=labels,
-            train_idx=self.data["train_idx"],
-            val_idx=self.data["valid_idx"],
-            lm_probs=lm_probs,
-        )
-        risk_manifest = estimator.build_manifest(
-            logits=final_outputs.get("logits"),
-            probs=final_outputs.get("prob"),
-            labels=labels,
-            val_idx=self.data["valid_idx"],
-            test_idx=self.data["test_idx"],
-            lm_probs=lm_probs,
-            budgets=budgets,
-        )
-        risk_manifest["calibration_metadata"] = {
-            **risk_manifest.get("calibration_metadata", {}),
-            "source": "dual_posterior_ranker",
-            "lm_only_head_manifest": str(self._lm_only_head_dir() / "manifest.json"),
-            "canonical_stage2": False,
-            "canonical_reference": "final_output_ranker",
-            "canonical_budgets": [float(item) for item in budgets],
-        }
-        ranker_manifest = {
-            "contract": "dual_posterior_ranker_v1",
-            "estimator_mode": "dual_posterior_ranker",
-            "canonical_stage2": False,
-            "ablation_only": True,
-            "target": "Stage 1 base detector residual failure screening",
-            "training_label": "z_i = 1[stage1_final_prediction != y_i]",
-            "screening_only": True,
-            "diagnosis_or_action": False,
-            "budgets": [float(item) for item in budgets],
-            "input_boundary": risk_manifest["calibration_metadata"].get("input_boundary", {}),
-            "calibration_metadata": risk_manifest["calibration_metadata"],
-            "lm_only_head_manifest": str(self._lm_only_head_dir() / "manifest.json"),
-            "lm_posterior_source": "frozen_lm_only_head_outputs_prob_cal_or_prob",
-        }
-        candidate_manifest = self._build_dual_posterior_candidate_manifest(risk_manifest, final_outputs, lm_probs, budgets)
-        return (
-            self._bundle_from_final_output_ranker_manifest(risk_manifest, mode="dual_posterior_ranker"),
-            ranker_manifest,
-            candidate_manifest,
-            torch.tensor(risk_manifest["risk_score"], dtype=torch.float32),
-            lm_bundle,
-        )
-
     def _stage2_probabilities(self, final_outputs):
         probs = final_outputs.get("prob")
         if probs is None:
@@ -3030,23 +5135,6 @@ class StageRunner:
             scores["logit_risk_calibrator"] = {"score": None, "metadata": calibrator_meta}
         gets_score, gets_meta = self._gets_lite_score(final_outputs)
         scores["gets_lite_graph_aware"] = {"score": gets_score, "metadata": gets_meta}
-        if lm_probs is not None:
-            lm_probs_np = lm_probs.detach().cpu().float().numpy()
-            lm_conf = lm_probs_np.max(axis=1)
-            gnn_conf = probs.max(axis=1)
-            lm_pred = lm_probs_np.argmax(axis=1)
-            gnn_pred = probs.argmax(axis=1)
-            disagreement = (lm_pred != gnn_pred).astype(np.float32)
-            score = 0.50 * (1.0 - gnn_conf) + 0.20 * (1.0 - lm_conf) + 0.20 * disagreement + 0.10 * np.abs(lm_conf - gnn_conf)
-            scores["dual_posterior_ranker"] = {
-                "score": np.clip(score, 0.0, 1.0).astype(np.float32),
-                "metadata": {"status": "available", "baseline": "LM-only posterior plus final GNN posterior disagreement"},
-            }
-        else:
-            scores["dual_posterior_ranker"] = {
-                "score": None,
-                "metadata": {"status": "not_available", "reason": "LM-only posterior artifact not loaded for this Stage 2 run"},
-            }
         return scores
 
     def _stage2_neighbor_label_masks(self, eval_mask):
@@ -3407,6 +5495,2170 @@ class StageRunner:
         if extra_artifacts:
             save_stage_artifacts(stage_dir, extra_artifacts)
 
+    def _run_glance_oracle_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        active_edge_index, active_edge_type = self._active_graph_tensors()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_oracle_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+
+        routed_masks = self._oracle_wrong_node_masks(pred_gnn.numpy())
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            active_edge_index,
+        )
+        refiner_features = torch.cat(
+            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+            dim=1,
+        )
+
+        train_idx = np.flatnonzero(routed_masks["train"])
+        valid_idx = np.flatnonzero(routed_masks["valid"])
+        test_idx = np.flatnonzero(routed_masks["test"])
+        if train_idx.size == 0:
+            raise MissingFrozenArtifactError(
+                "glance_oracle_refine found zero oracle-routed train nodes. "
+                "This upper-bound stage requires at least one train error node."
+            )
+
+        model = GlanceRefinerMLP(
+            input_dim=int(refiner_features.shape[1]),
+            hidden_dim=128,
+            activation=str(getattr(self.args, "activation", "leakyrelu")).lower(),
+            dropout=0.1,
+        )
+        model, fit_summary = self._train_glance_refiner(
+            model,
+            refiner_features[train_idx],
+            labels_t[train_idx],
+            refiner_features[valid_idx],
+            labels_t[valid_idx],
+        )
+
+        model.eval()
+        with torch.no_grad():
+            if train_idx.size > 0:
+                train_logits_ref = model(refiner_features[train_idx]).cpu()
+            else:
+                train_logits_ref = torch.empty((0, 2), dtype=torch.float32)
+            if valid_idx.size > 0:
+                valid_logits_ref = model(refiner_features[valid_idx]).cpu()
+            else:
+                valid_logits_ref = torch.empty((0, 2), dtype=torch.float32)
+            if test_idx.size > 0:
+                test_logits_ref = model(refiner_features[test_idx]).cpu()
+            else:
+                test_logits_ref = torch.empty((0, 2), dtype=torch.float32)
+
+        final_logits = logits_gnn.clone()
+        final_prob = p_gnn.clone()
+        final_pred = pred_gnn.clone()
+        if train_idx.size > 0:
+            final_logits[train_idx] = train_logits_ref
+            final_prob[train_idx] = torch.softmax(train_logits_ref, dim=1)
+            final_pred[train_idx] = train_logits_ref.argmax(dim=1)
+        if valid_idx.size > 0:
+            final_logits[valid_idx] = valid_logits_ref
+            final_prob[valid_idx] = torch.softmax(valid_logits_ref, dim=1)
+            final_pred[valid_idx] = valid_logits_ref.argmax(dim=1)
+        if test_idx.size > 0:
+            final_logits[test_idx] = test_logits_ref
+            final_prob[test_idx] = torch.softmax(test_logits_ref, dim=1)
+            final_pred[test_idx] = test_logits_ref.argmax(dim=1)
+
+        test_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), self.labels, self.test_mask)
+        routed_test_ratio = float(test_idx.size / max(int(self.test_mask.sum()), 1))
+        non_routed_test_mask = self.test_mask & ~routed_masks["test"]
+        preservation = float(
+            (final_pred.numpy()[non_routed_test_mask] == pred_gnn.numpy()[non_routed_test_mask]).mean()
+        ) if non_routed_test_mask.any() else 1.0
+
+        overall_test = _score_all(self.labels[self.test_mask], final_pred.numpy()[self.test_mask])
+        routed_test = _score_all(self.labels[test_idx], final_pred.numpy()[test_idx]) if test_idx.size else {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "bot_f1": 0.0,
+            "count": 0,
+        }
+        base_test = _score_all(self.labels[self.test_mask], pred_gnn.numpy()[self.test_mask])
+        base_wrong_count = int(test_idx.size)
+        base_correct_count = int(int(self.test_mask.sum()) - base_wrong_count)
+
+        metrics_payload = {
+            "contract": "glance_oracle_refine_metrics_v1",
+            "routing_mode": "oracle_wrong_nodes",
+            "upper_bound_only": True,
+            "not_deployable": True,
+            "overall_test": overall_test,
+            "routed_test": routed_test,
+            "base_test": base_test,
+            "non_routed_test_preservation_accuracy": preservation,
+            "routed_test_ratio": routed_test_ratio,
+            "fixed_wrong_to_right": int(test_delta["fix"]),
+            "fixed_right_to_wrong": int(test_delta["broke"]),
+            "net_gain_on_routed": int(test_delta["net"]),
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "wrong_node_fix_rate": float(test_delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+            "correct_node_break_rate": 0.0,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "oracle_routed_counts": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+                "all": int(routed_masks["all"].sum()),
+            },
+            "fit_summary": fit_summary,
+        }
+
+        manifest = {
+            "contract": "glance_oracle_refine_v1",
+            "status": "completed",
+            "routing_mode": "oracle_wrong_nodes",
+            "upper_bound_only": True,
+            "not_deployable": True,
+            "research_positioning": "error_only_oracle_upper_bound_for_correction_refiner",
+            "no_router_training": True,
+            "no_llm_generation": True,
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "semantic_stage_dir": str(semantic["dir"]),
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "graph_source": context["graph_bundle"]["source"],
+            "graph_source_root": context["graph_bundle"]["source_root"],
+            "text_encoder_identity": str(semantic["manifest"].get("lm_model", semantic["manifest"].get("semantic_backbone", "roberta_finetuned"))),
+            "refiner_architecture": {
+                "type": "oracle_glance_refiner_mlp",
+                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "hidden_dim": 128,
+                "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                "dropout": 0.1,
+                "output_dim": 2,
+                "hard_switch": True,
+            },
+            "oracle_routed_counts": metrics_payload["oracle_routed_counts"],
+        }
+        write_json(stage_dir / "manifest.json", manifest)
+        write_json(stage_dir / "metrics.json", metrics_payload)
+
+        per_node_rows = []
+        for node_idx in np.flatnonzero(self.test_mask):
+            per_node_rows.append({
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn[node_idx].item()),
+                "final_pred": int(final_pred[node_idx].item()),
+                "label": int(self.labels[node_idx]),
+                "routed": bool(routed_masks["test"][node_idx]),
+                "was_wrong_base": bool(pred_gnn[node_idx].item() != self.labels[node_idx]),
+                "is_wrong_final": bool(final_pred[node_idx].item() != self.labels[node_idx]),
+                "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+            })
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        analysis_summary = self._build_refiner_analysis_summary(per_node_rows, "oracle_wrong_nodes")
+        write_json(stage_dir / "analysis_summary.json", analysis_summary)
+
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": final_logits,
+                    "prob": final_prob,
+                    "pred": final_pred,
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "routed_masks": {key: torch.tensor(value, dtype=torch.bool) for key, value in routed_masks.items()},
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "model": model.state_dict(),
+                    "fit_summary": fit_summary,
+                },
+                "oracle_summary": {
+                    "routing_mode": "oracle_wrong_nodes",
+                    "warning": "upper bound only; routed masks use ground-truth errors in every split",
+                },
+                "analysis_summary": analysis_summary,
+                **base_bundle,
+            },
+        )
+
+        notes = [
+            "# GLANCE oracle upper bound",
+            "",
+            "This stage is an oracle upper-bound ablation.",
+            "Routed nodes are defined by ground-truth base-GNN errors within each split.",
+            "No router is trained and no generative LLM is queried.",
+            "Routed-node refinement uses semantic_finetune roberta-f embeddings with ego/1-hop/2-hop mean pooling.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_oracle_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    def _run_glance_full_graph_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        active_edge_index, active_edge_type = self._active_graph_tensors()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_full_graph_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            active_edge_index,
+        )
+        refiner_features = torch.cat(
+            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+            dim=1,
+        )
+
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        if train_idx.size == 0:
+            raise MissingFrozenArtifactError("glance_full_graph_refine requires a non-empty train_idx.")
+
+        model = GlanceRefinerMLP(
+            input_dim=int(refiner_features.shape[1]),
+            hidden_dim=128,
+            activation=str(getattr(self.args, "activation", "leakyrelu")).lower(),
+            dropout=0.1,
+        )
+        model, fit_summary = self._train_glance_refiner(
+            model,
+            refiner_features[train_idx],
+            labels_t[train_idx],
+            refiner_features[valid_idx],
+            labels_t[valid_idx],
+        )
+
+        model.eval()
+        with torch.no_grad():
+            final_logits = model(refiner_features).cpu()
+            final_prob = torch.softmax(final_logits, dim=1)
+            final_pred = final_logits.argmax(dim=1)
+
+        test_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), self.labels, self.test_mask)
+        overall_test = _score_all(self.labels[self.test_mask], final_pred.numpy()[self.test_mask])
+        base_test = _score_all(self.labels[self.test_mask], pred_gnn.numpy()[self.test_mask])
+        lm_only_test = None
+        overall_delta_vs_lm_only = None
+        lm_only_pred = None
+        if semantic.get("outputs") is not None:
+            lm_outputs = semantic["outputs"]
+            lm_prob = lm_outputs.get("prob_cal", lm_outputs.get("prob"))
+            lm_pred_t = lm_outputs.get("pred")
+            if lm_pred_t is None and lm_prob is not None:
+                lm_pred_t = lm_prob.argmax(dim=1)
+            if lm_pred_t is not None:
+                lm_only_pred = lm_pred_t.detach().cpu().long() if torch.is_tensor(lm_pred_t) else torch.tensor(lm_pred_t, dtype=torch.long)
+                lm_only_test = _score_all(self.labels[self.test_mask], lm_only_pred.numpy()[self.test_mask])
+                overall_delta_vs_lm_only = {
+                    "accuracy": float(overall_test["accuracy"] - lm_only_test["accuracy"]),
+                    "macro_f1": float(overall_test["macro_f1"] - lm_only_test["macro_f1"]),
+                    "bot_f1": float(overall_test["bot_f1"] - lm_only_test["bot_f1"]),
+                }
+
+        base_wrong_count = int((pred_gnn.numpy()[self.test_mask] != self.labels[self.test_mask]).sum())
+        base_correct_count = int(int(self.test_mask.sum()) - base_wrong_count)
+
+        metrics_payload = {
+            "contract": "glance_full_graph_refine_metrics_v1",
+            "routing_mode": "full_graph_supervised_refiner",
+            "upper_bound_only": False,
+            "not_deployable": False,
+            "overall_test": overall_test,
+            "base_test": base_test,
+            "lm_only_test": lm_only_test,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "overall_delta_vs_lm_only": overall_delta_vs_lm_only,
+            "improved_count": int(test_delta["fix"]),
+            "degraded_count": int(test_delta["broke"]),
+            "net_gain": int(test_delta["net"]),
+            "count": int(test_delta["touched"]),
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "wrong_node_fix_rate": float(test_delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+            "correct_node_break_rate": float(test_delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+            "fit_summary": fit_summary,
+            "split_scope": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+            },
+        }
+
+        manifest = {
+            "contract": "glance_full_graph_refine_v1",
+            "status": "completed",
+            "routing_mode": "full_graph_supervised_refiner",
+            "upper_bound_only": False,
+            "not_deployable": False,
+            "research_positioning": "no_router_lower_bound_router_ablation_for_refiner_diagnosis",
+            "no_router_training": True,
+            "no_llm_generation": True,
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "semantic_stage_dir": str(semantic["dir"]),
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "graph_source": context["graph_bundle"]["source"],
+            "graph_source_root": context["graph_bundle"]["source_root"],
+            "text_encoder_identity": str(semantic["manifest"].get("lm_model", semantic["manifest"].get("semantic_backbone", "roberta_finetuned"))),
+            "refiner_architecture": {
+                "type": "glance_full_graph_refiner_mlp",
+                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "hidden_dim": 128,
+                "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                "dropout": 0.1,
+                "output_dim": 2,
+                "full_graph": True,
+            },
+            "split_scope": metrics_payload["split_scope"],
+            "lm_only_reference_available": bool(lm_only_test is not None),
+            "seed_scope_note": "current local validation path is seed_1; multi-seed requires matching frozen_g0 per seed",
+        }
+        write_json(stage_dir / "manifest.json", manifest)
+        write_json(stage_dir / "metrics.json", metrics_payload)
+
+        per_node_rows = []
+        for node_idx in np.flatnonzero(self.test_mask):
+            row = {
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn[node_idx].item()),
+                "final_pred": int(final_pred[node_idx].item()),
+                "label": int(self.labels[node_idx]),
+                "routed": True,
+                "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+                "was_wrong_base": bool(pred_gnn[node_idx].item() != self.labels[node_idx]),
+                "is_wrong_final": bool(final_pred[node_idx].item() != self.labels[node_idx]),
+            }
+            if lm_only_pred is not None:
+                row["lm_only_pred"] = int(lm_only_pred[node_idx].item())
+            per_node_rows.append(row)
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        analysis_summary = self._build_refiner_analysis_summary(per_node_rows, "full_graph_supervised_refiner")
+        write_json(stage_dir / "analysis_summary.json", analysis_summary)
+
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": final_logits,
+                    "prob": final_prob,
+                    "pred": final_pred,
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "model": model.state_dict(),
+                    "fit_summary": fit_summary,
+                },
+                "refiner_summary": {
+                    "scope": "full_graph_supervised_refiner",
+                    "warning": "seed_1 local validation path uses shared LM embedding and per-seed frozen_g0 backbone",
+                },
+                "analysis_summary": analysis_summary,
+                **base_bundle,
+            },
+        )
+
+        notes = [
+            "# GLANCE full-graph refiner",
+            "",
+            "This stage trains a full-graph supervised refiner on train_idx and selects the best epoch on valid_idx.",
+            "The refiner input is [z_gnn || z_sem_0 || z_sem_1 || z_sem_2] with semantic embeddings from semantic_finetune or explicit --emb_path.",
+            "No router is trained and no generative LLM is queried.",
+            "Research positioning: no-router lower-bound / router ablation for diagnosing where the refiner helps or harms.",
+            "Current local validation path is seed_1 only; multi-seed requires matching frozen_g0 artifacts per seed.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_full_graph_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    def _run_local_conformal_prune_diag(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        gnn_outputs = context["gnn_outputs"]
+        logits_gnn = gnn_outputs.get("logits")
+        prob_gnn = gnn_outputs.get("prob")
+        pred_gnn = gnn_outputs.get("pred")
+        node_repr = gnn_outputs.get("node_repr")
+        if any(item is None for item in (logits_gnn, prob_gnn, pred_gnn, node_repr)):
+            raise MissingFrozenArtifactError(
+                "local_conformal_prune_diag requires frozen_g0 outputs with logits/prob/pred/node_repr."
+            )
+
+        edge_index = self.data.get("edge_index")
+        edge_type = self.data.get("edge_type")
+        if edge_index is None or edge_type is None:
+            raise MissingFrozenArtifactError("local_conformal_prune_diag requires graph edge_index and edge_type.")
+
+        logits_gnn = logits_gnn.detach().cpu().float()
+        prob_gnn = prob_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        node_repr = node_repr.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+        labels_np = labels_t.numpy()
+        semantic_bundle = resolve_g0_feature_bundle(self.args, self.data)
+        semantic_raw = semantic_bundle["raw_features"].detach().cpu().float()
+        semantic_norm = F.normalize(semantic_raw, p=2, dim=1, eps=1e-12)
+        similarity_gate_threshold = getattr(self.args, "local_conf_similarity_gate_threshold", None)
+        if similarity_gate_threshold is not None:
+            similarity_gate_threshold = float(similarity_gate_threshold)
+        degree_guard_enabled = not bool(getattr(self.args, "local_conf_disable_degree_guard", False))
+
+        router_bundle = self._fit_local_conformal_router(
+            logits_gnn=logits_gnn,
+            prob_gnn=prob_gnn,
+            labels_t=labels_t,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+        )
+        estimator = router_bundle["estimator"]
+        risk_manifest = router_bundle["risk_manifest"]
+        q_score = router_bundle["q_score"]
+        routed_mask = router_bundle["routed_mask"]
+        routed_budget = float(router_bundle["routed_budget"])
+        threshold = float(router_bundle["threshold"])
+
+        edge_index_cpu = edge_index.detach().cpu().long()
+        edge_type_cpu = edge_type.detach().cpu().long()
+        src_np = edge_index_cpu[0].numpy().astype(np.int64)
+        dst_np = edge_index_cpu[1].numpy().astype(np.int64)
+        rel_np = edge_type_cpu.numpy().astype(np.int64)
+        num_nodes = int(labels_t.numel())
+        num_edges = int(edge_index_cpu.size(1))
+        base_in_degree, base_out_degree = self._degree_arrays(edge_index_cpu, num_nodes)
+
+        routed_node_ids = np.flatnonzero(routed_mask)
+        routed_node_ids = np.asarray(
+            sorted(routed_node_ids.tolist(), key=lambda node_id: (-float(q_score[int(node_id)]), int(node_id))),
+            dtype=np.int64,
+        )
+        incident_edges = [[] for _ in range(num_nodes)]
+        for edge_pos, (u, v) in enumerate(zip(src_np.tolist(), dst_np.tolist())):
+            incident_edges[int(u)].append(int(edge_pos))
+            if int(v) != int(u):
+                incident_edges[int(v)].append(int(edge_pos))
+
+        edge_q_after_cache = {}
+        bucket_rows = {}
+        candidate_rows = []
+        for target_id in routed_node_ids.tolist():
+            for relation_id in (0, 1):
+                rows = []
+                for edge_pos in incident_edges[int(target_id)]:
+                    if int(rel_np[edge_pos]) != int(relation_id):
+                        continue
+                    if edge_pos not in edge_q_after_cache:
+                        cf_edge_index, cf_edge_type = self._remove_edge_at_position(edge_index_cpu, edge_type_cpu, edge_pos)
+                        q_after_all = estimator.score(
+                            logits_gnn,
+                            prob_gnn,
+                            edge_index=cf_edge_index,
+                            edge_type=cf_edge_type,
+                            node_repr=node_repr,
+                            direction_mode="incoming",
+                            relation_mode="agnostic",
+                        )
+                        edge_q_after_cache[int(edge_pos)] = {
+                            int(src_np[edge_pos]): float(q_after_all[int(src_np[edge_pos])]),
+                            int(dst_np[edge_pos]): float(q_after_all[int(dst_np[edge_pos])]),
+                        }
+                    q_after = float(edge_q_after_cache[int(edge_pos)][int(target_id)])
+                    cosine_uv = float((semantic_norm[int(src_np[edge_pos])] * semantic_norm[int(dst_np[edge_pos])]).sum().item())
+                    row = {
+                        "target_id": int(target_id),
+                        "edge": [int(src_np[edge_pos]), int(dst_np[edge_pos])],
+                        "relation": int(relation_id),
+                        "edge_pos": int(edge_pos),
+                        "q_before": float(q_score[int(target_id)]),
+                        "q_after": q_after,
+                        "delta_q": float(q_after - q_score[int(target_id)]),
+                        "cosine": cosine_uv,
+                        "similarity_gate_pass": True if similarity_gate_threshold is None else bool(cosine_uv <= similarity_gate_threshold),
+                        "selected": False,
+                        "selection_reason": None,
+                        "guard_blocked": False,
+                    }
+                    rows.append(row)
+                    candidate_rows.append(row)
+                bucket_rows[(int(target_id), int(relation_id))] = rows
+
+        conf_removed_positions = set()
+        conf_bucket_budget = {}
+        conf_in_degree = base_in_degree.copy()
+        conf_out_degree = base_out_degree.copy()
+        duplicate_attempts = 0
+        for target_id in routed_node_ids.tolist():
+            for relation_id in (0, 1):
+                rows = bucket_rows.get((int(target_id), int(relation_id)), [])
+                harmful_rows = sorted(
+                    [
+                        row
+                        for row in rows
+                        if float(row["delta_q"]) < 0.0 and bool(row["similarity_gate_pass"])
+                    ],
+                    key=lambda row: (float(row["delta_q"]), int(row["edge_pos"])),
+                )
+                selected_count = 0
+                for row in harmful_rows:
+                    edge_pos = int(row["edge_pos"])
+                    u, v = row["edge"]
+                    if edge_pos in conf_removed_positions:
+                        row["selection_reason"] = "duplicate_already_selected"
+                        duplicate_attempts += 1
+                        continue
+                    if degree_guard_enabled and (conf_out_degree[int(u)] <= 1 or conf_in_degree[int(v)] <= 1):
+                        row["guard_blocked"] = True
+                        row["selection_reason"] = "degree_guard_blocked"
+                        continue
+                    conf_removed_positions.add(edge_pos)
+                    if degree_guard_enabled:
+                        conf_out_degree[int(u)] -= 1
+                        conf_in_degree[int(v)] -= 1
+                    row["selected"] = True
+                    row["selection_reason"] = "topk_harmful"
+                    selected_count = 1
+                    break
+                conf_bucket_budget[(int(target_id), int(relation_id))] = int(selected_count)
+        for row in candidate_rows:
+            if row["selection_reason"] is None:
+                if float(row["delta_q"]) >= 0.0:
+                    row["selection_reason"] = "non_harmful_delta_q"
+                elif not bool(row["similarity_gate_pass"]):
+                    row["selection_reason"] = "similarity_gate_filtered"
+                else:
+                    row["selection_reason"] = "not_topk_harmful"
+
+        rng = np.random.default_rng(int(self.seed))
+        rand_removed_positions = set()
+        rand_in_degree = base_in_degree.copy()
+        rand_out_degree = base_out_degree.copy()
+        random_selected_rows = []
+        for target_id in routed_node_ids.tolist():
+            for relation_id in (0, 1):
+                desired = int(conf_bucket_budget.get((int(target_id), int(relation_id)), 0))
+                if desired <= 0:
+                    continue
+                rows = list(bucket_rows.get((int(target_id), int(relation_id)), []))
+                if not rows:
+                    continue
+                order = rng.permutation(len(rows))
+                picked = 0
+                for row_idx in order.tolist():
+                    row = rows[int(row_idx)]
+                    edge_pos = int(row["edge_pos"])
+                    u, v = row["edge"]
+                    if edge_pos in rand_removed_positions:
+                        continue
+                    if degree_guard_enabled and (rand_out_degree[int(u)] <= 1 or rand_in_degree[int(v)] <= 1):
+                        continue
+                    rand_removed_positions.add(edge_pos)
+                    if degree_guard_enabled:
+                        rand_out_degree[int(u)] -= 1
+                        rand_in_degree[int(v)] -= 1
+                    random_selected_rows.append(
+                        {
+                            "target_id": int(target_id),
+                            "edge": [int(u), int(v)],
+                            "relation": int(relation_id),
+                            "edge_pos": int(edge_pos),
+                            "selection_reason": "matched_local_random",
+                        }
+                    )
+                    picked += 1
+                    if picked >= desired:
+                        break
+
+        conf_edge_index, conf_edge_type = self._pruned_graph_from_removed_positions(
+            edge_index_cpu,
+            edge_type_cpu,
+            conf_removed_positions,
+        )
+        rand_edge_index, rand_edge_type = self._pruned_graph_from_removed_positions(
+            edge_index_cpu,
+            edge_type_cpu,
+            rand_removed_positions,
+        )
+        conf_zero_in, conf_zero_out = self._degree_arrays(conf_edge_index, num_nodes)
+        rand_zero_in, rand_zero_out = self._degree_arrays(rand_edge_index, num_nodes)
+
+        local_conf_context = self._rerun_frozen_g0_with_edge_override(
+            stage_dir,
+            "local_conf",
+            conf_edge_index,
+            conf_edge_type,
+        )
+        local_rand_context = self._rerun_frozen_g0_with_edge_override(
+            stage_dir,
+            "local_rand",
+            rand_edge_index,
+            rand_edge_type,
+        )
+
+        base_metrics = self._split_metrics_from_outputs(
+            context["frozen_g0"]["outputs"],
+            labels_np,
+            self.val_mask,
+            self.test_mask,
+        )
+        conf_metrics = self._split_metrics_from_outputs(
+            local_conf_context["outputs"],
+            labels_np,
+            self.val_mask,
+            self.test_mask,
+        )
+        rand_metrics = self._split_metrics_from_outputs(
+            local_rand_context["outputs"],
+            labels_np,
+            self.val_mask,
+            self.test_mask,
+        )
+
+        conf_selected_by_relation = {
+            str(relation_id): int(sum(1 for edge_pos in conf_removed_positions if int(rel_np[edge_pos]) == relation_id))
+            for relation_id in (0, 1)
+        }
+        rand_selected_by_relation = {
+            str(relation_id): int(sum(1 for edge_pos in rand_removed_positions if int(rel_np[edge_pos]) == relation_id))
+            for relation_id in (0, 1)
+        }
+        conf_selected_incident = np.zeros(num_nodes, dtype=np.int64)
+        rand_selected_incident = np.zeros(num_nodes, dtype=np.int64)
+        for edge_pos in conf_removed_positions:
+            conf_selected_incident[int(src_np[edge_pos])] += 1
+            if int(dst_np[edge_pos]) != int(src_np[edge_pos]):
+                conf_selected_incident[int(dst_np[edge_pos])] += 1
+        for edge_pos in rand_removed_positions:
+            rand_selected_incident[int(src_np[edge_pos])] += 1
+            if int(dst_np[edge_pos]) != int(src_np[edge_pos]):
+                rand_selected_incident[int(dst_np[edge_pos])] += 1
+
+        metrics_payload = {
+            "contract": "local_conformal_prune_diag_metrics_v1",
+            "q_source": "gnn_2hop_conformal_router_score",
+            "routed_budget": routed_budget,
+            "topk_per_relation": 1,
+            "base": {
+                "valid": base_metrics["valid"],
+                "test": base_metrics["test"],
+            },
+            "local_conf": {
+                "valid": conf_metrics["valid"],
+                "test": conf_metrics["test"],
+                "delta_vs_base": {
+                    "valid_accuracy": float(conf_metrics["valid"]["accuracy"] - base_metrics["valid"]["accuracy"]),
+                    "valid_macro_f1": float(conf_metrics["valid"]["macro_f1"] - base_metrics["valid"]["macro_f1"]),
+                    "test_accuracy": float(conf_metrics["test"]["accuracy"] - base_metrics["test"]["accuracy"]),
+                    "test_macro_f1": float(conf_metrics["test"]["macro_f1"] - base_metrics["test"]["macro_f1"]),
+                },
+            },
+            "local_rand": {
+                "valid": rand_metrics["valid"],
+                "test": rand_metrics["test"],
+                "delta_vs_base": {
+                    "valid_accuracy": float(rand_metrics["valid"]["accuracy"] - base_metrics["valid"]["accuracy"]),
+                    "valid_macro_f1": float(rand_metrics["valid"]["macro_f1"] - base_metrics["valid"]["macro_f1"]),
+                    "test_accuracy": float(rand_metrics["test"]["accuracy"] - base_metrics["test"]["accuracy"]),
+                    "test_macro_f1": float(rand_metrics["test"]["macro_f1"] - base_metrics["test"]["macro_f1"]),
+                },
+            },
+            "routing": {
+                "validation_threshold": threshold,
+                "routed_counts": {
+                    "train": int(routed_mask[self.train_mask].sum()),
+                    "valid": int(routed_mask[self.val_mask].sum()),
+                    "test": int(routed_mask[self.test_mask].sum()),
+                    "all": int(routed_mask.sum()),
+                },
+                "tune_cal_split_metadata": router_bundle["split_metadata"],
+            },
+            "selection": {
+                "candidate_edge_count": int(len(candidate_rows)),
+                "harmful_candidate_count": int(sum(1 for row in candidate_rows if float(row["delta_q"]) < 0.0)),
+                "negative_delta_ratio": float(sum(1 for row in candidate_rows if float(row["delta_q"]) < 0.0) / max(len(candidate_rows), 1)),
+                "selected_harmful_edge_count": int(len(conf_removed_positions)),
+                "selected_random_edge_count": int(len(rand_removed_positions)),
+                "guard_blocked_count": int(sum(1 for row in candidate_rows if bool(row["guard_blocked"]))),
+                "similarity_gate_threshold": similarity_gate_threshold,
+                "similarity_gate_filtered_count": int(sum(1 for row in candidate_rows if not bool(row["similarity_gate_pass"]))),
+                "duplicate_selected_attempts": int(duplicate_attempts),
+                "selected_edges_per_relation": conf_selected_by_relation,
+                "random_selected_edges_per_relation": rand_selected_by_relation,
+                "local_conf_zero_in_nodes_after": int((conf_zero_in == 0).sum()),
+                "local_conf_zero_out_nodes_after": int((conf_zero_out == 0).sum()),
+                "local_rand_zero_in_nodes_after": int((rand_zero_in == 0).sum()),
+                "local_rand_zero_out_nodes_after": int((rand_zero_out == 0).sum()),
+            },
+        }
+
+        manifest = {
+            "contract": "local_conformal_prune_diag_v1",
+            "status": "completed",
+            "stage": "local_conformal_prune_diag",
+            "q_source": "gnn_2hop_conformal_router_score",
+            "routed_budget": routed_budget,
+            "topk_per_relation": 1,
+            "candidate_scope": "1hop_incident_edges",
+            "relation_split": [0, 1],
+            "counterfactual_retrain": False,
+            "propagation_retrain": "frozen_g0_after_edge_selection",
+            "structural_guard": "no_zero_in_or_zero_out" if degree_guard_enabled else "disabled",
+            "similarity_gate_threshold": similarity_gate_threshold,
+            "test_labels_used_for_threshold": False,
+            "oracle_labels_used": False,
+            "diagnostic_only": True,
+            "direction_mode": "incoming",
+            "relation_mode": "agnostic",
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "local_conf_frozen_g0_dir": str(local_conf_context["dir"]),
+            "local_rand_frozen_g0_dir": str(local_rand_context["dir"]),
+            "local_conf_graph_edge_index_path": str(stage_dir / "local_conf_edge_index.pt"),
+            "local_conf_graph_edge_type_path": str(stage_dir / "local_conf_edge_type.pt"),
+            "local_rand_graph_edge_index_path": str(stage_dir / "local_rand_edge_index.pt"),
+            "local_rand_graph_edge_type_path": str(stage_dir / "local_rand_edge_type.pt"),
+            "routing_threshold_valid": threshold,
+            "tune_cal_split_metadata": router_bundle["split_metadata"],
+            "risk_manifest_summary": {
+                "thresholds": risk_manifest.get("thresholds"),
+                "calibration_metadata": risk_manifest.get("calibration_metadata"),
+            },
+        }
+        write_json(stage_dir / "manifest.json", manifest)
+        write_json(stage_dir / "metrics.json", metrics_payload)
+
+        selected_rows_sorted = sorted(
+            candidate_rows,
+            key=lambda row: (
+                int(row["target_id"]),
+                int(row["relation"]),
+                float(row["delta_q"]),
+                int(row["edge_pos"]),
+            ),
+        )
+        write_text(
+            stage_dir / "selected_edges.jsonl",
+            "\n".join(json.dumps({
+                "target_id": int(row["target_id"]),
+                "edge": [int(row["edge"][0]), int(row["edge"][1])],
+                "relation": int(row["relation"]),
+                "q_before": float(row["q_before"]),
+                "q_after": float(row["q_after"]),
+                "delta_q": float(row["delta_q"]),
+                "selected": bool(row["selected"]),
+                "selection_reason": str(row["selection_reason"]),
+                "guard_blocked": bool(row["guard_blocked"]),
+                "cosine": float(row["cosine"]),
+                "similarity_gate_pass": bool(row["similarity_gate_pass"]),
+            }, ensure_ascii=True, sort_keys=True) for row in selected_rows_sorted)
+            + ("\n" if selected_rows_sorted else ""),
+        )
+
+        per_node_rows = []
+        for node_idx in np.flatnonzero(self.test_mask):
+            per_node_rows.append(
+                {
+                    "node_id": int(node_idx),
+                    "label": int(labels_np[node_idx]),
+                    "routed": bool(routed_mask[node_idx]),
+                    "q_score": float(q_score[node_idx]),
+                    "base_pred": int(base_metrics["pred"][node_idx]),
+                    "local_conf_pred": int(conf_metrics["pred"][node_idx]),
+                    "local_rand_pred": int(rand_metrics["pred"][node_idx]),
+                    "base_correct": bool(base_metrics["pred"][node_idx] == labels_np[node_idx]),
+                    "local_conf_correct": bool(conf_metrics["pred"][node_idx] == labels_np[node_idx]),
+                    "local_rand_correct": bool(rand_metrics["pred"][node_idx] == labels_np[node_idx]),
+                    "conf_selected_incident_edges": int(conf_selected_incident[node_idx]),
+                    "rand_selected_incident_edges": int(rand_selected_incident[node_idx]),
+                }
+            )
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "labels": labels_t,
+                    "q_score": torch.tensor(q_score, dtype=torch.float32),
+                    "routed_mask": torch.tensor(routed_mask, dtype=torch.bool),
+                    "base_pred": torch.tensor(base_metrics["pred"], dtype=torch.long),
+                    "local_conf_pred": torch.tensor(conf_metrics["pred"], dtype=torch.long),
+                    "local_rand_pred": torch.tensor(rand_metrics["pred"], dtype=torch.long),
+                    "local_conf_removed_edge_pos": torch.tensor(sorted(conf_removed_positions), dtype=torch.long),
+                    "local_rand_removed_edge_pos": torch.tensor(sorted(rand_removed_positions), dtype=torch.long),
+                },
+                "local_conf_edge_index.pt": conf_edge_index,
+                "local_conf_edge_type.pt": conf_edge_type,
+                "local_rand_edge_index.pt": rand_edge_index,
+                "local_rand_edge_type.pt": rand_edge_type,
+                "risk_manifest": risk_manifest,
+                "random_selection_summary": {
+                    "selected_edges": random_selected_rows,
+                },
+                **base_bundle,
+            },
+        )
+        write_text(
+            stage_dir / "notes.md",
+            "\n".join(
+                [
+                    "# Local conformal prune diagnostic",
+                    "",
+                    "This stage fits gnn_2hop_conformal on the original frozen_g0 posterior.",
+                    "Routed nodes are selected by a validation-locked 10% threshold on router_score.",
+                    "For each routed node and each relation bucket, incident edges are tested with single-edge counterfactual delta_q = q(G-e) - q(G).",
+                    "Only top-1 harmful edges with delta_q < 0 are deleted for the local conformal graph; matched local random uses the same routed buckets and structural guard.",
+                    f"Degree guard enabled: {degree_guard_enabled}.",
+                    f"Similarity gate threshold: {similarity_gate_threshold}.",
+                    "Propagation validation is performed by retraining frozen_g0 on the edited graph only.",
+                ]
+            )
+            + "\n",
+        )
+        return {
+            "stage": "local_conformal_prune_diag",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    @staticmethod
+    def _node_cross_entropy_vector(prob, labels):
+        prob_t = prob.detach().cpu().float() if torch.is_tensor(prob) else torch.tensor(prob, dtype=torch.float32)
+        labels_t = labels.detach().cpu().long() if torch.is_tensor(labels) else torch.tensor(labels, dtype=torch.long)
+        row = torch.arange(labels_t.numel(), dtype=torch.long)
+        return (-torch.log(prob_t[row, labels_t].clamp_min(1e-8))).cpu()
+
+    @staticmethod
+    def _budget_key(budget):
+        return int(round(float(budget) * 100))
+
+    def _build_counterfactual_budget_rows(
+        self,
+        budgets,
+        risk_score,
+        pred_gnn,
+        pred_refiner,
+        labels_np,
+        eval_idx,
+        prob_gnn,
+        prob_refiner,
+    ):
+        risk_score = np.asarray(risk_score, dtype=np.float64)
+        pred_gnn_np = np.asarray(pred_gnn, dtype=np.int64)
+        pred_ref_np = np.asarray(pred_refiner, dtype=np.int64)
+        labels_np = np.asarray(labels_np, dtype=np.int64)
+        eval_idx = np.asarray(eval_idx, dtype=np.int64)
+        prob_gnn_t = prob_gnn.detach().cpu().float() if torch.is_tensor(prob_gnn) else torch.tensor(prob_gnn, dtype=torch.float32)
+        prob_ref_t = prob_refiner.detach().cpu().float() if torch.is_tensor(prob_refiner) else torch.tensor(prob_refiner, dtype=torch.float32)
+
+        order = eval_idx[np.argsort(-risk_score[eval_idx])] if eval_idx.size else np.asarray([], dtype=np.int64)
+        base_eval = _score_all(labels_np[eval_idx], pred_gnn_np[eval_idx]) if eval_idx.size else {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "bot_f1": 0.0,
+            "count": 0,
+        }
+        base_wrong_count = int((pred_gnn_np[eval_idx] != labels_np[eval_idx]).sum()) if eval_idx.size else 0
+        base_correct_count = int(eval_idx.size - base_wrong_count)
+        rows = []
+        payloads = {}
+        for budget in parse_budget_list(budgets):
+            k = min(max(int(eval_idx.size * float(budget)), 1), eval_idx.size) if eval_idx.size else 0
+            routed = order[:k]
+            routed_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            routed_mask[routed] = True
+            final_pred = pred_gnn_np.copy()
+            final_pred[routed] = pred_ref_np[routed]
+            test_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            test_mask[eval_idx] = True
+            delta = _delta_table(pred_gnn_np, final_pred, labels_np, test_mask)
+            routed_delta = _delta_table(pred_gnn_np, final_pred, labels_np, routed_mask)
+            final_eval = _score_all(labels_np[eval_idx], final_pred[eval_idx]) if eval_idx.size else dict(base_eval)
+            row = {
+                "budget": float(budget),
+                "routed_count": int(k),
+                "fix": int(delta["fix"]),
+                "break": int(delta["broke"]),
+                "net": int(delta["net"]),
+                "routed_fix": int(routed_delta["fix"]),
+                "routed_break": int(routed_delta["broke"]),
+                "routed_net": int(routed_delta["net"]),
+                "wrong_node_fix_rate": float(delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+                "correct_node_break_rate": float(delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+                "accuracy": float(final_eval["accuracy"]),
+                "macro_f1": float(final_eval["macro_f1"]),
+                "bot_f1": float(final_eval["bot_f1"]),
+                "delta_accuracy": float(final_eval["accuracy"] - base_eval["accuracy"]),
+                "delta_macro_f1": float(final_eval["macro_f1"] - base_eval["macro_f1"]),
+                "delta_bot_f1": float(final_eval["bot_f1"] - base_eval["bot_f1"]),
+                "mean_base_confidence_routed": float(prob_gnn_t[routed].max(dim=1).values.mean().item()) if k else 0.0,
+                "mean_refiner_confidence_routed": float(prob_ref_t[routed].max(dim=1).values.mean().item()) if k else 0.0,
+            }
+            rows.append(row)
+            payloads[str(self._budget_key(budget))] = {
+                "metrics": final_eval,
+                "delta_vs_base": {
+                    "accuracy": row["delta_accuracy"],
+                    "macro_f1": row["delta_macro_f1"],
+                    "bot_f1": row["delta_bot_f1"],
+                },
+                "routed_node_ids": [int(item) for item in routed.tolist()],
+                "final_pred": torch.tensor(final_pred, dtype=torch.long),
+                "routed_mask": torch.tensor(routed_mask, dtype=torch.bool),
+            }
+        return rows, payloads
+
+    def _load_glance_counterfactual_router_artifact(self):
+        manifest = self._require_stage_json("glance_counterfactual_router", "manifest")
+        metrics = self._require_stage_json("glance_counterfactual_router", "metrics")
+        comparison = self._read_stage_json("glance_counterfactual_router", "comparison")
+        risk_manifest = self._require_stage_json("glance_counterfactual_router", "risk_manifest")
+        outputs = self._require_stage_tensor("glance_counterfactual_router", "outputs")
+        router_scores = outputs.get("risk_score")
+        if router_scores is None:
+            raise MissingFrozenArtifactError(
+                "glance_counterfactual_router outputs.pt must contain risk_score for budgeted refine."
+            )
+        def _read_budget_curve_rows(filename):
+            budget_curve_path = self.experiment_root / "stages" / "glance_counterfactual_router" / filename
+            if not budget_curve_path.exists():
+                return []
+            import csv
+            with open(budget_curve_path, "r", encoding="utf-8") as handle:
+                return list(csv.DictReader(handle))
+        return {
+            "manifest": manifest,
+            "metrics": metrics,
+            "comparison": comparison,
+            "risk_manifest": risk_manifest,
+            "outputs": outputs,
+            "router_scores": router_scores,
+            "budget_curve_rows": _read_budget_curve_rows("budget_curve.csv"),
+            "valid_budget_curve_rows": _read_budget_curve_rows("valid_budget_curve.csv"),
+            "test_budget_curve_rows": _read_budget_curve_rows("test_budget_curve.csv"),
+        }
+
+    def _run_glance_counterfactual_router(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        refiner_artifact = self._load_glance_refiner_artifact()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_counterfactual_router requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+        labels_np = labels_t.numpy()
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            self.data.get("edge_index"),
+        )
+        if train_idx.size == 0:
+            raise MissingFrozenArtifactError("glance_counterfactual_router requires a non-empty train_idx.")
+        ref_outputs = refiner_artifact["outputs"]
+        prob_ref = ref_outputs.get("prob")
+        pred_ref = ref_outputs.get("pred")
+        logits_ref = ref_outputs.get("logits")
+        if prob_ref is None or pred_ref is None:
+            raise MissingFrozenArtifactError(
+                f"{refiner_artifact['stage_name']} outputs must include 'prob' and 'pred' for counterfactual routing."
+            )
+        prob_ref = prob_ref.detach().cpu().float() if torch.is_tensor(prob_ref) else torch.tensor(prob_ref, dtype=torch.float32)
+        pred_ref = pred_ref.detach().cpu().long() if torch.is_tensor(pred_ref) else torch.tensor(pred_ref, dtype=torch.long)
+        logits_ref = logits_ref.detach().cpu().float() if torch.is_tensor(logits_ref) else (
+            torch.log(prob_ref.clamp_min(1e-8)) if logits_ref is None else torch.tensor(logits_ref, dtype=torch.float32)
+        )
+
+        gnn_loss = self._node_cross_entropy_vector(p_gnn, labels_t)
+        refiner_loss = self._node_cross_entropy_vector(prob_ref, labels_t)
+        gnn_correct = pred_gnn.eq(labels_t).float()
+        refiner_correct = pred_ref.eq(labels_t).float()
+        advantage = (gnn_loss - refiner_loss - float(getattr(self.args, "glance_llm_query_cost", 0.2))).numpy()
+
+        budgets = self._router_budgets()
+        router = GlanceForContextResidualRiskSelector(
+            budgets=budgets,
+            training_objective="glance_advantage",
+            llm_query_cost=float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+        )
+        router.fit(
+            logits_gnn,
+            p_gnn,
+            labels_t,
+            train_idx=train_idx,
+            val_idx=valid_idx,
+            edge_index=self.data.get("edge_index"),
+            edge_type=self.data.get("edge_type"),
+            node_repr=z_gnn,
+            fit_idx=train_idx,
+            gnn_loss=gnn_loss,
+            llm_loss=refiner_loss,
+            gnn_correct=gnn_correct,
+            llm_correct=refiner_correct,
+            training_objective="glance_advantage",
+            llm_query_cost=float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+        )
+        risk_manifest = router.build_manifest(
+            logits_gnn,
+            p_gnn,
+            labels_t,
+            val_idx=valid_idx,
+            test_idx=test_idx,
+            edge_index=self.data.get("edge_index"),
+            edge_type=self.data.get("edge_type"),
+            node_repr=z_gnn,
+            q_probs=p_gnn,
+            gnn_loss=gnn_loss,
+            llm_loss=refiner_loss,
+            gnn_correct=gnn_correct,
+            llm_correct=refiner_correct,
+            training_objective="glance_advantage",
+            llm_query_cost=float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+        )
+        risk_score = np.asarray(risk_manifest["risk_score"], dtype=np.float32)
+        calibration_metadata = dict(risk_manifest.get("calibration_metadata", {}))
+        split_audit = {
+            "train_count": int(train_idx.size),
+            "valid_count": int(valid_idx.size),
+            "test_count": int(test_idx.size),
+            "train_valid_overlap": int(np.intersect1d(train_idx, valid_idx).size),
+            "train_test_overlap": int(np.intersect1d(train_idx, test_idx).size),
+            "valid_test_overlap": int(np.intersect1d(valid_idx, test_idx).size),
+        }
+        calibration_metadata.update({
+            "source": "glance_counterfactual_router",
+            "paper_identity": "GLANCE-inspired counterfactual advantage router",
+            "paper_faithful_glance_inspired": True,
+            "official_code_verified": False,
+            "counterfactual_outcome_used": True,
+            "llm_counterfactual_outcome_used": True,
+            "not_a_new_bot_classifier": True,
+            "risk_score_semantics": "expected_refiner_advantage_score_not_gnn_error_probability",
+            "test_labels_used_for_training": False,
+            "test_labels_used_for_threshold": False,
+            "train_target": "1[loss_gnn - loss_refiner - cost > 0]",
+            "refiner_input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "split_audit": split_audit,
+            "counterfactual_source_refiner": refiner_artifact["stage_name"],
+        })
+        risk_manifest["calibration_metadata"] = calibration_metadata
+
+        valid_budget_rows, valid_budget_payloads = self._build_counterfactual_budget_rows(
+            budgets=budgets,
+            risk_score=risk_score,
+            pred_gnn=pred_gnn.numpy(),
+            pred_refiner=pred_ref.numpy(),
+            labels_np=labels_np,
+            eval_idx=valid_idx,
+            prob_gnn=p_gnn,
+            prob_refiner=prob_ref,
+        )
+        test_budget_rows, test_budget_payloads = self._build_counterfactual_budget_rows(
+            budgets=budgets,
+            risk_score=risk_score,
+            pred_gnn=pred_gnn.numpy(),
+            pred_refiner=pred_ref.numpy(),
+            labels_np=labels_np,
+            eval_idx=test_idx,
+            prob_gnn=p_gnn,
+            prob_refiner=prob_ref,
+        )
+        base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx])
+        full_refiner_test = _score_all(labels_np[test_idx], pred_ref.numpy()[test_idx])
+        full_delta = _delta_table(pred_gnn.numpy(), pred_ref.numpy(), labels_np, self.test_mask)
+        base_wrong_count = int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum())
+        base_correct_count = int(test_idx.size - base_wrong_count)
+        selected_valid_row, best_key, valid_rows_by_key = self._select_best_budget_row(valid_budget_rows)
+        test_rows_by_key = {str(self._budget_key(item["budget"])): item for item in test_budget_rows}
+        selected_test_row = test_rows_by_key.get(best_key) if best_key is not None else None
+        best_payload = test_budget_payloads.get(best_key, {}) if best_key is not None else {}
+        best_final_pred = best_payload.get("final_pred", pred_gnn)
+        best_routed_mask = best_payload.get("routed_mask", torch.zeros_like(pred_gnn, dtype=torch.bool))
+
+        metrics_payload = {
+            "contract": "glance_counterfactual_router_metrics_v1",
+            "routing_mode": "glance_counterfactual_advantage",
+            "paper_faithful_glance_inspired": True,
+            "official_code_verified": False,
+            "test_labels_used_for_training": False,
+            "test_labels_used_for_threshold": False,
+            "base_test": base_test,
+            "full_refiner_test": full_refiner_test,
+            "full_refiner_delta_vs_base": {
+                "accuracy": float(full_refiner_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(full_refiner_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(full_refiner_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "full_refiner_fix_break": {
+                "fix": int(full_delta["fix"]),
+                "break": int(full_delta["broke"]),
+                "net": int(full_delta["net"]),
+                "wrong_node_fix_rate": float(full_delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+                "correct_node_break_rate": float(full_delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+            },
+            "selected_budget_source": "valid",
+            "selected_budget": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "selected_budget_valid": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "selected_budget_key": best_key,
+            "selected_valid_budget_metrics": selected_valid_row,
+            "selected_test_budget_metrics_under_valid_choice": selected_test_row,
+            "selected_budget_metrics": selected_test_row,
+            "overall_delta_vs_base_gnn": selected_test_row and {
+                "accuracy": float(selected_test_row["delta_accuracy"]),
+                "macro_f1": float(selected_test_row["delta_macro_f1"]),
+                "bot_f1": float(selected_test_row["delta_bot_f1"]),
+            },
+            "wrong_node_fix_rate": float(selected_test_row["wrong_node_fix_rate"]) if selected_test_row else 0.0,
+            "correct_node_break_rate": float(selected_test_row["correct_node_break_rate"]) if selected_test_row else 0.0,
+            "improved_count": int(selected_test_row["fix"]) if selected_test_row else 0,
+            "degraded_count": int(selected_test_row["break"]) if selected_test_row else 0,
+            "net_gain": int(selected_test_row["net"]) if selected_test_row else 0,
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "budget_curve": test_budget_rows,
+            "budget_curve_legacy_scope": "test_sweep_diagnostic_only",
+            "valid_budget_curve": valid_budget_rows,
+            "test_budget_curve": test_budget_rows,
+            "counterfactual_refiner_fit_summary": refiner_artifact["checkpoint"].get("fit_summary", {}),
+            "router_training_summary": router.training_summary,
+            "split_scope": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+            },
+        }
+        manifest = {
+            "contract": "glance_counterfactual_router_v1",
+            "status": "completed",
+            "routing_mode": "glance_counterfactual_advantage",
+            "paper_faithful_glance_inspired": True,
+            "diagnostic_lane_only": True,
+            "official_code_verified": False,
+            "not_official_reproduction": True,
+            "test_labels_used_for_training": False,
+            "test_labels_used_for_threshold": False,
+            "selected_budget_source": "valid",
+            "counterfactual_outcome_used": True,
+            "not_a_new_bot_classifier": True,
+            "research_positioning": "paper_faithful_glance_inspired_counterfactual_router_for_refiner_utility",
+            "no_llm_generation": True,
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "semantic_stage_dir": str(semantic["dir"]),
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "counterfactual_source_refiner": refiner_artifact["stage_name"],
+            "counterfactual_source_refiner_manifest": refiner_artifact["manifest"],
+            "router_training_target": "1[loss_gnn - loss_refiner - cost > 0]",
+            "glance_llm_query_cost": float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+            "budgets": [float(item) for item in budgets],
+            "selected_budget": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "selected_budget_valid": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "split_audit": split_audit,
+            "refiner_architecture": {
+                "type": str(refiner_artifact["manifest"].get("refiner_architecture", {}).get("type", "external_refiner")),
+                "input": str(refiner_artifact["manifest"].get("refiner_architecture", {}).get("input", "external_refiner_input")),
+                "hidden_dim": refiner_artifact["manifest"].get("refiner_architecture", {}).get("hidden_dim"),
+                "activation": refiner_artifact["manifest"].get("refiner_architecture", {}).get("activation"),
+                "dropout": refiner_artifact["manifest"].get("refiner_architecture", {}).get("dropout"),
+                "output_dim": int(logits_gnn.shape[1]),
+            },
+        }
+        write_json(stage_dir / "manifest.json", manifest)
+        write_json(stage_dir / "metrics.json", metrics_payload)
+        write_json(stage_dir / "risk_manifest.json", risk_manifest)
+        budget_payload_json = {}
+        budget_payload_tensors = {}
+        for budget_key, payload in test_budget_payloads.items():
+            budget_payload_json[budget_key] = {
+                "metrics": payload["metrics"],
+                "delta_vs_base": payload["delta_vs_base"],
+                "routed_node_ids": payload["routed_node_ids"],
+            }
+            budget_payload_tensors[f"budget_payload_{budget_key}.pt"] = {
+                "final_pred": payload["final_pred"],
+                "routed_mask": payload["routed_mask"],
+                "routed_node_ids": torch.tensor(payload["routed_node_ids"], dtype=torch.long),
+            }
+        write_json(stage_dir / "budget_payloads.json", budget_payload_json)
+        write_csv_rows(
+            stage_dir / "budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            test_budget_rows,
+        )
+        write_csv_rows(
+            stage_dir / "valid_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            valid_budget_rows,
+        )
+        write_csv_rows(
+            stage_dir / "test_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            test_budget_rows,
+        )
+
+        per_node_rows = []
+        best_routed_np = best_routed_mask.detach().cpu().numpy().astype(bool)
+        best_final_np = best_final_pred.detach().cpu().numpy().astype(np.int64)
+        gnn_loss_np = gnn_loss.numpy()
+        ref_loss_np = refiner_loss.numpy()
+        for node_idx in test_idx.tolist():
+            base_correct = bool(pred_gnn[node_idx].item() == int(labels_np[node_idx]))
+            ref_correct = bool(pred_ref[node_idx].item() == int(labels_np[node_idx]))
+            final_correct = bool(best_final_np[node_idx] == int(labels_np[node_idx]))
+            per_node_rows.append({
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn[node_idx].item()),
+                "refiner_pred": int(pred_ref[node_idx].item()),
+                "final_pred": int(best_final_np[node_idx]),
+                "label": int(labels_np[node_idx]),
+                "routed": bool(best_routed_np[node_idx]),
+                "advantage_score": float(risk_score[node_idx]),
+                "oracle_advantage": float(advantage[node_idx]),
+                "base_loss": float(gnn_loss_np[node_idx]),
+                "refiner_loss": float(ref_loss_np[node_idx]),
+                "base_correct": base_correct,
+                "refiner_correct": ref_correct,
+                "final_correct": final_correct,
+                "fix": bool((not base_correct) and final_correct),
+                "break": bool(base_correct and (not final_correct)),
+                "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+            })
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "base_logits": logits_gnn,
+                    "base_prob": p_gnn,
+                    "base_pred": pred_gnn,
+                    "refiner_logits": logits_ref,
+                    "refiner_prob": prob_ref,
+                    "refiner_pred": pred_ref,
+                    "final_pred": best_final_pred,
+                    "labels": labels_t,
+                    "risk_score": torch.tensor(risk_score, dtype=torch.float32),
+                    "selected_routed_mask": best_routed_mask,
+                    "gnn_loss": gnn_loss,
+                    "refiner_loss": refiner_loss,
+                    "oracle_advantage": torch.tensor(advantage, dtype=torch.float32),
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "counterfactual_source_refiner": refiner_artifact["stage_name"],
+                    "counterfactual_source_refiner_fit_summary": refiner_artifact["checkpoint"].get("fit_summary", {}),
+                    "router_state": router.state_dict_payload(),
+                },
+                "risk_manifest": risk_manifest,
+                "valid_budget_curve": valid_budget_rows,
+                "test_budget_curve": test_budget_rows,
+                "budget_payloads": budget_payload_json,
+                **budget_payload_tensors,
+                **base_bundle,
+            },
+        )
+        notes = [
+            "# GLANCE counterfactual router",
+            "",
+            "This stage is a diagnostic utility-selector lane, not the main strict GLANCE baseline.",
+            "It is a paper-faithful GLANCE-inspired adaptation for offline routed-set analysis, not an official reproduction.",
+            "The router is trained on train-split counterfactual refiner advantage: loss_gnn - loss_refiner - query_cost.",
+            "Budget sweeps are computed on both validation and test, but the final operating budget is selected on validation only and then locked for test reporting.",
+            "No generative LLM is queried; semantic views come from cached/fine-tuned RoBERTa embeddings.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_counterfactual_router",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    def _run_glance_refiner_analysis(self, stage_dir, base_bundle):
+        oracle_metrics = self._require_stage_json("glance_oracle_refine", "metrics")
+        oracle_manifest = self._require_stage_json("glance_oracle_refine", "manifest")
+        oracle_rows = self._require_stage_jsonl("glance_oracle_refine", "per_node_test")
+        full_metrics = self._require_stage_json("glance_full_graph_refine", "metrics")
+        full_manifest = self._require_stage_json("glance_full_graph_refine", "manifest")
+        full_rows = self._require_stage_jsonl("glance_full_graph_refine", "per_node_test")
+        budgeted_metrics = self._read_stage_json("glance_budgeted_refine", "metrics")
+        budgeted_manifest = self._read_stage_json("glance_budgeted_refine", "manifest")
+        budgeted_rows = self._require_stage_jsonl("glance_budgeted_refine", "per_node_test") if budgeted_metrics and budgeted_manifest else []
+
+        oracle_analysis = self._build_refiner_analysis_summary(oracle_rows, "oracle_wrong_nodes")
+        full_analysis = self._build_refiner_analysis_summary(full_rows, "full_graph_supervised_refiner")
+        budgeted_analysis = self._build_refiner_analysis_summary(budgeted_rows, "router_routed_fixed_budget_refiner") if budgeted_rows else None
+        comparison = {
+            "contract": "glance_refiner_analysis_v1",
+            "oracle_upper_bound": {
+                "manifest": oracle_manifest,
+                "metrics": oracle_metrics,
+                "analysis": oracle_analysis,
+            },
+            "full_graph_lower_bound": {
+                "manifest": full_manifest,
+                "metrics": full_metrics,
+                "analysis": full_analysis,
+            },
+            "budgeted_router_refine": (
+                {
+                    "manifest": budgeted_manifest,
+                    "metrics": budgeted_metrics,
+                    "analysis": budgeted_analysis,
+                }
+                if budgeted_metrics and budgeted_manifest and budgeted_analysis
+                else None
+            ),
+            "comparison_summary": {
+                "oracle_wrong_fix_rate": float(oracle_analysis["wrong_node_fix_rate"]),
+                "full_graph_wrong_fix_rate": float(full_analysis["wrong_node_fix_rate"]),
+                "full_graph_correct_break_rate": float(full_analysis["correct_node_break_rate"]),
+                "oracle_vs_full_graph_fix_gap": float(oracle_analysis["wrong_node_fix_rate"] - full_analysis["wrong_node_fix_rate"]),
+                "full_graph_net_gain": int(full_metrics.get("net_gain", 0)),
+                "budgeted_wrong_fix_rate": float(budgeted_analysis["wrong_node_fix_rate"]) if budgeted_analysis else None,
+                "budgeted_correct_break_rate": float(budgeted_analysis["correct_node_break_rate"]) if budgeted_analysis else None,
+                "budgeted_net_gain": int(budgeted_analysis["net_gain"]) if budgeted_analysis else None,
+                "budgeted_routed_wrong_coverage": float(budgeted_analysis["routed_wrong_coverage"]) if budgeted_analysis else None,
+                "budgeted_routed_wrong_precision": float(budgeted_analysis["routed_wrong_precision"]) if budgeted_analysis else None,
+                "budgeted_conditional_fix_rate_on_selected_wrong": (
+                    float(budgeted_analysis["conditional_fix_rate_on_selected_wrong"]) if budgeted_analysis else None
+                ),
+                "router_ablation_interpretation": (
+                    "oracle upper bound isolates what the correction refiner can do on true hard nodes; "
+                    "full-graph lower bound shows the cost of removing node selection; "
+                    "budgeted refine under the router-selected validation budget is the deployable operating point."
+                ),
+            },
+        }
+        write_json(stage_dir / "analysis_summary.json", comparison)
+        notes = [
+            "# GLANCE refiner analysis",
+            "",
+            "This stage compares the error-only oracle upper bound, the no-router full-graph lower bound, and the router-selected budgeted refine operating point when present.",
+            "Use the oracle stage to estimate refiner headroom on true hard nodes.",
+            "Use the full-graph stage to diagnose where a missing router causes correct nodes to be harmed.",
+            "When present, glance_budgeted_refine is interpreted under the router's validation-selected fixed budget, not a test-selected optimum.",
+            "The gap between oracle wrong-node fix rate and full-graph wrong-node fix rate is the main signal for router necessity.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "comparison": comparison,
+                **base_bundle,
+            },
+        )
+        return {
+            "stage": "glance_refiner_analysis",
+            "stage_dir": str(stage_dir),
+            "metrics": comparison["comparison_summary"],
+        }
+
+    def _run_glance_budgeted_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        router_artifact = self._load_glance_counterfactual_router_artifact()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_budgeted_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+        labels_np = labels_t.numpy()
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            self.data.get("edge_index"),
+        )
+        refiner_features = torch.cat(
+            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+            dim=1,
+        )
+
+        risk_scores = router_artifact["router_scores"].detach().cpu().numpy().astype(np.float32)
+        budgets = self._router_budgets()
+        train_order = train_idx[np.argsort(-risk_scores[train_idx])] if train_idx.size else np.asarray([], dtype=np.int64)
+        valid_order = valid_idx[np.argsort(-risk_scores[valid_idx])] if valid_idx.size else np.asarray([], dtype=np.int64)
+        test_order = test_idx[np.argsort(-risk_scores[test_idx])] if test_idx.size else np.asarray([], dtype=np.int64)
+        base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx]) if test_idx.size else {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "bot_f1": 0.0,
+            "count": 0,
+        }
+        base_wrong_count = int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()) if test_idx.size else 0
+        base_correct_count = int(test_idx.size - base_wrong_count)
+
+        budget_rows = []
+        budget_payload_json = {}
+        analysis_by_budget = {}
+        candidate_outputs_by_key = {}
+        router_selected_budget = router_artifact["metrics"].get(
+            "selected_budget_valid",
+            router_artifact["metrics"].get("selected_budget"),
+        )
+        if router_selected_budget is None:
+            raise MissingFrozenArtifactError(
+                "glance_budgeted_refine requires glance_counterfactual_router to persist a validation-selected budget."
+            )
+        router_selected_key = str(self._budget_key(router_selected_budget))
+
+        for budget in budgets:
+            train_k = min(max(int(train_idx.size * float(budget)), 1), train_idx.size) if train_idx.size else 0
+            valid_k = min(max(int(valid_idx.size * float(budget)), 1), valid_idx.size) if valid_idx.size else 0
+            test_k = min(max(int(test_idx.size * float(budget)), 1), test_idx.size) if test_idx.size else 0
+            train_routed = train_order[:train_k]
+            valid_routed = valid_order[:valid_k]
+            test_routed = test_order[:test_k]
+            if train_routed.size == 0:
+                continue
+
+            model = GlanceRefinerMLP(
+                input_dim=int(refiner_features.shape[1]),
+                hidden_dim=128,
+                activation=str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                dropout=0.1,
+            )
+            model, fit_summary = self._train_glance_refiner(
+                model,
+                refiner_features[train_routed],
+                labels_t[train_routed],
+                refiner_features[valid_routed],
+                labels_t[valid_routed],
+            )
+            model.eval()
+            with torch.no_grad():
+                train_logits_ref = model(refiner_features[train_routed]).cpu() if train_routed.size else torch.empty((0, 2), dtype=torch.float32)
+                valid_logits_ref = model(refiner_features[valid_routed]).cpu() if valid_routed.size else torch.empty((0, 2), dtype=torch.float32)
+                test_logits_ref = model(refiner_features[test_routed]).cpu() if test_routed.size else torch.empty((0, 2), dtype=torch.float32)
+
+            final_logits = logits_gnn.clone()
+            final_prob = p_gnn.clone()
+            final_pred = pred_gnn.clone()
+            if train_routed.size:
+                final_logits[train_routed] = train_logits_ref
+                final_prob[train_routed] = torch.softmax(train_logits_ref, dim=1)
+                final_pred[train_routed] = train_logits_ref.argmax(dim=1)
+            if valid_routed.size:
+                final_logits[valid_routed] = valid_logits_ref
+                final_prob[valid_routed] = torch.softmax(valid_logits_ref, dim=1)
+                final_pred[valid_routed] = valid_logits_ref.argmax(dim=1)
+            if test_routed.size:
+                final_logits[test_routed] = test_logits_ref
+                final_prob[test_routed] = torch.softmax(test_logits_ref, dim=1)
+                final_pred[test_routed] = test_logits_ref.argmax(dim=1)
+
+            test_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            test_mask[test_idx] = True
+            routed_test_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            routed_test_mask[test_routed] = True
+            delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), labels_np, test_mask)
+            routed_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), labels_np, routed_test_mask)
+            overall_test = _score_all(labels_np[test_idx], final_pred.numpy()[test_idx]) if test_idx.size else dict(base_test)
+            row = {
+                "budget": float(budget),
+                "train_routed_count": int(train_routed.size),
+                "valid_routed_count": int(valid_routed.size),
+                "test_routed_count": int(test_routed.size),
+                "fix": int(delta["fix"]),
+                "break": int(delta["broke"]),
+                "net": int(delta["net"]),
+                "routed_fix": int(routed_delta["fix"]),
+                "routed_break": int(routed_delta["broke"]),
+                "routed_net": int(routed_delta["net"]),
+                "wrong_node_fix_rate": float(delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+                "correct_node_break_rate": float(delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+                "accuracy": float(overall_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"]),
+                "delta_accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "delta_macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "delta_bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            }
+            budget_rows.append(row)
+            budget_key = str(self._budget_key(budget))
+            budget_payload_json[budget_key] = {
+                "metrics": overall_test,
+                "delta_vs_base": {
+                    "accuracy": row["delta_accuracy"],
+                    "macro_f1": row["delta_macro_f1"],
+                    "bot_f1": row["delta_bot_f1"],
+                },
+                "routed_node_ids_train": [int(item) for item in train_routed.tolist()],
+                "routed_node_ids_valid": [int(item) for item in valid_routed.tolist()],
+                "routed_node_ids_test": [int(item) for item in test_routed.tolist()],
+            }
+            per_node_rows = []
+            test_routed_np = routed_test_mask
+            for node_idx in test_idx.tolist():
+                per_node_rows.append({
+                    "node_id": int(node_idx),
+                    "base_pred": int(pred_gnn[node_idx].item()),
+                    "final_pred": int(final_pred[node_idx].item()),
+                    "label": int(labels_np[node_idx]),
+                    "routed": bool(test_routed_np[node_idx]),
+                    "was_wrong_base": bool(pred_gnn[node_idx].item() != labels_np[node_idx]),
+                    "is_wrong_final": bool(final_pred[node_idx].item() != labels_np[node_idx]),
+                    "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                    "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+                })
+            analysis_by_budget[budget_key] = self._build_refiner_analysis_summary(per_node_rows, f"budget_{budget_key}")
+            candidate_outputs_by_key[budget_key] = {
+                "budget": float(budget),
+                "logits": final_logits,
+                "prob": final_prob,
+                "pred": final_pred,
+                "model_state": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
+                "fit_summary": fit_summary,
+                "per_node_rows": per_node_rows,
+                "analysis_summary": analysis_by_budget[budget_key],
+                "row": row,
+                "routed_masks": {
+                    "train": torch.zeros(labels_t.numel(), dtype=torch.bool).scatter_(0, torch.tensor(train_routed, dtype=torch.long), True) if train_routed.size else torch.zeros(labels_t.numel(), dtype=torch.bool),
+                    "valid": torch.zeros(labels_t.numel(), dtype=torch.bool).scatter_(0, torch.tensor(valid_routed, dtype=torch.long), True) if valid_routed.size else torch.zeros(labels_t.numel(), dtype=torch.bool),
+                    "test": torch.tensor(test_routed_np, dtype=torch.bool),
+                },
+            }
+
+        if not budget_rows:
+            raise MissingFrozenArtifactError("glance_budgeted_refine could not build any budgeted routed subset.")
+
+        if router_selected_key not in candidate_outputs_by_key:
+            raise MissingFrozenArtifactError(
+                "glance_budgeted_refine could not match the router-selected validation budget "
+                f"{router_selected_budget} to a local budgeted refiner run."
+            )
+        selected_budget = float(router_selected_budget)
+        selected_key = router_selected_key
+        selected_outputs = candidate_outputs_by_key[selected_key]
+        metrics_payload = {
+            "contract": "glance_budgeted_refine_metrics_v1",
+            "routing_mode": "router_routed_fixed_budget_refiner",
+            "paper_faithful_glance_inspired": True,
+            "not_deployable": False,
+            "counterfactual_source_refiner": router_artifact["manifest"].get("counterfactual_source_refiner"),
+            "selected_budget_source": "valid",
+            "budget_source_stage": "glance_counterfactual_router",
+            "selected_budget": float(selected_budget),
+            "selected_budget_valid": float(selected_budget),
+            "selected_budget_key": selected_key,
+            "selected_budget_metrics": selected_outputs["row"],
+            "selected_test_budget_metrics_under_valid_choice": selected_outputs["row"],
+            "base_test": base_test,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(selected_outputs["row"]["delta_accuracy"]),
+                "macro_f1": float(selected_outputs["row"]["delta_macro_f1"]),
+                "bot_f1": float(selected_outputs["row"]["delta_bot_f1"]),
+            },
+            "wrong_node_fix_rate": float(selected_outputs["row"]["wrong_node_fix_rate"]),
+            "correct_node_break_rate": float(selected_outputs["row"]["correct_node_break_rate"]),
+            "improved_count": int(selected_outputs["row"]["fix"]),
+            "degraded_count": int(selected_outputs["row"]["break"]),
+            "net_gain": int(selected_outputs["row"]["net"]),
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "budget_curve": budget_rows,
+            "budget_curve_scope": "test_sweep_diagnostic_only",
+            "fit_summary": selected_outputs["fit_summary"],
+            "split_scope": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+            },
+        }
+        manifest = {
+            "contract": "glance_budgeted_refine_v1",
+            "status": "completed",
+            "routing_mode": "router_routed_fixed_budget_refiner",
+            "paper_faithful_glance_inspired": True,
+            "diagnostic_lane_only": True,
+            "not_deployable": False,
+            "research_positioning": "selector_gated_correction_refiner_under_fixed_budget",
+            "counterfactual_source_refiner": router_artifact["manifest"].get("counterfactual_source_refiner"),
+            "router_manifest": router_artifact["manifest"],
+            "budget_source_stage": "glance_counterfactual_router",
+            "selected_budget_source": "valid",
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "selected_budget": float(selected_budget),
+            "selected_budget_valid": float(selected_budget),
+            "budgets": [float(item) for item in budgets],
+            "refiner_architecture": {
+                "type": "glance_budgeted_refine_mlp",
+                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "hidden_dim": 128,
+                "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                "dropout": 0.1,
+                "output_dim": int(logits_gnn.shape[1]),
+            },
+        }
+        write_json(stage_dir / "manifest.json", manifest)
+        write_json(stage_dir / "metrics.json", metrics_payload)
+        write_json(stage_dir / "budget_payloads.json", budget_payload_json)
+        write_json(stage_dir / "analysis_summary.json", selected_outputs["analysis_summary"])
+        write_csv_rows(
+            stage_dir / "budget_curve.csv",
+            [
+                "budget",
+                "train_routed_count",
+                "valid_routed_count",
+                "test_routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+            ],
+            budget_rows,
+        )
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in selected_outputs["per_node_rows"]) + "\n",
+        )
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": selected_outputs["logits"],
+                    "prob": selected_outputs["prob"],
+                    "pred": selected_outputs["pred"],
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "routed_masks": selected_outputs["routed_masks"],
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "model": selected_outputs["model_state"],
+                    "fit_summary": selected_outputs["fit_summary"],
+                },
+                "router_budget_payloads": budget_payload_json,
+                **base_bundle,
+            },
+        )
+        notes = [
+            "# GLANCE budgeted refine",
+            "",
+            "This stage is a diagnostic routed-set correction lane, not the main strict GLANCE baseline.",
+            "It consumes routed node selections from glance_counterfactual_router and trains a routed-only correction refiner.",
+            "For each budget, the refiner is trained on train_routed(B), selected on valid_routed(B), and applied only to test_routed(B).",
+            "The final artifact is locked to the router's validation-selected budget; the per-budget curve is diagnostic only.",
+            "Non-routed nodes strictly preserve the base GNN prediction.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_budgeted_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+
+    def _run_glance_joint_router_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic_bundle = self._load_glance_semantic_source_bundle()
+        semantic = semantic_bundle["primary"]
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+        labels_np = labels_t.numpy()
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        if train_idx.size == 0 or valid_idx.size == 0 or test_idx.size == 0:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine requires non-empty train/valid/test splits."
+            )
+
+        strict_train_idx = self._strict_glance_train_idx(train_idx, cap=3000)
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            self.data.get("edge_index"),
+        )
+        refiner_features = torch.cat(
+            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+            dim=1,
+        ).detach().cpu().float()
+
+        original_node_features_bundle = self._strict_glance_original_node_features()
+        q_bundle = self._fit_strict_glance_q_probs(
+            original_node_features_bundle["features"],
+            strict_train_idx,
+            valid_idx,
+        )
+        backbone_input_features = self._strict_glance_backbone_input_features()
+        mc_bundle = self._strict_glance_mc_dropout_uncertainty(backbone_input_features)
+        router_feature_bundle = self._build_strict_glance_router_features(
+            logits_gnn=logits_gnn,
+            p_gnn=p_gnn,
+            z_gnn=z_gnn,
+            original_node_features=original_node_features_bundle["features"],
+            q_bundle=q_bundle,
+            mc_bundle=mc_bundle,
+        )
+        router_features, scaler_state = self._standardize_glance_router_features(
+            router_feature_bundle["features"],
+            strict_train_idx,
+        )
+
+        activation = str(getattr(self.args, "activation", "leakyrelu")).lower()
+        batch_size = 32
+        max_epochs = 10
+        patience = 2
+        decay_factor = 0.5
+        entropy_weight = 0.01
+        router_weight = 1.0
+        learning_rate = float(getattr(self.args, "lr_GNN", 5e-4))
+        weight_decay = float(getattr(self.args, "weight_decay_GNN", 1e-5))
+        eval_top_k = max(int(round(batch_size / 4.0)), 1)
+        beta_candidates = (0.1, 0.2, 0.3)
+
+        beta_runs = []
+        selected_beta_run = None
+        selected_beta_score = None
+        for beta in beta_candidates:
+            run = self._train_glance_joint_candidate(
+                labels_t=labels_t,
+                labels_np=labels_np,
+                train_idx=strict_train_idx,
+                valid_idx=valid_idx,
+                test_idx=test_idx,
+                logits_gnn=logits_gnn,
+                p_gnn=p_gnn,
+                pred_gnn=pred_gnn,
+                router_features=router_features,
+                refiner_features=refiner_features,
+                semantic_views=semantic_views,
+                activation=activation,
+                batch_size=batch_size,
+                max_epochs=max_epochs,
+                patience=patience,
+                decay_factor=decay_factor,
+                entropy_weight=entropy_weight,
+                router_weight=router_weight,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+                beta=float(beta),
+                eval_top_k=eval_top_k,
+            )
+            beta_runs.append(run)
+            beta_score = (float(run["valid_metrics"]["macro_f1"]), -float(run["valid_metrics"]["loss"]))
+            if selected_beta_score is None or beta_score > selected_beta_score:
+                selected_beta_score = beta_score
+                selected_beta_run = run
+
+        if selected_beta_run is None:
+            raise MissingFrozenArtifactError("glance_joint_router_refine could not select a beta on validation.")
+
+        final_run = selected_beta_run
+        selected_beta = float(final_run["beta"])
+        train_outputs = final_run["train_outputs"]
+        valid_outputs = final_run["valid_outputs"]
+        test_outputs = final_run["test_outputs"]
+        final_logits = logits_gnn.clone()
+        final_prob = p_gnn.clone()
+        final_pred = pred_gnn.clone()
+        routed_masks = {
+            "train": train_outputs["routed_mask"],
+            "valid": valid_outputs["routed_mask"],
+            "test": test_outputs["routed_mask"],
+        }
+        router_prob = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        for split_outputs in (train_outputs, valid_outputs, test_outputs):
+            split_mask = split_outputs["routed_mask"]
+            final_logits[split_mask] = split_outputs["logits"][split_mask]
+            final_prob[split_mask] = split_outputs["prob"][split_mask]
+            final_pred[split_mask] = split_outputs["pred"][split_mask]
+            router_prob = torch.maximum(router_prob, split_outputs["router_prob"])
+
+        base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx])
+        overall_test = _score_all(labels_np[test_idx], final_pred.numpy()[test_idx])
+        test_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), labels_np, self.test_mask)
+        per_node_rows = final_run["test_rows"]["rows"]
+        analysis_summary = final_run["test_rows"]["analysis"]
+
+        beta_sweep = []
+        for run in beta_runs:
+            beta_sweep.append({
+                "beta": float(run["beta"]),
+                "eval_top_k": int(run["eval_top_k"]),
+                "best_epoch": int(run["best_epoch"]),
+                "valid_accuracy": float(run["valid_metrics"]["accuracy"]),
+                "valid_macro_f1": float(run["valid_metrics"]["macro_f1"]),
+                "valid_bot_f1": float(run["valid_metrics"]["bot_f1"]),
+                "valid_loss": float(run["valid_metrics"]["loss"]),
+                "valid_routed_count": int(run["valid_metrics"]["routed_count"]),
+                "valid_query_rate": float(run["valid_metrics"]["query_rate"]),
+                "valid_net_gain": int(run["valid_rows"]["analysis"]["net_gain"]),
+                "valid_routed_wrong_precision": float(run["valid_rows"]["analysis"]["routed_wrong_precision"]),
+                "valid_routed_wrong_coverage": float(run["valid_rows"]["analysis"]["routed_wrong_coverage"]),
+                "valid_conditional_fix_rate": float(run["valid_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+                "test_accuracy": float(run["test_metrics"]["accuracy"]),
+                "test_macro_f1": float(run["test_metrics"]["macro_f1"]),
+                "test_bot_f1": float(run["test_metrics"]["bot_f1"]),
+                "test_loss": float(run["test_metrics"]["loss"]),
+                "test_routed_count": int(run["test_metrics"]["routed_count"]),
+                "test_query_rate": float(run["test_metrics"]["query_rate"]),
+                "test_net_gain": int(run["test_rows"]["analysis"]["net_gain"]),
+                "test_routed_wrong_precision": float(run["test_rows"]["analysis"]["routed_wrong_precision"]),
+                "test_routed_wrong_coverage": float(run["test_rows"]["analysis"]["routed_wrong_coverage"]),
+                "test_conditional_fix_rate": float(run["test_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+            })
+
+        metrics_payload = {
+            "contract": "glance_joint_router_refine_metrics_v1",
+            "routing_mode": "joint_topk_counterfactual_router_refiner",
+            "paper_faithful_glance_inspired": True,
+            "strict_training_protocol_alignment": True,
+            "semantic_alignment": False,
+            "not_official_reproduction": True,
+            "semantic_source_mode": semantic_bundle["mode"],
+            "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
+            "primary_semantic_manifest": semantic_bundle["primary"]["manifest"],
+            "external_frozen_g0_root": str(getattr(self.args, "external_frozen_g0_root", None) or ""),
+            "selected_beta_source": "validation",
+            "selected_beta": selected_beta,
+            "beta_candidates": [float(item) for item in beta_candidates],
+            "selected_beta_valid_metrics": final_run["valid_metrics"],
+            "selected_beta_test_metrics": final_run["test_metrics"],
+            "beta_sweep": beta_sweep,
+            "base_test": base_test,
+            "overall_test": overall_test,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "improved_count": int(test_delta["fix"]),
+            "degraded_count": int(test_delta["broke"]),
+            "net_gain": int(test_delta["net"]),
+            "wrong_node_fix_rate": float(test_delta["fix"] / max(int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+            "correct_node_break_rate": float(
+                test_delta["broke"]
+                / max(int(test_idx.size - int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum())), 1)
+            ),
+            "query_usage": {
+                "train_routed_count": int(train_outputs["routed_count"]),
+                "valid_routed_count": int(valid_outputs["routed_count"]),
+                "test_routed_count": int(test_outputs["routed_count"]),
+                "eval_top_k": int(eval_top_k),
+                "batch_size": int(batch_size),
+            },
+            "fit_summary": final_run["fit_summary"],
+        }
+        manifest = {
+            "contract": "glance_joint_router_refine_v1",
+            "status": "completed",
+            "routing_mode": "joint_topk_counterfactual_router_refiner",
+            "paper_faithful_glance_inspired": True,
+            "strict_training_protocol_alignment": True,
+            "semantic_alignment": False,
+            "not_official_reproduction": True,
+            "research_positioning": "paper_faithful_glance_training_contract_under_current_cached_semantic_encoder",
+            "selected_beta_source": "validation",
+            "selected_beta": selected_beta,
+            "beta_candidates": [float(item) for item in beta_candidates],
+            "semantic_source_mode": semantic_bundle["mode"],
+            "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
+            "semantic_source": "semantic_single_source",
+            "semantic_alignment_note": "Training protocol follows the GLANCE paper text; semantic expert remains the current cached embedding path rather than the paper's prompt-serialized LLM route.",
+            "semantic_manifest": semantic["manifest"],
+            "primary_semantic_manifest": semantic_bundle["primary"]["manifest"],
+            "external_frozen_g0_root": str(getattr(self.args, "external_frozen_g0_root", None) or ""),
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "train_node_cap": 3000,
+            "uncertainty_source": mc_bundle["source"],
+            "router_feature_family_used": list(router_feature_bundle["feature_names"]),
+            "router_architecture": {
+                "type": "logistic_router_linear_head",
+                "input_dim": int(router_features.shape[1]),
+                "feature_count": int(router_features.shape[1]),
+                "feature_family": list(router_feature_bundle["feature_names"]),
+                "scaler": scaler_state,
+            },
+            "refiner_architecture": {
+                "type": "glance_joint_refiner_mlp",
+                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "hidden_dim": 128,
+                "activation": activation,
+                "dropout": 0.1,
+                "output_dim": int(logits_gnn.shape[1]),
+                "semantic_view_mode": "legacy_inbound_khop",
+                "feature_kind": "flat_concat",
+                "semantic_view_names": ["ego", "hop1", "hop2"],
+            },
+            "training_contract": {
+                "frozen_gnn": True,
+                "frozen_semantic_encoder": True,
+                "train_router": True,
+                "train_refiner": True,
+                "batch_size": int(batch_size),
+                "max_epochs": int(max_epochs),
+                "patience": int(patience),
+                "train_node_cap": 3000,
+                "training_budget_schedule": {
+                    "k_start": int(batch_size),
+                    "k_end": int(eval_top_k),
+                    "decay_factor": float(decay_factor),
+                },
+                "router_weight": float(router_weight),
+                "entropy_weight": float(entropy_weight),
+                "beta_selection": "validation_only",
+            },
+            "q_estimator": {
+                "type": "logistic_regression",
+                "train_count": int(q_bundle["train_count"]),
+                "valid_count": int(q_bundle["valid_count"]),
+                "temperature": float(q_bundle["temperature"]),
+            },
+            "mc_dropout": {
+                "num_passes": int(mc_bundle["num_passes"]),
+                "logits_shape": list(mc_bundle["logits_shape"]),
+            },
+            "original_node_features": {
+                "path": str(original_node_features_bundle["path"]),
+                "feature_manifest": original_node_features_bundle["feature_manifest"],
+            },
+        }
+
+        write_json(stage_dir / "manifest.json", manifest)
+        write_json(stage_dir / "metrics.json", metrics_payload)
+        write_json(stage_dir / "analysis_summary.json", analysis_summary)
+        write_csv_rows(
+            stage_dir / "beta_sweep.csv",
+            [
+                "beta",
+                "eval_top_k",
+                "best_epoch",
+                "valid_accuracy",
+                "valid_macro_f1",
+                "valid_bot_f1",
+                "valid_loss",
+                "valid_routed_count",
+                "valid_query_rate",
+                "valid_net_gain",
+                "valid_routed_wrong_precision",
+                "valid_routed_wrong_coverage",
+                "valid_conditional_fix_rate",
+                "test_accuracy",
+                "test_macro_f1",
+                "test_bot_f1",
+                "test_loss",
+                "test_routed_count",
+                "test_query_rate",
+                "test_net_gain",
+                "test_routed_wrong_precision",
+                "test_routed_wrong_coverage",
+                "test_conditional_fix_rate",
+            ],
+            beta_sweep,
+        )
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": final_logits,
+                    "prob": final_prob,
+                    "pred": final_pred,
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "routed_masks": routed_masks,
+                    "router_prob": router_prob,
+                    "neighbor_count_1hop": torch.tensor(semantic_views.get("count_1hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views.get("count_2hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "router_model": final_run["router_state"],
+                    "refiner_model": final_run["refiner_state"],
+                    "fit_summary": final_run["fit_summary"],
+                    "selected_beta": selected_beta,
+                    "selected_eval_top_k": int(eval_top_k),
+                },
+                "beta_sweep": beta_sweep,
+                **base_bundle,
+            },
+        )
+        notes = [
+            "# GLANCE joint router-refiner baseline",
+            "",
+            "This stage implements a paper-text-aligned GLANCE joint router+refiner contract under the current cached semantic embedding path.",
+            "The training protocol alignment is strict; the semantic expert alignment is intentionally deferred.",
+            "The base GNN and semantic expert remain frozen; only the logistic router and the routed-node refiner MLP are trained.",
+            "Routing uses deterministic batch top-k selection with fixed K=8 at evaluation. Beta is selected on validation only from {0.1, 0.2, 0.3}.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_joint_router_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
     def _ensure_diagnostic_baseline_artifacts(self, risk_bundle):
         context = self.ensure_backbone_context()
         runtime_dir = context["runtime_dir"]
@@ -3531,190 +7783,7 @@ class StageRunner:
         )
         return {"stage": self.args.stage, "best_mode": best_mode}
 
-    def _run_final_output_ranker_matrix(self, stage_dir, base_bundle):
-        dependency = self._load_final_output_dependency()
-        final_outputs = dependency["all_node_outputs"]
-        risk_bundle, ranker_manifest, candidate_manifest, screening_scores = self._build_final_output_ranker_bundle(final_outputs)
-        budgets = self._final_output_ranker_budgets()
-        base_pred = final_outputs.get("pred")
-        if base_pred is None:
-            probs = final_outputs.get("prob")
-            if probs is None:
-                probs = torch.softmax(final_outputs["logits"].float(), dim=1)
-            base_pred = probs.argmax(dim=1)
-        base_pred = base_pred.detach().cpu().numpy()
-        triggered_mask = self._ranked_budget_mask(
-            risk_bundle["risk_manifest"]["risk_score"],
-            self.test_mask,
-            budgets[0],
-        )
-        metrics_payload, budget_curve = self._build_metrics_payload(
-            risk_bundle,
-            base_pred,
-            base_pred,
-            self.test_mask,
-            triggered_mask,
-            extra_metrics={
-                "canonical_stage2": "final_output_ranker",
-                "screening_role": "high_recall_residual_candidate_ranking",
-            },
-            budgets=budgets,
-        )
-        paper_bundle = self._build_stage2_paper_report(
-            "final_output_ranker",
-            risk_bundle,
-            final_outputs,
-            budgets,
-        )
-        self._write_stage2_paper_artifacts(stage_dir, paper_bundle)
-        metrics_payload["stage2_acceptance_gate"] = paper_bundle["acceptance_gate"]
-        metrics_payload["stage2_claim_status"] = paper_bundle["report"]["claim_status"]
-        notes = [
-            "claim tested: canonical Stage 2 high-recall residual screening from Stage 1 final outputs only",
-            "keep / kill: fixed canonical residual-risk ranker; graph-aware selectors remain calibration/ranking ablations",
-            "selector scope: screening only, no attribution, no action selection, no graph context, no LLM call",
-        ]
-        write_json(stage_dir / "metrics.json", metrics_payload)
-        write_csv_rows(
-            stage_dir / "budget_curve.csv",
-            ["budget", "triggered", "touched", "fix", "broke", "net", "utility", "screened_set_accuracy", "hcw_capture"],
-            budget_curve,
-        )
-        write_text(stage_dir / "notes.md", "\n".join(notes).strip() + "\n")
-        save_stage_artifacts(
-            stage_dir,
-            {
-                "dependency_manifest": {
-                    "stage_contract": "final_output_ranker_dependency_load_v1",
-                    "reads": [
-                        "stages/vertical_minimal/all_node_outputs.pt",
-                        "stages/vertical_minimal/survivor_manifest.json",
-                    ],
-                    "recomputed_upstream": False,
-                    "gats_required": False,
-                    "router_oof_required": False,
-                },
-                "summary": {"final_output_ranker": risk_bundle["risk_manifest"].get("validation_metrics", {})},
-                "risk_manifest": risk_bundle["risk_manifest"],
-                "stage2_paper_report": paper_bundle["report"],
-                "stage2_acceptance_gate": paper_bundle["acceptance_gate"],
-                "stage2_hard_node_subgroups": paper_bundle["subgroup_report"],
-                "final_output_ranker_manifest": ranker_manifest,
-                "candidate_manifest": candidate_manifest,
-                "screening_scores.pt": screening_scores,
-                "survivor_manifest": {
-                    "canonical_stage2": "final_output_ranker",
-                    "canonical_candidate_manifest": "candidate_manifest.json",
-                    "canonical_budgets": [float(item) for item in budgets],
-                    "stage2_paper_report": "stage2_paper_report.json",
-                    "stage2_acceptance_gate": "stage2_acceptance_gate.json",
-                    "claim_status": paper_bundle["report"]["claim_status"],
-                    "proxy_suite": ["final_output_ranker"],
-                    "ablations": ["msp_ts", "gats_faithful", "dual_posterior_ranker", "calibrated_multiview_router"],
-                },
-            },
-        )
-        return {"stage": self.args.stage, "best_mode": "final_output_ranker"}
-
-    def _run_dual_posterior_ranker_matrix(self, stage_dir, base_bundle):
-        dependency = self._load_final_output_dependency()
-        final_outputs = dependency["all_node_outputs"]
-        risk_bundle, ranker_manifest, candidate_manifest, screening_scores, lm_bundle = self._build_dual_posterior_ranker_bundle(final_outputs)
-        budgets = self._final_output_ranker_budgets()
-        base_pred = final_outputs.get("pred")
-        if base_pred is None:
-            probs = final_outputs.get("prob")
-            if probs is None:
-                probs = torch.softmax(final_outputs["logits"].float(), dim=1)
-            base_pred = probs.argmax(dim=1)
-        base_pred = base_pred.detach().cpu().numpy()
-        triggered_mask = self._ranked_budget_mask(
-            risk_bundle["risk_manifest"]["risk_score"],
-            self.test_mask,
-            budgets[0],
-        )
-        metrics_payload, budget_curve = self._build_metrics_payload(
-            risk_bundle,
-            base_pred,
-            base_pred,
-            self.test_mask,
-            triggered_mask,
-            extra_metrics={
-                "stage2_ablation": "dual_posterior_ranker",
-                "screening_role": "high_recall_residual_candidate_ranking",
-            },
-            budgets=budgets,
-        )
-        lm_outputs = lm_bundle["outputs"]
-        lm_probs = lm_outputs.get("prob_cal", lm_outputs.get("prob")).detach().cpu().float()
-        paper_bundle = self._build_stage2_paper_report(
-            "dual_posterior_ranker",
-            risk_bundle,
-            final_outputs,
-            budgets,
-            lm_probs=lm_probs,
-        )
-        self._write_stage2_paper_artifacts(stage_dir, paper_bundle)
-        metrics_payload["stage2_acceptance_gate"] = paper_bundle["acceptance_gate"]
-        metrics_payload["stage2_claim_status"] = paper_bundle["report"]["claim_status"]
-        notes = [
-            "claim tested: ablation-only Stage 2 residual screening from calibrated LM-only and final GNN posteriors",
-            "keep / kill: compare against canonical final_output_ranker before any paper-facing promotion",
-            "selector scope: screening only, no attribution, no action selection, no graph context, no LLM call",
-        ]
-        write_json(stage_dir / "metrics.json", metrics_payload)
-        write_csv_rows(
-            stage_dir / "budget_curve.csv",
-            ["budget", "triggered", "touched", "fix", "broke", "net", "utility", "screened_set_accuracy", "hcw_capture"],
-            budget_curve,
-        )
-        write_text(stage_dir / "notes.md", "\n".join(notes).strip() + "\n")
-        save_stage_artifacts(
-            stage_dir,
-            {
-                "dependency_manifest": {
-                    "stage_contract": "dual_posterior_ranker_dependency_load_v1",
-                    "reads": [
-                        "stages/vertical_minimal/all_node_outputs.pt",
-                        "stages/vertical_minimal/survivor_manifest.json",
-                        "frozen/lm_only_head/manifest.json",
-                        "frozen/lm_only_head/outputs.pt",
-                    ],
-                    "recomputed_upstream": lm_bundle.get("source") != "existing_frozen_lm_only_head",
-                    "gats_required": False,
-                    "router_oof_required": False,
-                    "lm_only_head_required": True,
-                    "lm_only_head_source": lm_bundle.get("source"),
-                    "lm_only_head_manifest": str(self._lm_only_head_dir() / "manifest.json"),
-                },
-                "summary": {"dual_posterior_ranker": risk_bundle["risk_manifest"].get("validation_metrics", {})},
-                "risk_manifest": risk_bundle["risk_manifest"],
-                "stage2_paper_report": paper_bundle["report"],
-                "stage2_acceptance_gate": paper_bundle["acceptance_gate"],
-                "stage2_hard_node_subgroups": paper_bundle["subgroup_report"],
-                "dual_posterior_ranker_manifest": ranker_manifest,
-                "candidate_manifest": candidate_manifest,
-                "dual_posterior_scores.pt": screening_scores,
-                "lm_only_head_manifest": lm_bundle["manifest"],
-                "survivor_manifest": {
-                    "canonical_stage2": "final_output_ranker",
-                    "ablation_stage2": "dual_posterior_ranker",
-                    "canonical_budgets": [float(item) for item in budgets],
-                    "stage2_paper_report": "stage2_paper_report.json",
-                    "stage2_acceptance_gate": "stage2_acceptance_gate.json",
-                    "claim_status": paper_bundle["report"]["claim_status"],
-                    "proxy_suite": ["dual_posterior_ranker"],
-                    "ablations": ["dual_posterior_ranker", "calibrated_multiview_router"],
-                },
-            },
-        )
-        return {"stage": self.args.stage, "best_mode": "dual_posterior_ranker"}
-
     def _run_estimator_matrix(self, stage_dir, base_bundle):
-        if self._final_output_ranker_requested():
-            return self._run_final_output_ranker_matrix(stage_dir, base_bundle)
-        if self._dual_posterior_ranker_requested():
-            return self._run_dual_posterior_ranker_matrix(stage_dir, base_bundle)
         if self._login_uncertainty_router_requested():
             return self._run_login_uncertainty_router_matrix(stage_dir, base_bundle)
         if self._graph_conformal_estimator_requested():
@@ -3737,16 +7806,12 @@ class StageRunner:
         router_artifacts = {}
         router_budget_rows = None
         if self._router_requested():
-            router_bundle, router_artifacts, router_budget_rows = self._build_multiview_router_bundle(load_gats_outputs(self.experiment_root))
-            router_mode_name = router_bundle["risk_manifest"].get("calibration_metadata", {}).get("source", "calibrated_multiview_router")
+            router_bundle, router_artifacts, router_budget_rows = self._build_glance_context_router_bundle(load_gats_outputs(self.experiment_root))
+            router_mode_name = router_bundle["risk_manifest"].get("calibration_metadata", {}).get("source", "glance_for_context_residual_risk_selector")
             suite[str(router_mode_name)] = router_bundle
 
         requested_mode = str(getattr(self.args, "estimator_mode", "none")).lower()
-        if requested_mode in {
-            "calibrated_multiview_router",
-            "calibrated_residual_risk_selector",
-            "glance_for_context_residual_risk_selector",
-        }:
+        if requested_mode == "glance_for_context_residual_risk_selector":
             best_mode, risk_bundle = requested_mode, suite[requested_mode]
         else:
             best_mode, risk_bundle = self._pick_best_risk_bundle(suite)
@@ -3785,11 +7850,7 @@ class StageRunner:
             f"keep / kill: current stage-local risk anchor is {best_mode}",
             "enter next main table: only if top-budget error coverage beats uncertainty baselines across seeds",
         ]
-        if best_mode in {
-            "calibrated_multiview_router",
-            "calibrated_residual_risk_selector",
-            "glance_for_context_residual_risk_selector",
-        }:
+        if best_mode == "glance_for_context_residual_risk_selector":
             notes.append("selector scope: no local rewrite, no LLM call, no raw embedding input, and no action utility in this stage")
         else:
             notes.append("selector scope: OOF graph-aware residual-risk selector not selected for this run")
@@ -3841,7 +7902,7 @@ class StageRunner:
                 ["budget", "selected_count", "error_recall", "precision", "lift", "remaining_risk"],
                 router_budget_rows,
             )
-            if best_mode in {"calibrated_residual_risk_selector", "glance_for_context_residual_risk_selector"}:
+            if best_mode == "glance_for_context_residual_risk_selector":
                 write_csv_rows(
                     stage_dir / "residual_risk_budget_curve.csv",
                     ["budget", "selected_count", "error_recall", "precision", "lift", "remaining_risk"],
@@ -3870,199 +7931,6 @@ class StageRunner:
     def _run_appendix(self, stage_dir, base_bundle, risk_bundle):
         self._strict_recompute_forbidden("_run_appendix")
 
-    def _run_eqc_v8_matrix(self, stage_dir, base_bundle):
-        """Driver for ``--stage eqc_v8_matrix``.
-
-        Executes the v8 EQC pipeline (see ``refine-logs/FINAL_PROPOSAL.md``)
-        and dispatches to one of the pre-registered experimental blocks via
-        ``--eqc_v8_block``. Stages 1-5 are constructed from the frozen Stage-0
-        backbone outputs (``h_gnn``, ``p_gnn``) and the frozen LM-head
-        outputs (``p_lm``); Stage-6 delegates to :mod:`llm_evidence_refiner`.
-
-        The ``sanity`` block runs a single-seed plumbing check (Stage-1..6
-        with the E-null variant, zero LLM calls); all other blocks implement
-        the falsification experiments described in the FINAL_PROPOSAL
-        Block-E / Block-P / Block-R / Block-L / Block-CT acceptance criteria.
-        """
-        from estimators import (
-            TwoTermEgoUncertaintyEstimator,
-            CalibratedExpectedErrorProxy,
-        )
-        from operators import (
-            IterativeStructuralTextConfirmRetriever,
-            EvidenceGraphRewriter,
-        )
-        from llm_evidence_refiner import (
-            LLMEvidenceRefiner,
-            build_block_e_encoder_specs,
-            assemble_block_e_acceptance_report,
-        )
-
-        block = str(getattr(self.args, "eqc_v8_block", "sanity"))
-        context = self.ensure_backbone_context()
-        gnn_outputs = context.get("gnn_outputs", {})
-        lm_outputs_path = self._lm_only_head_dir() / "outputs.pt"
-        if not lm_outputs_path.exists():
-            raise MissingFrozenArtifactError(
-                "v8 EQC pipeline requires a frozen LM-only head. "
-                f"Expected outputs at {lm_outputs_path}; run --stage semantic_finetune first."
-            )
-        lm_outputs = safe_torch_load(lm_outputs_path, map_location="cpu")
-
-        p_gnn = gnn_outputs.get("prob")
-        logits_gnn = gnn_outputs.get("logits")
-        if p_gnn is None and logits_gnn is None:
-            raise MissingFrozenArtifactError("Frozen GNN backbone must provide 'prob' or 'logits'.")
-        p_lm = lm_outputs.get("prob_cal", lm_outputs.get("prob"))
-        if p_lm is None:
-            raise MissingFrozenArtifactError("Frozen LM-only head must provide 'prob' or 'prob_cal'.")
-
-        labels = self.data["labels"]
-        train_idx = self.data.get("train_idx")
-        val_idx = self.data["valid_idx"]
-        test_idx = self.data["test_idx"]
-
-        estimator = TwoTermEgoUncertaintyEstimator(alpha=float(self.args.eqc_v8_alpha))
-        estimator.fit(
-            logits=logits_gnn,
-            probs=p_gnn,
-            labels=labels,
-            train_idx=train_idx,
-            val_idx=val_idx,
-            lm_probs=p_lm,
-        )
-        manifest = estimator.build_manifest(
-            logits=logits_gnn,
-            probs=p_gnn,
-            labels=labels,
-            val_idx=val_idx,
-            test_idx=test_idx,
-            lm_probs=p_lm,
-        )
-
-        q_composite = np.asarray(manifest["q_composite"], dtype=np.float64)
-        set_size = np.asarray(manifest["set_size"], dtype=np.float64)
-        budget_frac = float(getattr(self.args, "eqc_v8_hard_node_budget", 0.15))
-        num_nodes = int(q_composite.shape[0])
-        valid_mask = np.zeros(num_nodes, dtype=bool)
-        valid_mask[np.asarray(val_idx).reshape(-1)] = True
-        target_count = max(int(round(float(valid_mask.sum()) * budget_frac)), 1)
-        order = np.argsort(-q_composite[valid_mask])
-        threshold_value = float(q_composite[valid_mask][order[target_count - 1]])
-        hard_mask_all = q_composite >= threshold_value - 1e-12
-
-        # Stage-4 accept-rule: calibrated expected-error proxy (5-fold CV on valid_cal).
-        posterior_gnn_np = np.asarray(
-            p_gnn.detach().cpu().numpy() if hasattr(p_gnn, "detach") else p_gnn,
-            dtype=np.float64,
-        )
-        val_idx_np = np.asarray(val_idx, dtype=np.int64).reshape(-1)
-        labels_np = np.asarray(labels, dtype=np.int64).reshape(-1)
-        preds_np = posterior_gnn_np.argmax(axis=1)
-        calibrator = CalibratedExpectedErrorProxy(
-            n_folds=int(getattr(self.args, "eqc_v8_calibrator_folds", 5)),
-            seed=int(self.seed),
-        )
-        calibrator.fit(
-            posterior_val=posterior_gnn_np[val_idx_np],
-            q_composite_val=q_composite[val_idx_np],
-            set_size_val=set_size[val_idx_np],
-            labels_val=labels_np[val_idx_np],
-            preds_val=preds_np[val_idx_np],
-        )
-
-        stage_report = {
-            "contract": "eqc_v8_matrix_stage_report_v1",
-            "block": block,
-            "estimator_fit_summary": estimator.fit_summary,
-            "calibrator_fit_summary": calibrator.fit_summary,
-            "hard_node_budget": float(budget_frac),
-            "hard_node_count": int(hard_mask_all.sum()),
-            "threshold_q": float(threshold_value),
-        }
-
-        if block == "sanity":
-            retriever = IterativeStructuralTextConfirmRetriever(
-                max_iterations=int(self.args.eqc_v8_t_ret),
-                k_struct=int(self.args.eqc_v8_k_struct),
-                epsilon=float(self.args.eqc_v8_epsilon_stop),
-                single_pass_budget_matched=bool(self.args.eqc_v8_single_pass_budget_matched),
-            )
-            node_repr_source = next(
-                (v for v in [gnn_outputs.get("node_repr"), gnn_outputs.get("h_gnn"), context.get("x_roberta")] if v is not None),
-                None,
-            )
-            if node_repr_source is None:
-                raise MissingFrozenArtifactError("Stage-3 retrieval requires a node embedding context.")
-            retriever.fit(node_repr=node_repr_source, val_idx=val_idx)
-            rewriter = EvidenceGraphRewriter(
-                lambda_reweight=float(self.args.eqc_v8_lambda_reweight),
-                rho_stability_cap=float(self.args.eqc_v8_rho_stability_cap),
-                token_budget=int(self.args.eqc_v8_token_budget),
-            )
-            sanity_probe = LLMEvidenceRefiner(
-                spec=build_block_e_encoder_specs(include_shuffle_controls=False, include_mistral=False)[0],
-                h_gnn_dim=int(context.get("h_gnn_dim", 256)),
-                x_roberta_dim=int(context.get("x_roberta_dim", 768)),
-                seed=int(self.seed),
-            )
-            stage_report.update({
-                "retriever_fit_summary": retriever.fit_summary,
-                "rewriter_schema_version": rewriter.schema_version,
-                "stage6_probe_variant": sanity_probe.spec.name,
-                "sanity_status": "plumbing_initialized_no_linear_probe_fit",
-                "smoke_note": (
-                    "Stage-1..Stage-5 fits executed; Stage-6 linear probe is left unfit to keep "
-                    "the sanity runner compute-free. Full falsification experiments live in the "
-                    "block_e / block_p / block_r / block_l / block_ct branches."
-                ),
-            })
-        elif block == "block_e":
-            stage_report["block_e_acceptance_criterion"] = assemble_block_e_acceptance_report
-            stage_report["block_e_variants_pending"] = [
-                spec.name for spec in build_block_e_encoder_specs()
-            ]
-            stage_report["block_e_note"] = (
-                "Block-E execution is driven by an external sweep driver that varies "
-                "--eqc_v8_llm_backbone / --eqc_v8_schema_mode across the seven canonical "
-                "encoder specs; this stage call materializes only the Stage-1..5 artifacts "
-                "consumed by that sweep."
-            )
-        else:
-            stage_report["pending_block"] = block
-            stage_report["status"] = (
-                f"Block '{block}' orchestration is declared in refine-logs/FINAL_PROPOSAL.md "
-                "and scheduled for driver implementation in the experiment-queue / "
-                "run-experiment layer; Stage-1..5 artifacts persist in stage_report."
-            )
-
-        self._write_stage_outputs(
-            stage_dir,
-            None,
-            stage_report,
-            [],
-            notes_lines=[
-                "claim tested: v8 EQC Stage-1..Stage-6 plumbing + Block selection",
-                f"v8 block: {block}",
-                "stage-5 canonical schema: v1.0 (target + supportive + suspicious + uncertain + quality_summary)",
-            ],
-            extra_artifacts={
-                **base_bundle,
-                "eqc_v8_stage_report": stage_report,
-                "eqc_v8_estimator_manifest": {
-                    "risk_score": manifest["risk_score"],
-                    "prediction_sets": manifest["prediction_sets"],
-                    "set_size": manifest["set_size"],
-                    "thresholds": manifest["thresholds"],
-                    "calibration_metadata": manifest["calibration_metadata"],
-                    "q_composite_threshold": float(threshold_value),
-                    "hard_node_mask_count": int(hard_mask_all.sum()),
-                },
-            },
-            subgroup_extra={"eqc_v8_block": block},
-        )
-        return {"stage": self.args.stage, "eqc_v8_block": block}
-
     def _fail_outside_phase0_scope(self):
         require_stage_gates(self.experiment_root, self.args.stage)
         dependency_map = {
@@ -4085,14 +7953,17 @@ class StageRunner:
         stage_dir = build_stage_dir(self.experiment_root, self.args.stage)
         base_bundle = self._base_artifact_bundle()
 
+        if self.args.stage == "local_conformal_prune_diag":
+            return self._run_local_conformal_prune_diag(stage_dir, base_bundle)
+
+        if self.args.stage == "glance_joint_router_refine":
+            return self._run_glance_joint_router_refine(stage_dir, base_bundle)
+
         if self.args.stage == "vertical_minimal":
             return self._run_vertical_minimal(stage_dir, base_bundle)
 
         if self.args.stage == "estimator_matrix":
             return self._run_estimator_matrix(stage_dir, base_bundle)
-
-        if self.args.stage == "eqc_v8_matrix":
-            return self._run_eqc_v8_matrix(stage_dir, base_bundle)
 
         if self.args.stage in {
             "semantic_matrix",

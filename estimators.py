@@ -13,27 +13,15 @@ from sklearn.preprocessing import StandardScaler
 
 
 RESIDUAL_RISK_PAPER_BUDGETS = (0.10, 0.20, 0.30, 0.40)
-FINAL_OUTPUT_RANKER_BUDGETS = RESIDUAL_RISK_PAPER_BUDGETS
 
 RISK_CANDIDATE_MSP = "msp"
 RISK_CANDIDATE_ENTROPY = "entropy"
 RISK_CANDIDATE_MARGIN = "margin"
 RISK_CANDIDATE_MSP_TS = "msp_ts"
-GETS_POSTHOC_GRAPH_LOGISTIC = "gets_posthoc_graph_logistic"
-GETS_POSTHOC_MSP_GRAPH_BLEND = "gets_posthoc_msp_graph_blend"
-GETS_POSTHOC_ENTROPY_GRAPH_BLEND = "gets_posthoc_entropy_graph_blend"
 GLANCE_ROUTER_LOGISTIC = "glance_router_logistic"
 GLANCE_SOFT_HOMOPHILY_PRIOR = "glance_soft_homophily_prior"
 GLANCE_DEGREE_HOMOPHILY_PRIOR = "glance_degree_homophily_prior"
 GLANCE_UNCERTAINTY_HOMOPHILY_BLEND = "glance_uncertainty_homophily_blend"
-
-GETS_GRAPH_FEATURE_NAMES = (
-    "log_degree",
-    "sparse_degree_score",
-    "local_prediction_inconsistency",
-    "neighbor_context_gap",
-    "relation_skew",
-)
 
 GLANCE_ROUTING_STRUCTURAL_FEATURE_NAMES = (
     "glance_log_total_degree",
@@ -54,17 +42,6 @@ GLANCE_FORMULA_REFERENCE = {
     "soft_estimated_homophily": "hat_h_v = p_Q,v dot mean_{u in N_1(v)} p_Q,u",
     "router_probability": "a_v = sigmoid(w^T f_v), with fixed-budget top-k/top-B selection",
     "stage2_adaptation": "learn P(Stage1 prediction is wrong | f_v); no LLM query outcome or repair action is used",
-}
-
-RESIDUAL_RISK_VARIANT_TO_LEGACY_VIEW = {
-    "prediction_only": "router_1_pred",
-    "dual_posterior_disagreement": "router_2_disagreement",
-    "gets_lite_graph_context": "router_3_graph_context",
-    "view_ensemble": "router_4_view_ensemble",
-    "router_1_pred": "router_1_pred",
-    "router_2_disagreement": "router_2_disagreement",
-    "router_3_graph_context": "router_3_graph_context",
-    "router_4_view_ensemble": "router_4_view_ensemble",
 }
 
 STAGE2_MINIMUM_THRESHOLDS = {
@@ -90,30 +67,6 @@ STAGE2_STRONG_THRESHOLDS = {
     "auprc_error_ratio": 2.50,
     "aurc_relative_reduction": 0.10,
 }
-
-POSTERIOR_RANKER_FORBIDDEN_INPUTS = (
-    "edge_index",
-    "edge_type",
-    "node_repr",
-    "q_graph",
-    "structural_features",
-    "structural_manifest",
-    "probe_features",
-    "neighbor_context",
-    "semantic_source_outputs",
-    "raw_text",
-    "raw_semantic_embedding",
-    "embeddings",
-    "qwen_embedding",
-    "roberta_embedding",
-    "lm_embedding",
-    "gnn_embedding",
-    "hidden_states",
-    "lm_hidden_state",
-    "gnn_hidden_state",
-    "attribution_outputs",
-)
-
 
 def _to_numpy(value):
     if torch.is_tensor(value):
@@ -255,8 +208,12 @@ def build_glance_advantage_training_target(
             "target_source": target_source,
             "target_semantics": target_semantics,
             "llm_query_cost": beta,
-            "stage3_action_or_repair_outcome_used": False,
+            "stage3_action_or_repair_outcome_used": True,
             "llm_counterfactual_outcome_used": True,
+            "counterfactual_outcome_used": True,
+            "paper_faithful_glance_inspired": True,
+            "official_code_verified": False,
+            "not_a_new_bot_classifier": True,
             "fit_count": int(fit_idx_np.size),
             "positive_count": int(fit_labels.sum()) if fit_idx_np.size else 0,
         },
@@ -774,39 +731,6 @@ def _neighbor_probability_context(probs, edge_index, edge_type=None):
     return ctx, deg, relation_skew
 
 
-def build_multiview_router_features(lm_probs, gnn_probs, edge_index, edge_type=None):
-    lm_probs = _normalize_probs(lm_probs)
-    gnn_probs = _normalize_probs(gnn_probs)
-    if lm_probs.shape != gnn_probs.shape:
-        raise ValueError("LM-only and GNN calibrated probabilities must have the same shape.")
-    if lm_probs.dim() != 2 or lm_probs.size(1) != 2:
-        raise ValueError(
-            "Stage 2 residual-risk view ensemble currently expects binary probabilities shaped [num_nodes, 2]."
-        )
-
-    ctx_probs, in_degree, relation_skew = _neighbor_probability_context(gnn_probs, edge_index, edge_type=edge_type)
-    js = _js_divergence(lm_probs, gnn_probs).unsqueeze(1)
-    abs_gap = torch.abs(lm_probs - gnn_probs)
-    pred_disagree = (lm_probs.argmax(dim=1) != gnn_probs.argmax(dim=1)).float().unsqueeze(1)
-    ctx_gap = torch.abs(gnn_probs - ctx_probs)
-    lm_conf = lm_probs.max(dim=1).values.unsqueeze(1)
-    gnn_conf = gnn_probs.max(dim=1).values.unsqueeze(1)
-    degree_feature = torch.log1p(in_degree).unsqueeze(1)
-    relation_feature = relation_skew.unsqueeze(1)
-    positive_gap = torch.abs(lm_probs[:, 1:2] - gnn_probs[:, 1:2])
-
-    return {
-        "pred": torch.cat([lm_probs, gnn_probs], dim=1).float(),
-        "disc": torch.cat([abs_gap, js, pred_disagree], dim=1).float(),
-        "ctx": torch.cat([gnn_probs, ctx_probs, ctx_gap], dim=1).float(),
-        "gate": torch.cat([lm_conf, gnn_conf, js, positive_gap, degree_feature, relation_feature], dim=1).float(),
-        "context_probs": ctx_probs.float(),
-        "in_degree": in_degree.float(),
-        "relation_skew": relation_skew.float(),
-        "js_divergence": js.view(-1).float(),
-    }
-
-
 def _minmax01(values):
     values = np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     if values.size == 0:
@@ -816,147 +740,6 @@ def _minmax01(values):
     if high - low <= 1e-12:
         return np.zeros_like(values, dtype=np.float32)
     return ((values - low) / (high - low)).astype(np.float32)
-
-
-def _posterior_residual_feature_block(logits, probs):
-    """Stage 1 posterior-only residual-risk features and baseline scores."""
-    probs_t = _normalize_probs(probs)
-    logits_t = _to_tensor(logits).float().cpu()
-    probs_np = probs_t.numpy()
-    logits_np = logits_t.numpy()
-    if probs_np.ndim != 2:
-        raise ValueError("GETS-style post-hoc residual-risk features require [num_nodes, num_classes] probabilities.")
-    if logits_np.shape != probs_np.shape:
-        logits_np = np.log(np.clip(probs_np, 1e-8, 1.0))
-
-    num_nodes, num_classes = probs_np.shape
-    top2_prob = np.sort(probs_np, axis=1)[:, -2:] if num_classes >= 2 else np.repeat(probs_np, 2, axis=1)
-    top2_logits = np.sort(logits_np, axis=1)[:, -2:] if num_classes >= 2 else np.repeat(logits_np, 2, axis=1)
-    predictions = probs_np.argmax(axis=1)
-    msp_risk = 1.0 - probs_np.max(axis=1)
-    normalized_entropy = (-probs_np * np.log(np.clip(probs_np, 1e-8, 1.0))).sum(axis=1) / max(
-        math.log(max(num_classes, 2)),
-        1e-8,
-    )
-    margin = top2_prob[:, 1] - top2_prob[:, 0]
-    margin_risk = 1.0 - margin
-    logit_gap = top2_logits[:, 1] - top2_logits[:, 0]
-    max_logit = logits_np.max(axis=1)
-
-    return {
-        "probs_t": probs_t,
-        "probs_np": probs_np,
-        "predictions": predictions,
-        "columns": [msp_risk, normalized_entropy, margin_risk, logit_gap, max_logit],
-        "feature_names": ["msp_risk", "normalized_entropy", "margin_risk", "logit_gap", "max_logit"],
-        "base_scores": {
-            RISK_CANDIDATE_MSP: np.clip(msp_risk, 0.0, 1.0).astype(np.float32),
-            RISK_CANDIDATE_ENTROPY: np.clip(normalized_entropy, 0.0, 1.0).astype(np.float32),
-            RISK_CANDIDATE_MARGIN: np.clip(margin_risk, 0.0, 1.0).astype(np.float32),
-        },
-    }
-
-
-def _graph_context_residual_feature_block(probs_t, probs_np, predictions, edge_index=None, edge_type=None):
-    """Light graph-aware calibration features inspired by GNN post-hoc calibration work."""
-    num_nodes = int(probs_np.shape[0])
-    if edge_index is not None:
-        context_probs, in_degree, relation_skew = _neighbor_probability_context(probs_t, edge_index, edge_type=edge_type)
-        context_np = context_probs.numpy()
-        degree_np = in_degree.numpy()
-        relation_np = relation_skew.numpy()
-        local_support = context_np[np.arange(num_nodes), predictions]
-        local_inconsistency = 1.0 - local_support
-        context_gap = np.abs(probs_np - context_np).sum(axis=1) / 2.0
-    else:
-        degree_np = np.zeros(num_nodes, dtype=np.float32)
-        relation_np = np.zeros(num_nodes, dtype=np.float32)
-        local_inconsistency = np.zeros(num_nodes, dtype=np.float32)
-        context_gap = np.zeros(num_nodes, dtype=np.float32)
-
-    log_degree = np.log1p(degree_np)
-    return {
-        "columns": [
-            log_degree,
-            1.0 - _minmax01(log_degree),
-            local_inconsistency,
-            context_gap,
-            relation_np,
-        ],
-        "feature_names": list(GETS_GRAPH_FEATURE_NAMES),
-        "graph_feature_names": list(GETS_GRAPH_FEATURE_NAMES),
-    }
-
-
-def _dual_posterior_residual_feature_block(lm_probs, gnn_probs_t, gnn_probs_np, predictions):
-    """Optional LM-only vs final-GNN posterior disagreement features."""
-    if lm_probs is None:
-        return {"columns": [], "feature_names": []}
-
-    lm_probs_t = _normalize_probs(lm_probs)
-    lm_probs_np = lm_probs_t.numpy()
-    if lm_probs_np.shape != gnn_probs_np.shape:
-        raise ValueError("LM-only and final GNN probabilities must align for GETS-style post-hoc features.")
-
-    num_nodes, num_classes = gnn_probs_np.shape
-    lm_confidence = lm_probs_np.max(axis=1)
-    gnn_confidence = gnn_probs_np.max(axis=1)
-    js_divergence = _js_divergence(lm_probs_t, gnn_probs_t).numpy()
-    top1_disagreement = (lm_probs_np.argmax(axis=1) != predictions).astype(np.float32)
-    positive_class_gap = (
-        np.abs(lm_probs_np[:, -1] - gnn_probs_np[:, -1])
-        if num_classes >= 2
-        else np.zeros(num_nodes, dtype=np.float32)
-    )
-
-    return {
-        "columns": [
-            1.0 - lm_confidence,
-            np.abs(lm_confidence - gnn_confidence),
-            js_divergence,
-            top1_disagreement,
-            positive_class_gap,
-        ],
-        "feature_names": [
-            "lm_msp_risk",
-            "lm_gnn_confidence_gap",
-            "lm_gnn_js_divergence",
-            "lm_gnn_top1_disagreement",
-            "lm_gnn_positive_class_gap",
-        ],
-    }
-
-
-def build_gets_posthoc_residual_features(logits, probs, edge_index=None, edge_type=None, lm_probs=None):
-    """GETS-inspired post-hoc features for residual-risk calibration/ranking."""
-    posterior_block = _posterior_residual_feature_block(logits=logits, probs=probs)
-    graph_block = _graph_context_residual_feature_block(
-        probs_t=posterior_block["probs_t"],
-        probs_np=posterior_block["probs_np"],
-        predictions=posterior_block["predictions"],
-        edge_index=edge_index,
-        edge_type=edge_type,
-    )
-    dual_block = _dual_posterior_residual_feature_block(
-        lm_probs=lm_probs,
-        gnn_probs_t=posterior_block["probs_t"],
-        gnn_probs_np=posterior_block["probs_np"],
-        predictions=posterior_block["predictions"],
-    )
-
-    columns = list(posterior_block["columns"]) + list(graph_block["columns"]) + list(dual_block["columns"])
-    feature_names = (
-        list(posterior_block["feature_names"])
-        + list(graph_block["feature_names"])
-        + list(dual_block["feature_names"])
-    )
-    features = np.column_stack(columns).astype(np.float32)
-    return {
-        "features": features,
-        "feature_names": feature_names,
-        "graph_feature_names": graph_block["graph_feature_names"],
-        "base_scores": posterior_block["base_scores"],
-    }
 
 
 def _optional_node_matrix(value, num_nodes, name):
@@ -1295,19 +1078,6 @@ def _base_residual_candidate_metadata():
     }
 
 
-def _gets_graph_candidate_metadata(feature_names, graph_feature_names):
-    return {
-        "status": "available",
-        "family": "GETS_style_graph_aware_posthoc",
-        "feature_family": list(feature_names),
-        "graph_feature_family": list(graph_feature_names),
-        "fit_scope": "train_split_oof_residual_labels_only",
-        "screening_only": True,
-        "diagnosis_or_action": False,
-        "gets_inspiration": "graph-aware post-hoc calibration/ranking; not Graph-MoE action routing",
-    }
-
-
 def _one_hot_candidate_view_tensors(candidate_scores, selected_candidate):
     candidate_names = list(candidate_scores)
     view_matrix = np.column_stack([np.asarray(candidate_scores[name], dtype=np.float32) for name in candidate_names])
@@ -1315,76 +1085,6 @@ def _one_hot_candidate_view_tensors(candidate_scores, selected_candidate):
     weights = np.zeros((view_matrix.shape[0], len(candidate_names)), dtype=np.float32)
     weights[:, selected_column] = 1.0
     return candidate_names, torch.tensor(view_matrix, dtype=torch.float32), torch.tensor(weights, dtype=torch.float32)
-
-
-class _ResidualRiskViewEnsemble(nn.Module):
-    def __init__(self, pred_dim, disc_dim, ctx_dim, gate_dim, hidden_dim=16, dropout=0.0, variant="router_4_view_ensemble"):
-        super().__init__()
-        self.variant = str(variant)
-
-        def head(in_dim):
-            return nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, 1),
-            )
-
-        self.pred_head = head(pred_dim)
-        self.disc_head = head(disc_dim)
-        self.ctx_head = head(ctx_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(gate_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 3),
-        )
-
-    def forward(self, features):
-        pred_score = torch.sigmoid(self.pred_head(features["pred"]).view(-1))
-        disc_score = torch.sigmoid(self.disc_head(features["disc"]).view(-1))
-        ctx_score = torch.sigmoid(self.ctx_head(features["ctx"]).view(-1))
-        view_scores = torch.stack([pred_score, disc_score, ctx_score], dim=1)
-        gate_weights = torch.softmax(self.gate(features["gate"]), dim=1)
-
-        if self.variant == "router_1_pred":
-            weights = torch.tensor([1.0, 0.0, 0.0], device=view_scores.device).view(1, 3).expand_as(view_scores)
-        elif self.variant == "router_2_disagreement":
-            weights = torch.tensor([0.5, 0.5, 0.0], device=view_scores.device).view(1, 3).expand_as(view_scores)
-        elif self.variant == "router_3_graph_context":
-            weights = torch.full_like(view_scores, 1.0 / 3.0)
-        elif self.variant == "router_4_view_ensemble":
-            weights = gate_weights
-        else:
-            raise ValueError(f"Unsupported residual-risk view variant: {self.variant}")
-
-        score = (weights * view_scores).sum(dim=1)
-        return {
-            "score": score,
-            "view_scores": view_scores,
-            "view_weights": weights,
-            "learned_gate_weights": gate_weights,
-        }
-
-
-_RouterViewEnsemble = _ResidualRiskViewEnsemble
-
-
-def _pairwise_ranking_loss(scores, labels, margin=0.1, max_pairs=4096):
-    labels = labels.float().view(-1)
-    pos = scores[labels > 0.5]
-    neg = scores[labels <= 0.5]
-    if pos.numel() == 0 or neg.numel() == 0:
-        return scores.new_tensor(0.0)
-    if pos.numel() * neg.numel() > max_pairs:
-        pos = pos[: min(pos.numel(), int(np.sqrt(max_pairs)) + 1)]
-        neg = neg[: min(neg.numel(), int(np.sqrt(max_pairs)) + 1)]
-    losses = F.relu(float(margin) - pos.view(-1, 1) + neg.view(1, -1))
-    return losses.mean()
-
-
-def _slice_feature_dict(features, idx):
-    idx = _to_tensor(idx).long().cpu()
-    return {key: value[idx] for key, value in features.items() if torch.is_tensor(value)}
 
 
 def build_probe_features(logits, probs, edge_index, edge_type, node_repr):
@@ -1540,376 +1240,43 @@ class MSPTemperatureEstimator(BaseRiskEstimator):
         return 1.0 - scaled_probs.max(axis=1)
 
 
-class FinalOutputRanker(BaseRiskEstimator):
-    metadata = {
-        "claim_role": "stage_b_canonical_screening_ranker",
-        "stage2_role": "screening_ranker",
-        "canonical_stage2": True,
-        "scientific_gate": "stage1_final_outputs_only",
-        "paper_identity_risk": "low_if_posterior_only",
-        "promotion_rule": "canonical_fixed",
-        "input_boundary": "posterior_only_final_logits_or_probs",
-    }
-
-    _FORBIDDEN_INPUT_NAMES = POSTERIOR_RANKER_FORBIDDEN_INPUTS + ("action_outputs",)
-
-    def __init__(self, budgets=FINAL_OUTPUT_RANKER_BUDGETS):
-        super().__init__()
-        self.temperature = 1.0
-        self.budgets = parse_budget_list(budgets, default=FINAL_OUTPUT_RANKER_BUDGETS)
-        self.input_boundary_audit = self._input_boundary_audit()
-
-    @classmethod
-    def _input_boundary_audit(cls, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        supplied = {
-            "edge_index": edge_index is not None,
-            "edge_type": edge_type is not None,
-            "node_repr": node_repr is not None,
-        }
-        for name in cls._FORBIDDEN_INPUT_NAMES:
-            supplied.setdefault(name, kwargs.get(name) is not None)
-        return {
-            "allowed_inputs": [
-                "stage1_final_logits",
-                "stage1_final_probabilities",
-                "stage1_final_predictions",
-                "calibration_split_labels",
-            ],
-            "forbidden_inputs_ignored": {name: bool(supplied.get(name, False)) for name in cls._FORBIDDEN_INPUT_NAMES},
-            "raw_text": False,
-            "raw_semantic_embedding": False,
-            "qwen_embedding": False,
-            "roberta_embedding": False,
-            "gnn_hidden_state": False,
-            "edge_index_argument_ignored": bool(edge_index is not None),
-            "edge_type_argument_ignored": bool(edge_type is not None),
-            "node_repr_argument_ignored": bool(node_repr is not None),
-            "enforcement": "posterior_only_structural_ignore",
-        }
-
-    def _posterior_probabilities(self, logits=None, probs=None):
-        if logits is not None:
-            logits = _to_tensor(logits).float()
-            if logits.dim() != 2:
-                raise ValueError("final_output_ranker expects final logits shaped [num_nodes, num_classes].")
-            return F.softmax(logits / float(self.temperature), dim=1).detach().cpu().numpy()
-        if probs is None:
-            raise ValueError("final_output_ranker requires Stage 1 final logits or probabilities.")
-        probs = _normalize_probs(probs)
-        if probs.dim() != 2:
-            raise ValueError("final_output_ranker expects final probabilities shaped [num_nodes, num_classes].")
-        return probs.detach().cpu().numpy()
-
-    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        labels_np = _to_numpy(labels)
-        if labels_np.ndim > 1:
-            labels_np = labels_np.argmax(axis=1)
-        val_idx_np = _to_numpy(val_idx).astype(np.int64)
-        if logits is not None and val_idx_np.size:
-            self.temperature = fit_temperature_scaling(_to_tensor(logits)[val_idx_np], labels_np[val_idx_np])
-            calibration_source = "validation_temperature_scaled_final_logits"
-        else:
-            self.temperature = 1.0
-            calibration_source = "final_probabilities_no_temperature_fit"
-        self.input_boundary_audit = self._input_boundary_audit(
-            edge_index=edge_index,
-            edge_type=edge_type,
-            node_repr=node_repr,
-            **kwargs,
-        )
-        self.calibration_metadata = {
-            "source": "final_output_ranker",
-            "calibration_source": calibration_source,
-            "temperature": float(self.temperature),
-            "fit_scope": "validation_split_labels_only",
-            "posterior_only": True,
-            "canonical_stage2": True,
-            "stage2_role": "screening_ranker",
-            "budgets": [float(item) for item in self.budgets],
-            "input_boundary": dict(self.input_boundary_audit),
-        }
-        return self
-
-    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        posterior = self._posterior_probabilities(logits=logits, probs=probs)
-        return (1.0 - posterior.max(axis=1)).astype(np.float32)
-
-    def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        risk_score = self.score(logits, probs, edge_index=edge_index, edge_type=edge_type, node_repr=node_repr, **kwargs)
-        posterior = self._posterior_probabilities(logits=logits, probs=probs)
-        labels_np = _to_numpy(labels)
-        if labels_np.ndim > 1:
-            labels_np = labels_np.argmax(axis=1)
-        preds = posterior.argmax(axis=1)
-        wrong = (preds != labels_np).astype(np.int32)
-        val_idx_np = _to_numpy(val_idx).astype(np.int64)
-        test_idx_np = _to_numpy(test_idx).astype(np.int64)
-        if self.val_threshold is None:
-            budget = self.budgets[0] if self.budgets else FINAL_OUTPUT_RANKER_BUDGETS[0]
-            k = max(int(len(val_idx_np) * float(budget)), 1) if val_idx_np.size else 0
-            self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
-        hcw_mask = ((1.0 - posterior.max(axis=1)) < 0.1) & (wrong == 1)
-        metadata = dict(self.calibration_metadata)
-        metadata["input_boundary"] = self._input_boundary_audit(
-            edge_index=edge_index,
-            edge_type=edge_type,
-            node_repr=node_repr,
-            **kwargs,
-        )
-        validation_metrics = _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets) if val_idx_np.size else {}
-        test_metrics = _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets) if test_idx_np.size else {}
-        if val_idx_np.size:
-            validation_metrics["budget_curve"] = router_budget_curve(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets)
-        if test_idx_np.size:
-            test_metrics["budget_curve"] = router_budget_curve(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets)
-        return {
-            "risk_score": risk_score.astype(np.float32),
-            "thresholds": {"validation_risk_threshold": float(self.val_threshold)},
-            "calibration_metadata": metadata,
-            "hcw_mask": hcw_mask.tolist(),
-            "validation_metrics": validation_metrics,
-            "test_metrics": test_metrics,
-        }
-
-
-class DualPosteriorRanker(BaseRiskEstimator):
-    metadata = {
-        "claim_role": "stage_b_ablation_residual_risk_estimator",
-        "stage2_role": "screening_ranker",
-        "canonical_stage2": False,
-        "scientific_gate": "lm_gnn_posterior_only",
-        "paper_identity_risk": "low_if_posterior_only",
-        "promotion_rule": "ablation_only_never_canonical",
-        "input_boundary": "posterior_only_lm_and_final_gnn",
-    }
-
-    _FORBIDDEN_INPUT_NAMES = POSTERIOR_RANKER_FORBIDDEN_INPUTS + (
-        "action_outputs",
-        "action_labels",
-        "repair_outputs",
-        "semantic_retrieval",
-        "structural_retrieval",
-    )
-
-    def __init__(self, budgets=FINAL_OUTPUT_RANKER_BUDGETS, feature_weights=None):
-        super().__init__()
-        self.temperature = 1.0
-        self.budgets = parse_budget_list(budgets, default=FINAL_OUTPUT_RANKER_BUDGETS)
-        self.feature_weights = feature_weights or {
-            "gnn_uncertainty": 0.40,
-            "lm_uncertainty": 0.20,
-            "confidence_gap": 0.15,
-            "prediction_disagreement": 0.15,
-            "js_divergence": 0.10,
-        }
-        self.input_boundary_audit = self._input_boundary_audit()
-        self.last_feature_table = None
-
-    @classmethod
-    def _input_boundary_audit(cls, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        supplied = {
-            "edge_index": edge_index is not None,
-            "edge_type": edge_type is not None,
-            "node_repr": node_repr is not None,
-        }
-        for name in cls._FORBIDDEN_INPUT_NAMES:
-            supplied.setdefault(name, kwargs.get(name) is not None)
-        return {
-            "allowed_inputs": [
-                "lm_only_calibrated_probabilities",
-                "stage1_final_logits",
-                "stage1_final_probabilities",
-                "stage1_final_predictions",
-                "calibration_split_labels",
-            ],
-            "forbidden_inputs_ignored": {name: bool(supplied.get(name, False)) for name in cls._FORBIDDEN_INPUT_NAMES},
-            "raw_text": False,
-            "raw_semantic_embedding": False,
-            "qwen_embedding": False,
-            "roberta_embedding": False,
-            "gnn_hidden_state": False,
-            "action_labels": False,
-            "edge_index_argument_ignored": bool(edge_index is not None),
-            "edge_type_argument_ignored": bool(edge_type is not None),
-            "node_repr_argument_ignored": bool(node_repr is not None),
-            "enforcement": "posterior_only_structural_ignore",
-        }
-
-    def _gnn_posterior_probabilities(self, logits=None, probs=None):
-        if logits is not None:
-            logits = _to_tensor(logits).float()
-            if logits.dim() != 2:
-                raise ValueError("dual_posterior_ranker expects final logits shaped [num_nodes, num_classes].")
-            return _normalize_probs(F.softmax(logits / float(self.temperature), dim=1))
-        if probs is None:
-            raise ValueError("dual_posterior_ranker requires Stage 1 final logits or probabilities.")
-        probs = _normalize_probs(probs)
-        if probs.dim() != 2:
-            raise ValueError("dual_posterior_ranker expects final probabilities shaped [num_nodes, num_classes].")
-        return probs
-
-    def _lm_posterior_probabilities(self, lm_probs, reference):
-        if lm_probs is None:
-            raise ValueError("dual_posterior_ranker requires LM-only calibrated probabilities.")
-        lm_probs = _normalize_probs(lm_probs)
-        if lm_probs.dim() != 2:
-            raise ValueError("dual_posterior_ranker expects LM-only probabilities shaped [num_nodes, num_classes].")
-        if tuple(lm_probs.shape) != tuple(reference.shape):
-            raise ValueError("dual_posterior_ranker requires LM-only and final GNN probabilities to have the same shape.")
-        return lm_probs
-
-    def _feature_table(self, logits=None, probs=None, lm_probs=None):
-        gnn_probs = self._gnn_posterior_probabilities(logits=logits, probs=probs)
-        lm_probs = self._lm_posterior_probabilities(lm_probs, reference=gnn_probs)
-        js = _js_divergence(lm_probs, gnn_probs)
-        js_norm = js / max(math.log(float(gnn_probs.size(1))), 1e-8)
-        gnn_conf = gnn_probs.max(dim=1).values
-        lm_conf = lm_probs.max(dim=1).values
-        table = {
-            "gnn_uncertainty": 1.0 - gnn_conf,
-            "lm_uncertainty": 1.0 - lm_conf,
-            "confidence_gap": torch.abs(lm_conf - gnn_conf),
-            "prediction_disagreement": (lm_probs.argmax(dim=1) != gnn_probs.argmax(dim=1)).float(),
-            "js_divergence": js_norm.clamp(0.0, 1.0),
-        }
-        return {key: value.detach().cpu().float() for key, value in table.items()}
-
-    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        labels_np = _to_numpy(labels)
-        if labels_np.ndim > 1:
-            labels_np = labels_np.argmax(axis=1)
-        val_idx_np = _to_numpy(val_idx).astype(np.int64)
-        if logits is not None and val_idx_np.size:
-            self.temperature = fit_temperature_scaling(_to_tensor(logits)[val_idx_np], labels_np[val_idx_np])
-            calibration_source = "validation_temperature_scaled_final_logits"
-        else:
-            self.temperature = 1.0
-            calibration_source = "final_probabilities_no_temperature_fit"
-        self._feature_table(logits=logits, probs=probs, lm_probs=kwargs.get("lm_probs"))
-        self.input_boundary_audit = self._input_boundary_audit(
-            edge_index=edge_index,
-            edge_type=edge_type,
-            node_repr=node_repr,
-            **kwargs,
-        )
-        self.calibration_metadata = {
-            "source": "dual_posterior_ranker",
-            "calibration_source": calibration_source,
-            "temperature": float(self.temperature),
-            "fit_scope": "validation_split_labels_only_for_gnn_temperature",
-            "posterior_only": True,
-            "canonical_stage2": False,
-            "stage2_role": "screening_ranker",
-            "promotion_rule": "ablation_only_never_canonical",
-            "budgets": [float(item) for item in self.budgets],
-            "feature_weights": {key: float(value) for key, value in self.feature_weights.items()},
-            "input_boundary": dict(self.input_boundary_audit),
-        }
-        return self
-
-    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        table = self._feature_table(logits=logits, probs=probs, lm_probs=kwargs.get("lm_probs"))
-        self.last_feature_table = {key: value.clone() for key, value in table.items()}
-        score = torch.zeros_like(next(iter(table.values())))
-        for key, weight in self.feature_weights.items():
-            score = score + float(weight) * table[key].clamp(0.0, 1.0)
-        return score.clamp(0.0, 1.0).numpy().astype(np.float32)
-
-    def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        risk_score = self.score(
-            logits,
-            probs,
-            edge_index=edge_index,
-            edge_type=edge_type,
-            node_repr=node_repr,
-            lm_probs=kwargs.get("lm_probs"),
-        )
-        gnn_posterior = self._gnn_posterior_probabilities(logits=logits, probs=probs)
-        labels_np = _to_numpy(labels)
-        if labels_np.ndim > 1:
-            labels_np = labels_np.argmax(axis=1)
-        preds = gnn_posterior.argmax(dim=1).numpy()
-        wrong = (preds != labels_np).astype(np.int32)
-        val_idx_np = _to_numpy(val_idx).astype(np.int64)
-        test_idx_np = _to_numpy(test_idx).astype(np.int64)
-        if self.val_threshold is None:
-            budget = self.budgets[0] if self.budgets else FINAL_OUTPUT_RANKER_BUDGETS[0]
-            k = max(int(len(val_idx_np) * float(budget)), 1) if val_idx_np.size else 0
-            self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
-        hcw_mask = ((1.0 - gnn_posterior.max(dim=1).values.numpy()) < 0.1) & (wrong == 1)
-        metadata = dict(self.calibration_metadata)
-        metadata["input_boundary"] = self._input_boundary_audit(
-            edge_index=edge_index,
-            edge_type=edge_type,
-            node_repr=node_repr,
-            **kwargs,
-        )
-        validation_metrics = _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets) if val_idx_np.size else {}
-        test_metrics = _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets) if test_idx_np.size else {}
-        if val_idx_np.size:
-            validation_metrics["budget_curve"] = router_budget_curve(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets)
-        if test_idx_np.size:
-            test_metrics["budget_curve"] = router_budget_curve(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets)
-        return {
-            "risk_score": risk_score.astype(np.float32),
-            "thresholds": {"validation_risk_threshold": float(self.val_threshold)},
-            "calibration_metadata": metadata,
-            "hcw_mask": hcw_mask.tolist(),
-            "validation_metrics": validation_metrics,
-            "test_metrics": test_metrics,
-        }
-
-
 class LOGINUncertaintyRouter(BaseRiskEstimator):
     metadata = {
-        "claim_role": "stage_b_login_style_uncertainty_router",
+        "claim_role": "stage_b_login_official_uncertainty_router",
         "stage2_role": "hard_node_selector",
         "canonical_stage2": False,
         "scientific_gate": "phase_a_frozen_gnn_uncertainty_only",
-        "paper_identity": "LOGIN-style Uncertainty Hard-Node Router",
-        "paper_identity_risk": "medium_until_official_code_verified",
+        "paper_identity": "LOGIN_init Node-Selection Uncertainty Router",
+        "paper_identity_risk": "uncertainty_submodule_only",
         "promotion_rule": "ablation_only_never_canonical",
         "screening_only": True,
         "diagnosis_or_action": False,
         "llm_call": False,
-        "login_scope": "hard_node_selection_only",
+        "login_scope": "node_selection_uncertainty_only",
     }
 
-    def __init__(self, budgets=RESIDUAL_RISK_PAPER_BUDGETS, official_code_verified=False):
+    OFFICIAL_REPO_PATH = r"G:\Research\BotDetection\LOGIN_init"
+    OFFICIAL_FORMULA = "var(stack(logits_list), dim=0).sum(dim=1)"
+    OFFICIAL_SELECTION_CONTRACT = "global_topk_by_pl_rate"
+    OFFICIAL_DROPOUT_LIST = [0.5, 0.5, 0.5, 0.5, 0.5]
+    OFFICIAL_PL_RATE = 0.1
+
+    def __init__(self, budgets=RESIDUAL_RISK_PAPER_BUDGETS, official_code_verified=True):
         super().__init__()
         self.budgets = parse_budget_list(budgets, default=RESIDUAL_RISK_PAPER_BUDGETS)
         self.official_code_verified = bool(official_code_verified)
-        self.mc_dropout_available = False
-        self.last_components = {}
+        self.last_risk_score = None
+        self.last_official_pl_mask = None
+        self.last_logits_shape = None
         self.fit_summary = {}
-
-    @staticmethod
-    def _entropy(probabilities):
-        probabilities = np.asarray(probabilities, dtype=np.float64)
-        num_classes = probabilities.shape[-1]
-        entropy = -(probabilities * np.log(np.clip(probabilities, 1e-12, 1.0))).sum(axis=-1)
-        return entropy / max(math.log(float(num_classes)), 1e-8)
-
-    @staticmethod
-    def _normalize_array(values):
-        values = np.asarray(values, dtype=np.float64)
-        finite = values[np.isfinite(values)]
-        if finite.size == 0:
-            return np.zeros_like(values, dtype=np.float64)
-        low = float(finite.min())
-        high = float(finite.max())
-        if high - low <= 1e-12:
-            return np.zeros_like(values, dtype=np.float64)
-        return np.clip((values - low) / (high - low), 0.0, 1.0)
 
     @staticmethod
     def _input_boundary_audit(edge_index=None, edge_type=None, node_repr=None, **kwargs):
         return {
             "allowed_inputs": [
-                "phase_a_frozen_gnn_logits",
-                "phase_a_frozen_gnn_probabilities",
-                "optional_mc_dropout_logits_or_probabilities",
-                "validation_split_labels_for_threshold_only",
+                "five_independent_gnn_training_logits_list",
+                "reference_frozen_gnn_logits_or_probabilities_for_auxiliary_analysis_only",
+                "validation_split_labels_for_auxiliary_budget_analysis_only",
                 "test_split_labels_for_reporting_only",
             ],
             "raw_text": False,
@@ -1924,7 +1291,7 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             "llm_call": False,
             "semantic_feature_update": False,
             "structure_refinement": False,
-            "gnn_retrain": False,
+            "gnn_retrain": True,
             "test_labels_for_threshold": False,
             "forbidden_inputs_ignored": {
                 name: kwargs.get(name) is not None
@@ -1940,7 +1307,7 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
                     "repair_outputs",
                 )
             },
-            "enforcement": "posterior_uncertainty_only",
+            "enforcement": "official_login_uncertainty_submodule_only",
         }
 
     def _posterior_probabilities(self, logits=None, probs=None):
@@ -1956,112 +1323,98 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             raise ValueError("login_uncertainty_router expects probabilities shaped [num_nodes, num_classes].")
         return probs_t.detach().cpu().numpy()
 
-    def _mc_dropout_probabilities(self, reference, mc_dropout_logits=None, mc_dropout_probs=None):
-        if mc_dropout_logits is None and mc_dropout_probs is None:
-            return None
-        if mc_dropout_logits is not None:
-            samples = F.softmax(_to_tensor(mc_dropout_logits).float(), dim=-1).detach().cpu().numpy()
-        else:
-            samples_t = _to_tensor(mc_dropout_probs).float().cpu()
-            if samples_t.dim() != 3:
-                raise ValueError("MC-dropout probabilities must be shaped [samples, num_nodes, num_classes].")
-            samples_t = samples_t.clamp_min(1e-8)
-            samples_t = samples_t / samples_t.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            samples = samples_t.numpy()
-        if samples.ndim != 3:
-            raise ValueError("MC-dropout samples must be shaped [samples, num_nodes, num_classes].")
-        if samples.shape[0] < 2:
-            raise ValueError("MC-dropout samples require at least two stochastic forward passes.")
-        if tuple(samples.shape[1:]) != tuple(reference.shape):
+    def _prepare_logits_list(self, logits_list, reference_logits=None):
+        if logits_list is None:
             raise ValueError(
-                "MC-dropout samples must align with frozen GNN posterior shape "
-                f"{tuple(reference.shape)}, got {tuple(samples.shape[1:])}."
+                "login_uncertainty_router requires logits_list from five independent GNN training runs. "
+                "MC-dropout and single-posterior proxies are not allowed in the official uncertainty path."
             )
-        return np.clip(samples, 1e-8, 1.0)
+        if torch.is_tensor(logits_list):
+            logits_stack = logits_list.detach().cpu().float()
+        elif isinstance(logits_list, (list, tuple)):
+            if not logits_list:
+                raise ValueError("login_uncertainty_router received an empty logits_list.")
+            logits_stack = torch.stack([_to_tensor(item).detach().cpu().float() for item in logits_list], dim=0)
+        else:
+            logits_stack = _to_tensor(logits_list).detach().cpu().float()
+        if logits_stack.dim() != 3:
+            raise ValueError("login_uncertainty_router expects logits_list shaped [runs, num_nodes, num_classes].")
+        if logits_stack.size(0) < 2:
+            raise ValueError("login_uncertainty_router requires at least two GNN runs to compute variance.")
+        if reference_logits is not None:
+            ref = _to_tensor(reference_logits)
+            if ref.dim() != 2:
+                raise ValueError("Reference logits for login_uncertainty_router must be shaped [num_nodes, num_classes].")
+            if tuple(logits_stack.shape[1:]) != tuple(ref.shape):
+                raise ValueError(
+                    "logits_list runs must align with the reference frozen GNN logits shape "
+                    f"{tuple(ref.shape)}, got {tuple(logits_stack.shape[1:])}."
+                )
+        return logits_stack
 
-    def _score_components(self, logits=None, probs=None, mc_dropout_logits=None, mc_dropout_probs=None):
-        posterior = self._posterior_probabilities(logits=logits, probs=probs)
-        samples = self._mc_dropout_probabilities(
-            posterior,
-            mc_dropout_logits=mc_dropout_logits,
-            mc_dropout_probs=mc_dropout_probs,
-        )
-        if samples is None:
-            entropy = self._entropy(posterior)
-            mean_confidence = posterior.max(axis=1)
-            margin = 1.0 - np.sort(posterior, axis=1)[:, -1] + np.sort(posterior, axis=1)[:, -2]
-            components = {
-                "predictive_entropy": entropy,
-                "mean_confidence": mean_confidence,
-                "one_minus_mean_confidence": 1.0 - mean_confidence,
-                "margin_risk": np.clip(margin, 0.0, 1.0),
-            }
-            score = 0.50 * components["predictive_entropy"] + 0.50 * components["one_minus_mean_confidence"]
-            return np.clip(score, 0.0, 1.0).astype(np.float32), components, False
+    def _compute_uncertainty_score(self, logits_list, logits=None, probs=None):
+        reference_logits = logits
+        if reference_logits is None and probs is not None:
+            probs_t = _normalize_probs(probs)
+            reference_logits = probs_t
+        logits_stack = self._prepare_logits_list(logits_list, reference_logits=reference_logits)
+        variance = torch.var(logits_stack, dim=0)
+        uncertainty_score = torch.sum(variance, dim=1).detach().cpu().float()
+        self.last_logits_shape = [int(item) for item in logits_stack.shape]
+        return uncertainty_score, logits_stack
 
-        mean_probs = samples.mean(axis=0)
-        predictive_entropy = self._entropy(mean_probs)
-        expected_entropy = self._entropy(samples).mean(axis=0)
-        mutual_information = np.clip(predictive_entropy - expected_entropy, 0.0, None)
-        sample_preds = samples.argmax(axis=2)
-        variation_ratio = []
-        for node_preds in sample_preds.T:
-            counts = np.bincount(node_preds.astype(np.int64), minlength=mean_probs.shape[1])
-            variation_ratio.append(1.0 - float(counts.max()) / float(sample_preds.shape[0]))
-        variation_ratio = np.asarray(variation_ratio, dtype=np.float64)
-        mean_confidence = mean_probs.max(axis=1)
-        mi_norm = self._normalize_array(mutual_information)
-        components = {
-            "predictive_entropy": predictive_entropy,
-            "expected_entropy": expected_entropy,
-            "mean_confidence": mean_confidence,
-            "one_minus_mean_confidence": 1.0 - mean_confidence,
-            "variation_ratio": variation_ratio,
-            "mutual_information": mutual_information,
-            "mutual_information_normalized": mi_norm,
-        }
-        score = (
-            0.35 * predictive_entropy
-            + 0.25 * components["one_minus_mean_confidence"]
-            + 0.20 * variation_ratio
-            + 0.20 * mi_norm
-        )
-        return np.clip(score, 0.0, 1.0).astype(np.float32), components, True
+    def _official_topk_mask(self, uncertainty_score):
+        uncertainty_score = _to_tensor(uncertainty_score).detach().cpu().float().reshape(-1)
+        k = int(float(self.OFFICIAL_PL_RATE) * int(uncertainty_score.numel()))
+        pl_mask = torch.zeros_like(uncertainty_score, dtype=torch.bool)
+        if k > 0:
+            topk_indices = torch.topk(uncertainty_score, k).indices
+            pl_mask[topk_indices] = True
+        return pl_mask
 
     def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        risk_score, components, mc_available = self._score_components(
+        self.budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
+        uncertainty_score, logits_stack = self._compute_uncertainty_score(
+            kwargs.get("logits_list"),
             logits=logits,
             probs=probs,
-            mc_dropout_logits=kwargs.get("mc_dropout_logits"),
-            mc_dropout_probs=kwargs.get("mc_dropout_probs"),
         )
+        risk_score = uncertainty_score.detach().cpu().numpy()
         val_idx_np = _valid_index_array(val_idx, risk_score.shape[0])
         budget = self.budgets[0] if self.budgets else RESIDUAL_RISK_PAPER_BUDGETS[0]
         k = max(int(val_idx_np.size * float(budget)), 1) if val_idx_np.size else 0
         self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
-        self.mc_dropout_available = bool(mc_available)
-        self.last_components = {key: np.asarray(value, dtype=np.float32) for key, value in components.items()}
-        component_names = (
-            ["predictive_entropy", "one_minus_mean_confidence", "variation_ratio", "mutual_information"]
-            if mc_available
-            else ["predictive_entropy", "one_minus_mean_confidence"]
-        )
+        self.last_risk_score = risk_score.astype(np.float32)
+        self.last_official_pl_mask = self._official_topk_mask(uncertainty_score).detach().cpu().numpy().astype(bool)
         self.fit_summary = {
             "source": "login_uncertainty_router",
-            "fit_scope": "validation_split_threshold_only",
+            "fit_scope": "official_uncertainty_score_plus_auxiliary_validation_budget_analysis",
             "validation_count": int(val_idx_np.size),
-            "validation_budget_for_threshold": float(budget),
-            "validation_risk_threshold": float(self.val_threshold),
-            "mc_dropout_available": bool(mc_available),
+            "auxiliary_validation_budget_for_threshold": float(budget),
+            "auxiliary_validation_risk_threshold": float(self.val_threshold),
             "official_code_verified": bool(self.official_code_verified),
-            "uncertainty_components": component_names,
+            "official_repo_path": self.OFFICIAL_REPO_PATH,
+            "official_submodule_scope": "node_selection_uncertainty_only",
+            "official_formula": self.OFFICIAL_FORMULA,
+            "official_selection_contract": self.OFFICIAL_SELECTION_CONTRACT,
+            "official_drop_out_list": list(self.OFFICIAL_DROPOUT_LIST),
+            "official_pl_rate": float(self.OFFICIAL_PL_RATE),
+            "auxiliary_budget_analysis": True,
+            "full_LOGIN_loop": False,
+            "prompt_llm": False,
+            "feature_update": False,
+            "edge_pruning": False,
+            "logits_list_shape": list(self.last_logits_shape or [int(logits_stack.size(0)), int(logits_stack.size(1)), int(logits_stack.size(2))]),
             "test_labels_used_for_threshold": False,
         }
         self.calibration_metadata = {
             **self.metadata,
             **self.fit_summary,
             "source": "login_uncertainty_router",
-            "posterior_only": True,
+            "posterior_only": False,
+            "risk_score_semantics": "official_login_uncertainty_score",
+            "risk_score_formula": self.OFFICIAL_FORMULA,
+            "not_a_new_classifier": True,
             "input_boundary": self._input_boundary_audit(
                 edge_index=edge_index,
                 edge_type=edge_type,
@@ -2073,15 +1426,14 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
         return self
 
     def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        risk_score, components, mc_available = self._score_components(
+        uncertainty_score, _ = self._compute_uncertainty_score(
+            kwargs.get("logits_list"),
             logits=logits,
             probs=probs,
-            mc_dropout_logits=kwargs.get("mc_dropout_logits"),
-            mc_dropout_probs=kwargs.get("mc_dropout_probs"),
         )
-        self.mc_dropout_available = bool(mc_available)
-        self.last_components = {key: np.asarray(value, dtype=np.float32) for key, value in components.items()}
-        return risk_score
+        self.last_risk_score = uncertainty_score.detach().cpu().numpy().astype(np.float32)
+        self.last_official_pl_mask = self._official_topk_mask(uncertainty_score).detach().cpu().numpy().astype(bool)
+        return self.last_risk_score
 
     def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
         risk_score = self.score(
@@ -2090,8 +1442,7 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             edge_index=edge_index,
             edge_type=edge_type,
             node_repr=node_repr,
-            mc_dropout_logits=kwargs.get("mc_dropout_logits"),
-            mc_dropout_probs=kwargs.get("mc_dropout_probs"),
+            logits_list=kwargs.get("logits_list"),
         )
         posterior = self._posterior_probabilities(logits=logits, probs=probs)
         labels_np = _labels_to_numpy(labels)
@@ -2103,30 +1454,42 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             budget = self.budgets[0] if self.budgets else RESIDUAL_RISK_PAPER_BUDGETS[0]
             k = max(int(val_idx_np.size * float(budget)), 1) if val_idx_np.size else 0
             self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
+        official_pl_mask = (
+            np.asarray(self.last_official_pl_mask, dtype=bool)
+            if self.last_official_pl_mask is not None
+            else self._official_topk_mask(torch.tensor(risk_score, dtype=torch.float32)).detach().cpu().numpy().astype(bool)
+        )
         metadata = {
             **self.metadata,
             **dict(self.calibration_metadata),
             "source": "login_uncertainty_router",
-            "fit_scope": "validation_split_threshold_only",
-            "mc_dropout_available": bool(self.mc_dropout_available),
+            "fit_scope": "official_uncertainty_score_plus_auxiliary_validation_budget_analysis",
             "official_code_verified": bool(self.official_code_verified),
             "screening_only": True,
             "diagnosis_or_action": False,
             "llm_call": False,
-            "login_scope": "hard_node_selection_only",
+            "login_scope": "node_selection_uncertainty_only",
             "test_labels_used_for_threshold": False,
-            "threshold_source": "validation_split_top_budget",
+            "threshold_source": "auxiliary_validation_split_top_budget",
+            "official_selection_contract": self.OFFICIAL_SELECTION_CONTRACT,
+            "official_formula": self.OFFICIAL_FORMULA,
+            "official_repo_path": self.OFFICIAL_REPO_PATH,
+            "official_submodule_scope": "node_selection_uncertainty_only",
+            "official_drop_out_list": list(self.OFFICIAL_DROPOUT_LIST),
+            "official_pl_rate": float(self.OFFICIAL_PL_RATE),
+            "full_LOGIN_loop": False,
+            "prompt_llm": False,
+            "feature_update": False,
+            "edge_pruning": False,
+            "auxiliary_budget_analysis": True,
+            "not_a_new_classifier": True,
             "input_boundary": self._input_boundary_audit(
                 edge_index=edge_index,
                 edge_type=edge_type,
                 node_repr=node_repr,
                 **kwargs,
             ),
-            "uncertainty_components": (
-                ["predictive_entropy", "one_minus_mean_confidence", "variation_ratio", "mutual_information"]
-                if self.mc_dropout_available
-                else ["predictive_entropy", "one_minus_mean_confidence"]
-            ),
+            "uncertainty_components": ["logits_variance_sum"],
         }
         validation_metrics = _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets) if val_idx_np.size else {}
         test_metrics = _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets) if test_idx_np.size else {}
@@ -2137,7 +1500,14 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
         hcw_mask = ((1.0 - posterior.max(axis=1)) < 0.1) & (wrong == 1)
         return {
             "risk_score": risk_score.astype(np.float32),
-            "thresholds": {"validation_risk_threshold": float(self.val_threshold)},
+            "official_pl_mask": official_pl_mask.tolist(),
+            "official_topk_indices": [int(item) for item in np.flatnonzero(official_pl_mask).tolist()],
+            "thresholds": {
+                "validation_risk_threshold": float(self.val_threshold),
+                "threshold_source": "auxiliary_validation_budget_analysis",
+                "official_pl_rate": float(self.OFFICIAL_PL_RATE),
+                "official_topk_count": int(official_pl_mask.sum()),
+            },
             "calibration_metadata": metadata,
             "hcw_mask": hcw_mask.tolist(),
             "validation_metrics": validation_metrics,
@@ -2149,70 +1519,14 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             "class": "LOGINUncertaintyRouter",
             "budgets": [float(item) for item in self.budgets],
             "val_threshold": float(self.val_threshold if self.val_threshold is not None else float("inf")),
-            "mc_dropout_available": bool(self.mc_dropout_available),
             "official_code_verified": bool(self.official_code_verified),
+            "official_repo_path": self.OFFICIAL_REPO_PATH,
+            "official_formula": self.OFFICIAL_FORMULA,
+            "official_selection_contract": self.OFFICIAL_SELECTION_CONTRACT,
+            "official_drop_out_list": list(self.OFFICIAL_DROPOUT_LIST),
+            "official_pl_rate": float(self.OFFICIAL_PL_RATE),
             "fit_summary": dict(self.fit_summary),
         }
-
-
-class LogisticProxyEstimator(BaseRiskEstimator):
-    metadata = {
-        "claim_role": "supporting_baseline",
-        "scientific_gate": "proxy_first",
-        "paper_identity_risk": "proxy_gap",
-        "promotion_rule": "if_proxy_inconclusive",
-    }
-
-    def __init__(self, mode_name):
-        super().__init__()
-        self.mode_name = mode_name
-        self.scaler = StandardScaler()
-        self.classifier = LogisticRegression(max_iter=1000, class_weight="balanced")
-
-    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        features = build_probe_features(logits, probs, edge_index, edge_type, node_repr)
-        labels_np = _to_numpy(labels)
-        if labels_np.ndim > 1:
-            labels_np = labels_np.argmax(axis=1)
-        preds = _to_numpy(probs).argmax(axis=1)
-        train_idx_np = _to_numpy(train_idx).astype(np.int64)
-        val_idx_np = _to_numpy(val_idx).astype(np.int64)
-
-        y_train = (preds[train_idx_np] != labels_np[train_idx_np]).astype(np.int32)
-        x_train = features["features"][train_idx_np]
-        x_val = features["features"][val_idx_np]
-
-        if self.mode_name == "cagcn_proxy":
-            x_train = x_train[:, [0, 1, 2, 5, 7]]
-            x_val = x_val[:, [0, 1, 2, 5, 7]]
-        elif self.mode_name == "gats_proxy":
-            x_train = x_train[:, [0, 1, 2, 3, 4, 6, 7]]
-            x_val = x_val[:, [0, 1, 2, 3, 4, 6, 7]]
-
-        x_train_s = self.scaler.fit_transform(x_train)
-        x_val_s = self.scaler.transform(x_val)
-        self.classifier.fit(x_train_s, y_train)
-        val_risk = self.classifier.predict_proba(x_val_s)[:, 1]
-
-        budget = max(int(len(val_idx_np) * 0.15), 1)
-        self.val_threshold = float(np.sort(val_risk)[-budget])
-        self.calibration_metadata = {
-            "mode": self.mode_name,
-            "num_features": int(x_train.shape[1]),
-            "validation_threshold": self.val_threshold,
-            "target_policy": "train_only_failure_proxy",
-            "fit_scope": "train_idx_only",
-        }
-        return self
-
-    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        features = build_probe_features(logits, probs, edge_index, edge_type, node_repr)
-        x_all = features["features"]
-        if self.mode_name == "cagcn_proxy":
-            x_all = x_all[:, [0, 1, 2, 5, 7]]
-        elif self.mode_name == "gats_proxy":
-            x_all = x_all[:, [0, 1, 2, 3, 4, 6, 7]]
-        return self.classifier.predict_proba(self.scaler.transform(x_all))[:, 1]
 
 
 class GraphConformalSetEstimator(BaseRiskEstimator):
@@ -2309,6 +1623,7 @@ class GraphConformalSetEstimator(BaseRiskEstimator):
         }
 
     def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        self.budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
         posterior = self._graph_smoothed_posterior(self._posterior(logits=logits, probs=probs), edge_index=edge_index)
         labels_np = _labels_to_numpy(labels).astype(np.int64)
         val_idx_np = _valid_index_array(val_idx, labels_np.shape[0])
@@ -2378,6 +1693,155 @@ class GraphConformalSetEstimator(BaseRiskEstimator):
         return {
             "alpha": float(self.alpha),
             "graph_smoothing": float(self.graph_smoothing),
+            "threshold": float(self.threshold if self.threshold is not None else 1.0),
+            "num_classes": self.num_classes,
+            "fit_summary": self.fit_summary,
+        }
+
+
+class PostHocCalibratedRanker(GraphConformalSetEstimator):
+    metadata = {
+        "claim_role": "stage2_canonical_posthoc_ranker",
+        "stage2_role": "posthoc_calibrated_score_rank",
+        "canonical_stage2": True,
+        "scientific_gate": "posterior_only_validation_calibration",
+        "paper_identity": "Post-hoc Calibrated Score/Rank Router",
+        "paper_identity_risk": "low_if_router_only_no_classifier_claim",
+        "promotion_rule": "canonical_scalar_only",
+        "prediction_set_estimator": True,
+        "diagnosis_or_action": False,
+        "input_boundary": "frozen_gnn_posterior_only",
+    }
+
+    def __init__(self, alpha=0.20, budgets=RESIDUAL_RISK_PAPER_BUDGETS):
+        super().__init__(alpha=alpha, graph_smoothing=0.0, budgets=budgets)
+
+    @staticmethod
+    def _rank_desc(values):
+        values = np.nan_to_num(np.asarray(values, dtype=np.float64).reshape(-1), nan=-1e12, posinf=1e12, neginf=-1e12)
+        ranks = np.zeros(values.shape[0], dtype=np.int64)
+        if values.size == 0:
+            return ranks
+        order = np.argsort(-values, kind="mergesort")
+        ranks[order] = np.arange(1, values.size + 1, dtype=np.int64)
+        return ranks
+
+    @staticmethod
+    def _nonconformity_gap(posterior):
+        class_scores = 1.0 - np.asarray(posterior, dtype=np.float64)
+        if class_scores.shape[1] <= 1:
+            return np.ones(class_scores.shape[0], dtype=np.float64)
+        sorted_scores = np.sort(class_scores, axis=1)
+        return sorted_scores[:, 1] - sorted_scores[:, 0]
+
+    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        self.budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
+        super().fit(
+            logits=logits,
+            probs=probs,
+            labels=labels,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            edge_index=None,
+            edge_type=None,
+            node_repr=None,
+            **kwargs,
+        )
+        self.fit_summary = {
+            **dict(self.fit_summary),
+            "source": "posthoc_calibrated_ranker",
+            "fit_scope": "validation_split_labels_only_posterior_scalar",
+            "calibration_role": "posthoc_calibrated_score_rank",
+            "posterior_only": True,
+            "scalar_only": True,
+            "graph_smoothing": 0.0,
+            "graph_context_used": False,
+            "edge_type_used": False,
+            "relation_channel_used": False,
+            "direction_channel_used": False,
+            "embedding_context_used": False,
+            "node_repr_used": False,
+            "prediction_set_contract": "posterior_only_conformal_prediction_set_v1",
+            "risk_score_contract": "posthoc_prediction_set_size_margin_rank_v1",
+            "rank_contract": "rank_1_is_highest_predicted_error_risk",
+            "test_labels_used_for_threshold": False,
+            "not_a_new_bot_classifier": True,
+            "screening_only": True,
+            "diagnosis_or_action": False,
+            "does_not_claim_conformal_coverage_after_rewrite": True,
+            "literature_basis": [
+                "Selective Classification",
+                "Conformal Risk Control",
+                "Localized Conformal Prediction",
+                "CF-GNN",
+                "Graph CP benchmarks",
+                "Graph reject option",
+            ],
+            "literature_boundary": (
+                "Uses frozen GNN posterior calibration for hard-node ranking only; "
+                "relation/direction/local graph channels remain ablations, not the canonical router."
+            ),
+        }
+        self.calibration_metadata = dict(self.fit_summary)
+        return self
+
+    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        posterior = self._posterior(logits=logits, probs=probs)
+        return self._prediction_set_payload(posterior)["abstain_risk"]
+
+    def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        posterior = self._posterior(logits=logits, probs=probs)
+        payload = self._prediction_set_payload(posterior)
+        risk_score = payload["abstain_risk"].astype(np.float32)
+        labels_np = _labels_to_numpy(labels).astype(np.int64)
+        preds = posterior.argmax(axis=1)
+        pred_label_score = posterior[np.arange(posterior.shape[0]), preds]
+        wrong = (preds != labels_np).astype(np.int32)
+        val_idx_np = _valid_index_array(val_idx, wrong.shape[0])
+        test_idx_np = _valid_index_array(test_idx, wrong.shape[0])
+        budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
+        if self.val_threshold is None:
+            budget = budgets[0] if budgets else RESIDUAL_RISK_PAPER_BUDGETS[0]
+            k = max(int(len(val_idx_np) * float(budget)), 1) if val_idx_np.size else 0
+            self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
+        metadata = {
+            **dict(self.calibration_metadata),
+            "source": "posthoc_calibrated_ranker",
+            "threshold_source": "validation_conformal_nonconformity_posterior_only",
+            "posterior_only": True,
+            "scalar_only": True,
+            "graph_context_used": False,
+            "edge_type_used": False,
+            "relation_channel_used": False,
+            "direction_channel_used": False,
+            "embedding_context_used": False,
+            "node_repr_used": False,
+            "test_labels_used_for_threshold": False,
+        }
+        return {
+            "risk_score": risk_score,
+            "rank": self._rank_desc(risk_score).tolist(),
+            "router_score": risk_score,
+            "prediction_sets": payload["prediction_sets"],
+            "set_size": payload["set_size"],
+            "coverage_margin": payload["coverage_margin"].astype(np.float32),
+            "nonconformity_gap": self._nonconformity_gap(posterior).astype(np.float32),
+            "pred_label_score": pred_label_score.astype(np.float32),
+            "abstain_risk": risk_score,
+            "thresholds": {
+                "validation_risk_threshold": float(self.val_threshold),
+                "conformal_nonconformity_threshold": float(self.threshold if self.threshold is not None else 1.0),
+            },
+            "calibration_metadata": metadata,
+            "hcw_mask": ((1.0 - posterior.max(axis=1)) < 0.1) & (wrong == 1),
+            "validation_metrics": _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=budgets) if val_idx_np.size else {},
+            "test_metrics": _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=budgets) if test_idx_np.size else {},
+        }
+
+    def state_dict_payload(self):
+        return {
+            "alpha": float(self.alpha),
+            "graph_smoothing": 0.0,
             "threshold": float(self.threshold if self.threshold is not None else 1.0),
             "num_classes": self.num_classes,
             "fit_summary": self.fit_summary,
@@ -2879,465 +2343,6 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
         }
 
 
-class CalibratedMultiViewResidualRouter(BaseRiskEstimator):
-    metadata = {
-        "claim_role": "stage_b_ablation_residual_risk_estimator",
-        "scientific_gate": "oof_required",
-        "paper_identity_risk": "low_if_behavior_only_inputs",
-        "promotion_rule": "ablation_only_never_canonical",
-    }
-
-    def __init__(
-        self,
-        variant="router_4_view_ensemble",
-        lambda_rank=0.2,
-        rank_margin=0.1,
-        budgets=RESIDUAL_RISK_PAPER_BUDGETS,
-        hidden_dim=16,
-        epochs=100,
-        lr=1e-2,
-        weight_decay=1e-4,
-    ):
-        super().__init__()
-        self.variant = str(variant)
-        self.lambda_rank = float(lambda_rank)
-        self.rank_margin = float(rank_margin)
-        self.budgets = tuple(float(item) for item in budgets)
-        self.hidden_dim = int(hidden_dim)
-        self.epochs = int(epochs)
-        self.lr = float(lr)
-        self.weight_decay = float(weight_decay)
-        self.model = None
-        self.training_summary = {}
-        self.last_view_weights = None
-        self.last_view_scores = None
-
-    def _build_features(self, lm_probs, gnn_probs, edge_index, edge_type=None):
-        if lm_probs is None:
-            raise ValueError("calibrated_multiview_router requires LM-only calibrated probabilities.")
-        return build_multiview_router_features(lm_probs, gnn_probs, edge_index=edge_index, edge_type=edge_type)
-
-    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        fit_idx = kwargs.get("fit_idx", None)
-        lm_probs = kwargs.get("lm_probs", None)
-        if fit_idx is None:
-            raise ValueError(
-                "calibrated_multiview_router requires OOF fit_idx from frozen router OOF artifacts; "
-                "direct train correctness is not an allowed training target."
-            )
-        if edge_index is None:
-            raise ValueError("calibrated_multiview_router requires edge_index for graph-context view.")
-
-        labels_np = _to_numpy(labels)
-        if labels_np.ndim > 1:
-            labels_np = labels_np.argmax(axis=1)
-        fit_idx = _to_tensor(fit_idx).long().cpu()
-        gnn_probs = _normalize_probs(probs)
-        lm_probs = _normalize_probs(lm_probs)
-        features_all = self._build_features(lm_probs, gnn_probs, edge_index=edge_index, edge_type=edge_type)
-        features_fit = _slice_feature_dict(features_all, fit_idx)
-        pred = gnn_probs.argmax(dim=1).numpy()
-        y_wrong = torch.tensor((pred[fit_idx.numpy()] != labels_np[fit_idx.numpy()]).astype(np.float32))
-
-        self.model = _ResidualRiskViewEnsemble(
-            pred_dim=int(features_all["pred"].size(1)),
-            disc_dim=int(features_all["disc"].size(1)),
-            ctx_dim=int(features_all["ctx"].size(1)),
-            gate_dim=int(features_all["gate"].size(1)),
-            hidden_dim=self.hidden_dim,
-            variant=self.variant,
-        )
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        pos_weight = None
-        if 0 < y_wrong.sum() < y_wrong.numel():
-            pos_weight = torch.tensor([(y_wrong.numel() - y_wrong.sum()).item() / y_wrong.sum().item()])
-
-        for _ in range(max(self.epochs, 1)):
-            optimizer.zero_grad()
-            out = self.model(features_fit)
-            bce = F.binary_cross_entropy(out["score"], y_wrong.float(), weight=None)
-            if pos_weight is not None:
-                logits_for_weighted = torch.logit(out["score"].clamp(1e-5, 1.0 - 1e-5))
-                bce = F.binary_cross_entropy_with_logits(logits_for_weighted, y_wrong.float(), pos_weight=pos_weight)
-            rank = _pairwise_ranking_loss(out["score"], y_wrong, margin=self.rank_margin)
-            loss = bce + self.lambda_rank * rank
-            loss.backward()
-            optimizer.step()
-
-        with torch.no_grad():
-            train_score = self.model(features_fit)["score"].detach().cpu().numpy()
-        self.training_summary = {
-            "variant": self.variant,
-            "fit_scope": "train_split_oof_artifact_only",
-            "fit_count": int(fit_idx.numel()),
-            "positive_count": int(y_wrong.sum().item()),
-            "lambda_rank": self.lambda_rank,
-            "rank_margin": self.rank_margin,
-            "train_metrics": _safe_router_metrics(y_wrong.numpy(), train_score, budgets=self.budgets),
-            "forbidden_inputs_audit": {
-                "raw_text": False,
-                "raw_semantic_embedding": False,
-                "qwen_embedding": False,
-                "gnn_hidden_state": False,
-                "node_repr_argument_ignored": node_repr is not None,
-            },
-            "oof_provenance": kwargs.get("oof_metadata", {}),
-        }
-        self.calibration_metadata = dict(self.training_summary)
-        return self
-
-    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        if self.model is None:
-            raise ValueError("calibrated_multiview_router must be fit before score().")
-        if edge_index is None:
-            raise ValueError("calibrated_multiview_router requires edge_index for graph-context view.")
-        features = self._build_features(kwargs.get("lm_probs", None), probs, edge_index=edge_index, edge_type=edge_type)
-        self.model.eval()
-        with torch.no_grad():
-            out = self.model(features)
-        self.last_view_weights = out["view_weights"].detach().cpu()
-        self.last_view_scores = out["view_scores"].detach().cpu()
-        return out["score"].detach().cpu().numpy().astype(np.float32)
-
-    def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        risk_score = self.score(
-            logits,
-            probs,
-            edge_index=edge_index,
-            edge_type=edge_type,
-            node_repr=node_repr,
-            lm_probs=kwargs.get("lm_probs"),
-        )
-        labels_np = _to_numpy(labels)
-        if labels_np.ndim > 1:
-            labels_np = labels_np.argmax(axis=1)
-        preds = _to_numpy(probs).argmax(axis=1)
-        wrong = (preds != labels_np).astype(np.int32)
-        val_idx_np = _to_numpy(val_idx).astype(np.int64)
-        test_idx_np = _to_numpy(test_idx).astype(np.int64)
-        if self.val_threshold is None:
-            budget = max(int(len(val_idx_np) * 0.15), 1)
-            self.val_threshold = float(np.sort(risk_score[val_idx_np])[-budget]) if val_idx_np.size else float("inf")
-        hcw_mask = ((1.0 - _to_numpy(probs).max(axis=1)) < 0.1) & (wrong == 1)
-        return {
-            "risk_score": risk_score.astype(np.float32),
-            "thresholds": {"validation_risk_threshold": float(self.val_threshold)},
-            "calibration_metadata": dict(self.calibration_metadata),
-            "hcw_mask": hcw_mask.tolist(),
-            "validation_metrics": _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets) if val_idx_np.size else {},
-            "test_metrics": _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets) if test_idx_np.size else {},
-        }
-
-    def state_dict_payload(self):
-        return {
-            "variant": self.variant,
-            "model_state": self.model.state_dict() if self.model is not None else None,
-            "training_summary": self.training_summary,
-        }
-
-
-class GETSStylePostHocResidualRiskSelector(BaseRiskEstimator):
-    metadata = {
-        "claim_role": "stage_b_paper_facing_residual_risk_selector",
-        "stage2_role": "hard_node_selector",
-        "canonical_stage2": False,
-        "scientific_gate": "oof_train_plus_validation_posthoc",
-        "paper_identity": "Calibrated Residual-Risk Hard-Node Selector",
-        "paper_identity_risk": "low_if_screening_only",
-        "promotion_rule": "candidate_only_if_acceptance_gate_passes",
-        "screening_only": True,
-        "diagnosis_or_action": False,
-        "gets_inspiration": "graph-aware post-hoc calibration/ranking; not action routing",
-    }
-
-    def __init__(self, budgets=RESIDUAL_RISK_PAPER_BUDGETS, risk_variant="gets_posthoc", max_iter=1000):
-        super().__init__()
-        self.risk_variant = str(risk_variant)
-        self.variant = self.risk_variant
-        self.budgets = tuple(float(item) for item in budgets)
-        self.max_iter = int(max_iter)
-        self.scaler = None
-        self.classifier = None
-        self.feature_names = []
-        self.graph_feature_names = []
-        self.selected_candidate = None
-        self.candidate_selection = {}
-        self.candidate_metadata = {}
-        self.temperature = None
-        self.training_summary = {}
-        self.last_view_weights = None
-        self.last_view_scores = None
-
-    def _fit_graph_posthoc(self, feature_matrix, residual_fit_labels):
-        if feature_matrix.shape[0] == 0 or np.unique(residual_fit_labels).size < 2:
-            return False
-        self.scaler = StandardScaler()
-        scaled_features = self.scaler.fit_transform(feature_matrix)
-        self.classifier = LogisticRegression(max_iter=self.max_iter, class_weight="balanced")
-        self.classifier.fit(scaled_features, residual_fit_labels)
-        return True
-
-    def _graph_posthoc_score(self, feature_matrix):
-        if self.scaler is None or self.classifier is None:
-            return None
-        return self.classifier.predict_proba(self.scaler.transform(feature_matrix))[:, 1].astype(np.float32)
-
-    def _temperature_scaled_msp(self, logits, labels=None, val_idx=None):
-        logits_t = _to_tensor(logits).float().cpu()
-        if self.temperature is None and labels is not None and val_idx is not None:
-            labels_np = _labels_to_numpy(labels)
-            val_idx_np = _valid_index_array(val_idx, labels_np.shape[0])
-            if val_idx_np.size and np.unique(labels_np[val_idx_np]).size >= 2:
-                self.temperature = fit_temperature_scaling(
-                    logits_t[val_idx_np],
-                    torch.tensor(labels_np[val_idx_np], dtype=torch.long),
-                )
-        if self.temperature is None:
-            return None
-        prob_ts = torch.softmax(logits_t / float(self.temperature), dim=1).numpy()
-        return (1.0 - prob_ts.max(axis=1)).astype(np.float32)
-
-    def _build_training_summary(
-        self,
-        fit_idx_np,
-        residual_errors,
-        graph_posthoc_available,
-        graph_train_score,
-        node_repr=None,
-        oof_metadata=None,
-    ):
-        train_metrics = {}
-        if graph_posthoc_available and fit_idx_np.size:
-            train_metrics = _safe_router_metrics(
-                residual_errors[fit_idx_np],
-                graph_train_score[fit_idx_np],
-                budgets=self.budgets,
-            )
-        return {
-            "variant": self.risk_variant,
-            "fit_scope": "train_split_oof_artifact_only",
-            "validation_selection_scope": "validation_split_residual_labels_only",
-            "fit_count": int(fit_idx_np.size),
-            "positive_count": int(residual_errors[fit_idx_np].sum()) if fit_idx_np.size else 0,
-            "feature_family": list(self.feature_names),
-            "graph_feature_family": list(self.graph_feature_names),
-            "graph_posthoc_available": bool(graph_posthoc_available),
-            "train_metrics": train_metrics,
-            "forbidden_inputs_audit": {
-                "raw_text": False,
-                "raw_semantic_embedding": False,
-                "qwen_embedding": False,
-                "gnn_hidden_state": False,
-                "node_repr_argument_ignored": node_repr is not None,
-                "stage3_action_or_repair_outcome": False,
-            },
-            "oof_provenance": oof_metadata or {},
-            "screening_only": True,
-            "diagnosis_or_action": False,
-            "gets_inspiration": "GETS graph-aware calibration adapted as post-hoc residual-risk ranking.",
-        }
-
-    def _build_manifest_metadata(self, selection, candidate_metadata, candidate_names):
-        return {
-            **dict(self.calibration_metadata),
-            "selected_candidate": self.selected_candidate,
-            "candidate_order": selection.get("candidate_order", []),
-            "candidate_selection": selection,
-            "candidate_metadata": candidate_metadata,
-            "candidate_names": candidate_names,
-            "input_boundary": self.training_summary.get("forbidden_inputs_audit", {}),
-            "selection_scope": "validation_split_residual_labels_only",
-            "risk_variant": self.risk_variant,
-            "screening_only": True,
-            "diagnosis_or_action": False,
-            "positioning": "GETS-inspired graph-aware post-hoc residual-risk selector; not a Stage 3 action router",
-        }
-
-    def _candidate_scores(self, logits, probs, edge_index=None, edge_type=None, lm_probs=None, labels=None, val_idx=None):
-        feature_bundle = build_gets_posthoc_residual_features(
-            logits=logits,
-            probs=probs,
-            edge_index=edge_index,
-            edge_type=edge_type,
-            lm_probs=lm_probs,
-        )
-        self.feature_names = list(feature_bundle["feature_names"])
-        self.graph_feature_names = list(feature_bundle["graph_feature_names"])
-        candidate_scores = dict(feature_bundle["base_scores"])
-        candidate_metadata = _base_residual_candidate_metadata()
-        msp_ts = self._temperature_scaled_msp(logits, labels=labels, val_idx=val_idx)
-        if msp_ts is not None:
-            candidate_scores[RISK_CANDIDATE_MSP_TS] = np.clip(msp_ts, 0.0, 1.0).astype(np.float32)
-            candidate_metadata[RISK_CANDIDATE_MSP_TS] = {
-                "status": "available",
-                "family": "temperature_scaled_posterior",
-                "temperature": float(self.temperature),
-                "fit_scope": "validation_split_class_labels_only",
-            }
-
-        graph_score = self._graph_posthoc_score(feature_bundle["features"])
-        if graph_score is not None:
-            graph_score = np.clip(graph_score, 0.0, 1.0).astype(np.float32)
-            anchor_score = candidate_scores.get(RISK_CANDIDATE_MSP_TS, candidate_scores[RISK_CANDIDATE_MSP])
-            candidate_scores[GETS_POSTHOC_GRAPH_LOGISTIC] = graph_score
-            candidate_scores[GETS_POSTHOC_MSP_GRAPH_BLEND] = np.clip(
-                0.65 * anchor_score + 0.35 * graph_score,
-                0.0,
-                1.0,
-            ).astype(np.float32)
-            candidate_scores[GETS_POSTHOC_ENTROPY_GRAPH_BLEND] = np.clip(
-                0.55 * anchor_score + 0.25 * candidate_scores[RISK_CANDIDATE_ENTROPY] + 0.20 * graph_score,
-                0.0,
-                1.0,
-            ).astype(np.float32)
-            graph_metadata = _gets_graph_candidate_metadata(self.feature_names, self.graph_feature_names)
-            candidate_metadata[GETS_POSTHOC_GRAPH_LOGISTIC] = dict(graph_metadata)
-            candidate_metadata[GETS_POSTHOC_MSP_GRAPH_BLEND] = {
-                **graph_metadata,
-                "blend": "0.65*msp_ts_or_msp + 0.35*graph_logistic",
-            }
-            candidate_metadata[GETS_POSTHOC_ENTROPY_GRAPH_BLEND] = {
-                **graph_metadata,
-                "blend": "0.55*msp_ts_or_msp + 0.25*entropy + 0.20*graph_logistic",
-            }
-        else:
-            candidate_metadata[GETS_POSTHOC_GRAPH_LOGISTIC] = {
-                "status": "not_available",
-                "reason": "OOF fit labels did not contain both residual classes",
-            }
-
-        self.candidate_metadata = candidate_metadata
-        return candidate_scores, candidate_metadata
-
-    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        fit_idx = kwargs.get("fit_idx", None)
-        lm_probs = kwargs.get("lm_probs", None)
-        if fit_idx is None:
-            raise ValueError("GETS-style post-hoc residual-risk selector requires OOF fit_idx; direct train correctness is not allowed.")
-
-        _, _, residual_errors, _ = _stage1_residual_errors(labels, probs)
-        fit_idx_np = _valid_index_array(fit_idx, residual_errors.shape[0])
-
-        feature_bundle = build_gets_posthoc_residual_features(
-            logits=logits,
-            probs=probs,
-            edge_index=edge_index,
-            edge_type=edge_type,
-            lm_probs=lm_probs,
-        )
-        self.feature_names = list(feature_bundle["feature_names"])
-        self.graph_feature_names = list(feature_bundle["graph_feature_names"])
-        graph_posthoc_available = self._fit_graph_posthoc(
-            feature_bundle["features"][fit_idx_np],
-            residual_errors[fit_idx_np],
-        )
-        graph_train_score = self._graph_posthoc_score(feature_bundle["features"])
-
-        self.training_summary = self._build_training_summary(
-            fit_idx_np=fit_idx_np,
-            residual_errors=residual_errors,
-            graph_posthoc_available=graph_posthoc_available,
-            graph_train_score=graph_train_score,
-            node_repr=node_repr,
-            oof_metadata=kwargs.get("oof_metadata", {}),
-        )
-        self.calibration_metadata = dict(self.training_summary)
-        return self
-
-    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        candidates, _ = self._candidate_scores(
-            logits,
-            probs,
-            edge_index=edge_index,
-            edge_type=edge_type,
-            lm_probs=kwargs.get("lm_probs"),
-        )
-        selected = self.selected_candidate if self.selected_candidate in candidates else None
-        if selected is None:
-            selected = GETS_POSTHOC_GRAPH_LOGISTIC if GETS_POSTHOC_GRAPH_LOGISTIC in candidates else RISK_CANDIDATE_MSP
-        return np.asarray(candidates[selected], dtype=np.float32)
-
-    def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
-        _, _, residual_errors, probs_np = _stage1_residual_errors(labels, probs)
-        val_idx_np = _valid_index_array(val_idx, residual_errors.shape[0])
-        test_idx_np = _valid_index_array(test_idx, residual_errors.shape[0])
-
-        candidate_scores, candidate_metadata = self._candidate_scores(
-            logits,
-            probs,
-            edge_index=edge_index,
-            edge_type=edge_type,
-            lm_probs=kwargs.get("lm_probs"),
-            labels=labels,
-            val_idx=val_idx,
-        )
-        selection = _select_residual_risk_candidate(
-            residual_errors,
-            candidate_scores,
-            val_idx_np,
-            budgets=self.budgets,
-        )
-        self.candidate_selection = selection
-        self.selected_candidate = selection["selected_candidate"]
-        risk_score = np.asarray(candidate_scores[self.selected_candidate], dtype=np.float32)
-        candidate_names, self.last_view_scores, self.last_view_weights = _one_hot_candidate_view_tensors(
-            candidate_scores,
-            self.selected_candidate,
-        )
-
-        if self.val_threshold is None:
-            budget = max(int(len(val_idx_np) * 0.15), 1)
-            self.val_threshold = float(np.sort(risk_score[val_idx_np])[-budget]) if val_idx_np.size else float("inf")
-        hcw_mask = ((1.0 - probs_np.max(axis=1)) < 0.1) & (residual_errors == 1)
-        calibration_metadata = self._build_manifest_metadata(
-            selection=selection,
-            candidate_metadata=candidate_metadata,
-            candidate_names=candidate_names,
-        )
-        self.calibration_metadata = calibration_metadata
-        return {
-            "risk_score": risk_score.astype(np.float32),
-            "thresholds": {"validation_risk_threshold": float(self.val_threshold)},
-            "calibration_metadata": calibration_metadata,
-            "hcw_mask": hcw_mask.tolist(),
-            "validation_metrics": _safe_router_metrics(
-                residual_errors[val_idx_np],
-                risk_score[val_idx_np],
-                budgets=self.budgets,
-            )
-            if val_idx_np.size
-            else {},
-            "test_metrics": _safe_router_metrics(
-                residual_errors[test_idx_np],
-                risk_score[test_idx_np],
-                budgets=self.budgets,
-            )
-            if test_idx_np.size
-            else {},
-        }
-
-    def state_dict_payload(self):
-        return {
-            "variant": self.risk_variant,
-            "feature_names": self.feature_names,
-            "graph_feature_names": self.graph_feature_names,
-            "selected_candidate": self.selected_candidate,
-            "candidate_selection": self.candidate_selection,
-            "candidate_metadata": self.candidate_metadata,
-            "temperature": self.temperature,
-            "training_summary": self.training_summary,
-            "classifier": {
-                "coef": self.classifier.coef_.tolist() if self.classifier is not None else None,
-                "intercept": self.classifier.intercept_.tolist() if self.classifier is not None else None,
-                "classes": self.classifier.classes_.tolist() if self.classifier is not None else None,
-            },
-            "scaler": {
-                "mean": self.scaler.mean_.tolist() if self.scaler is not None else None,
-                "scale": self.scaler.scale_.tolist() if self.scaler is not None else None,
-            },
-        }
-
-
 class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
     metadata = {
         "claim_role": "stage_b_ablation_residual_risk_estimator",
@@ -3461,9 +2466,13 @@ class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
         if self.training_objective == "glance_advantage":
             fit_scope = "explicit_glance_counterfactual_advantage_labels"
             family = "GLANCE_for_Context_advantage_router_ablation"
+            screening_only = False
+            diagnosis_or_action = True
         else:
             fit_scope = "train_split_oof_residual_labels_only"
             family = "GLANCE_for_Context_lightweight_router"
+            screening_only = True
+            diagnosis_or_action = False
         metadata = {
             **_base_residual_candidate_metadata(),
             GLANCE_SOFT_HOMOPHILY_PRIOR: {
@@ -3490,8 +2499,8 @@ class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
                 "formula": GLANCE_FORMULA_REFERENCE["router_probability"],
                 "fit_scope": fit_scope,
                 "training_objective": self.training_objective,
-                "screening_only": True,
-                "diagnosis_or_action": False,
+                "screening_only": screening_only,
+                "diagnosis_or_action": diagnosis_or_action,
                 "llm_query_cost_reference": float(self.llm_query_cost),
                 "feature_family": list(self.feature_names or feature_bundle["feature_names"]),
                 "structural_feature_family": list(feature_bundle.get("structural_feature_names", [])),
@@ -3554,7 +2563,8 @@ class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
             "fit_scope": "train_split_oof_artifact_only",
             "validation_selection_scope": "validation_split_residual_labels_only",
             "fit_count": int(fit_idx_np.size),
-            "positive_count": int(residual_errors[fit_idx_np].sum()) if fit_idx_np.size else 0,
+            "positive_count": int(training_target.labels.sum()) if fit_idx_np.size else 0,
+            "residual_error_positive_count": int(residual_errors[fit_idx_np].sum()) if fit_idx_np.size else 0,
             "router_available": bool(router_available),
             "feature_family": list(self.feature_names),
             "structural_feature_family": list(self.structural_feature_names),
@@ -3567,12 +2577,18 @@ class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
             "training_objective": training_target.objective,
             "target_semantics": training_target.target_semantics,
             "target_metadata": dict(training_target.metadata),
-            "screening_only": True,
-            "diagnosis_or_action": False,
+            "screening_only": bool(training_target.objective != "glance_advantage"),
+            "diagnosis_or_action": bool(training_target.objective == "glance_advantage"),
+            "paper_faithful_glance_inspired": bool(training_target.objective == "glance_advantage"),
+            "official_code_verified": False,
+            "counterfactual_outcome_used": bool(training_target.metadata.get("counterfactual_outcome_used", False)),
+            "not_a_new_bot_classifier": True,
             "training_objective_adaptation": self._training_objective_adaptation_note(training_target),
             "forbidden_inputs_audit": {
                 "raw_text": False,
-                "stage3_action_or_repair_outcome": False,
+                "stage3_action_or_repair_outcome": bool(
+                    training_target.metadata.get("stage3_action_or_repair_outcome_used", False)
+                ),
                 "llm_counterfactual_outcome": bool(
                     training_target.metadata.get("llm_counterfactual_outcome_used", False)
                 ),
@@ -3617,14 +2633,24 @@ class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
             node_repr=node_repr,
             **kwargs,
         )
-        selection = _select_residual_risk_candidate(
-            residual_errors,
-            candidate_scores,
-            val_idx_np,
-            budgets=self.budgets,
-        )
+        if self.training_objective == "glance_advantage" and GLANCE_ROUTER_LOGISTIC in candidate_scores:
+            selection = {
+                "selected_candidate": GLANCE_ROUTER_LOGISTIC,
+                "candidate_order": [GLANCE_ROUTER_LOGISTIC],
+                "selection_metric": "paper_faithful_counterfactual_advantage_router",
+                "selection_scope": "trained_advantage_router_no_residual_error_candidate_switch",
+                "note": "Advantage mode routes by the learned GLANCE-style counterfactual router, not by validation residual-risk candidate selection.",
+            }
+            self.selected_candidate = GLANCE_ROUTER_LOGISTIC
+        else:
+            selection = _select_residual_risk_candidate(
+                residual_errors,
+                candidate_scores,
+                val_idx_np,
+                budgets=self.budgets,
+            )
+            self.selected_candidate = selection["selected_candidate"]
         self.candidate_selection = selection
-        self.selected_candidate = selection["selected_candidate"]
         self.candidate_metadata = candidate_metadata
         risk_score = np.asarray(candidate_scores[self.selected_candidate], dtype=np.float32)
         candidate_names, self.last_view_scores, self.last_view_weights = _one_hot_candidate_view_tensors(
@@ -3644,9 +2670,17 @@ class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
             "candidate_names": candidate_names,
             "input_boundary": self.training_summary.get("forbidden_inputs_audit", {}),
             "selection_scope": "validation_split_residual_labels_only",
-            "screening_only": True,
-            "diagnosis_or_action": False,
-            "positioning": "GLANCE-inspired node-aware residual-risk ranking; not a Stage 3 action router",
+            "screening_only": bool(self.training_objective != "glance_advantage"),
+            "diagnosis_or_action": bool(self.training_objective == "glance_advantage"),
+            "paper_faithful_glance_inspired": bool(self.training_objective == "glance_advantage"),
+            "official_code_verified": False,
+            "counterfactual_outcome_used": bool(self.training_objective == "glance_advantage"),
+            "not_a_new_bot_classifier": True,
+            "positioning": (
+                "GLANCE-inspired counterfactual advantage router; selects refiner action utility"
+                if self.training_objective == "glance_advantage"
+                else "GLANCE-inspired node-aware residual-risk ranking; not a Stage 3 action router"
+            ),
             "homophily_estimator_source": feature_bundle.get("homophily_estimator_source"),
         }
         self.calibration_metadata = calibration_metadata
@@ -3695,294 +2729,6 @@ class GlanceForContextResidualRiskSelector(BaseRiskEstimator):
 
 
 GlanceForContextResidualRiskRouter = GlanceForContextResidualRiskSelector
-
-
-class CalibratedResidualRiskHardNodeSelector(CalibratedMultiViewResidualRouter):
-    metadata = {
-        "claim_role": "stage_b_ablation_residual_risk_estimator",
-        "stage2_role": "hard_node_selector",
-        "canonical_stage2": False,
-        "scientific_gate": "oof_required",
-        "paper_identity": "Calibrated Residual-Risk Hard-Node Selector",
-        "paper_identity_risk": "low_if_behavior_only_inputs",
-        "promotion_rule": "ablation_only_never_canonical",
-        "screening_only": True,
-        "diagnosis_or_action": False,
-    }
-
-    _RISK_TO_LEGACY_VARIANT = RESIDUAL_RISK_VARIANT_TO_LEGACY_VIEW
-
-    def __init__(self, risk_variant="view_ensemble", **kwargs):
-        legacy_variant = self._RISK_TO_LEGACY_VARIANT.get(str(risk_variant), str(risk_variant))
-        super().__init__(variant=legacy_variant, **kwargs)
-        self.risk_variant = str(risk_variant)
-        self.paper_identity = "Calibrated Residual-Risk Hard-Node Selector"
-
-
-class TwoTermEgoUncertaintyEstimator(BaseRiskEstimator):
-    """Stage-1 of the v8 EQC pipeline.
-
-    Implements the minimal anchored two-term composite non-conformity score
-
-        s(v, y) = s_lbl(v, y) + w_tg * JSD(p_LM(v) || p_GNN(v)) / log 2
-
-    with ``w_lbl`` fixed to 1.0 and ``w_tg`` selected by a pre-registered
-    one-dimensional grid search on the validation calibration split. The
-    calibration threshold ``q_hat`` is fit on the validation-split
-    non-conformity scores; no test labels are used at any point.
-
-    The estimator is deliberately presented as pre-committed plumbing for
-    the v8 proposal: its score feeds downstream selection/refinement, and
-    the paper makes no novelty claim at this stage. Failure of ``w_tg > 0``
-    after the grid search falls back to pure label non-conformity and the
-    paper honestly reports that the JSD term is unnecessary.
-    """
-
-    metadata = {
-        "claim_role": "eqc_v8_stage1_two_term_composite",
-        "scientific_gate": "calibration_split_labels_only",
-        "paper_identity": "v8 EQC Two-Term Ego-Uncertainty Estimator",
-        "paper_identity_risk": "low_plumbing_not_novelty",
-        "promotion_rule": "pre_committed_plumbing_never_primary_claim",
-        "prediction_set_estimator": True,
-        "diagnosis_or_action": False,
-    }
-
-    _GRID_WEIGHTS_DEFAULT = (0.0, 0.25, 0.5, 0.75, 1.0)
-
-    def __init__(self, alpha=0.15, weight_grid=None, budgets=RESIDUAL_RISK_PAPER_BUDGETS):
-        super().__init__()
-        self.alpha = float(alpha)
-        self.weight_grid = tuple(self._GRID_WEIGHTS_DEFAULT if weight_grid is None else weight_grid)
-        self.budgets = parse_budget_list(budgets, default=RESIDUAL_RISK_PAPER_BUDGETS)
-        self.w_tg = None
-        self.threshold = None
-        self.num_classes = None
-        self.fit_summary = {}
-        self.calibration_metadata = {}
-        self.val_threshold = None
-
-    @staticmethod
-    def _posterior_from(logits=None, probs=None):
-        if logits is not None:
-            logits_t = _to_tensor(logits).float()
-            if logits_t.dim() != 2:
-                raise ValueError("two_term_ego_uncertainty expects logits shaped [num_nodes, num_classes].")
-            return F.softmax(logits_t, dim=1).detach().cpu().numpy().astype(np.float64)
-        probs_t = _normalize_probs(probs)
-        if probs_t.dim() != 2:
-            raise ValueError("two_term_ego_uncertainty expects probabilities shaped [num_nodes, num_classes].")
-        return probs_t.detach().cpu().numpy().astype(np.float64)
-
-    @staticmethod
-    def _jsd_disagreement(p_lm, p_gnn):
-        """Jensen-Shannon divergence between LM and GNN predictive distributions,
-        normalised to ``[0, 1]`` via division by ``log 2``.
-
-        Returns
-        -------
-        numpy.ndarray
-            Array of shape ``[num_nodes]`` with values in ``[0, 1]``.
-        """
-        p_lm = np.clip(np.asarray(p_lm, dtype=np.float64), 1e-12, 1.0)
-        p_gnn = np.clip(np.asarray(p_gnn, dtype=np.float64), 1e-12, 1.0)
-        mixture = 0.5 * (p_lm + p_gnn)
-        mixture = np.clip(mixture, 1e-12, 1.0)
-        kl_lm = np.sum(p_lm * (np.log(p_lm) - np.log(mixture)), axis=1)
-        kl_gnn = np.sum(p_gnn * (np.log(p_gnn) - np.log(mixture)), axis=1)
-        jsd = 0.5 * (kl_lm + kl_gnn)
-        return np.clip(jsd / np.log(2.0), 0.0, 1.0).astype(np.float64)
-
-    @staticmethod
-    def _composite_score(posterior_gnn, jsd_per_node, w_tg):
-        """Return the per-(node, class) composite non-conformity score
-        ``s(v, y) = (1 - p_GNN(y|v)) + w_tg * s_tg(v)``.
-        """
-        label_term = 1.0 - np.asarray(posterior_gnn, dtype=np.float64)
-        return label_term + float(w_tg) * jsd_per_node[:, None]
-
-    @staticmethod
-    def _fit_threshold(nonconformity_scores, alpha):
-        scores = np.asarray(nonconformity_scores, dtype=np.float64).reshape(-1)
-        if scores.size == 0:
-            return float("inf")
-        # Standard split-conformal quantile: ceil((n+1)(1-alpha))/n.
-        # When q > 1 (calibration set too small for the requested coverage),
-        # the conservative choice is include-all (+inf), not the max score.
-        q_raw = float(np.ceil((scores.size + 1) * (1.0 - float(alpha)))) / scores.size
-        if q_raw > 1.0:
-            return float("inf")
-        q = max(q_raw, 0.0)
-        return float(np.quantile(scores, q, method="higher"))
-
-    def _select_w_tg(self, posterior_gnn, jsd_per_node, labels_np, val_idx_np):
-        """Pre-registered one-dimensional grid search over ``w_tg``.
-
-        The objective is mean set size on the validation calibration split
-        at the nominal coverage level ``1 - alpha``; ties are broken by the
-        calibrated non-conformity threshold ``q_hat`` (smaller is tighter).
-        This returns ``(w_tg_star, threshold_star)`` along with the full
-        per-weight diagnostics for reproducibility.
-        """
-        diagnostics = []
-        best = None
-        for w in self.weight_grid:
-            composite_scores = self._composite_score(posterior_gnn, jsd_per_node, w)
-            # Index only val_idx rows so test labels never enter the threshold path.
-            val_scores = composite_scores[val_idx_np]
-            val_labels = labels_np[val_idx_np]
-            calibration_scores = val_scores[np.arange(val_idx_np.size), val_labels]
-            threshold = self._fit_threshold(calibration_scores, self.alpha)
-            in_set = composite_scores <= threshold + 1e-12
-            set_size = in_set.sum(axis=1).astype(np.float64)
-            mean_set_size = float(set_size[val_idx_np].mean()) if val_idx_np.size else float("inf")
-            diagnostics.append(
-                {"w_tg": float(w), "threshold": float(threshold), "val_mean_set_size": mean_set_size}
-            )
-            # Tie-break: prefer larger threshold (conservative) among equal set-size candidates.
-            key = (mean_set_size, -threshold)
-            if best is None or key < best[0]:
-                best = (key, float(w), float(threshold))
-        return best[1], best[2], diagnostics
-
-    def fit(self, logits, probs, labels, train_idx, val_idx,
-            edge_index=None, edge_type=None, node_repr=None,
-            lm_logits=None, lm_probs=None, **kwargs):
-        if lm_logits is None and lm_probs is None:
-            raise ValueError(
-                "two_term_ego_uncertainty.fit requires frozen LM posteriors via 'lm_logits' or 'lm_probs'."
-            )
-        posterior_gnn = self._posterior_from(logits=logits, probs=probs)
-        posterior_lm = self._posterior_from(logits=lm_logits, probs=lm_probs)
-        if posterior_lm.shape != posterior_gnn.shape:
-            raise ValueError(
-                f"LM posterior shape {posterior_lm.shape} does not match GNN posterior shape {posterior_gnn.shape}."
-            )
-        labels_np = _labels_to_numpy(labels).astype(np.int64)
-        val_idx_np = _valid_index_array(val_idx, labels_np.shape[0])
-        if val_idx_np.size == 0:
-            raise ValueError("two_term_ego_uncertainty requires a non-empty calibration/validation split.")
-
-        self.num_classes = int(posterior_gnn.shape[1])
-        jsd = self._jsd_disagreement(posterior_lm, posterior_gnn)
-        w_tg_star, threshold_star, diagnostics = self._select_w_tg(
-            posterior_gnn, jsd, labels_np, val_idx_np
-        )
-        self.w_tg = float(w_tg_star)
-        self.threshold = float(threshold_star)
-        self.fit_summary = {
-            "source": "two_term_ego_uncertainty_estimator",
-            "fit_scope": "validation_split_labels_only",
-            "calibration_count": int(val_idx_np.size),
-            "alpha": float(self.alpha),
-            "threshold": float(self.threshold),
-            "w_tg": float(self.w_tg),
-            "w_lbl_fixed": 1.0,
-            "weight_grid": list(self.weight_grid),
-            "weight_grid_diagnostics": diagnostics,
-            "jsd_basis": "Jensen-Shannon divergence of frozen LM and GNN posteriors, normalized by log 2",
-            "test_labels_used_for_threshold": False,
-            "literature_basis": ["CF-GNN heuristic calibration (no coverage theorem)"],
-            "framing": "valid_cal_quantile_calibrated_selection_rule",
-        }
-        self.calibration_metadata = dict(self.fit_summary)
-        self.val_threshold = None
-        return self
-
-    def _prediction_set_payload(self, posterior_gnn, jsd):
-        composite_scores = self._composite_score(posterior_gnn, jsd, self.w_tg or 0.0)
-        threshold = float(self.threshold if self.threshold is not None else float("inf"))
-        in_set = composite_scores <= threshold + 1e-12
-        prediction_sets = []
-        empty_set_mask = []
-        for row_idx, row in enumerate(in_set):
-            hits = np.flatnonzero(row).astype(int).tolist()
-            empty = not hits
-            if empty:
-                # Threshold failure: return argmax as a fallback but flag the node.
-                hits = [int(np.argmax(posterior_gnn[row_idx]))]
-            prediction_sets.append(hits)
-            empty_set_mask.append(empty)
-        set_size = np.asarray([len(hits) for hits in prediction_sets], dtype=np.float32)
-        best_margin = threshold - composite_scores.min(axis=1)
-        q_v = composite_scores.min(axis=1).astype(np.float32)
-        abstain_risk = np.clip(1.0 - np.clip(best_margin / max(abs(threshold), 1e-8), 0.0, 1.0), 0.0, 1.0).astype(np.float32)
-        # Nodes with empty prediction sets get maximum abstain risk.
-        empty_arr = np.asarray(empty_set_mask, dtype=bool)
-        abstain_risk[empty_arr] = 1.0
-        return {
-            "prediction_sets": prediction_sets,
-            "set_size": set_size.astype(np.int64).tolist(),
-            "coverage_margin": best_margin.astype(np.float32),
-            "abstain_risk": abstain_risk,
-            "q_composite": q_v,
-            "empty_set_count": int(empty_arr.sum()),
-        }
-
-    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None,
-              lm_logits=None, lm_probs=None, **kwargs):
-        posterior_gnn = self._posterior_from(logits=logits, probs=probs)
-        posterior_lm = self._posterior_from(logits=lm_logits, probs=lm_probs)
-        jsd = self._jsd_disagreement(posterior_lm, posterior_gnn)
-        return self._prediction_set_payload(posterior_gnn, jsd)["abstain_risk"]
-
-    def build_manifest(self, logits, probs, labels, val_idx, test_idx,
-                       edge_index=None, edge_type=None, node_repr=None,
-                       lm_logits=None, lm_probs=None, **kwargs):
-        posterior_gnn = self._posterior_from(logits=logits, probs=probs)
-        posterior_lm = self._posterior_from(logits=lm_logits, probs=lm_probs)
-        jsd = self._jsd_disagreement(posterior_lm, posterior_gnn)
-        payload = self._prediction_set_payload(posterior_gnn, jsd)
-
-        labels_np = _labels_to_numpy(labels)
-        preds = posterior_gnn.argmax(axis=1)
-        wrong = (preds != labels_np).astype(np.int32)
-        val_idx_np = _valid_index_array(val_idx, wrong.shape[0])
-        test_idx_np = _valid_index_array(test_idx, wrong.shape[0])
-        risk_score = payload["abstain_risk"].astype(np.float32)
-        if self.val_threshold is None:
-            budget = self.budgets[0] if self.budgets else RESIDUAL_RISK_PAPER_BUDGETS[0]
-            k = max(int(len(val_idx_np) * float(budget)), 1) if val_idx_np.size else 0
-            self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
-
-        metadata = {
-            **dict(self.calibration_metadata),
-            "graph_context_used": edge_index is not None,
-            "embedding_context_used": node_repr is not None,
-            "threshold_source": "validation_composite_nonconformity",
-            "test_labels_used_for_threshold": False,
-        }
-        return {
-            "risk_score": risk_score,
-            "prediction_sets": payload["prediction_sets"],
-            "set_size": payload["set_size"],
-            "coverage_margin": payload["coverage_margin"].astype(np.float32),
-            "abstain_risk": risk_score,
-            "q_composite": payload["q_composite"],
-            "thresholds": {
-                "validation_risk_threshold": float(self.val_threshold),
-                "conformal_nonconformity_threshold": float(self.threshold if self.threshold is not None else 1.0),
-                "w_tg": float(self.w_tg if self.w_tg is not None else 0.0),
-            },
-            "calibration_metadata": metadata,
-            "hcw_mask": ((1.0 - posterior_gnn.max(axis=1)) < 0.1) & (wrong == 1),
-            "validation_metrics": _safe_router_metrics(
-                wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets
-            ) if val_idx_np.size else {},
-            "test_metrics": _safe_router_metrics(
-                wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets
-            ) if test_idx_np.size else {},
-        }
-
-    def state_dict_payload(self):
-        return {
-            "alpha": float(self.alpha),
-            "weight_grid": list(self.weight_grid),
-            "w_tg": float(self.w_tg if self.w_tg is not None else 0.0),
-            "threshold": float(self.threshold if self.threshold is not None else 1.0),
-            "num_classes": self.num_classes,
-            "fit_summary": self.fit_summary,
-        }
 
 
 class CalibratedExpectedErrorProxy:
@@ -4116,28 +2862,14 @@ class CalibratedExpectedErrorProxy:
 def build_estimator(mode):
     if mode == "msp_ts":
         return MSPTemperatureEstimator()
-    if mode == "final_output_ranker":
-        return FinalOutputRanker()
-    if mode == "dual_posterior_ranker":
-        return DualPosteriorRanker()
+    if mode == "posthoc_calibrated_ranker":
+        return PostHocCalibratedRanker()
     if mode == "login_uncertainty_router":
         return LOGINUncertaintyRouter()
     if mode == "graph_conformal_set_estimator":
         return GraphConformalSetEstimator()
     if mode == "gnn_2hop_conformal":
         return GNN2HopConformalEstimator()
-    if mode == "eqc_v8_stage1":
-        return TwoTermEgoUncertaintyEstimator()
-    if mode == "cagcn_proxy":
-        return LogisticProxyEstimator(mode_name=mode)
-    if mode == "gats_proxy":
-        return LogisticProxyEstimator(mode_name=mode)
-    if mode == "calibrated_residual_risk_selector":
-        return CalibratedResidualRiskHardNodeSelector()
-    if mode == "gets_posthoc_residual_risk_selector":
-        return GETSStylePostHocResidualRiskSelector()
     if mode in {"glance_for_context_residual_risk_selector", "glance_residual_risk_selector", "glance_router"}:
         return GlanceForContextResidualRiskSelector()
-    if mode == "calibrated_multiview_router":
-        return CalibratedMultiViewResidualRouter()
     raise ValueError(f"Unknown estimator mode: {mode}")

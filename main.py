@@ -39,6 +39,8 @@ PREPARATION_STAGES = {
 }
 
 FORMAL_STAGES = {
+    "local_conformal_prune_diag",
+    "glance_joint_router_refine",
     "vertical_minimal",
     "estimator_matrix",
     "semantic_matrix",
