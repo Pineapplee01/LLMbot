@@ -40,8 +40,27 @@ Use this fixed routing:
 - For parser/config changes, run a lightweight argument surface check such as `python main.py --help` when the active mainline imports are available.
 - For stage behavior, prefer bounded smoke commands with explicit `--stage`, `--seeds`, `--disable_wandb`, and small limits when available.
 - For research artifact changes, verify manifest fields and output paths produced by the CLI command.
-- For governance or skill changes, run drift checks for stale `LLMbot/baseline/` default-mainline wording, role-boundary language, and skill frontmatter.
+- For governance or skill changes, run drift checks for stale `LLMbot/baseline/` default-mainline wording, role-boundary language, skill frontmatter, and missing code-documentation sync.
 - If a CLI run is unsafe, too expensive, or missing data/GPU, state the exact command that would validate it and explain why it was not run.
+
+## Documentation Sync Contract
+
+Every active-mainline code change must update the matching code-development
+docs in the same task.
+
+Minimum mapping:
+
+- parser, task names, public flags, hidden aliases, or command examples:
+  update `docs/code/parser.md` and `LLMbot/README.md`
+- stage dispatch, module boundaries, runtime flow, or extraction progress:
+  update `docs/ARCHITECTURE.md` and `docs/code/research.md`
+- maintainability hotspots, transitional risk, or unresolved implementation debt:
+  update `code.md`
+- operator-visible workflow or onboarding changes:
+  update `LLMbot/README.md`
+
+Do not leave documentation catch-up as a later cleanup item. If the code surface
+changed, the matching docs must land in the same task.
 
 ## Code Quality Rules
 
@@ -67,4 +86,5 @@ Use this fixed routing:
 - List changed files.
 - State whether any new source or test files were created.
 - Report the CLI args, manifest checks, or governance commands used for validation.
+- State which code-development docs were updated to match the code change, or explain why no doc sync was required.
 - State remaining risks, especially research-claim or external-code-verification gaps.

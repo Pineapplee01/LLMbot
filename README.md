@@ -62,7 +62,10 @@ Internal-only implemented branches are not part of the public CLI contract:
 
 `joint_router_refinement` is the only public GLANCE-family task. It is still a
 GLANCE-style implementation under the current cached semantic-embedding path,
-not a full official-pipeline reproduction.
+not a full official-pipeline reproduction. The strict router path now mirrors
+the paper more closely by fitting a lightweight auxiliary MLP `Q` on node
+features and using its predicted probabilities to build the soft local
+homophily feature for routing.
 
 ## Command Examples
 
@@ -177,10 +180,102 @@ active naming surface.
 
 - `trainer.py` is already a thin compatibility facade, but most execution logic
   still lives in `trainer_legacy_impl.py`.
+- `stage_runner.py`, `trainer_preparation.py`, `trainer_semantic.py`,
+  `trainer_graph.py`, `trainer_glance.py`, and `stage_helpers.py` already act
+  as canonical import surfaces, but most still forward into
+  `trainer_legacy_impl.py` while extraction continues.
 - `estimators.py` and `trainer_legacy_impl.py` remain the main refactor
   hotspots.
 - `python main.py --help` is now intended to work as a parser-only check even if
   the training runtime is not fully installed.
+
+## Refactor Snapshot 2026-05-24
+
+- public task naming is now canonical and owned by `stage_registry.py`
+- parser output includes canonical fields first and legacy shadow fields only
+  for compatibility
+- `main.py` resolves stage behavior through the registry instead of maintaining
+  a separate public-task truth table
+- preparation artifacts now write to canonical namespaces under
+  `seed_<n>/preparation/`
+- runtime-only helper artifacts are still in migration and may retain
+  compatibility fallbacks
+- strict GLANCE now derives its router-side soft local homophily signal from a
+  lightweight auxiliary MLP `Q`, replacing the earlier logistic-regression
+  placeholder
+- LOGIN-style uncertainty routing remains explicitly bounded to hard-node
+  selection only; manifests record `official_code_verified = false`,
+  `repo_locally_verified = false`, and
+  `verified_scope = node_selection_uncertainty_only`
+- `joint_router_refinement` remains the only public GLANCE-family task; richer
+  GLANCE branches are implemented but internal-only
+
+## Code Governance Status 2026-05-24
+
+The active mainline is now governance-aligned, but not yet structurally
+finished.
+
+Completed governance work:
+
+- `LLMbot/` is the only active mainline
+- canonical public tasks and canonical public flags are now the operator-facing
+  contract
+- hidden legacy aliases are isolated to a compatibility window instead of
+  remaining the public interface
+- internal GLANCE branches are explicitly separated from the public CLI surface
+- the active code-development docs now describe the canonical mainline rather
+  than deprecated `baseline/core` terminology
+
+Still incomplete:
+
+- most execution logic still resides in `trainer_legacy_impl.py`
+- several extracted modules are currently boundary surfaces rather than true
+  logic owners
+- active internal code still carries a canonical-to-legacy compatibility layer
+- `StageSpec` is only partially consumed as a runtime policy source
+- runtime-only helper artifact naming is still in migration
+
+This means the project has passed the public-contract cleanup phase, but has
+not yet finished the implementation extraction phase.
+
+## Next Refactor Plan
+
+1. Make `trainer_preparation.py` the real owner of preparation logic.
+   Move `load_frozen_g0`, `build_or_load_frozen_g0`, and
+   `build_or_load_faithful_gats` out of `trainer_legacy_impl.py`, and move
+   shared path/provenance helpers into `stage_helpers.py`.
+2. Make `trainer_semantic.py` the real owner of semantic finetune execution.
+   Move `run_semantic_finetune_seed` and its manifest/report helpers out of
+   `trainer_legacy_impl.py`.
+3. Finish the active parser-namespace migration inside code.
+   Keep legacy flags parse-compatible, but make active mainline code read
+   canonical fields such as `experiment_task`, `graph_backbone`,
+   `text_encoder`, `semantic_encoder`, and `embedding_path`.
+4. Consume `StageSpec` more uniformly at runtime.
+   Replace remaining hand-written dispatch or gate special cases in `main.py`
+   with registry fields such as `runner_kind`, `claim_grade_allowed`, and
+   `forces_use_gnn`.
+5. Extract graph and GLANCE execution ownership into
+   `trainer_graph.py`, `trainer_glance.py`, and `stage_runner.py`.
+   The goal is for those modules to own their execution branches directly,
+   rather than re-exporting `trainer_legacy_impl.py`.
+6. Canonicalize runtime-only helper artifacts after extraction.
+   New helper outputs should stop writing migration-era naming where practical,
+   while read compatibility remains in place for one transition window.
+
+## Documentation Sync Rule
+
+Every future code change in `LLMbot/` must update the matching code-development
+docs in the same task.
+
+Minimum mapping:
+
+- parser or CLI changes: update `docs/code/parser.md` and this file
+- dispatch, module-boundary, or extraction changes: update
+  `docs/ARCHITECTURE.md` and `docs/code/research.md`
+- maintainability or unresolved-risk changes: update `code.md`
+
+Do not treat documentation sync as optional cleanup.
 
 ## Deprecated Surfaces
 

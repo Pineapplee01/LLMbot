@@ -498,7 +498,8 @@ def train_frozen_g0(args, seed, data, experiment_root):
 
 
 def load_frozen_g0(experiment_root):
-    canonical_dir = Path(build_preparation_dir(experiment_root, "graph_detector"))
+    experiment_root = Path(experiment_root)
+    canonical_dir = experiment_root / "preparation" / "graph_detector"
     legacy_dir = Path(experiment_root) / "frozen" / "g0"
     out_dir = canonical_dir if (canonical_dir / "manifest.json").exists() else legacy_dir
     required = {
@@ -2192,6 +2193,22 @@ class GlanceRouterLinear(nn.Module):
         return logits, prob
 
 
+class GlanceHomophilyQMLP(nn.Module):
+    """Lightweight auxiliary classifier used to estimate GLANCE-style soft homophily."""
+
+    def __init__(self, input_dim, hidden_dim=128, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(int(input_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 2),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def _select_semantic_train_idx(train_idx, limit, seed):
     train_idx = _as_long_cpu_tensor(train_idx)
     if int(limit or 0) <= 0 or int(limit) >= int(train_idx.numel()):
@@ -3041,25 +3058,109 @@ class StageRunner:
         if classes.size < 2:
             q_probs = np.zeros((x_all.shape[0], 2), dtype=np.float32)
             q_probs[:, int(classes[0])] = 1.0
+            q_logits = torch.log(torch.tensor(q_probs, dtype=torch.float32).clamp_min(1e-8))
             classifier_payload = {
                 "type": "constant",
                 "class": int(classes[0]),
             }
         else:
-            clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=int(self.seed))
-            clf.fit(x_train, y_all[train_idx])
-            q_probs = clf.predict_proba(x_full).astype(np.float32)
-            fixed = np.zeros((x_all.shape[0], 2), dtype=np.float32)
-            for col, cls in enumerate(getattr(clf, "classes_", [0, 1])):
-                fixed[:, int(cls)] = q_probs[:, col]
-            q_probs = fixed
+            q_device = self.device if isinstance(self.device, torch.device) else torch.device("cpu")
+            x_train_t = torch.tensor(x_train, dtype=torch.float32)
+            y_train_t = torch.tensor(y_all[train_idx], dtype=torch.long)
+            x_full_t = torch.tensor(x_full, dtype=torch.float32)
+            valid_labels_t = (
+                torch.tensor(y_all[valid_idx], dtype=torch.long)
+                if valid_idx.size > 0
+                else torch.empty(0, dtype=torch.long)
+            )
+            class_counts = np.bincount(y_train_t.numpy(), minlength=2).astype(np.float32)
+            class_weights = np.zeros(2, dtype=np.float32)
+            nonzero = class_counts > 0
+            class_weights[nonzero] = float(y_train_t.numel()) / (2.0 * class_counts[nonzero])
+            q_model = GlanceHomophilyQMLP(
+                input_dim=int(x_train_t.shape[1]),
+                hidden_dim=128,
+                dropout=0.1,
+            ).to(q_device)
+            optimizer = torch.optim.AdamW(q_model.parameters(), lr=1e-3, weight_decay=1e-4)
+            loss_fn = CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=q_device))
+            batch_size = max(32, min(256, int(x_train_t.shape[0])))
+            max_epochs = 50
+            patience = 5
+            generator = torch.Generator()
+            generator.manual_seed(int(self.seed))
+            train_loader = DataLoader(
+                TensorDataset(x_train_t, y_train_t),
+                batch_size=batch_size,
+                shuffle=True,
+                generator=generator,
+            )
+            best_state = None
+            best_epoch = 0
+            best_score = float("inf")
+            wait = 0
+            final_train_loss = float("inf")
+
+            for epoch in range(max_epochs):
+                q_model.train()
+                train_loss_sum = 0.0
+                train_count = 0
+                for batch_x, batch_y in train_loader:
+                    batch_x = batch_x.to(q_device)
+                    batch_y = batch_y.to(q_device)
+                    optimizer.zero_grad(set_to_none=True)
+                    logits = q_model(batch_x)
+                    loss = loss_fn(logits, batch_y)
+                    loss.backward()
+                    optimizer.step()
+                    train_loss_sum += float(loss.detach().cpu().item()) * int(batch_y.numel())
+                    train_count += int(batch_y.numel())
+                final_train_loss = train_loss_sum / max(train_count, 1)
+
+                q_model.eval()
+                with torch.no_grad():
+                    logits_full_t = q_model(x_full_t.to(q_device)).detach().cpu()
+                if valid_idx.size > 0:
+                    valid_loss = float(
+                        F.cross_entropy(logits_full_t[valid_idx], valid_labels_t).detach().cpu().item()
+                    )
+                    selection_score = valid_loss
+                else:
+                    valid_loss = final_train_loss
+                    selection_score = final_train_loss
+
+                if selection_score < best_score:
+                    best_score = selection_score
+                    best_epoch = int(epoch + 1)
+                    best_state = {key: value.detach().cpu().clone() for key, value in q_model.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
+                    if wait >= patience:
+                        break
+
+            if best_state is None:
+                raise MissingFrozenArtifactError("glance_joint_router_refine failed to train the auxiliary Q MLP.")
+            q_model.load_state_dict(best_state)
+            q_model.eval()
+            with torch.no_grad():
+                q_logits = q_model(x_full_t.to(q_device)).detach().cpu()
+            q_probs = torch.softmax(q_logits, dim=1).numpy().astype(np.float32)
             classifier_payload = {
-                "type": "logistic_regression",
-                "classes": [int(item) for item in getattr(clf, "classes_", [0, 1])],
-                "coef": getattr(clf, "coef_", np.zeros((1, x_train.shape[1]))).tolist(),
-                "intercept": getattr(clf, "intercept_", np.zeros(1)).tolist(),
+                "type": "mlp",
+                "input_dim": int(x_train.shape[1]),
+                "hidden_dim": 128,
+                "dropout": 0.1,
+                "batch_size": int(batch_size),
+                "max_epochs": int(max_epochs),
+                "patience": int(patience),
+                "learning_rate": 1e-3,
+                "weight_decay": 1e-4,
+                "best_epoch": int(best_epoch),
+                "final_train_loss": float(final_train_loss),
+                "best_selection_loss": float(best_score),
+                "class_weighting": "inverse_frequency_balanced",
             }
-        q_logits = torch.log(torch.tensor(q_probs, dtype=torch.float32).clamp_min(1e-8))
         temperature = 1.0
         if valid_idx.size > 0 and len(np.unique(y_all[valid_idx])) > 1:
             temperature = fit_temperature_scaling(q_logits[valid_idx], y_all[valid_idx])
@@ -8543,7 +8644,7 @@ class StageRunner:
                 "beta_selection": "validation_only",
             },
             "q_estimator": {
-                "type": "logistic_regression",
+                **q_bundle["classifier"],
                 "train_count": int(q_bundle["train_count"]),
                 "valid_count": int(q_bundle["valid_count"]),
                 "temperature": float(q_bundle["temperature"]),
@@ -8561,9 +8662,9 @@ class StageRunner:
         self._write_stage_manifest(
             stage_dir,
             manifest,
-            artifact_namespace="stages/glance_full_graph_refinement_internal",
-            visibility="internal",
-            resolved_task="glance_full_graph_refinement_internal",
+            artifact_namespace="stages/joint_router_refinement",
+            visibility="public",
+            resolved_task="joint_router_refinement",
         )
         write_json(stage_dir / "metrics.json", metrics_payload)
         write_json(stage_dir / "analysis_summary.json", analysis_summary)
