@@ -1,26 +1,17 @@
-﻿import argparse
+import argparse
 import sys
 
-
-CANONICAL_STAGE_CHOICES = (
-    "frozen_g0",
-    "frozen_gats",
-    "semantic_finetune",
-    "local_conformal_prune_diag",
-    "glance_joint_router_refine",
-    "legacy_distill",
-    "vertical_minimal",
-    "estimator_matrix",
-    "semantic_matrix",
-    "semantic_source_matrix",
-    "repair_matrix",
-    "selector_matrix",
-    "positioning_matrix",
-    "backbone_stress",
-    "appendix",
+from stage_registry import (
+    DEPRECATED_STAGE_VALUES,
+    accepted_stage_values,
+    legacy_name_for,
+    public_canonical_stage_names,
+    resolve_stage_spec,
 )
-LEGACY_STAGE_CHOICES = CANONICAL_STAGE_CHOICES
-DEPRECATED_STAGE_VALUES = set()
+
+
+CANONICAL_STAGE_CHOICES = public_canonical_stage_names()
+LEGACY_STAGE_CHOICES = accepted_stage_values(include_internal=False, include_deprecated=True)
 
 RENAMED_FLAGS = {
     "--stage": "--experiment_task",
@@ -38,7 +29,7 @@ RENAMED_FLAGS = {
     "--lr_GNN": "--gnn_learning_rate",
     "--weight_decay_LM": "--lm_weight_decay",
     "--weight_decay_GNN": "--gnn_weight_decay",
-    "--embedding_path": "--emb_path",
+    "--emb_path": "--embedding_path",
     "--g0_feature_path": "--embedding_path",
     "--g0_epochs": "--graph_detector_epochs",
     "--gats_max_iter": "--gate_calibrator_max_iter",
@@ -112,19 +103,43 @@ def _deprecated_cli_flags(args, raw_args):
     for flag in _extract_cli_flags(raw_args):
         if flag in RENAMED_FLAGS or flag in DEPRECATED_UNWIRED_FLAGS:
             deprecated.append(flag)
-
-    if getattr(args, "stage", None) in DEPRECATED_STAGE_VALUES:
-        deprecated.append(f"stage:{args.stage}")
-
+    if getattr(args, "legacy_task_name_used", None):
+        deprecated.append(f"stage:{args.legacy_task_name_used}")
+    if getattr(args, "requested_experiment_task", None) in DEPRECATED_STAGE_VALUES:
+        deprecated.append(f"stage:{args.requested_experiment_task}")
     return _dedupe_preserve_order(deprecated)
 
 
 def normalize_args(args, raw_args=None):
-    """Normalize shared compatibility aliases without reviving retired GLANCE flags."""
-    if getattr(args, "emb_path", None):
-        args.g0_feature_path = args.emb_path
-    elif getattr(args, "g0_feature_path", None):
-        args.emb_path = args.g0_feature_path
+    requested_task = getattr(args, "experiment_task", None)
+    if requested_task is None:
+        requested_task = getattr(args, "stage", None)
+    requested_task = str(requested_task).strip()
+    resolved_spec = resolve_stage_spec(requested_task)
+
+    args.requested_experiment_task = requested_task
+    args.experiment_task = resolved_spec.canonical_name
+    args.stage = resolved_spec.canonical_name
+    args.requested_stage = requested_task
+    args.stage_spec = resolved_spec
+    args.stage_visibility = resolved_spec.visibility
+    args.legacy_stage = legacy_name_for(args.experiment_task)
+    args.legacy_task_name_used = requested_task if requested_task in resolved_spec.legacy_names else None
+
+    args.graph_backbone = getattr(args, "graph_backbone", None)
+    args.GNN_model = args.graph_backbone
+    args.text_encoder = getattr(args, "text_encoder", None)
+    args.LM_model = args.text_encoder
+    args.semantic_encoder = getattr(args, "semantic_encoder", None)
+    args.semantic_backbone = args.semantic_encoder
+    args.embedding_path = getattr(args, "embedding_path", None)
+    args.emb_path = args.embedding_path
+    args.g0_feature_path = args.embedding_path
+
+    if getattr(args, "risk_budgets", None) is None and getattr(args, "router_budgets", None) is not None:
+        args.risk_budgets = args.router_budgets
+    if getattr(args, "router_budgets", None) is None and getattr(args, "risk_budgets", None) is not None:
+        args.router_budgets = args.risk_budgets
 
     args.reset_split = str(args.reset_split).strip()
     args.deprecated_cli_flags = _deprecated_cli_flags(args, raw_args)
@@ -135,27 +150,25 @@ def parser_args(argv=None):
     raw_args = sys.argv[1:] if argv is None else list(argv)
     parser = argparse.ArgumentParser()
 
-    # Core routing
     parser.add_argument(
         "--experiment_task",
-        dest="stage",
+        dest="experiment_task",
         type=str,
-        default="legacy_distill",
+        default="distillation_pipeline",
         choices=CANONICAL_STAGE_CHOICES,
         help="Canonical experiment task. Use legacy --stage only for historical commands.",
     )
     parser.add_argument(
         "--stage",
-        dest="stage",
+        dest="experiment_task",
         type=str,
         default=argparse.SUPPRESS,
         choices=LEGACY_STAGE_CHOICES,
         help=argparse.SUPPRESS,
     )
 
-    # Experiment metadata
-    parser.add_argument("--project_name", type=str, default="baseline-core")
-    parser.add_argument("--experiment_name", type=str, default="baseline_experiment")
+    parser.add_argument("--project_name", type=str, default="llmbot-mainline")
+    parser.add_argument("--experiment_name", type=str, default="llmbot_run")
     parser.add_argument("--artifact_root", type=str, default=None)
     parser.add_argument("--disable_wandb", action="store_true")
     parser.add_argument("--reuse_existing_artifacts", action="store_true")
@@ -166,7 +179,6 @@ def parser_args(argv=None):
         help="Require claim-grade comparability gates before launching a run.",
     )
 
-    # Dataset
     parser.add_argument("--dataset", type=str, default="TwiBot-20", help="Dataset name")
     parser.add_argument("--lm_batch_size", dest="batch_size_LM", type=int, default=32)
     parser.add_argument("--batch_size_LM", dest="batch_size_LM", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -177,10 +189,9 @@ def parser_args(argv=None):
     parser.add_argument("--is_processed", type=_parse_bool, default=True, help=argparse.SUPPRESS)
     parser.add_argument("--reset_split", type=str, default="-1")
 
-    # Stage routing
     parser.add_argument(
         "--graph_backbone",
-        dest="GNN_model",
+        dest="graph_backbone",
         type=str,
         default="botrgcn",
         choices=["botrgcn", "rgcn", "rgt", "hgt", "simplehgn", "gatv2"],
@@ -188,7 +199,7 @@ def parser_args(argv=None):
     )
     parser.add_argument(
         "--GNN_model",
-        dest="GNN_model",
+        dest="graph_backbone",
         type=str,
         default=argparse.SUPPRESS,
         choices=["botrgcn", "rgcn", "rgt", "hgt", "simplehgn", "gatv2"],
@@ -237,12 +248,11 @@ def parser_args(argv=None):
         help=argparse.SUPPRESS,
     )
 
-    # LM configuration
-    parser.add_argument("--text_encoder", dest="LM_model", type=str, default="roberta")
-    parser.add_argument("--LM_model", dest="LM_model", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--text_encoder", dest="text_encoder", type=str, default="roberta")
+    parser.add_argument("--LM_model", dest="text_encoder", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument(
         "--semantic_encoder",
-        dest="semantic_backbone",
+        dest="semantic_encoder",
         type=str,
         default="auto",
         choices=["auto", "roberta", "roberta_finetuned", "qwen3_frozen", "qwen3_peft"],
@@ -250,7 +260,7 @@ def parser_args(argv=None):
     )
     parser.add_argument(
         "--semantic_backbone",
-        dest="semantic_backbone",
+        dest="semantic_encoder",
         type=str,
         default=argparse.SUPPRESS,
         choices=["auto", "roberta", "roberta_finetuned", "qwen3_frozen", "qwen3_peft"],
@@ -260,7 +270,7 @@ def parser_args(argv=None):
         "--qwen_model_path",
         type=str,
         default="/root/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-8B/snapshots/1d8ad4ca9b3dd8059ad90a75d4983776a23d44af",
-        help="Local path or HF id for Qwen3-Embedding-8B when --semantic_backbone qwen3_peft.",
+        help="Local path or HF id for Qwen3-Embedding-8B when --semantic_encoder qwen3_peft.",
     )
     parser.add_argument(
         "--qwen_trust_remote_code",
@@ -280,7 +290,6 @@ def parser_args(argv=None):
     parser.add_argument("--label_smoothing_factor", type=float, default=0.0)
     parser.add_argument("--warmup", type=float, default=0.6)
 
-    # GNN configuration
     parser.add_argument("--use_GNN", action="store_true")
     parser.add_argument("--n_layers", type=int, default=2)
     parser.add_argument("--hidden_dim", type=int, default=128)
@@ -304,7 +313,7 @@ def parser_args(argv=None):
             "directional_relation_aware_oracle_prune",
             "directional_relation_aware_oracle_prune_no_hetero_priority",
         ],
-        help="Optional graph-only refinement applied before frozen_g0 GNN training.",
+        help="Optional graph-only refinement applied before graph_detector_prepare GNN training.",
     )
     parser.add_argument(
         "--graph_refine_budget",
@@ -315,37 +324,42 @@ def parser_args(argv=None):
     parser.add_argument(
         "--local_conf_disable_degree_guard",
         action="store_true",
-        help="Disable the no-zero-in/no-zero-out structural guard inside local_conformal_prune_diag.",
+        help="Disable the no-zero-in/no-zero-out structural guard inside local_conformal_diagnostic.",
     )
     parser.add_argument(
         "--local_conf_similarity_gate_threshold",
         type=float,
         default=None,
         help=(
-            "Optional max cosine threshold for local_conformal_prune_diag delete candidates. "
+            "Optional max cosine threshold for local_conformal_diagnostic delete candidates. "
             "When set, only harmful edges with semantic cosine <= threshold remain eligible."
         ),
     )
     parser.add_argument(
-        "--external_graph_edge_index_path",
-        type=str,
-        default=None,
-        help="Optional refined edge_index tensor consumed by graph-aware refiner stages.",
+        "--conflict_router_budget",
+        type=float,
+        default=0.10,
+        help="Target routed-node fraction for local_conflict_diagnostic, tuned on validation and applied to test.",
     )
     parser.add_argument(
-        "--external_graph_edge_type_path",
-        type=str,
-        default=None,
-        help="Optional refined edge_type tensor consumed by graph-aware refiner stages.",
+        "--conflict_topk_per_bucket",
+        type=int,
+        default=1,
+        help="Maximum number of positive-delta conflict edges removed per (relation, target_role) bucket.",
     )
+    parser.add_argument(
+        "--conflict_disable_degree_guard",
+        action="store_true",
+        help="Disable the no-zero-in/no-zero-out structural guard inside local_conflict_diagnostic.",
+    )
+    parser.add_argument("--external_graph_edge_index_path", type=str, default=None)
+    parser.add_argument("--external_graph_edge_type_path", type=str, default=None)
 
-    # MLP configuration
     parser.add_argument("--MLP_n_layers", type=int, default=3, help=argparse.SUPPRESS)
     parser.add_argument("--MLP_hidden_dim", type=int, default=128, help=argparse.SUPPRESS)
     parser.add_argument("--optimizer_MLP", type=str, default="adamw", help=argparse.SUPPRESS)
     parser.add_argument("--MLP_dropout", type=float, default=0.4, help=argparse.SUPPRESS)
 
-    # Training and evaluation
     parser.add_argument("--seeds", type=str, default="1,2,3,4,5")
     parser.add_argument("--device", type=int, default=-1)
     parser.add_argument("--LM_pretrain_epochs", type=float, default=5)
@@ -353,13 +367,13 @@ def parser_args(argv=None):
         "--semantic_max_steps",
         type=int,
         default=0,
-        help="Optional step cap for --experiment_task semantic_finetune; 0 uses one pass over the selected train subset.",
+        help="Optional step cap for --experiment_task semantic_encoder_finetune; 0 uses one pass over the selected train subset.",
     )
     parser.add_argument(
         "--semantic_train_limit",
         type=int,
         default=0,
-        help="Optional train_idx cap for --experiment_task semantic_finetune smoke runs; 0 uses the full train split.",
+        help="Optional train_idx cap for --experiment_task semantic_encoder_finetune smoke runs; 0 uses the full train split.",
     )
     parser.add_argument("--MLP_KD_epochs", type=int, default=300, help=argparse.SUPPRESS)
     parser.add_argument("--LM_eval_patience", type=int, default=20)
@@ -387,7 +401,6 @@ def parser_args(argv=None):
     parser.add_argument("--lr_MLP", type=float, default=5e-4, help=argparse.SUPPRESS)
     parser.add_argument("--weight_decay_MLP", type=float, default=1e-5, help=argparse.SUPPRESS)
 
-    # Module-specific controls
     parser.add_argument("--sparse_degree_quantile", type=float, default=0.25)
     parser.add_argument("--propagation_quantile", type=float, default=0.85)
     parser.add_argument("--bootstrap_samples", type=int, default=512)
@@ -395,29 +408,17 @@ def parser_args(argv=None):
         "--external_frozen_g0_root",
         type=str,
         default=None,
-        help="Optional experiment root whose frozen/g0 artifact is reused read-only by strict GLANCE stages.",
-    )
-    parser.add_argument(
-        "--emb_path",
-        dest="emb_path",
-        type=str,
-        default=None,
-        help="Cached semantic embedding tensor for Phase A, frozen_g0, and strict GLANCE.",
+        help="Optional experiment root whose graph-detector preparation artifact is reused read-only by strict GLANCE stages.",
     )
     parser.add_argument(
         "--embedding_path",
-        dest="emb_path",
-        type=str,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--g0_feature_path",
-        dest="g0_feature_path",
+        dest="embedding_path",
         type=str,
         default=None,
-        help=argparse.SUPPRESS,
+        help="Cached semantic embedding tensor for Phase A, graph_detector_prepare, and strict GLANCE.",
     )
+    parser.add_argument("--emb_path", dest="embedding_path", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--g0_feature_path", dest="embedding_path", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument(
         "--phase_a_project_dim",
         type=int,
@@ -442,41 +443,15 @@ def parser_args(argv=None):
     parser.add_argument("--g0_epochs", dest="g0_epochs", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--gate_calibrator_max_iter", dest="gats_max_iter", type=int, default=300)
     parser.add_argument("--gats_max_iter", dest="gats_max_iter", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--phase_a_semantic_sources",
-        type=str,
-        default="auto",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--phase_a_feature_paths",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--phase_a_gnn_family",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--phase_a_fixed_gnn",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--phase_a_fixed_semantic_source",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
+    parser.add_argument("--risk_budgets", type=str, default=None, help="Comma-separated residual-risk routing budgets in (0, 1].")
+    parser.add_argument("--router_budgets", dest="router_budgets", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--router_oof_mode", type=str, default="artifact", choices=["artifact"])
+    parser.add_argument("--phase_a_semantic_sources", type=str, default="auto", help=argparse.SUPPRESS)
+    parser.add_argument("--phase_a_feature_paths", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--phase_a_gnn_family", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--phase_a_fixed_gnn", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--phase_a_fixed_semantic_source", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--phase_a_latency_repeats", type=int, default=3, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--phase_a_include_structural_smoke",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
+    parser.add_argument("--phase_a_include_structural_smoke", action="store_true", help=argparse.SUPPRESS)
 
     return normalize_args(parser.parse_args(raw_args), raw_args=raw_args)

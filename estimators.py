@@ -1261,7 +1261,7 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
     OFFICIAL_DROPOUT_LIST = [0.5, 0.5, 0.5, 0.5, 0.5]
     OFFICIAL_PL_RATE = 0.1
 
-    def __init__(self, budgets=RESIDUAL_RISK_PAPER_BUDGETS, official_code_verified=True):
+    def __init__(self, budgets=RESIDUAL_RISK_PAPER_BUDGETS, official_code_verified=False):
         super().__init__()
         self.budgets = parse_budget_list(budgets, default=RESIDUAL_RISK_PAPER_BUDGETS)
         self.official_code_verified = bool(official_code_verified)
@@ -1393,6 +1393,9 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             "auxiliary_validation_budget_for_threshold": float(budget),
             "auxiliary_validation_risk_threshold": float(self.val_threshold),
             "official_code_verified": bool(self.official_code_verified),
+            "paper_aligned": True,
+            "repo_locally_verified": False,
+            "verified_scope": "node_selection_uncertainty_only",
             "official_repo_path": self.OFFICIAL_REPO_PATH,
             "official_submodule_scope": "node_selection_uncertainty_only",
             "official_formula": self.OFFICIAL_FORMULA,
@@ -1465,6 +1468,9 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             "source": "login_uncertainty_router",
             "fit_scope": "official_uncertainty_score_plus_auxiliary_validation_budget_analysis",
             "official_code_verified": bool(self.official_code_verified),
+            "paper_aligned": True,
+            "repo_locally_verified": False,
+            "verified_scope": "node_selection_uncertainty_only",
             "screening_only": True,
             "diagnosis_or_action": False,
             "llm_call": False,
@@ -1520,6 +1526,9 @@ class LOGINUncertaintyRouter(BaseRiskEstimator):
             "budgets": [float(item) for item in self.budgets],
             "val_threshold": float(self.val_threshold if self.val_threshold is not None else float("inf")),
             "official_code_verified": bool(self.official_code_verified),
+            "paper_aligned": True,
+            "repo_locally_verified": False,
+            "verified_scope": "node_selection_uncertainty_only",
             "official_repo_path": self.OFFICIAL_REPO_PATH,
             "official_formula": self.OFFICIAL_FORMULA,
             "official_selection_contract": self.OFFICIAL_SELECTION_CONTRACT,

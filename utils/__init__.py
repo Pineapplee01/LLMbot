@@ -173,6 +173,10 @@ def build_stage_dir(experiment_root, stage):
     return ensure_dir(Path(experiment_root) / "stages" / stage)
 
 
+def build_preparation_dir(experiment_root, name):
+    return ensure_dir(Path(experiment_root) / "preparation" / name)
+
+
 def save_stage_artifacts(stage_dir, artifact_bundle):
     stage_dir = ensure_dir(stage_dir)
     for name, payload in artifact_bundle.items():
@@ -351,6 +355,7 @@ __all__ = [
     "SupConLoss",
     "build_account_text",
     "build_experiment_root",
+    "build_preparation_dir",
     "build_stage_dir",
     "capture_code_commit",
     "capture_code_metadata",

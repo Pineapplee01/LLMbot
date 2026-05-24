@@ -1,3 +1,12 @@
+import sys
+
+# Keep parser/help validation independent from the training runtime.
+# `python main.py --help` should work even when torch and GPU deps are absent.
+if __name__ == "__main__" and any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    from parser_args import parser_args as _parser_args
+
+    _parser_args(["--help"])
+
 import shutil
 from pathlib import Path
 
@@ -6,18 +15,12 @@ from sklearn.metrics import f1_score
 
 from model_building import _labels_to_index, _score_logits
 from parser_args import parser_args
-from trainer import (
-    MissingFrozenArtifactError,
-    PHASE_A_CONTRACT,
-    PHASE_A_DISABLED_COMPONENTS,
-    StageRunner,
-    _resolve_device,
-    build_or_load_faithful_gats,
-    build_or_load_frozen_g0,
-    load_frozen_g0,
-    run_legacy_graph_seed,
-    run_semantic_finetune_seed,
-)
+from stage_registry import get_stage_spec, resolve_stage_spec
+from stage_helpers import MissingFrozenArtifactError, PHASE_A_CONTRACT, PHASE_A_DISABLED_COMPONENTS, _resolve_device
+from stage_runner import StageRunner
+from trainer import run_legacy_graph_seed
+from trainer_preparation import build_or_load_faithful_gats, build_or_load_frozen_g0, load_frozen_g0
+from trainer_semantic import run_semantic_finetune_seed
 from utils import (
     build_experiment_root,
     build_stage_dir,
@@ -32,27 +35,8 @@ from utils import (
     write_torch,
 )
 
-PREPARATION_STAGES = {
-    "frozen_g0",
-    "frozen_gats",
-    "semantic_finetune",
-}
 
-FORMAL_STAGES = {
-    "local_conformal_prune_diag",
-    "glance_joint_router_refine",
-    "vertical_minimal",
-    "estimator_matrix",
-    "semantic_matrix",
-    "semantic_source_matrix",
-    "repair_matrix",
-    "selector_matrix",
-    "positioning_matrix",
-    "backbone_stress",
-    "appendix",
-}
-
-PHASE_A_INTERNAL_STAGE = "semantic_source_matrix"
+PHASE_A_INTERNAL_STAGE = "phase_a_single_cell_internal"
 PHASE_A_CLOSED_CONTROLS = {
     "estimator_mode": "none",
     "semantic_mode": "off",
@@ -67,12 +51,11 @@ def _normalized_reset_split(reset_split):
 
 
 def _is_phase_a_module_controls(args):
-    if str(getattr(args, "stage", "legacy_distill")) != "legacy_distill":
+    if str(getattr(args, "experiment_task", "distillation_pipeline")) != "distillation_pipeline":
         return False
     has_embedding_source = (
-        getattr(args, "emb_path", None)
-        or getattr(args, "g0_feature_path", None)
-        or str(getattr(args, "semantic_backbone", "auto")).lower() != "auto"
+        getattr(args, "embedding_path", None)
+        or str(getattr(args, "semantic_encoder", "auto")).lower() != "auto"
     )
     if not has_embedding_source:
         return False
@@ -85,88 +68,81 @@ def _is_phase_a_module_controls(args):
 
 
 def _phase_a_semantic_source_name(args):
-    semantic_backbone = str(getattr(args, "semantic_backbone", "auto")).lower()
-    if semantic_backbone != "auto":
-        return semantic_backbone
-    return str(getattr(args, "LM_model", "roberta")).lower()
+    semantic_encoder = str(getattr(args, "semantic_encoder", "auto")).lower()
+    if semantic_encoder != "auto":
+        return semantic_encoder
+    return str(getattr(args, "text_encoder", "roberta")).lower()
 
 
 def _phase_a_single_cell_id(args):
-    return f"{_phase_a_semantic_source_name(args)}__{str(args.GNN_model).lower()}"
+    return f"{_phase_a_semantic_source_name(args)}__{str(args.graph_backbone).lower()}"
 
 
-def _find_latest_semantic_finetune_embedding(seed, semantic_backbone):
+def _find_latest_semantic_finetune_embedding(seed, semantic_encoder):
     candidates = []
-    pattern = f"*/seed_{int(seed)}/stages/semantic_finetune/manifest.json"
-    for manifest_path in Path(".").glob(pattern):
-        manifest = read_json(manifest_path, default={}) or {}
-        if manifest.get("status") != "completed":
-            continue
-        if str(manifest.get("semantic_backbone", "")).lower() != semantic_backbone:
-            continue
-        embedding_path = Path(manifest.get("embeddings_path", manifest_path.parent / "embeddings.pt"))
-        if embedding_path.exists():
-            candidates.append(embedding_path)
+    pattern = f"*/seed_{int(seed)}/stages/semantic_encoder_finetune/manifest.json"
+    legacy_pattern = f"*/seed_{int(seed)}/stages/semantic_finetune/manifest.json"
+    for current_pattern in (pattern, legacy_pattern):
+        for manifest_path in Path(".").glob(current_pattern):
+            manifest = read_json(manifest_path, default={}) or {}
+            if manifest.get("status") != "completed":
+                continue
+            if str(manifest.get("semantic_backbone", manifest.get("semantic_encoder", ""))).lower() != semantic_encoder:
+                continue
+            embedding_path = Path(manifest.get("embeddings_path", manifest_path.parent / "embeddings.pt"))
+            if embedding_path.exists():
+                candidates.append(embedding_path)
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _resolve_semantic_backbone_embedding_path(args, data, experiment_root=None, seed=None):
-    semantic_backbone = str(getattr(args, "semantic_backbone", "auto")).lower()
+    semantic_encoder = str(getattr(args, "semantic_encoder", "auto")).lower()
     dataset_path = Path(data.get("dataset_path", "."))
-    if semantic_backbone == "qwen3_peft":
+    if semantic_encoder == "qwen3_peft":
         if experiment_root is not None:
-            candidate = Path(experiment_root) / "stages" / "semantic_finetune" / "embeddings.pt"
-            if candidate.exists():
-                return candidate, "semantic_finetune_current_experiment"
+            for relative in ("stages/semantic_encoder_finetune/embeddings.pt", "stages/semantic_finetune/embeddings.pt"):
+                candidate = Path(experiment_root) / relative
+                if candidate.exists():
+                    return candidate, "semantic_encoder_finetune_current_experiment"
         if seed is not None:
-            candidate = _find_latest_semantic_finetune_embedding(seed, semantic_backbone)
+            candidate = _find_latest_semantic_finetune_embedding(seed, semantic_encoder)
             if candidate is not None:
-                return candidate, "semantic_finetune_latest_matching_seed"
+                return candidate, "semantic_encoder_finetune_latest_matching_seed"
         raise MissingFrozenArtifactError(
-            "Phase A with --semantic_backbone qwen3_peft requires embeddings from "
-            "--stage semantic_finetune. Run semantic_finetune first or pass --emb_path."
+            "Phase A with --semantic_encoder qwen3_peft requires embeddings from "
+            "--experiment_task semantic_encoder_finetune. Run semantic_encoder_finetune first or pass --embedding_path."
         )
 
-    if semantic_backbone == "qwen3_frozen":
+    if semantic_encoder == "qwen3_frozen":
         candidates = [dataset_path / "qwen3_emb_last.pt"]
         candidates.extend(sorted(dataset_path.glob("**/qwen3_emb_last.pt")))
         candidates.extend(sorted(dataset_path.glob("**/qwen3_emb_L-1.pt")))
-    elif semantic_backbone in {"roberta", "roberta_finetuned"}:
+    elif semantic_encoder in {"roberta", "roberta_finetuned"}:
         candidates = [dataset_path / "embeddings_roberta.pt"]
     else:
         candidates = []
     for candidate in candidates:
         if candidate.exists():
-            return candidate, f"semantic_backbone_{semantic_backbone}"
+            return candidate, f"semantic_encoder_{semantic_encoder}"
     raise MissingFrozenArtifactError(
-        f"Could not resolve embeddings for --semantic_backbone {semantic_backbone}. "
-        "Pass --emb_path explicitly."
+        f"Could not resolve embeddings for --semantic_encoder {semantic_encoder}. "
+        "Pass --embedding_path explicitly."
     )
 
 
 def _resolve_phase_a_embedding_path(args, data, experiment_root=None, seed=None):
-    emb_path = getattr(args, "emb_path", None)
-    legacy_path = getattr(args, "g0_feature_path", None)
-    if emb_path and legacy_path and Path(emb_path) != Path(legacy_path):
-        raise ValueError(
-            "Phase A received conflicting embedding paths: --emb_path and "
-            "--g0_feature_path must point to the same tensor when both are provided."
-        )
-
-    if emb_path:
-        path = Path(emb_path)
-        resolver = "emb_path"
-    elif legacy_path:
-        path = Path(legacy_path)
-        resolver = "g0_feature_path_compat"
+    embedding_path = getattr(args, "embedding_path", None)
+    if embedding_path:
+        path = Path(embedding_path)
+        resolver = "embedding_path"
     else:
-        semantic_backbone = str(getattr(args, "semantic_backbone", "auto")).lower()
-        if semantic_backbone == "auto":
+        semantic_encoder = str(getattr(args, "semantic_encoder", "auto")).lower()
+        if semantic_encoder == "auto":
             raise MissingFrozenArtifactError(
-                "Phase A module-controls entry requires --emb_path pointing to a cached "
-                "semantic embedding tensor, or an explicit --semantic_backbone. "
+                "Phase A module-controls entry requires --embedding_path pointing to a cached "
+                "semantic embedding tensor, or an explicit --semantic_encoder. "
                 "Structural fallback and implicit LM cache lookup are disabled for Phase A."
             )
         path, resolver = _resolve_semantic_backbone_embedding_path(
@@ -180,18 +156,19 @@ def _resolve_phase_a_embedding_path(args, data, experiment_root=None, seed=None)
         raise MissingFrozenArtifactError(
             "Phase A module-controls entry requires a cached semantic embedding tensor. "
             f"Resolved path does not exist: {path}. "
-            "Pass --emb_path /path/to/embedding.pt."
+            "Pass --embedding_path /path/to/embedding.pt."
         )
 
+    args.embedding_path = str(path)
     args.emb_path = str(path)
     args.g0_feature_path = str(path)
     return {
         "resolver": resolver,
-        "LM_model": getattr(args, "LM_model", "roberta"),
-        "semantic_backbone": str(getattr(args, "semantic_backbone", "auto")).lower(),
+        "LM_model": getattr(args, "text_encoder", "roberta"),
+        "semantic_backbone": str(getattr(args, "semantic_encoder", "auto")).lower(),
         "semantic_source": _phase_a_semantic_source_name(args),
         "path": str(path),
-        "formal_comparison_eligible": resolver in {"emb_path", "g0_feature_path_compat"},
+        "formal_comparison_eligible": resolver == "embedding_path",
     }
 
 
@@ -202,7 +179,7 @@ def _maybe_force_phase_a_retrain(args, experiment_root, embedding_path):
     feature_manifest = manifest.get("feature_manifest", {})
     existing_path = feature_manifest.get("path")
     existing_backbone = str(manifest.get("backbone", "")).lower()
-    requested_backbone = str(getattr(args, "GNN_model", "")).lower()
+    requested_backbone = str(getattr(args, "graph_backbone", "")).lower()
     if existing_path != str(embedding_path) or existing_backbone != requested_backbone:
         args.force_retrain_backbone = True
 
@@ -333,9 +310,9 @@ def _write_phase_a_single_cell_stage(args, seed, data, experiment_root, g0_conte
         "disabled_components": PHASE_A_DISABLED_COMPONENTS,
         "control_variables": {
             "split": "canonical dataset split; --reset_split -1 required by main.py",
-            "semantic_source": "--semantic_backbone plus resolved semantic embedding tensor",
+            "semantic_source": "--semantic_encoder plus resolved semantic embedding tensor",
             "input_projection": "all semantic sources projected to --phase_a_project_dim before GNN input",
-            "gnn_backbone": "--GNN_model",
+            "gnn_backbone": "--graph_backbone",
             "module_controls": PHASE_A_CLOSED_CONTROLS,
             "selection_scope": "validation macro-F1, validation loss tie-breaker",
         },
@@ -344,7 +321,7 @@ def _write_phase_a_single_cell_stage(args, seed, data, experiment_root, g0_conte
             "gnn_backbones": ["rgcn", "rgt"],
             "project_dim": int(getattr(args, "phase_a_project_dim", 768)),
             "projector": getattr(args, "phase_a_projector", "pca"),
-            "cell_execution": "one LM_model x GNN_model cell per --emb_path command",
+            "cell_execution": "one text_encoder x graph_backbone cell per --embedding_path command",
             "gated_cell": "qwen3_peft__rgt",
             "gate_rule": (
                 "Run qwen3_peft x rgt only if qwen3_peft x rgcn improves validation macro_f1 "
@@ -370,7 +347,7 @@ def _write_phase_a_single_cell_stage(args, seed, data, experiment_root, g0_conte
         "cell_id": cell_id,
         "seed": int(seed),
         "semantic_source": _phase_a_semantic_source_name(args),
-        "gnn_backbone": getattr(args, "GNN_model", "rgcn"),
+        "gnn_backbone": getattr(args, "graph_backbone", "rgcn"),
         "embedding_manifest": embedding_manifest,
         "feature_manifest": g0_manifest.get("feature_manifest", {}),
         "disabled_components": PHASE_A_DISABLED_COMPONENTS,
@@ -392,9 +369,9 @@ def _write_phase_a_single_cell_stage(args, seed, data, experiment_root, g0_conte
         **contract,
         "seed": int(seed),
         "cell_id": cell_id,
-        "LM_model": getattr(args, "LM_model", "roberta"),
-        "semantic_backbone": getattr(args, "semantic_backbone", "auto"),
-        "GNN_model": getattr(args, "GNN_model", "rgcn"),
+        "LM_model": getattr(args, "text_encoder", "roberta"),
+        "semantic_backbone": getattr(args, "semantic_encoder", "auto"),
+        "GNN_model": getattr(args, "graph_backbone", "rgcn"),
         "embedding_manifest": embedding_manifest,
         "frozen_g0_dir": str(g0_context["dir"]),
         "frozen_g0_checkpoint": g0_context["checkpoint_path"],
@@ -408,7 +385,7 @@ def _write_phase_a_single_cell_stage(args, seed, data, experiment_root, g0_conte
         "contract": PHASE_A_CONTRACT,
         "best_cell": cell_id,
         "best_semantic_source": _phase_a_semantic_source_name(args),
-        "best_gnn_backbone": getattr(args, "GNN_model", "rgcn"),
+        "best_gnn_backbone": getattr(args, "graph_backbone", "rgcn"),
         "selection_metric": "validation_macro_f1",
         "tie_breaker": "validation_loss",
         "mode": "module_controls_phase_a",
@@ -427,9 +404,9 @@ def _write_phase_a_single_cell_stage(args, seed, data, experiment_root, g0_conte
             [
                 "# Phase A single-cell smoke",
                 "",
-                "Entry: main.py module controls with --emb_path and graph execution enabled.",
-                "Semantic embedding is resolved from --emb_path, --g0_feature_path, or explicit --semantic_backbone.",
-                "GNN detector is selected by --GNN_model.",
+                "Entry: main.py module controls with --embedding_path and graph execution enabled.",
+                "Semantic embedding is resolved from --embedding_path or explicit --semantic_encoder.",
+                "GNN detector is selected by --graph_backbone.",
                 "Post-hoc estimator, local semantic enhancement, repair, selector, calibration, same-head refinement, and appendix lanes are disabled.",
             ]
         )
@@ -463,7 +440,7 @@ def _format_stage_result(result):
 
 
 def _requires_canonical_split(stage):
-    return stage in FORMAL_STAGES or stage in PREPARATION_STAGES
+    return bool(resolve_stage_spec(stage).requires_canonical_split)
 
 
 def _validate_claim_grade_run(args, execution_stage, reset_split_value):
@@ -471,16 +448,16 @@ def _validate_claim_grade_run(args, execution_stage, reset_split_value):
         return
     if reset_split_value != "-1":
         raise ValueError("Claim-grade runs require canonical splits; pass --reset_split -1.")
-    if execution_stage == "legacy_distill":
+    if execution_stage == "distillation_pipeline":
         raise ValueError(
-            "legacy_distill is compatibility-only for claim-grade runs; use a formal staged entrypoint."
+            "distillation_pipeline is compatibility-only for claim-grade runs; use a formal staged entrypoint."
         )
 
 
 def _stage_uses_graph_data(args, execution_stage):
-    if execution_stage == "legacy_distill":
+    if execution_stage == "distillation_pipeline":
         return args.use_GNN
-    return execution_stage != "semantic_finetune"
+    return resolve_stage_spec(execution_stage).graph_data_mode != "none"
 
 
 def _load_seed_data(args, execution_stage):
@@ -492,23 +469,23 @@ def _load_seed_data(args, execution_stage):
 
 
 def _run_seed_stage(args, seed, data, run, execution_stage, experiment_root):
-    if execution_stage == "semantic_finetune":
+    if execution_stage == "semantic_encoder_finetune":
         result = run_semantic_finetune_seed(args, seed, data, experiment_root, run)
         return _stage_result(
-            "semantic_finetune",
+            "semantic_encoder_finetune",
             seed,
             result.get("artifact_dir") or result.get("stage_dir"),
             result=result,
         )
 
-    if execution_stage == "frozen_g0":
+    if execution_stage == "graph_detector_prepare":
         result = build_or_load_frozen_g0(args, seed, data, experiment_root)
-        return _stage_result("frozen_g0", seed, result.get("artifact_dir"), result=result)
+        return _stage_result("graph_detector_prepare", seed, result.get("artifact_dir"), result=result)
 
-    if execution_stage == "frozen_gats":
+    if execution_stage == "graph_calibration_prepare":
         g0_context = load_frozen_g0(experiment_root)
         result = build_or_load_faithful_gats(args, seed, data, experiment_root, g0_context)
-        return _stage_result("frozen_gats", seed, result.get("artifact_dir"), result=result)
+        return _stage_result("graph_calibration_prepare", seed, result.get("artifact_dir"), result=result)
 
     if execution_stage == PHASE_A_INTERNAL_STAGE:
         embedding_manifest = _resolve_phase_a_embedding_path(args, data, experiment_root=experiment_root, seed=seed)
@@ -517,9 +494,9 @@ def _run_seed_stage(args, seed, data, run, execution_stage, experiment_root):
         result = _write_phase_a_single_cell_stage(args, seed, data, experiment_root, g0_context, embedding_manifest)
         return _stage_result(execution_stage, seed, result.get("stage_dir"), result=result)
 
-    if execution_stage == "legacy_distill":
+    if execution_stage == "distillation_pipeline":
         run_legacy_graph_seed(args, seed, data, run)
-        return _stage_result("legacy_distill", seed, experiment_root)
+        return _stage_result("distillation_pipeline", seed, experiment_root)
 
     runner = StageRunner(args=args, seed=seed, data=data, run=run)
     result = runner.run()
@@ -533,9 +510,10 @@ def _run_seed_stage(args, seed, data, run, execution_stage, experiment_root):
 
 def main(args):
     args.device = _resolve_device(args.device)
-    requested_stage = args.stage
+    requested_stage = args.experiment_task
+    requested_spec = get_stage_spec(requested_stage)
     phase_a_by_controls = _is_phase_a_module_controls(args)
-    execution_stage = PHASE_A_INTERNAL_STAGE if phase_a_by_controls else requested_stage
+    execution_stage = PHASE_A_INTERNAL_STAGE if phase_a_by_controls else requested_spec.canonical_name
     args._phase_a_user_entry = "module_controls_phase_a" if phase_a_by_controls else "stage_compatibility"
     reset_split_value = _normalized_reset_split(args.reset_split)
 
@@ -547,9 +525,10 @@ def main(args):
         )
 
     args.requested_stage = requested_stage
+    args.execution_task = execution_stage
     args.stage = execution_stage
     args.reset_split = reset_split_value
-    if execution_stage not in {"legacy_distill", "semantic_finetune"}:
+    if execution_stage not in {"distillation_pipeline", "semantic_encoder_finetune"}:
         args.use_GNN = True
 
     for seed in _parse_seed_list(args.seeds):
@@ -558,10 +537,8 @@ def main(args):
         run = setup_wandb(args, seed)
         experiment_root = build_experiment_root(args, seed)
         print(_format_stage_result(_run_seed_stage(args, seed, data, run, execution_stage, experiment_root)))
-
         run.finish()
 
 
 if __name__ == "__main__":
-    # parser_args 读取 CLI 参数并执行主流程
     main(parser_args())
