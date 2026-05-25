@@ -352,6 +352,23 @@ def parser_args(argv=None):
         action="store_true",
         help="Disable the no-zero-in/no-zero-out structural guard inside local_conflict_diagnostic.",
     )
+    parser.add_argument(
+        "--local_dignn_conflict_router_budget",
+        type=float,
+        default=0.10,
+        help="Target routed-node fraction for local_dignn_conflict_refine_diag.",
+    )
+    parser.add_argument(
+        "--local_dignn_conflict_topk_per_bucket",
+        type=int,
+        default=1,
+        help="Maximum number of selected edges per (relation, target_role) bucket for local_dignn_conflict_refine_diag.",
+    )
+    parser.add_argument(
+        "--local_dignn_conflict_disable_degree_guard",
+        action="store_true",
+        help="Disable the no-zero-in/no-zero-out structural guard inside local_dignn_conflict_refine_diag.",
+    )
     parser.add_argument("--external_graph_edge_index_path", type=str, default=None)
     parser.add_argument("--external_graph_edge_type_path", type=str, default=None)
 
@@ -408,17 +425,91 @@ def parser_args(argv=None):
         "--external_frozen_g0_root",
         type=str,
         default=None,
-        help="Optional experiment root whose graph-detector preparation artifact is reused read-only by strict GLANCE stages.",
+        help=(
+            "Optional experiment root whose graph-detector preparation artifact is reused read-only by "
+            "diagnostic graph-aware stages. Public joint_router_refinement requires the current run's own "
+            "preparation/graph_detector artifact unless --joint_refiner_embedding_path is used for a "
+            "refiner-only semantic override ablation."
+        ),
+    )
+    parser.add_argument(
+        "--joint_train_node_cap",
+        type=int,
+        default=3000,
+        help=(
+            "Training-node cap for public joint_router_refinement. "
+            "Use 3000 for the paper-style cap, or 0 to train router/refiner on the full train split."
+        ),
+    )
+    parser.add_argument(
+        "--joint_refiner_explicit_gate",
+        action="store_true",
+        help=(
+            "Enable an explicit keep/change gate inside public joint_router_refinement. "
+            "The gate interpolates between the frozen GNN path and the routed refiner path."
+        ),
+    )
+    parser.add_argument(
+        "--joint_refiner_target_mode",
+        type=str,
+        default="predict",
+        choices=["predict", "keep_change"],
+        help=(
+            "Training target for the strict joint refiner. "
+            "'predict' keeps direct label prediction, while 'keep_change' learns whether the routed node should flip the base detector decision."
+        ),
+    )
+    parser.add_argument(
+        "--joint_refiner_weight_mode",
+        type=str,
+        default="off",
+        choices=["off", "base_wrong", "utility_positive", "base_wrong_plus_utility"],
+        help=(
+            "Optional routed-node loss reweighting for public joint_router_refinement. "
+            "Weights can emphasize base-wrong nodes, oracle-utility-positive nodes, or both."
+        ),
+    )
+    parser.add_argument(
+        "--joint_refiner_base_wrong_weight",
+        type=float,
+        default=2.0,
+        help="Multiplicative routed-node loss weight applied to base-wrong nodes when joint_refiner_weight_mode includes base_wrong.",
+    )
+    parser.add_argument(
+        "--joint_refiner_utility_weight",
+        type=float,
+        default=3.0,
+        help="Multiplicative routed-node loss weight applied to oracle-utility-positive nodes when joint_refiner_weight_mode includes utility_positive.",
+    )
+    parser.add_argument(
+        "--joint_refiner_gate_weight",
+        type=float,
+        default=0.5,
+        help="Loss weight for explicit keep/change gate supervision when joint_refiner_explicit_gate is enabled.",
     )
     parser.add_argument(
         "--embedding_path",
         dest="embedding_path",
         type=str,
         default=None,
-        help="Cached semantic embedding tensor for Phase A, graph_detector_prepare, and strict GLANCE.",
+        help=(
+            "Cached semantic embedding tensor for Phase A and graph_detector_prepare. "
+            "joint_router_refinement now inherits its semantic source from the current run's "
+            "graph_detector_prepare feature_manifest and only accepts an explicit path when it matches that artifact."
+        ),
     )
     parser.add_argument("--emb_path", dest="embedding_path", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--g0_feature_path", dest="embedding_path", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--joint_refiner_embedding_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional refiner-only semantic override for joint_router_refinement. "
+            "Keeps graph_detector_prepare backbone features unchanged and only replaces the joint refiner semantic source. "
+            "Accepts either a plain [num_nodes, d] tensor or a prompt-cache payload with ego/hop1/hop2 tensors."
+        ),
+    )
     parser.add_argument(
         "--phase_a_project_dim",
         type=int,

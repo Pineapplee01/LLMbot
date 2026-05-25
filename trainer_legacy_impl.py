@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score, average_precision_score, roc_auc_score
 import numpy as np
 from time import perf_counter
 from model_building import (
@@ -1710,6 +1710,137 @@ def _classification_metrics_from_logits(logits, labels, idx):
     return scores
 
 
+def _normalize_glance_advantage_target(advantage):
+    if advantage.numel() == 0:
+        return advantage
+    centered = advantage - advantage.mean()
+    scale = centered.std(unbiased=False).clamp_min(1e-6)
+    return centered / scale
+
+
+def _scale_glance_advantage_target(advantage):
+    if advantage.numel() == 0:
+        return advantage
+    scale = advantage.std(unbiased=False).clamp_min(1e-6)
+    return advantage / scale
+
+
+def _glance_oracle_topk_membership(advantage, k):
+    if advantage.numel() == 0:
+        return torch.zeros_like(advantage, dtype=torch.float32)
+    k = min(max(int(k), 1), int(advantage.numel()))
+    target = torch.zeros_like(advantage, dtype=torch.float32)
+    top_idx = torch.topk(advantage.detach(), k=k, largest=True, sorted=False).indices
+    target[top_idx] = 1.0
+    return target
+
+
+def _glance_pairwise_ranking_loss(scores, targets):
+    if scores.numel() < 2:
+        return scores.sum() * 0.0
+    score_diff = scores.unsqueeze(1) - scores.unsqueeze(0)
+    target_diff = targets.unsqueeze(1) - targets.unsqueeze(0)
+    pair_mask = torch.triu(torch.ones_like(target_diff, dtype=torch.bool), diagonal=1)
+    pair_mask = pair_mask & (target_diff.abs() > 1e-6)
+    if not bool(pair_mask.any().item()):
+        return scores.sum() * 0.0
+    signed_margin = torch.sign(target_diff[pair_mask]) * score_diff[pair_mask]
+    pair_weight = target_diff[pair_mask].abs()
+    loss = F.softplus(-signed_margin)
+    return (loss * pair_weight).sum() / pair_weight.sum().clamp_min(1e-6)
+
+
+def _safe_score_corr(x, y):
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if x.size != y.size or x.size < 2:
+        return None
+    x_std = float(np.std(x))
+    y_std = float(np.std(y))
+    if x_std <= 1e-12 or y_std <= 1e-12:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _safe_binary_score_metrics(labels, scores):
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if labels.size != scores.size or labels.size == 0:
+        return {
+            "positive_rate": 0.0,
+            "mean_score": 0.0,
+            "auroc": None,
+            "auprc": None,
+        }
+    metrics = {
+        "positive_rate": float(labels.mean()),
+        "mean_score": float(scores.mean()),
+        "auroc": None,
+        "auprc": None,
+    }
+    if np.unique(labels).size < 2:
+        return metrics
+    try:
+        metrics["auroc"] = float(roc_auc_score(labels, scores))
+    except Exception:
+        metrics["auroc"] = None
+    try:
+        metrics["auprc"] = float(average_precision_score(labels, scores))
+    except Exception:
+        metrics["auprc"] = None
+    return metrics
+
+
+def _safe_advantage_router_metrics(advantage, scores, routed_mask=None):
+    advantage = np.asarray(advantage, dtype=np.float64).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if advantage.size != scores.size or advantage.size == 0:
+        return {
+            "positive_rate": 0.0,
+            "mean_advantage": 0.0,
+            "score_adv_corr": None,
+            "auroc": None,
+            "auprc": None,
+        }
+    labels = (advantage > 0.0).astype(np.int64)
+    metrics = {
+        "positive_rate": float(labels.mean()),
+        "mean_advantage": float(advantage.mean()),
+        "score_adv_corr": _safe_score_corr(scores, advantage),
+        "auroc": None,
+        "auprc": None,
+    }
+    if np.unique(labels).size >= 2:
+        try:
+            metrics["auroc"] = float(roc_auc_score(labels, scores))
+        except Exception:
+            metrics["auroc"] = None
+        try:
+            metrics["auprc"] = float(average_precision_score(labels, scores))
+        except Exception:
+            metrics["auprc"] = None
+    if routed_mask is not None:
+        routed_mask = np.asarray(routed_mask, dtype=bool).reshape(-1)
+        if routed_mask.size == labels.size and routed_mask.any():
+            routed_labels = labels[routed_mask]
+            metrics["routed_positive_precision"] = float(routed_labels.mean())
+            metrics["routed_mean_advantage"] = float(advantage[routed_mask].mean())
+            positive_count = int(labels.sum())
+            metrics["routed_positive_coverage"] = float(routed_labels.sum() / positive_count) if positive_count > 0 else 0.0
+            budget = int(routed_mask.sum())
+            oracle_idx = np.argsort(-advantage)[:budget]
+            routed_idx = np.flatnonzero(routed_mask)
+            metrics["routed_oracle_topk_overlap"] = float(
+                len(set(routed_idx.tolist()).intersection(set(oracle_idx.tolist()))) / max(budget, 1)
+            )
+        else:
+            metrics["routed_positive_precision"] = 0.0
+            metrics["routed_mean_advantage"] = 0.0
+            metrics["routed_positive_coverage"] = 0.0
+            metrics["routed_oracle_topk_overlap"] = 0.0
+    return metrics
+
+
 def _infer_embedding_source_identity(path):
     path = Path(path)
     stem = path.stem.lower()
@@ -1915,6 +2046,51 @@ def _direct_embedding_manifest(path):
     }
 
 
+def _normalize_semantic_payload(payload):
+    payload_keys = []
+    precomputed_views = None
+    embeddings = payload
+    if isinstance(payload, dict):
+        payload_keys = sorted(str(key) for key in payload.keys())
+        direct_views = {}
+        for view_name in ("ego", "hop1", "hop2"):
+            if view_name not in payload:
+                continue
+            view_value = payload[view_name]
+            if not torch.is_tensor(view_value):
+                try:
+                    view_value = torch.as_tensor(view_value)
+                except Exception:
+                    continue
+            if view_value.dim() != 2:
+                continue
+            direct_views[view_name] = view_value.detach().cpu().float()
+        if len(direct_views) == 3:
+            precomputed_views = direct_views
+        for candidate_key in ("embeddings", "features", "x"):
+            if candidate_key in payload:
+                embeddings = payload[candidate_key]
+                break
+        else:
+            if precomputed_views is not None:
+                embeddings = precomputed_views["ego"]
+    if not torch.is_tensor(embeddings):
+        embeddings = torch.as_tensor(embeddings)
+    embeddings = embeddings.detach().cpu().float()
+    if precomputed_views is not None:
+        expected_nodes = int(embeddings.shape[0]) if embeddings.dim() == 2 else int(precomputed_views["ego"].shape[0])
+        for view_name, view_tensor in precomputed_views.items():
+            if view_tensor.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"Semantic payload view {view_name} must be 2-D, got {tuple(view_tensor.shape)}."
+                )
+            if int(view_tensor.shape[0]) != expected_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Semantic payload view {view_name} has {int(view_tensor.shape[0])} nodes, expected {expected_nodes}."
+                )
+    return embeddings, precomputed_views, payload_keys
+
+
 class GlanceRefinerMLP(nn.Module):
     """GLANCE-inspired post-hoc refiner over frozen GNN + semantic embeddings."""
 
@@ -1938,6 +2114,36 @@ class GlanceRefinerMLP(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class GatedGlanceRefinerMLP(nn.Module):
+    """Strict joint refiner with an explicit keep/change gate over base and semantic paths."""
+
+    def __init__(self, input_dim, hidden_dim=128, activation="leakyrelu", dropout=0.1):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act_factory = nn.LeakyReLU
+        elif activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "elu":
+            act_factory = nn.ELU
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.shared = nn.Sequential(
+            nn.Linear(int(input_dim), int(hidden_dim)),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+        )
+        self.classifier = nn.Linear(int(hidden_dim), 2)
+        self.gate_head = nn.Linear(int(hidden_dim), 1)
+
+    def forward(self, x):
+        hidden = self.shared(x)
+        logits = self.classifier(hidden)
+        gate_logits = self.gate_head(hidden).squeeze(-1)
+        gate_prob = torch.sigmoid(gate_logits)
+        return logits, gate_logits, gate_prob
 
 
 class DirectionalGatedGlanceRefinerMLP(nn.Module):
@@ -2180,17 +2386,34 @@ def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, dev
     return refiner_features[batch_idx].to(device)
 
 
-class GlanceRouterLinear(nn.Module):
-    """Single-layer GLANCE-style router over cheap node-wise routing features."""
+class GlanceRouterMLP(nn.Module):
+    """Shallow scorer MLP over cheap node-wise routing features."""
 
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, hidden_dim=128, dropout=0.1):
         super().__init__()
-        self.linear = nn.Linear(int(input_dim), 1)
+        input_dim = int(input_dim)
+        hidden_dim = int(hidden_dim)
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.reliability_head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def forward(self, x):
-        logits = self.linear(x).squeeze(-1)
+        normalized = self.input_norm(x)
+        logits = self.net(normalized).squeeze(-1)
+        reliability_logits = self.reliability_head(normalized).squeeze(-1)
         prob = torch.sigmoid(logits)
-        return logits, prob
+        reliability_prob = torch.sigmoid(reliability_logits)
+        return logits, prob, reliability_logits, reliability_prob
 
 
 class GlanceHomophilyQMLP(nn.Module):
@@ -2716,6 +2939,13 @@ class StageRunner:
         if self.base_context is not None:
             return self.base_context
         external_root = getattr(self.args, "external_frozen_g0_root", None)
+        if self.execution_stage == "joint_router_refinement" and external_root:
+            if not getattr(self.args, "joint_refiner_embedding_path", None):
+                raise MissingFrozenArtifactError(
+                    "joint_router_refinement now requires the current run's own preparation/graph_detector artifact. "
+                    "Cross-root --external_frozen_g0_root reuse is only allowed together with "
+                    "--joint_refiner_embedding_path for refiner-only semantic override ablations."
+                )
         frozen_root = Path(external_root) if external_root else self.experiment_root
         frozen = load_frozen_g0(frozen_root)
         self._validate_external_frozen_g0(frozen, frozen_root)
@@ -2731,6 +2961,18 @@ class StageRunner:
             "graph_bundle": graph_bundle,
         }
         return self.base_context
+
+    def _strict_joint_feature_manifest(self):
+        context = self.ensure_backbone_context()
+        manifest = context["frozen_g0"].get("manifest", {}) or {}
+        feature_manifest = manifest.get("feature_manifest", {}) or {}
+        feature_path = feature_manifest.get("path")
+        if not feature_path:
+            raise MissingFrozenArtifactError(
+                "joint_router_refinement requires graph_detector_prepare to record feature_manifest.path in the "
+                "current run's preparation/graph_detector manifest."
+            )
+        return feature_manifest, Path(feature_path)
 
     def _validate_external_frozen_g0(self, frozen, frozen_root):
         manifest = frozen.get("manifest", {}) or {}
@@ -2910,30 +3152,46 @@ class StageRunner:
         }
 
     def _load_glance_semantic_source_bundle(self):
-        emb_path = (
+        feature_manifest, feature_path = self._strict_joint_feature_manifest()
+        override_path = getattr(self.args, "joint_refiner_embedding_path", None)
+        requested_path = (
             getattr(self.args, "embedding_path", None)
             or getattr(self.args, "emb_path", None)
             or getattr(self.args, "g0_feature_path", None)
         )
-        if not emb_path:
-            raise MissingFrozenArtifactError(
-                "joint_router_refinement requires --embedding_path pointing to a cached semantic embedding tensor. "
-                "The strict paper-text-aligned stage no longer infers semantic_encoder_finetune artifacts implicitly."
-            )
-        emb_path = Path(emb_path)
+        if override_path:
+            emb_path = Path(override_path)
+            if requested_path:
+                requested_path = Path(requested_path)
+                if requested_path != feature_path:
+                    raise MissingFrozenArtifactError(
+                        "joint_router_refinement keeps backbone provenance pinned to the current run's "
+                        "graph_detector_prepare artifact even when --joint_refiner_embedding_path is used. "
+                        f"Requested --embedding_path {requested_path} does not match frozen_g0 feature_manifest.path {feature_path}."
+                    )
+            provenance_binding = "joint_refiner_override_same_backbone"
+            manifest_source = "joint_refiner_embedding_override"
+            semantic_override_role = "refiner_only"
+        else:
+            if requested_path:
+                requested_path = Path(requested_path)
+                if requested_path != feature_path:
+                    raise MissingFrozenArtifactError(
+                        "joint_router_refinement requires semantic input provenance to match the current run's "
+                        "graph_detector_prepare artifact. "
+                        f"Requested --embedding_path {requested_path} does not match frozen_g0 feature_manifest.path {feature_path}."
+                    )
+            emb_path = feature_path
+            provenance_binding = "strict_same_root_graph_detector_prepare"
+            manifest_source = "graph_detector_prepare_feature_manifest"
+            semantic_override_role = "shared_backbone_and_refiner"
         if not emb_path.exists():
             raise MissingFrozenArtifactError(
-                f"joint_router_refinement could not find the requested semantic embedding tensor at {emb_path}."
+                "joint_router_refinement could not find the requested semantic embedding tensor at "
+                f"{emb_path}."
             )
-        embeddings = safe_torch_load(emb_path, map_location="cpu")
-        if isinstance(embeddings, dict):
-            for key in ("embeddings", "features", "x"):
-                if key in embeddings:
-                    embeddings = embeddings[key]
-                    break
-        if not torch.is_tensor(embeddings):
-            embeddings = torch.tensor(embeddings)
-        embeddings = embeddings.detach().cpu().float()
+        payload = safe_torch_load(emb_path, map_location="cpu")
+        embeddings, precomputed_views, payload_keys = _normalize_semantic_payload(payload)
         if embeddings.dim() != 2:
             raise MissingFrozenArtifactError(
                 f"joint_router_refinement expects --embedding_path to contain a 2-D tensor, got {tuple(embeddings.shape)}."
@@ -2942,10 +3200,27 @@ class StageRunner:
             raise MissingFrozenArtifactError(
                 "joint_router_refinement semantic embeddings do not align with the current dataset node count."
             )
+        if precomputed_views is not None:
+            for view_name, view_tensor in precomputed_views.items():
+                if int(view_tensor.shape[0]) != int(len(self.labels)):
+                    raise MissingFrozenArtifactError(
+                        f"joint_router_refinement semantic view {view_name} does not align with the current dataset node count."
+                    )
+        semantic_view_mode = "precomputed_prompt_views" if precomputed_views is not None else "legacy_inbound_khop"
         primary = {
             "dir": emb_path.parent,
-            "manifest": _direct_embedding_manifest(emb_path),
+            "manifest": {
+                **_direct_embedding_manifest(emb_path),
+                "source": manifest_source,
+                "feature_manifest": feature_manifest,
+                "provenance_binding": provenance_binding,
+                "semantic_override_role": semantic_override_role,
+                "payload_keys": payload_keys,
+                "semantic_view_mode": semantic_view_mode,
+            },
             "embeddings": embeddings,
+            "precomputed_views": precomputed_views,
+            "semantic_view_mode": semantic_view_mode,
             "outputs": None,
         }
         bundle = {
@@ -3229,6 +3504,24 @@ class StageRunner:
             raise MissingFrozenArtifactError(
                 "glance_joint_router_refine strict router features require one MC-dropout uncertainty value per node."
             )
+        logits_gnn = logits_gnn.detach().cpu().float()
+        p_gnn = p_gnn.detach().cpu().float()
+        if logits_gnn.dim() != 2 or int(logits_gnn.shape[0]) != num_nodes:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine strict router features require logits_gnn shaped [num_nodes, num_classes]."
+            )
+        if p_gnn.dim() != 2 or int(p_gnn.shape[0]) != num_nodes:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine strict router features require p_gnn shaped [num_nodes, num_classes]."
+            )
+        if int(logits_gnn.shape[1]) < 2 or int(p_gnn.shape[1]) < 2:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine strict router features require binary-class logits/probabilities."
+            )
+        logit_margin = (logits_gnn[:, 1] - logits_gnn[:, 0]).detach().cpu().numpy().astype(np.float32)
+        prob_margin = (p_gnn[:, 1] - p_gnn[:, 0]).detach().cpu().numpy().astype(np.float32)
+        pred_prob = torch.max(p_gnn, dim=1).values.detach().cpu().numpy().astype(np.float32)
+        entropy = -(p_gnn.clamp_min(1e-6) * torch.log(p_gnn.clamp_min(1e-6))).sum(dim=1).detach().cpu().numpy().astype(np.float32)
 
         total_degree = np.zeros(num_nodes, dtype=np.float32)
         relative_degree = np.ones(num_nodes, dtype=np.float32)
@@ -3261,6 +3554,10 @@ class StageRunner:
         node_features_np = original_node_features.detach().cpu().numpy().astype(np.float32)
         uncertainty_np = uncertainty.numpy().astype(np.float32).reshape(-1, 1)
         homophily_np = np.clip(soft_homophily.astype(np.float32), 0.0, 1.0).reshape(-1, 1)
+        logit_margin_np = logit_margin.reshape(-1, 1)
+        prob_margin_np = prob_margin.reshape(-1, 1)
+        pred_prob_np = pred_prob.reshape(-1, 1)
+        entropy_np = entropy.reshape(-1, 1)
         degree_np = np.column_stack(
             [
                 log_total_degree.reshape(-1, 1),
@@ -3268,11 +3565,22 @@ class StageRunner:
             ]
         ).astype(np.float32)
         strict_features = np.concatenate(
-            [z_gnn_np, uncertainty_np, homophily_np, node_features_np, degree_np],
+            [
+                z_gnn_np,
+                logit_margin_np,
+                prob_margin_np,
+                pred_prob_np,
+                entropy_np,
+                uncertainty_np,
+                homophily_np,
+                node_features_np,
+                degree_np,
+            ],
             axis=1,
         ).astype(np.float32)
         selected_names = (
             [f"z_gnn_{dim:03d}" for dim in range(z_gnn_np.shape[1])]
+            + ["gnn_logit_margin", "gnn_prob_margin", "gnn_pred_prob", "gnn_entropy"]
             + ["mc_dropout_uncertainty", "soft_local_homophily"]
             + [f"node_feature_{dim:03d}" for dim in range(node_features_np.shape[1])]
             + ["log_total_degree", "relative_degree"]
@@ -3325,15 +3633,41 @@ class StageRunner:
         }
 
     def _build_k_hop_semantic_views(self, semantic_embeddings, edge_index):
-        x_sem = semantic_embeddings.detach().cpu().float()
+        direct_views = None
+        if isinstance(semantic_embeddings, dict):
+            maybe_direct = {}
+            for view_name in ("ego", "hop1", "hop2"):
+                if view_name not in semantic_embeddings:
+                    maybe_direct = None
+                    break
+                view_tensor = semantic_embeddings[view_name]
+                if not torch.is_tensor(view_tensor):
+                    view_tensor = torch.as_tensor(view_tensor)
+                maybe_direct[view_name] = view_tensor.detach().cpu().float()
+            if maybe_direct is not None:
+                direct_views = maybe_direct
+                x_sem = direct_views["ego"]
+            else:
+                base_tensor = None
+                for key in ("embeddings", "features", "x"):
+                    if key in semantic_embeddings:
+                        base_tensor = semantic_embeddings[key]
+                        break
+                if base_tensor is None:
+                    raise ValueError("semantic_embeddings dict must provide ego/hop1/hop2 or embeddings/features/x.")
+                if not torch.is_tensor(base_tensor):
+                    base_tensor = torch.as_tensor(base_tensor)
+                x_sem = base_tensor.detach().cpu().float()
+        else:
+            x_sem = semantic_embeddings.detach().cpu().float()
         num_nodes = int(x_sem.shape[0])
         if edge_index is None:
             zero = torch.zeros_like(x_sem)
             counts = np.zeros(num_nodes, dtype=np.int64)
             return {
                 "ego": x_sem,
-                "hop1": zero.clone(),
-                "hop2": zero.clone(),
+                "hop1": direct_views["hop1"].clone() if direct_views is not None else zero.clone(),
+                "hop2": direct_views["hop2"].clone() if direct_views is not None else zero.clone(),
                 "count_1hop": counts.copy(),
                 "count_2hop": counts.copy(),
             }
@@ -3346,8 +3680,8 @@ class StageRunner:
             counts = np.zeros(num_nodes, dtype=np.int64)
             return {
                 "ego": x_sem,
-                "hop1": zero.clone(),
-                "hop2": zero.clone(),
+                "hop1": direct_views["hop1"].clone() if direct_views is not None else zero.clone(),
+                "hop2": direct_views["hop2"].clone() if direct_views is not None else zero.clone(),
                 "count_1hop": counts.copy(),
                 "count_2hop": counts.copy(),
             }
@@ -3359,15 +3693,15 @@ class StageRunner:
             if 0 <= s < num_nodes and 0 <= d < num_nodes:
                 neighbors_in[d].append(s)
 
-        hop1 = torch.zeros_like(x_sem)
-        hop2 = torch.zeros_like(x_sem)
+        hop1 = direct_views["hop1"].clone() if direct_views is not None else torch.zeros_like(x_sem)
+        hop2 = direct_views["hop2"].clone() if direct_views is not None else torch.zeros_like(x_sem)
         count_1hop = np.zeros(num_nodes, dtype=np.int64)
         count_2hop = np.zeros(num_nodes, dtype=np.int64)
 
         for node_idx in range(num_nodes):
             n1 = sorted(set(int(n) for n in neighbors_in[node_idx] if int(n) != node_idx))
             count_1hop[node_idx] = len(n1)
-            if n1:
+            if direct_views is None and n1:
                 hop1[node_idx] = x_sem[torch.tensor(n1, dtype=torch.long)].mean(dim=0)
 
             n1_set = set(n1)
@@ -3380,7 +3714,7 @@ class StageRunner:
                     n2.add(cand)
             n2 = sorted(n2)
             count_2hop[node_idx] = len(n2)
-            if n2:
+            if direct_views is None and n2:
                 hop2[node_idx] = x_sem[torch.tensor(n2, dtype=torch.long)].mean(dim=0)
 
         return {
@@ -3786,6 +4120,48 @@ class StageRunner:
         value = k_end + (k_start - k_end) * (float(decay_factor) ** int(epoch_index))
         return max(min(int(round(value)), batch_size), 1)
 
+    @staticmethod
+    def _glance_refiner_forward(refiner_model, batch_refiner, batch_base_logits=None):
+        outputs = refiner_model(batch_refiner)
+        if isinstance(outputs, tuple):
+            if len(outputs) == 3:
+                refiner_logits, gate_logits, gate_prob = outputs
+            elif len(outputs) == 2:
+                refiner_logits, gate_prob = outputs
+                gate_logits = torch.logit(gate_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6))
+            else:
+                raise ValueError("Unsupported gated refiner output arity.")
+        else:
+            refiner_logits = outputs
+            gate_logits = None
+            gate_prob = None
+        mixed_logits = refiner_logits
+        if gate_prob is not None:
+            if batch_base_logits is None:
+                raise ValueError("Gated refiner requires batch_base_logits for mixed inference.")
+            base_prob = torch.softmax(batch_base_logits, dim=1)
+            ref_prob = torch.softmax(refiner_logits, dim=1)
+            mixed_prob = (1.0 - gate_prob.unsqueeze(1)) * base_prob + gate_prob.unsqueeze(1) * ref_prob
+            mixed_prob = mixed_prob.clamp_min(1e-8)
+            mixed_prob = mixed_prob / mixed_prob.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            mixed_logits = torch.log(mixed_prob)
+        return {
+            "refiner_logits": refiner_logits,
+            "mixed_logits": mixed_logits,
+            "gate_logits": gate_logits,
+            "gate_prob": gate_prob,
+        }
+
+    @staticmethod
+    def _glance_refiner_sample_weights(base_wrong_target, utility_target, mode, base_wrong_weight=2.0, utility_weight=3.0):
+        mode = str(mode or "off").lower()
+        weights = torch.ones_like(base_wrong_target, dtype=torch.float32)
+        if mode in {"base_wrong", "base_wrong_plus_utility"}:
+            weights = weights + base_wrong_target.float() * max(float(base_wrong_weight) - 1.0, 0.0)
+        if mode in {"utility_positive", "base_wrong_plus_utility"}:
+            weights = weights + utility_target.float() * max(float(utility_weight) - 1.0, 0.0)
+        return weights
+
     def _apply_glance_joint_policy(
         self,
         router_model,
@@ -3795,6 +4171,8 @@ class StageRunner:
         base_logits,
         base_prob,
         base_pred,
+        labels_t,
+        beta,
         split_idx,
         batch_size,
         top_k,
@@ -3805,6 +4183,8 @@ class StageRunner:
         final_pred = base_pred.clone()
         routed_mask = torch.zeros(base_pred.numel(), dtype=torch.bool)
         router_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        router_score_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        oracle_advantage_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
         if split_idx.size == 0:
             return {
                 "logits": final_logits,
@@ -3812,6 +4192,8 @@ class StageRunner:
                 "pred": final_pred,
                 "routed_mask": routed_mask,
                 "router_prob": router_prob_all,
+                "router_score": router_score_all,
+                "oracle_advantage": oracle_advantage_all,
                 "routed_count": 0,
             }
 
@@ -3822,17 +4204,39 @@ class StageRunner:
         with torch.no_grad():
             for batch_idx_np in self._iter_glance_batches(split_idx, batch_size, shuffle=False):
                 batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
-                _, batch_prob = router_model(router_features[batch_idx].to(router_device))
+                batch_score, batch_prob, _, _ = router_model(router_features[batch_idx].to(router_device))
+                batch_score = batch_score.detach().cpu()
                 batch_prob = batch_prob.detach().cpu()
+                router_score_all[batch_idx] = batch_score
                 router_prob_all[batch_idx] = batch_prob
                 k = min(max(int(top_k), 1), int(batch_idx.numel()))
-                routed_rel = torch.topk(batch_prob, k=k, largest=True, sorted=False).indices
+                routed_rel = torch.topk(batch_score, k=k, largest=True, sorted=False).indices
                 routed_idx = batch_idx[routed_rel]
                 routed_mask[routed_idx] = True
-                ref_logits = refiner_model(refiner_features[routed_idx].to(refiner_device)).cpu()
-                final_logits[routed_idx] = ref_logits
-                final_prob[routed_idx] = torch.softmax(ref_logits, dim=1)
-                final_pred[routed_idx] = ref_logits.argmax(dim=1)
+                routed_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    refiner_features[routed_idx].to(refiner_device),
+                    batch_base_logits=base_logits[routed_idx].to(refiner_device),
+                )
+                final_logits[routed_idx] = routed_forward["mixed_logits"].cpu()
+                final_prob[routed_idx] = torch.softmax(routed_forward["mixed_logits"].cpu(), dim=1)
+                final_pred[routed_idx] = routed_forward["mixed_logits"].cpu().argmax(dim=1)
+                full_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    refiner_features[batch_idx].to(refiner_device),
+                    batch_base_logits=base_logits[batch_idx].to(refiner_device),
+                )
+                full_ref_loss = F.cross_entropy(
+                    full_forward["mixed_logits"].cpu(),
+                    labels_t[batch_idx].to(refiner_device).cpu(),
+                    reduction="none",
+                )
+                base_loss = F.cross_entropy(
+                    base_logits[batch_idx],
+                    labels_t[batch_idx],
+                    reduction="none",
+                )
+                oracle_advantage_all[batch_idx] = base_loss.detach().cpu() - full_ref_loss.detach().cpu() - float(beta)
 
         return {
             "logits": final_logits,
@@ -3840,7 +4244,85 @@ class StageRunner:
             "pred": final_pred,
             "routed_mask": routed_mask,
             "router_prob": router_prob_all,
+            "router_score": router_score_all,
+            "oracle_advantage": oracle_advantage_all,
             "routed_count": int(routed_mask[torch.tensor(split_idx, dtype=torch.long)].sum().item()),
+        }
+
+    def _collect_glance_joint_full_split_outputs(
+        self,
+        router_model,
+        refiner_model,
+        router_features,
+        refiner_features,
+        base_logits,
+        base_prob,
+        base_pred,
+        labels_t,
+        beta,
+        split_idx,
+        batch_size,
+    ):
+        split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
+        refiner_logits_all = base_logits.clone()
+        refiner_prob_all = base_prob.clone()
+        refiner_pred_all = base_pred.clone()
+        router_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        router_score_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        oracle_advantage_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        if split_idx.size == 0:
+            return {
+                "refiner_logits": refiner_logits_all,
+                "refiner_prob": refiner_prob_all,
+                "refiner_pred": refiner_pred_all,
+                "router_prob": router_prob_all,
+                "router_score": router_score_all,
+                "oracle_advantage": oracle_advantage_all,
+            }
+
+        router_model.eval()
+        refiner_model.eval()
+        router_device = next(router_model.parameters()).device
+        refiner_device = next(refiner_model.parameters()).device
+        with torch.no_grad():
+            for batch_idx_np in self._iter_glance_batches(split_idx, batch_size, shuffle=False):
+                batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
+                batch_score, batch_prob, _, _ = router_model(router_features[batch_idx].to(router_device))
+                batch_score = batch_score.detach().cpu()
+                batch_prob = batch_prob.detach().cpu()
+                router_score_all[batch_idx] = batch_score
+                router_prob_all[batch_idx] = batch_prob
+
+                full_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    refiner_features[batch_idx].to(refiner_device),
+                    batch_base_logits=base_logits[batch_idx].to(refiner_device),
+                )
+                full_ref_logits = full_forward["mixed_logits"].detach().cpu()
+                full_ref_prob = torch.softmax(full_ref_logits, dim=1)
+                refiner_logits_all[batch_idx] = full_ref_logits
+                refiner_prob_all[batch_idx] = full_ref_prob
+                refiner_pred_all[batch_idx] = full_ref_logits.argmax(dim=1)
+
+                full_ref_loss = F.cross_entropy(
+                    full_ref_logits,
+                    labels_t[batch_idx],
+                    reduction="none",
+                )
+                base_loss = F.cross_entropy(
+                    base_logits[batch_idx],
+                    labels_t[batch_idx],
+                    reduction="none",
+                )
+                oracle_advantage_all[batch_idx] = base_loss.detach().cpu() - full_ref_loss.detach().cpu() - float(beta)
+
+        return {
+            "refiner_logits": refiner_logits_all,
+            "refiner_prob": refiner_prob_all,
+            "refiner_pred": refiner_pred_all,
+            "router_prob": router_prob_all,
+            "router_score": router_score_all,
+            "oracle_advantage": oracle_advantage_all,
         }
 
     @staticmethod
@@ -3869,8 +4351,14 @@ class StageRunner:
         labels_np,
         routed_mask,
         router_prob,
+        router_score,
+        oracle_advantage,
         semantic_views,
         mode_name,
+        route_prob_by_epoch=None,
+        route_score_by_epoch=None,
+        refiner_pred_by_epoch=None,
+        base_pred_by_epoch=None,
     ):
         split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
         rows = []
@@ -3878,6 +4366,8 @@ class StageRunner:
         pred_gnn_np = pred_gnn.detach().cpu().numpy().astype(np.int64)
         routed_mask_np = routed_mask.detach().cpu().numpy().astype(bool)
         router_prob_np = router_prob.detach().cpu().numpy().astype(np.float32)
+        router_score_np = router_score.detach().cpu().numpy().astype(np.float32) if router_score is not None else None
+        oracle_advantage_np = oracle_advantage.detach().cpu().numpy().astype(np.float32) if oracle_advantage is not None else None
         count_1hop = semantic_views.get("count_1hop")
         count_2hop = semantic_views.get("count_2hop")
         if count_1hop is None:
@@ -3885,13 +4375,15 @@ class StageRunner:
         if count_2hop is None:
             count_2hop = semantic_views.get("count_follower")
         for node_idx in split_idx.tolist():
-            rows.append({
+            row = {
                 "node_id": int(node_idx),
                 "base_pred": int(pred_gnn_np[node_idx]),
                 "final_pred": int(final_pred_np[node_idx]),
                 "label": int(labels_np[node_idx]),
                 "routed": bool(routed_mask_np[node_idx]),
                 "router_prob": float(router_prob_np[node_idx]),
+                "router_score": float(router_score_np[node_idx]) if router_score_np is not None else 0.0,
+                "oracle_advantage": float(oracle_advantage_np[node_idx]) if oracle_advantage_np is not None else 0.0,
                 "was_wrong_base": bool(pred_gnn_np[node_idx] != labels_np[node_idx]),
                 "is_wrong_final": bool(final_pred_np[node_idx] != labels_np[node_idx]),
                 "neighbor_count_1hop": int(count_1hop[node_idx]) if count_1hop is not None else 0,
@@ -3900,7 +4392,16 @@ class StageRunner:
                 "neighbor_count_follower": int(semantic_views["count_follower"][node_idx]) if "count_follower" in semantic_views else 0,
                 "has_following": int(semantic_views["has_following"][node_idx]) if "has_following" in semantic_views else 0,
                 "has_follower": int(semantic_views["has_follower"][node_idx]) if "has_follower" in semantic_views else 0,
-            })
+            }
+            if route_prob_by_epoch is not None:
+                row["router_prob_by_epoch"] = [float(v[node_idx]) for v in route_prob_by_epoch]
+            if route_score_by_epoch is not None:
+                row["router_score_by_epoch"] = [float(v[node_idx]) for v in route_score_by_epoch]
+            if refiner_pred_by_epoch is not None:
+                row["refiner_pred_by_epoch"] = [int(v[node_idx]) for v in refiner_pred_by_epoch]
+            if base_pred_by_epoch is not None:
+                row["base_pred_by_epoch"] = [int(v[node_idx]) for v in base_pred_by_epoch]
+            rows.append(row)
         return {
             "rows": rows,
             "analysis": self._build_refiner_analysis_summary(rows, mode_name),
@@ -3927,23 +4428,45 @@ class StageRunner:
         decay_factor,
         entropy_weight,
         router_weight,
+        router_regression_weight,
+        router_ranking_weight,
+        router_calibration_weight,
+        router_reliability_weight,
         learning_rate,
         weight_decay,
         beta,
         eval_top_k,
+        refiner_explicit_gate=False,
+        refiner_target_mode="predict",
+        refiner_weight_mode="off",
+        refiner_base_wrong_weight=2.0,
+        refiner_utility_weight=3.0,
+        refiner_gate_weight=0.5,
     ):
         candidate_seed = int(self.seed) * 100000 + int(round(float(beta) * 1000)) * 10 + int(eval_top_k)
         torch.manual_seed(candidate_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(candidate_seed)
         np.random.seed(candidate_seed % (2**32 - 1))
-        router_model = GlanceRouterLinear(input_dim=int(router_features.shape[1]))
-        refiner_model = GlanceRefinerMLP(
-            input_dim=int(refiner_features.shape[1]),
+        router_model = GlanceRouterMLP(
+            input_dim=int(router_features.shape[1]),
             hidden_dim=128,
-            activation=activation,
             dropout=0.1,
         )
+        if bool(refiner_explicit_gate):
+            refiner_model = GatedGlanceRefinerMLP(
+                input_dim=int(refiner_features.shape[1]),
+                hidden_dim=128,
+                activation=activation,
+                dropout=0.1,
+            )
+        else:
+            refiner_model = GlanceRefinerMLP(
+                input_dim=int(refiner_features.shape[1]),
+                hidden_dim=128,
+                activation=activation,
+                dropout=0.1,
+            )
         router_model.to(self.device)
         refiner_model.to(self.device)
         optimizer = torch.optim.AdamW(
@@ -3957,6 +4480,10 @@ class StageRunner:
         best_score = (-1.0, float("inf"))
         wait = 0
         epoch_history = []
+        epoch_component_curves = []
+        train_wrong = (pred_gnn.numpy()[train_idx] != labels_np[train_idx]).astype(np.int64)
+        valid_wrong = (pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).astype(np.int64)
+        test_wrong = (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).astype(np.int64)
 
         for epoch in range(max_epochs):
             router_model.train()
@@ -3964,6 +4491,13 @@ class StageRunner:
             train_loss_history = []
             train_pred_history = []
             train_route_history = []
+            train_router_regression_history = []
+            train_router_ranking_history = []
+            train_router_selection_history = []
+            train_router_reliability_history = []
+            train_adv_corr_history = []
+            train_gate_history = []
+            train_routed_weight_history = []
             train_k = self._glance_training_top_k(
                 batch_size,
                 epoch,
@@ -3981,28 +4515,73 @@ class StageRunner:
                 batch_refiner = refiner_features[batch_idx].to(self.device)
                 batch_labels = labels_t[batch_idx].to(self.device)
                 batch_base_logits = logits_gnn[batch_idx].to(self.device)
+                batch_base_pred = pred_gnn[batch_idx].to(self.device)
                 batch_base_loss = F.cross_entropy(
                     batch_base_logits,
                     batch_labels,
                     reduction="none",
                 ).detach()
 
-                _, route_prob = router_model(batch_router_x)
+                route_score, route_prob, reliability_logits, reliability_prob = router_model(batch_router_x)
                 k = min(max(int(train_k), 1), int(batch_idx.numel()))
-                routed_rel = torch.topk(route_prob, k=k, largest=True, sorted=False).indices
+                routed_rel = torch.topk(route_score, k=k, largest=True, sorted=False).indices
                 routed_mask = torch.zeros(batch_labels.size(0), dtype=torch.bool, device=self.device)
                 routed_mask[routed_rel] = True
 
+                full_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    batch_refiner,
+                    batch_base_logits=batch_base_logits,
+                )
+                base_wrong_target = (batch_base_pred != batch_labels).float()
+                full_refiner_loss = F.cross_entropy(
+                    full_forward["mixed_logits"],
+                    batch_labels,
+                    reduction="none",
+                )
+                utility_target = ((batch_base_loss - full_refiner_loss.detach() - float(beta)) > 0.0).float()
+
                 routed_labels = batch_labels[routed_mask]
                 if int(routed_labels.numel()) > 0:
-                    routed_refiner_logits = refiner_model(batch_refiner[routed_mask])
-                    routed_refiner_loss = F.cross_entropy(
-                        routed_refiner_logits,
-                        routed_labels,
-                        reduction="none",
+                    routed_forward = self._glance_refiner_forward(
+                        refiner_model,
+                        batch_refiner[routed_mask],
+                        batch_base_logits=batch_base_logits[routed_mask],
                     )
+                    routed_sample_weights = self._glance_refiner_sample_weights(
+                        base_wrong_target[routed_mask],
+                        utility_target[routed_mask],
+                        refiner_weight_mode,
+                        base_wrong_weight=refiner_base_wrong_weight,
+                        utility_weight=refiner_utility_weight,
+                    )
+                    if str(refiner_target_mode).lower() == "keep_change":
+                        routed_target = (batch_base_pred[routed_mask] != routed_labels).long()
+                        routed_refiner_loss_raw = F.cross_entropy(
+                            routed_forward["refiner_logits"],
+                            routed_target,
+                            reduction="none",
+                        )
+                    else:
+                        routed_refiner_loss_raw = F.cross_entropy(
+                            routed_forward["mixed_logits"],
+                            routed_labels,
+                            reduction="none",
+                        )
+                    routed_refiner_loss = routed_refiner_loss_raw * routed_sample_weights
+                    if routed_forward["gate_logits"] is not None:
+                        gate_target = ((batch_base_pred[routed_mask] != routed_labels) | (utility_target[routed_mask] > 0.0)).float()
+                        gate_loss = F.binary_cross_entropy_with_logits(
+                            routed_forward["gate_logits"],
+                            gate_target,
+                            weight=routed_sample_weights,
+                        )
+                    else:
+                        gate_loss = routed_refiner_loss.sum() * 0.0
                 else:
                     routed_refiner_loss = torch.empty((0,), device=self.device)
+                    routed_sample_weights = torch.empty((0,), device=self.device)
+                    gate_loss = batch_base_loss.sum() * 0.0
                 refiner_loss = batch_base_loss.detach().clone()
                 refiner_loss[routed_mask] = routed_refiner_loss
                 pred_loss = (
@@ -4013,6 +4592,9 @@ class StageRunner:
                 routed_reward = batch_base_loss - refiner_loss.detach() - float(beta)
                 non_routed_reward = -batch_base_loss
                 reward = torch.where(routed_mask, routed_reward, non_routed_reward).detach()
+                oracle_advantage = (batch_base_loss - full_refiner_loss.detach() - float(beta)).detach()
+                scaled_advantage = _scale_glance_advantage_target(oracle_advantage)
+                oracle_topk_membership = _glance_oracle_topk_membership(oracle_advantage, train_k)
                 action_prob = torch.where(
                     routed_mask,
                     route_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6),
@@ -4024,7 +4606,39 @@ class StageRunner:
                     * torch.log((1.0 - route_prob).clamp_min(1e-6).clamp_max(1.0 - 1e-6))
                 ).mean()
                 route_loss = (-(reward * torch.log(action_prob)).mean()) - float(entropy_weight) * entropy
-                total_loss = pred_loss + float(router_weight) * route_loss
+                router_regression_loss = F.smooth_l1_loss(route_score, scaled_advantage)
+                router_ranking_loss = _glance_pairwise_ranking_loss(route_score, oracle_advantage)
+                pos_count = int(base_wrong_target.sum().detach().cpu().item())
+                neg_count = int(base_wrong_target.numel() - pos_count)
+                if 0 < pos_count < int(base_wrong_target.numel()):
+                    pos_weight = torch.tensor(
+                        float(neg_count / max(pos_count, 1)),
+                        dtype=reliability_logits.dtype,
+                        device=reliability_logits.device,
+                    )
+                    router_selection_loss = F.binary_cross_entropy_with_logits(
+                        reliability_logits,
+                        base_wrong_target,
+                        pos_weight=pos_weight,
+                    )
+                else:
+                    router_selection_loss = reliability_logits.sum() * 0.0
+                with torch.no_grad():
+                    utility_target = (oracle_advantage > 0.0).float()
+                    reliability_gate = reliability_prob.detach().clamp_min(1e-4).clamp_max(1.0 - 1e-4)
+                utility_consistency_loss = F.binary_cross_entropy(
+                    reliability_gate,
+                    utility_target,
+                )
+                total_loss = (
+                    pred_loss
+                    + float(refiner_gate_weight) * gate_loss
+                    + float(router_weight) * route_loss
+                    + float(router_regression_weight) * router_regression_loss
+                    + float(router_ranking_weight) * router_ranking_loss
+                    + float(router_calibration_weight) * router_selection_loss
+                    + float(router_reliability_weight) * utility_consistency_loss
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
@@ -4033,9 +4647,38 @@ class StageRunner:
                 train_loss_history.append(float(total_loss.detach().cpu().item()))
                 train_pred_history.append(float(pred_loss.detach().cpu().item()))
                 train_route_history.append(float(route_loss.detach().cpu().item()))
+                train_router_regression_history.append(float(router_regression_loss.detach().cpu().item()))
+                train_router_ranking_history.append(float(router_ranking_loss.detach().cpu().item()))
+                train_router_selection_history.append(float(router_selection_loss.detach().cpu().item()))
+                train_router_reliability_history.append(float(utility_consistency_loss.detach().cpu().item()))
+                train_gate_history.append(float(gate_loss.detach().cpu().item()))
+                train_routed_weight_history.append(float(routed_sample_weights.mean().detach().cpu().item()) if int(routed_sample_weights.numel()) > 0 else 0.0)
+                train_adv_corr_history.append(
+                    float(
+                        _safe_score_corr(
+                            route_score.detach().cpu().numpy(),
+                            oracle_advantage.detach().cpu().numpy(),
+                        )
+                        or 0.0
+                    )
+                )
 
             router_model.to("cpu")
             refiner_model.to("cpu")
+            train_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                train_idx,
+                batch_size,
+                eval_top_k,
+            )
             valid_outputs = self._apply_glance_joint_policy(
                 router_model,
                 refiner_model,
@@ -4044,7 +4687,23 @@ class StageRunner:
                 logits_gnn,
                 p_gnn,
                 pred_gnn,
+                labels_t,
+                beta,
                 valid_idx,
+                batch_size,
+                eval_top_k,
+            )
+            test_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                test_idx,
                 batch_size,
                 eval_top_k,
             )
@@ -4055,6 +4714,34 @@ class StageRunner:
             )
             valid_metrics["routed_count"] = int(valid_outputs["routed_count"])
             valid_metrics["query_rate"] = float(valid_outputs["routed_count"] / max(int(valid_idx.size), 1))
+            train_metrics_epoch = _classification_metrics_from_logits(
+                train_outputs["logits"],
+                labels_t,
+                torch.tensor(train_idx, dtype=torch.long),
+            )
+            train_metrics_epoch["routed_count"] = int(train_outputs["routed_count"])
+            train_metrics_epoch["query_rate"] = float(train_outputs["routed_count"] / max(int(train_idx.size), 1))
+            train_router_diag_epoch = _safe_binary_score_metrics(train_wrong, train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy())
+            valid_router_diag_epoch = _safe_binary_score_metrics(valid_wrong, valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy())
+            test_router_diag_epoch = _safe_binary_score_metrics(test_wrong, test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy())
+            train_adv_diag_epoch = _safe_advantage_router_metrics(
+                train_outputs["oracle_advantage"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+                train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+                train_outputs["routed_mask"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            )
+            valid_adv_diag_epoch = _safe_advantage_router_metrics(
+                valid_outputs["oracle_advantage"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+                valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+                valid_outputs["routed_mask"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            )
+            test_adv_diag_epoch = _safe_advantage_router_metrics(
+                test_outputs["oracle_advantage"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+                test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+                test_outputs["routed_mask"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            )
+            train_delta_epoch = _delta_table(pred_gnn.numpy(), train_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], train_idx))
+            valid_delta_epoch = _delta_table(pred_gnn.numpy(), valid_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], valid_idx))
+            test_delta_epoch = _delta_table(pred_gnn.numpy(), test_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], test_idx))
 
             epoch_summary = {
                 "epoch": int(epoch + 1),
@@ -4064,9 +4751,61 @@ class StageRunner:
                 "avg_total_loss": float(np.mean(train_loss_history)) if train_loss_history else 0.0,
                 "avg_pred_loss": float(np.mean(train_pred_history)) if train_pred_history else 0.0,
                 "avg_route_loss": float(np.mean(train_route_history)) if train_route_history else 0.0,
+                "avg_router_regression_loss": float(np.mean(train_router_regression_history)) if train_router_regression_history else 0.0,
+                "avg_router_ranking_loss": float(np.mean(train_router_ranking_history)) if train_router_ranking_history else 0.0,
+                "avg_router_selection_loss": float(np.mean(train_router_selection_history)) if train_router_selection_history else 0.0,
+                "avg_router_calibration_loss": float(np.mean(train_router_selection_history)) if train_router_selection_history else 0.0,
+                "avg_router_reliability_loss": float(np.mean(train_router_reliability_history)) if train_router_reliability_history else 0.0,
+                "avg_refiner_gate_loss": float(np.mean(train_gate_history)) if train_gate_history else 0.0,
+                "avg_routed_sample_weight": float(np.mean(train_routed_weight_history)) if train_routed_weight_history else 0.0,
+                "avg_router_advantage_corr": float(np.mean(train_adv_corr_history)) if train_adv_corr_history else 0.0,
+                "train": train_metrics_epoch,
                 "valid": valid_metrics,
+                "router_diagnostics": {
+                    "train": train_router_diag_epoch,
+                    "valid": valid_router_diag_epoch,
+                    "test": test_router_diag_epoch,
+                },
+                "advantage_router_diagnostics": {
+                    "train": train_adv_diag_epoch,
+                    "valid": valid_adv_diag_epoch,
+                    "test": test_adv_diag_epoch,
+                },
+                "component_deltas": {
+                    "train": train_delta_epoch,
+                    "valid": valid_delta_epoch,
+                    "test": test_delta_epoch,
+                },
             }
             epoch_history.append(epoch_summary)
+            epoch_component_curves.append({
+                "epoch": int(epoch + 1),
+                "beta": float(beta),
+                "eval_top_k": int(eval_top_k),
+                "train_top_k": int(train_k),
+                "router": {
+                    "train": train_router_diag_epoch,
+                    "valid": valid_router_diag_epoch,
+                    "test": test_router_diag_epoch,
+                },
+                "refiner": {
+                    "train": {
+                        "wrong_node_fix_rate": float(train_delta_epoch["fix"] / max(int((pred_gnn.numpy()[train_idx] != labels_np[train_idx]).sum()), 1)),
+                        "correct_node_break_rate": float(train_delta_epoch["broke"] / max(int(train_idx.size - (pred_gnn.numpy()[train_idx] != labels_np[train_idx]).sum()), 1)),
+                        "net_gain": int(train_delta_epoch["net"]),
+                    },
+                    "valid": {
+                        "wrong_node_fix_rate": float(valid_delta_epoch["fix"] / max(int((pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).sum()), 1)),
+                        "correct_node_break_rate": float(valid_delta_epoch["broke"] / max(int(valid_idx.size - (pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).sum()), 1)),
+                        "net_gain": int(valid_delta_epoch["net"]),
+                    },
+                    "test": {
+                        "wrong_node_fix_rate": float(test_delta_epoch["fix"] / max(int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+                        "correct_node_break_rate": float(test_delta_epoch["broke"] / max(int(test_idx.size - (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+                        "net_gain": int(test_delta_epoch["net"]),
+                    },
+                },
+            })
             current_score = (float(valid_metrics["macro_f1"]), -float(valid_metrics["loss"]))
             if current_score > best_score:
                 best_score = current_score
@@ -4092,7 +4831,7 @@ class StageRunner:
         router_model.to("cpu")
         refiner_model.to("cpu")
 
-        train_outputs = self._apply_glance_joint_policy(
+        topk_train_outputs = self._apply_glance_joint_policy(
             router_model,
             refiner_model,
             router_features,
@@ -4100,11 +4839,13 @@ class StageRunner:
             logits_gnn,
             p_gnn,
             pred_gnn,
+            labels_t,
+            beta,
             train_idx,
             batch_size,
             eval_top_k,
         )
-        valid_outputs = self._apply_glance_joint_policy(
+        topk_valid_outputs = self._apply_glance_joint_policy(
             router_model,
             refiner_model,
             router_features,
@@ -4112,11 +4853,13 @@ class StageRunner:
             logits_gnn,
             p_gnn,
             pred_gnn,
+            labels_t,
+            beta,
             valid_idx,
             batch_size,
             eval_top_k,
         )
-        test_outputs = self._apply_glance_joint_policy(
+        topk_test_outputs = self._apply_glance_joint_policy(
             router_model,
             refiner_model,
             router_features,
@@ -4124,33 +4867,228 @@ class StageRunner:
             logits_gnn,
             p_gnn,
             pred_gnn,
+            labels_t,
+            beta,
             test_idx,
             batch_size,
             eval_top_k,
         )
 
-        train_metrics = _classification_metrics_from_logits(
-            train_outputs["logits"],
+        topk_train_metrics = _classification_metrics_from_logits(
+            topk_train_outputs["logits"],
             labels_t,
             torch.tensor(train_idx, dtype=torch.long),
         )
-        valid_metrics = _classification_metrics_from_logits(
-            valid_outputs["logits"],
+        topk_valid_metrics = _classification_metrics_from_logits(
+            topk_valid_outputs["logits"],
             labels_t,
             torch.tensor(valid_idx, dtype=torch.long),
         )
-        test_metrics = _classification_metrics_from_logits(
-            test_outputs["logits"],
+        topk_test_metrics = _classification_metrics_from_logits(
+            topk_test_outputs["logits"],
             labels_t,
             torch.tensor(test_idx, dtype=torch.long),
         )
         for split_metrics, split_outputs, split_idx in (
-            (train_metrics, train_outputs, train_idx),
-            (valid_metrics, valid_outputs, valid_idx),
-            (test_metrics, test_outputs, test_idx),
+            (topk_train_metrics, topk_train_outputs, train_idx),
+            (topk_valid_metrics, topk_valid_outputs, valid_idx),
+            (topk_test_metrics, topk_test_outputs, test_idx),
         ):
             split_metrics["routed_count"] = int(split_outputs["routed_count"])
             split_metrics["query_rate"] = float(split_outputs["routed_count"] / max(int(split_idx.size), 1))
+
+        topk_train_rows = self._build_glance_joint_per_node_rows(
+            train_idx,
+            pred_gnn,
+            topk_train_outputs["pred"],
+            labels_np,
+            topk_train_outputs["routed_mask"],
+            topk_train_outputs["router_prob"],
+            topk_train_outputs["router_score"],
+            topk_train_outputs["oracle_advantage"],
+            semantic_views,
+            "glance_joint_router_refine_train",
+        )
+        topk_valid_rows = self._build_glance_joint_per_node_rows(
+            valid_idx,
+            pred_gnn,
+            topk_valid_outputs["pred"],
+            labels_np,
+            topk_valid_outputs["routed_mask"],
+            topk_valid_outputs["router_prob"],
+            topk_valid_outputs["router_score"],
+            topk_valid_outputs["oracle_advantage"],
+            semantic_views,
+            "glance_joint_router_refine_valid",
+        )
+        topk_test_rows = self._build_glance_joint_per_node_rows(
+            test_idx,
+            pred_gnn,
+            topk_test_outputs["pred"],
+            labels_np,
+            topk_test_outputs["routed_mask"],
+            topk_test_outputs["router_prob"],
+            topk_test_outputs["router_score"],
+            topk_test_outputs["oracle_advantage"],
+            semantic_views,
+            "glance_joint_router_refine_test",
+        )
+        train_wrong = (pred_gnn.numpy()[train_idx] != labels_np[train_idx]).astype(np.int64)
+        valid_wrong = (pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).astype(np.int64)
+        test_wrong = (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).astype(np.int64)
+        topk_train_router_diag = _safe_binary_score_metrics(train_wrong, topk_train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy())
+        topk_valid_router_diag = _safe_binary_score_metrics(valid_wrong, topk_valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy())
+        topk_test_router_diag = _safe_binary_score_metrics(test_wrong, topk_test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy())
+        topk_train_adv_diag = _safe_advantage_router_metrics(
+            topk_train_outputs["oracle_advantage"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            topk_train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            topk_train_outputs["routed_mask"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+        )
+        topk_valid_adv_diag = _safe_advantage_router_metrics(
+            topk_valid_outputs["oracle_advantage"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            topk_valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            topk_valid_outputs["routed_mask"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+        )
+        topk_test_adv_diag = _safe_advantage_router_metrics(
+            topk_test_outputs["oracle_advantage"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            topk_test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            topk_test_outputs["routed_mask"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+        )
+        component_curve_summary = {
+            "best_epoch": int(best_epoch_summary["epoch"]),
+            "curve": [
+                {
+                    "epoch": int(item["epoch"]),
+                    "beta": float(item["beta"]),
+                    "train_top_k": int(item["train_top_k"]),
+                    "eval_top_k": int(item["eval_top_k"]),
+                    "router_train_auroc": item["router"]["train"].get("auroc"),
+                    "router_valid_auroc": item["router"]["valid"].get("auroc"),
+                    "router_test_auroc": item["router"]["test"].get("auroc"),
+                    "router_valid_adv_auroc": item.get("advantage_router_diagnostics", {}).get("valid", {}).get("auroc"),
+                    "router_test_adv_auroc": item.get("advantage_router_diagnostics", {}).get("test", {}).get("auroc"),
+                    "router_valid_auprc": item["router"]["valid"].get("auprc"),
+                    "router_valid_adv_auprc": item.get("advantage_router_diagnostics", {}).get("valid", {}).get("auprc"),
+                    "refiner_valid_fix_rate": item["refiner"]["valid"].get("wrong_node_fix_rate"),
+                    "refiner_valid_break_rate": item["refiner"]["valid"].get("correct_node_break_rate"),
+                    "refiner_test_fix_rate": item["refiner"]["test"].get("wrong_node_fix_rate"),
+                    "refiner_test_break_rate": item["refiner"]["test"].get("correct_node_break_rate"),
+                }
+                for item in epoch_component_curves
+            ],
+        }
+
+        full_train_outputs = self._collect_glance_joint_full_split_outputs(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            labels_t,
+            beta,
+            train_idx,
+            batch_size,
+        )
+        full_valid_outputs = self._collect_glance_joint_full_split_outputs(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            labels_t,
+            beta,
+            valid_idx,
+            batch_size,
+        )
+        full_test_outputs = self._collect_glance_joint_full_split_outputs(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            labels_t,
+            beta,
+            test_idx,
+            batch_size,
+        )
+        budget_values = self._router_budgets()
+        train_budget_rows, train_budget_payloads = self._build_glance_joint_budget_rows(
+            budget_values,
+            train_idx,
+            labels_np,
+            labels_t,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            full_train_outputs["refiner_logits"],
+            full_train_outputs["refiner_prob"],
+            full_train_outputs["refiner_pred"],
+            full_train_outputs["router_score"],
+            full_train_outputs["router_prob"],
+            full_train_outputs["oracle_advantage"],
+        )
+        valid_budget_rows, valid_budget_payloads = self._build_glance_joint_budget_rows(
+            budget_values,
+            valid_idx,
+            labels_np,
+            labels_t,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            full_valid_outputs["refiner_logits"],
+            full_valid_outputs["refiner_prob"],
+            full_valid_outputs["refiner_pred"],
+            full_valid_outputs["router_score"],
+            full_valid_outputs["router_prob"],
+            full_valid_outputs["oracle_advantage"],
+        )
+        test_budget_rows, test_budget_payloads = self._build_glance_joint_budget_rows(
+            budget_values,
+            test_idx,
+            labels_np,
+            labels_t,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            full_test_outputs["refiner_logits"],
+            full_test_outputs["refiner_prob"],
+            full_test_outputs["refiner_pred"],
+            full_test_outputs["router_score"],
+            full_test_outputs["router_prob"],
+            full_test_outputs["oracle_advantage"],
+        )
+        selected_valid_budget_row, selected_budget_key, _ = self._select_best_budget_row(valid_budget_rows)
+        if selected_valid_budget_row is None or selected_budget_key is None:
+            raise MissingFrozenArtifactError("glance_joint_router_refine failed to select a validation budget.")
+        if selected_budget_key not in train_budget_payloads or selected_budget_key not in valid_budget_payloads or selected_budget_key not in test_budget_payloads:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine budget selection produced inconsistent train/valid/test payloads."
+            )
+
+        train_outputs = train_budget_payloads[selected_budget_key]["outputs"]
+        valid_outputs = valid_budget_payloads[selected_budget_key]["outputs"]
+        test_outputs = test_budget_payloads[selected_budget_key]["outputs"]
+
+        def _row_to_metrics(row, split_size):
+            return {
+                "loss": float(row["loss"]),
+                "accuracy": float(row["accuracy"]),
+                "macro_f1": float(row["macro_f1"]),
+                "bot_f1": float(row["bot_f1"]),
+                "count": int(split_size),
+                "routed_count": int(row["routed_count"]),
+                "query_rate": float(row["query_rate"]),
+            }
+
+        train_metrics = _row_to_metrics(train_budget_payloads[selected_budget_key]["row"], train_idx.size)
+        valid_metrics = _row_to_metrics(valid_budget_payloads[selected_budget_key]["row"], valid_idx.size)
+        test_metrics = _row_to_metrics(test_budget_payloads[selected_budget_key]["row"], test_idx.size)
 
         train_rows = self._build_glance_joint_per_node_rows(
             train_idx,
@@ -4159,6 +5097,8 @@ class StageRunner:
             labels_np,
             train_outputs["routed_mask"],
             train_outputs["router_prob"],
+            train_outputs["router_score"],
+            train_outputs["oracle_advantage"],
             semantic_views,
             "glance_joint_router_refine_train",
         )
@@ -4169,6 +5109,8 @@ class StageRunner:
             labels_np,
             valid_outputs["routed_mask"],
             valid_outputs["router_prob"],
+            valid_outputs["router_score"],
+            valid_outputs["oracle_advantage"],
             semantic_views,
             "glance_joint_router_refine_valid",
         )
@@ -4179,9 +5121,30 @@ class StageRunner:
             labels_np,
             test_outputs["routed_mask"],
             test_outputs["router_prob"],
+            test_outputs["router_score"],
+            test_outputs["oracle_advantage"],
             semantic_views,
             "glance_joint_router_refine_test",
         )
+        train_router_diag = _safe_binary_score_metrics(train_wrong, train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy())
+        valid_router_diag = _safe_binary_score_metrics(valid_wrong, valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy())
+        test_router_diag = _safe_binary_score_metrics(test_wrong, test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy())
+        train_adv_diag = _safe_advantage_router_metrics(
+            train_outputs["oracle_advantage"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            train_outputs["routed_mask"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+        )
+        valid_adv_diag = _safe_advantage_router_metrics(
+            valid_outputs["oracle_advantage"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            valid_outputs["routed_mask"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+        )
+        test_adv_diag = _safe_advantage_router_metrics(
+            test_outputs["oracle_advantage"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            test_outputs["routed_mask"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+        )
+
         return {
             "beta": float(beta),
             "eval_top_k": int(eval_top_k),
@@ -4192,12 +5155,51 @@ class StageRunner:
             "fit_summary": {
                 "best_epoch": int(best_epoch_summary["epoch"]),
                 "epoch_history": epoch_history,
+                "epoch_component_curves": epoch_component_curves,
+                "component_curve_summary": component_curve_summary,
                 "selected_train": train_metrics,
                 "selected_valid": valid_metrics,
                 "selected_test": test_metrics,
+                "selected_budget_source": "validation",
+                "selected_budget": float(selected_valid_budget_row["budget"]),
+                "selected_budget_key": selected_budget_key,
                 "router_weight": float(router_weight),
+                "router_regression_weight": float(router_regression_weight),
+                "router_ranking_weight": float(router_ranking_weight),
+                "router_selection_weight": float(router_calibration_weight),
+                "router_calibration_weight": float(router_calibration_weight),
                 "entropy_weight": float(entropy_weight),
                 "eval_top_k": int(eval_top_k),
+                "router_diagnostics": {
+                    "train": train_router_diag,
+                    "valid": valid_router_diag,
+                    "test": test_router_diag,
+                },
+                "advantage_router_diagnostics": {
+                    "train": train_adv_diag,
+                    "valid": valid_adv_diag,
+                    "test": test_adv_diag,
+                },
+                "topk_reference": {
+                    "train_metrics": topk_train_metrics,
+                    "valid_metrics": topk_valid_metrics,
+                    "test_metrics": topk_test_metrics,
+                    "router_diagnostics": {
+                        "train": topk_train_router_diag,
+                        "valid": topk_valid_router_diag,
+                        "test": topk_test_router_diag,
+                    },
+                    "advantage_router_diagnostics": {
+                        "train": topk_train_adv_diag,
+                        "valid": topk_valid_adv_diag,
+                        "test": topk_test_adv_diag,
+                    },
+                    "analysis": {
+                        "train": topk_train_rows["analysis"],
+                        "valid": topk_valid_rows["analysis"],
+                        "test": topk_test_rows["analysis"],
+                    },
+                },
             },
             "train_outputs": train_outputs,
             "valid_outputs": valid_outputs,
@@ -4208,6 +5210,21 @@ class StageRunner:
             "train_rows": train_rows,
             "valid_rows": valid_rows,
             "test_rows": test_rows,
+            "component_curves": epoch_component_curves,
+            "component_curve_summary": component_curve_summary,
+            "selected_budget": float(selected_valid_budget_row["budget"]),
+            "selected_budget_key": selected_budget_key,
+            "selected_budget_source": "validation",
+            "selected_budget_metrics": {
+                "train": train_metrics,
+                "valid": valid_metrics,
+                "test": test_metrics,
+            },
+            "selected_valid_budget_metrics": dict(selected_valid_budget_row),
+            "selected_test_budget_metrics_under_valid_choice": dict(test_budget_payloads[selected_budget_key]["row"]),
+            "train_budget_curve": train_budget_rows,
+            "valid_budget_curve": valid_budget_rows,
+            "test_budget_curve": test_budget_rows,
         }
 
     def _base_artifact_bundle(self):
@@ -7557,6 +8574,113 @@ class StageRunner:
             "test_budget_curve_rows": _read_budget_curve_rows("test_budget_curve.csv"),
         }
 
+    def _build_glance_joint_budget_rows(
+        self,
+        budgets,
+        split_idx,
+        labels_np,
+        labels_t,
+        base_logits,
+        base_prob,
+        base_pred,
+        refiner_logits,
+        refiner_prob,
+        refiner_pred,
+        router_score,
+        router_prob,
+        oracle_advantage,
+    ):
+        split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
+        labels_np = np.asarray(labels_np, dtype=np.int64)
+        base_pred_np = base_pred.detach().cpu().numpy() if torch.is_tensor(base_pred) else np.asarray(base_pred, dtype=np.int64)
+        refiner_pred_np = refiner_pred.detach().cpu().numpy() if torch.is_tensor(refiner_pred) else np.asarray(refiner_pred, dtype=np.int64)
+        router_score_np = router_score.detach().cpu().numpy() if torch.is_tensor(router_score) else np.asarray(router_score, dtype=np.float64)
+        router_prob_t = router_prob.detach().cpu().float() if torch.is_tensor(router_prob) else torch.tensor(router_prob, dtype=torch.float32)
+        oracle_advantage_t = oracle_advantage.detach().cpu().float() if torch.is_tensor(oracle_advantage) else torch.tensor(oracle_advantage, dtype=torch.float32)
+        base_logits_t = base_logits.detach().cpu().float() if torch.is_tensor(base_logits) else torch.tensor(base_logits, dtype=torch.float32)
+        base_prob_t = base_prob.detach().cpu().float() if torch.is_tensor(base_prob) else torch.tensor(base_prob, dtype=torch.float32)
+        refiner_logits_t = refiner_logits.detach().cpu().float() if torch.is_tensor(refiner_logits) else torch.tensor(refiner_logits, dtype=torch.float32)
+        refiner_prob_t = refiner_prob.detach().cpu().float() if torch.is_tensor(refiner_prob) else torch.tensor(refiner_prob, dtype=torch.float32)
+
+        base_eval = _classification_metrics_from_logits(
+            base_logits_t,
+            labels_t,
+            torch.tensor(split_idx, dtype=torch.long),
+        ) if split_idx.size else {"loss": float("inf"), "accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0}
+        base_wrong_count = int((base_pred_np[split_idx] != labels_np[split_idx]).sum()) if split_idx.size else 0
+        base_correct_count = int(split_idx.size - base_wrong_count)
+        order = split_idx[np.argsort(-router_score_np[split_idx])] if split_idx.size else np.asarray([], dtype=np.int64)
+
+        rows = []
+        payloads = {}
+        for budget in parse_budget_list(budgets):
+            k = min(max(int(round(split_idx.size * float(budget))), 1), split_idx.size) if split_idx.size else 0
+            routed = order[:k]
+            routed_mask = torch.zeros(base_pred_np.shape[0], dtype=torch.bool)
+            if k:
+                routed_mask[torch.tensor(routed, dtype=torch.long)] = True
+            final_logits = base_logits_t.clone()
+            final_prob = base_prob_t.clone()
+            final_pred = base_pred.detach().cpu().clone() if torch.is_tensor(base_pred) else torch.tensor(base_pred_np, dtype=torch.long)
+            if k:
+                routed_t = torch.tensor(routed, dtype=torch.long)
+                final_logits[routed_t] = refiner_logits_t[routed_t]
+                final_prob[routed_t] = refiner_prob_t[routed_t]
+                final_pred[routed_t] = refiner_pred_t = torch.tensor(refiner_pred_np[routed], dtype=torch.long)
+            split_metrics = _classification_metrics_from_logits(
+                final_logits,
+                labels_t,
+                torch.tensor(split_idx, dtype=torch.long),
+            ) if split_idx.size else {"loss": float("inf"), "accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0}
+            delta = _delta_table(base_pred_np, final_pred.numpy(), labels_np, _mask_from_idx(labels_np.shape[0], split_idx))
+
+            routed_wrong_count = int((base_pred_np[routed] != labels_np[routed]).sum()) if k else 0
+            routed_correct_count = int(k - routed_wrong_count)
+            conditional_fix = int((refiner_pred_np[routed] == labels_np[routed]).sum()) if k else 0
+            conditional_fix -= int((base_pred_np[routed] == labels_np[routed]).sum()) if k else 0
+            row = {
+                "budget": float(budget),
+                "routed_count": int(k),
+                "query_rate": float(k / max(int(split_idx.size), 1)),
+                "fix": int(delta["fix"]),
+                "break": int(delta["broke"]),
+                "net": int(delta["net"]),
+                "accuracy": float(split_metrics["accuracy"]),
+                "macro_f1": float(split_metrics["macro_f1"]),
+                "bot_f1": float(split_metrics["bot_f1"]),
+                "loss": float(split_metrics["loss"]),
+                "delta_accuracy": float(split_metrics["accuracy"] - base_eval["accuracy"]),
+                "delta_macro_f1": float(split_metrics["macro_f1"] - base_eval["macro_f1"]),
+                "delta_bot_f1": float(split_metrics["bot_f1"] - base_eval["bot_f1"]),
+                "wrong_node_fix_rate": float(delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+                "correct_node_break_rate": float(delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+                "routed_wrong_count": int(routed_wrong_count),
+                "routed_correct_count": int(routed_correct_count),
+                "routed_wrong_coverage": float(routed_wrong_count / base_wrong_count) if base_wrong_count else 0.0,
+                "routed_wrong_precision": float(routed_wrong_count / k) if k else 0.0,
+                "conditional_fix_rate_on_selected_wrong": float(delta["fix"] / routed_wrong_count) if routed_wrong_count else 0.0,
+                "conditional_break_rate_on_selected_correct": float(delta["broke"] / routed_correct_count) if routed_correct_count else 0.0,
+                "mean_router_score_routed": float(router_score_np[routed].mean()) if k else 0.0,
+                "mean_router_prob_routed": float(router_prob_t[routed].mean().item()) if k else 0.0,
+                "mean_oracle_advantage_routed": float(oracle_advantage_t[routed].mean().item()) if k else 0.0,
+            }
+            rows.append(row)
+            payloads[str(self._budget_key(budget))] = {
+                "row": row,
+                "routed_node_ids": [int(item) for item in routed.tolist()],
+                "outputs": {
+                    "logits": final_logits,
+                    "prob": final_prob,
+                    "pred": final_pred,
+                    "routed_mask": routed_mask,
+                    "router_prob": router_prob_t,
+                    "router_score": torch.tensor(router_score_np, dtype=torch.float32),
+                    "oracle_advantage": oracle_advantage_t,
+                    "routed_count": int(k),
+                },
+            }
+        return rows, payloads
+
     def _run_glance_counterfactual_router(self, stage_dir, base_bundle):
         context = self.ensure_backbone_context()
         semantic = self._load_semantic_finetune_artifact()
@@ -7664,7 +8788,9 @@ class StageRunner:
             "counterfactual_outcome_used": True,
             "llm_counterfactual_outcome_used": True,
             "not_a_new_bot_classifier": True,
-            "risk_score_semantics": "expected_refiner_advantage_score_not_gnn_error_probability",
+            "risk_score_semantics": "learned_router_score_proxy_for_counterfactual_advantage",
+            "router_score_semantics": "deterministic_top_k_proxy_for_routing",
+            "oracle_advantage_semantics": "counterfactual_reward_loss_gnn_minus_loss_refiner_minus_query_cost",
             "test_labels_used_for_training": False,
             "test_labels_used_for_threshold": False,
             "train_target": "1[loss_gnn - loss_refiner - cost > 0]",
@@ -7728,6 +8854,8 @@ class StageRunner:
                 "wrong_node_fix_rate": float(full_delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
                 "correct_node_break_rate": float(full_delta["broke"] / base_correct_count) if base_correct_count else 0.0,
             },
+            "router_score_semantics": "learned_router_score_proxy_for_counterfactual_advantage",
+            "oracle_advantage_semantics": "counterfactual_reward_loss_gnn_minus_loss_refiner_minus_query_cost",
             "selected_budget_source": "valid",
             "selected_budget": float(selected_valid_row["budget"]) if selected_valid_row else None,
             "selected_budget_valid": float(selected_valid_row["budget"]) if selected_valid_row else None,
@@ -7935,13 +9063,14 @@ class StageRunner:
                     "refiner_prob": prob_ref,
                     "refiner_pred": pred_ref,
                     "final_pred": best_final_pred,
-                    "labels": labels_t,
-                    "risk_score": torch.tensor(risk_score, dtype=torch.float32),
-                    "selected_routed_mask": best_routed_mask,
-                    "gnn_loss": gnn_loss,
-                    "refiner_loss": refiner_loss,
-                    "oracle_advantage": torch.tensor(advantage, dtype=torch.float32),
-                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                "labels": labels_t,
+                "risk_score": torch.tensor(risk_score, dtype=torch.float32),
+                "router_score": torch.tensor(risk_score, dtype=torch.float32),
+                "selected_routed_mask": best_routed_mask,
+                "gnn_loss": gnn_loss,
+                "refiner_loss": refiner_loss,
+                "oracle_advantage": torch.tensor(advantage, dtype=torch.float32),
+                "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
                     "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
                 },
                 "checkpoint.pt": {
@@ -7962,7 +9091,9 @@ class StageRunner:
             "",
             "This stage is a diagnostic utility-selector lane, not the main strict GLANCE baseline.",
             "It is a paper-faithful GLANCE-inspired adaptation for offline routed-set analysis, not an official reproduction.",
-            "The router is trained on train-split counterfactual refiner advantage: loss_gnn - loss_refiner - query_cost.",
+            "The learned router score is the proxy used for deterministic top-k routing.",
+            "The oracle_advantage tensor is the post-hoc counterfactual reward trace: loss_gnn - loss_refiner - query_cost.",
+            "The legacy risk_score field is retained as a compatibility alias of router_score.",
             "Budget sweeps are computed on both validation and test, but the final operating budget is selected on validation only and then locked for test reporting.",
             "No generative LLM is queried; semantic views come from cached/fine-tuned RoBERTa embeddings.",
         ]
@@ -8407,11 +9538,20 @@ class StageRunner:
                 "glance_joint_router_refine requires non-empty train/valid/test splits."
             )
 
-        strict_train_idx = self._strict_glance_train_idx(train_idx, cap=3000)
+        configured_train_cap = int(getattr(self.args, "joint_train_node_cap", 3000))
+        strict_train_idx = self._strict_glance_train_idx(train_idx, cap=configured_train_cap)
+        train_cap_mode = "full_train_split" if configured_train_cap <= 0 else "capped_train_subset"
+        semantic_view_mode = semantic.get("semantic_view_mode", semantic["manifest"].get("semantic_view_mode", "legacy_inbound_khop"))
         semantic_views = self._build_k_hop_semantic_views(
-            semantic["embeddings"],
+            semantic.get("precomputed_views") if semantic.get("precomputed_views") is not None else semantic["embeddings"],
             self.data.get("edge_index"),
         )
+        refiner_explicit_gate = bool(getattr(self.args, "joint_refiner_explicit_gate", False))
+        refiner_target_mode = str(getattr(self.args, "joint_refiner_target_mode", "predict")).lower()
+        refiner_weight_mode = str(getattr(self.args, "joint_refiner_weight_mode", "off")).lower()
+        refiner_base_wrong_weight = float(getattr(self.args, "joint_refiner_base_wrong_weight", 2.0))
+        refiner_utility_weight = float(getattr(self.args, "joint_refiner_utility_weight", 3.0))
+        refiner_gate_weight = float(getattr(self.args, "joint_refiner_gate_weight", 0.5))
         refiner_features = torch.cat(
             [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
             dim=1,
@@ -8473,13 +9613,26 @@ class StageRunner:
                 decay_factor=decay_factor,
                 entropy_weight=entropy_weight,
                 router_weight=router_weight,
+                router_regression_weight=1.0,
+                router_ranking_weight=1.0,
+                router_calibration_weight=0.25,
+                router_reliability_weight=0.25,
                 learning_rate=learning_rate,
                 weight_decay=weight_decay,
                 beta=float(beta),
                 eval_top_k=eval_top_k,
+                refiner_explicit_gate=refiner_explicit_gate,
+                refiner_target_mode=refiner_target_mode,
+                refiner_weight_mode=refiner_weight_mode,
+                refiner_base_wrong_weight=refiner_base_wrong_weight,
+                refiner_utility_weight=refiner_utility_weight,
+                refiner_gate_weight=refiner_gate_weight,
             )
             beta_runs.append(run)
-            beta_score = (float(run["valid_metrics"]["macro_f1"]), -float(run["valid_metrics"]["loss"]))
+            beta_score = (
+                float(run["selected_budget_metrics"]["valid"]["macro_f1"]),
+                -float(run["selected_budget_metrics"]["valid"]["loss"]),
+            )
             if selected_beta_score is None or beta_score > selected_beta_score:
                 selected_beta_score = beta_score
                 selected_beta_run = run
@@ -8489,6 +9642,8 @@ class StageRunner:
 
         final_run = selected_beta_run
         selected_beta = float(final_run["beta"])
+        selected_budget = float(final_run["selected_budget"])
+        selected_budget_key = str(final_run["selected_budget_key"])
         train_outputs = final_run["train_outputs"]
         valid_outputs = final_run["valid_outputs"]
         test_outputs = final_run["test_outputs"]
@@ -8501,12 +9656,21 @@ class StageRunner:
             "test": test_outputs["routed_mask"],
         }
         router_prob = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
-        for split_outputs in (train_outputs, valid_outputs, test_outputs):
+        router_score = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        oracle_advantage = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        for split_outputs, split_idx in (
+            (train_outputs, train_idx),
+            (valid_outputs, valid_idx),
+            (test_outputs, test_idx),
+        ):
             split_mask = split_outputs["routed_mask"]
+            split_idx_t = torch.tensor(split_idx, dtype=torch.long)
             final_logits[split_mask] = split_outputs["logits"][split_mask]
             final_prob[split_mask] = split_outputs["prob"][split_mask]
             final_pred[split_mask] = split_outputs["pred"][split_mask]
-            router_prob = torch.maximum(router_prob, split_outputs["router_prob"])
+            router_prob[split_idx_t] = split_outputs["router_prob"][split_idx_t]
+            router_score[split_idx_t] = split_outputs["router_score"][split_idx_t]
+            oracle_advantage[split_idx_t] = split_outputs["oracle_advantage"][split_idx_t]
 
         base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx])
         overall_test = _score_all(labels_np[test_idx], final_pred.numpy()[test_idx])
@@ -8520,45 +9684,87 @@ class StageRunner:
                 "beta": float(run["beta"]),
                 "eval_top_k": int(run["eval_top_k"]),
                 "best_epoch": int(run["best_epoch"]),
-                "valid_accuracy": float(run["valid_metrics"]["accuracy"]),
-                "valid_macro_f1": float(run["valid_metrics"]["macro_f1"]),
-                "valid_bot_f1": float(run["valid_metrics"]["bot_f1"]),
-                "valid_loss": float(run["valid_metrics"]["loss"]),
-                "valid_routed_count": int(run["valid_metrics"]["routed_count"]),
-                "valid_query_rate": float(run["valid_metrics"]["query_rate"]),
+                "selected_budget": float(run["selected_budget"]),
+                "selected_budget_key": str(run["selected_budget_key"]),
+                "valid_accuracy": float(run["selected_budget_metrics"]["valid"]["accuracy"]),
+                "valid_macro_f1": float(run["selected_budget_metrics"]["valid"]["macro_f1"]),
+                "valid_bot_f1": float(run["selected_budget_metrics"]["valid"]["bot_f1"]),
+                "valid_loss": float(run["selected_budget_metrics"]["valid"]["loss"]),
+                "valid_routed_count": int(run["selected_budget_metrics"]["valid"]["routed_count"]),
+                "valid_query_rate": float(run["selected_budget_metrics"]["valid"]["query_rate"]),
                 "valid_net_gain": int(run["valid_rows"]["analysis"]["net_gain"]),
                 "valid_routed_wrong_precision": float(run["valid_rows"]["analysis"]["routed_wrong_precision"]),
                 "valid_routed_wrong_coverage": float(run["valid_rows"]["analysis"]["routed_wrong_coverage"]),
                 "valid_conditional_fix_rate": float(run["valid_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
-                "test_accuracy": float(run["test_metrics"]["accuracy"]),
-                "test_macro_f1": float(run["test_metrics"]["macro_f1"]),
-                "test_bot_f1": float(run["test_metrics"]["bot_f1"]),
-                "test_loss": float(run["test_metrics"]["loss"]),
-                "test_routed_count": int(run["test_metrics"]["routed_count"]),
-                "test_query_rate": float(run["test_metrics"]["query_rate"]),
+                "test_accuracy": float(run["selected_budget_metrics"]["test"]["accuracy"]),
+                "test_macro_f1": float(run["selected_budget_metrics"]["test"]["macro_f1"]),
+                "test_bot_f1": float(run["selected_budget_metrics"]["test"]["bot_f1"]),
+                "test_loss": float(run["selected_budget_metrics"]["test"]["loss"]),
+                "test_routed_count": int(run["selected_budget_metrics"]["test"]["routed_count"]),
+                "test_query_rate": float(run["selected_budget_metrics"]["test"]["query_rate"]),
                 "test_net_gain": int(run["test_rows"]["analysis"]["net_gain"]),
                 "test_routed_wrong_precision": float(run["test_rows"]["analysis"]["routed_wrong_precision"]),
                 "test_routed_wrong_coverage": float(run["test_rows"]["analysis"]["routed_wrong_coverage"]),
                 "test_conditional_fix_rate": float(run["test_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
             })
 
+        valid_budget_curve = final_run["valid_budget_curve"]
+        test_budget_curve = final_run["test_budget_curve"]
+        if getattr(self.args, "joint_refiner_embedding_path", None):
+            dependency_alignment_note = (
+                "joint_router_refinement keeps backbone provenance pinned to the current run's "
+                "preparation/graph_detector artifact while allowing a refiner-only semantic override through "
+                "--joint_refiner_embedding_path."
+            )
+        else:
+            dependency_alignment_note = (
+                "Public joint_router_refinement is bound to the current run's preparation/graph_detector artifact "
+                "and reuses its recorded feature_manifest.path as the semantic tensor source."
+            )
+
         metrics_payload = {
             "contract": "glance_joint_router_refine_metrics_v1",
-            "routing_mode": "joint_topk_counterfactual_router_refiner",
+            "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
             "paper_faithful_glance_inspired": True,
-            "strict_training_protocol_alignment": True,
+            "strict_training_protocol_alignment": bool(configured_train_cap == 3000),
+            "twibot20_adapted_training": bool(configured_train_cap <= 0),
+            "strict_dependency_provenance_alignment": True,
             "semantic_alignment": False,
             "not_official_reproduction": True,
+            "paper_text_evaluation_alignment": False,
+            "evaluation_protocol": "validation_selected_global_budget_by_router_score",
+            "evaluation_alignment_note": "Training keeps paper-text batch top-k routing; final public evaluation selects a global budget on validation and locks that budget on test for TwiBot20-suitable score-based routing.",
+            "dependency_alignment_note": dependency_alignment_note,
             "semantic_source_mode": semantic_bundle["mode"],
             "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
             "primary_semantic_manifest": semantic_bundle["primary"]["manifest"],
+            "joint_refiner_embedding_path": str(getattr(self.args, "joint_refiner_embedding_path", None) or ""),
+            "semantic_view_mode": semantic_view_mode,
             "external_frozen_g0_root": str(getattr(self.args, "external_frozen_g0_root", None) or ""),
             "selected_beta_source": "validation",
             "selected_beta": selected_beta,
             "beta_candidates": [float(item) for item in beta_candidates],
-            "selected_beta_valid_metrics": final_run["valid_metrics"],
-            "selected_beta_test_metrics": final_run["test_metrics"],
+            "selected_budget_source": "validation",
+            "selected_budget": selected_budget,
+            "selected_budget_key": selected_budget_key,
+            "selected_valid_budget_metrics": final_run["selected_valid_budget_metrics"],
+            "selected_test_budget_metrics_under_valid_choice": final_run["selected_test_budget_metrics_under_valid_choice"],
+            "selected_beta_valid_metrics": final_run["selected_budget_metrics"]["valid"],
+            "selected_beta_test_metrics": final_run["selected_budget_metrics"]["test"],
             "beta_sweep": beta_sweep,
+            "valid_budget_curve": valid_budget_curve,
+            "test_budget_curve": test_budget_curve,
+            "router_training_objective": "continuous_advantage_regression_plus_pairwise_ranking_plus_reliability_auxiliary",
+            "oracle_advantage_semantics": "loss_gnn_minus_loss_refiner_minus_beta",
+            "router_score_semantics": "learned_continuous_utility_scorer_for_global_budget_routing",
+            "router_reliability_semantics": "auxiliary_base_wrong_probability_estimator",
+            "refiner_target_mode": refiner_target_mode,
+            "refiner_weight_mode": refiner_weight_mode,
+            "refiner_explicit_gate": bool(refiner_explicit_gate),
+            "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
+            "refiner_utility_weight": float(refiner_utility_weight),
+            "refiner_gate_weight": float(refiner_gate_weight),
+            "advantage_router_diagnostics": final_run["fit_summary"].get("advantage_router_diagnostics", {}),
             "base_test": base_test,
             "overall_test": overall_test,
             "overall_delta_vs_base_gnn": {
@@ -8578,6 +9784,7 @@ class StageRunner:
                 "train_routed_count": int(train_outputs["routed_count"]),
                 "valid_routed_count": int(valid_outputs["routed_count"]),
                 "test_routed_count": int(test_outputs["routed_count"]),
+                "selected_budget": selected_budget,
                 "eval_top_k": int(eval_top_k),
                 "batch_size": int(batch_size),
             },
@@ -8586,44 +9793,62 @@ class StageRunner:
         manifest = {
             "contract": "glance_joint_router_refine_v1",
             "status": "completed",
-            "routing_mode": "joint_topk_counterfactual_router_refiner",
+            "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
             "paper_faithful_glance_inspired": True,
-            "strict_training_protocol_alignment": True,
+            "strict_training_protocol_alignment": bool(configured_train_cap == 3000),
+            "twibot20_adapted_training": bool(configured_train_cap <= 0),
+            "strict_dependency_provenance_alignment": True,
             "semantic_alignment": False,
             "not_official_reproduction": True,
+            "paper_text_evaluation_alignment": False,
+            "evaluation_protocol": "validation_selected_global_budget_by_router_score",
+            "evaluation_alignment_note": "Batch top-k is kept only inside strict GLANCE training. Public final evaluation uses a validation-selected global budget and test-locked router ranking.",
             "research_positioning": "paper_faithful_glance_training_contract_under_current_cached_semantic_encoder",
             "selected_beta_source": "validation",
             "selected_beta": selected_beta,
             "beta_candidates": [float(item) for item in beta_candidates],
+            "selected_budget_source": "validation",
+            "selected_budget": selected_budget,
+            "selected_budget_key": selected_budget_key,
             "semantic_source_mode": semantic_bundle["mode"],
             "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
             "semantic_source": "semantic_single_source",
             "semantic_alignment_note": "Training protocol follows the GLANCE paper text; semantic expert remains the current cached embedding path rather than the paper's prompt-serialized LLM route.",
+            "dependency_alignment_note": dependency_alignment_note,
             "semantic_manifest": semantic["manifest"],
             "primary_semantic_manifest": semantic_bundle["primary"]["manifest"],
+            "joint_refiner_embedding_path": str(getattr(self.args, "joint_refiner_embedding_path", None) or ""),
             "external_frozen_g0_root": str(getattr(self.args, "external_frozen_g0_root", None) or ""),
             "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
             "frozen_g0_manifest": context["frozen_g0"]["manifest"],
-            "train_node_cap": 3000,
+            "train_node_cap": int(configured_train_cap),
+            "effective_train_node_count": int(strict_train_idx.size),
+            "full_train_node_count": int(train_idx.size),
+            "train_cap_mode": train_cap_mode,
             "uncertainty_source": mc_bundle["source"],
             "router_feature_family_used": list(router_feature_bundle["feature_names"]),
             "router_architecture": {
-                "type": "logistic_router_linear_head",
+                "type": "mlp_utility_scorer_with_reliability_auxiliary_head",
+                "hidden_dim": 128,
+                "dropout": 0.1,
                 "input_dim": int(router_features.shape[1]),
                 "feature_count": int(router_features.shape[1]),
                 "feature_family": list(router_feature_bundle["feature_names"]),
                 "scaler": scaler_state,
             },
             "refiner_architecture": {
-                "type": "glance_joint_refiner_mlp",
+                "type": "gated_glance_joint_refiner_mlp" if refiner_explicit_gate else "glance_joint_refiner_mlp",
                 "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
                 "hidden_dim": 128,
                 "activation": activation,
                 "dropout": 0.1,
                 "output_dim": int(logits_gnn.shape[1]),
-                "semantic_view_mode": "legacy_inbound_khop",
+                "semantic_view_mode": semantic_view_mode,
                 "feature_kind": "flat_concat",
                 "semantic_view_names": ["ego", "hop1", "hop2"],
+                "target_mode": refiner_target_mode,
+                "explicit_gate": bool(refiner_explicit_gate),
+                "weight_mode": refiner_weight_mode,
             },
             "training_contract": {
                 "frozen_gnn": True,
@@ -8633,15 +9858,30 @@ class StageRunner:
                 "batch_size": int(batch_size),
                 "max_epochs": int(max_epochs),
                 "patience": int(patience),
-                "train_node_cap": 3000,
+                "train_node_cap": int(configured_train_cap),
+                "effective_train_node_count": int(strict_train_idx.size),
+                "full_train_node_count": int(train_idx.size),
+                "train_cap_mode": train_cap_mode,
                 "training_budget_schedule": {
                     "k_start": int(batch_size),
-                    "k_end": int(eval_top_k),
+                    "k_end": int(max(int(round(batch_size / 4.0)), 1)),
                     "decay_factor": float(decay_factor),
                 },
                 "router_weight": float(router_weight),
+                "router_regression_weight": float(1.0),
+                "router_ranking_weight": float(1.0),
+                "router_selection_weight": float(0.25),
+                "router_calibration_weight": float(0.25),
+                "router_reliability_weight": float(0.25),
                 "entropy_weight": float(entropy_weight),
                 "beta_selection": "validation_only",
+                "auxiliary_router_target": "base_wrong_probability_plus_utility_consistency",
+                "refiner_target_mode": refiner_target_mode,
+                "refiner_explicit_gate": bool(refiner_explicit_gate),
+                "refiner_weight_mode": refiner_weight_mode,
+                "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
+                "refiner_utility_weight": float(refiner_utility_weight),
+                "refiner_gate_weight": float(refiner_gate_weight),
             },
             "q_estimator": {
                 **q_bundle["classifier"],
@@ -8674,6 +9914,8 @@ class StageRunner:
                 "beta",
                 "eval_top_k",
                 "best_epoch",
+                "selected_budget",
+                "selected_budget_key",
                 "valid_accuracy",
                 "valid_macro_f1",
                 "valid_bot_f1",
@@ -8697,6 +9939,66 @@ class StageRunner:
             ],
             beta_sweep,
         )
+        write_csv_rows(
+            stage_dir / "valid_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "query_rate",
+                "fix",
+                "break",
+                "net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "routed_wrong_count",
+                "routed_correct_count",
+                "routed_wrong_coverage",
+                "routed_wrong_precision",
+                "conditional_fix_rate_on_selected_wrong",
+                "conditional_break_rate_on_selected_correct",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "loss",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_router_score_routed",
+                "mean_router_prob_routed",
+                "mean_oracle_advantage_routed",
+            ],
+            valid_budget_curve,
+        )
+        write_csv_rows(
+            stage_dir / "test_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "query_rate",
+                "fix",
+                "break",
+                "net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "routed_wrong_count",
+                "routed_correct_count",
+                "routed_wrong_coverage",
+                "routed_wrong_precision",
+                "conditional_fix_rate_on_selected_wrong",
+                "conditional_break_rate_on_selected_correct",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "loss",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_router_score_routed",
+                "mean_router_prob_routed",
+                "mean_oracle_advantage_routed",
+            ],
+            test_budget_curve,
+        )
         write_text(
             stage_dir / "per_node_test.jsonl",
             "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
@@ -8712,6 +10014,8 @@ class StageRunner:
                     "base_pred": pred_gnn,
                     "routed_masks": routed_masks,
                     "router_prob": router_prob,
+                    "router_score": router_score,
+                    "oracle_advantage": oracle_advantage,
                     "neighbor_count_1hop": torch.tensor(semantic_views.get("count_1hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
                     "neighbor_count_2hop": torch.tensor(semantic_views.get("count_2hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
                 },
@@ -8720,9 +10024,12 @@ class StageRunner:
                     "refiner_model": final_run["refiner_state"],
                     "fit_summary": final_run["fit_summary"],
                     "selected_beta": selected_beta,
+                    "selected_budget": selected_budget,
                     "selected_eval_top_k": int(eval_top_k),
                 },
                 "beta_sweep": beta_sweep,
+                "valid_budget_curve": valid_budget_curve,
+                "test_budget_curve": test_budget_curve,
                 **base_bundle,
             },
         )
@@ -8730,9 +10037,10 @@ class StageRunner:
             "# GLANCE joint router-refiner baseline",
             "",
             "This stage implements a paper-text-aligned GLANCE joint router+refiner contract under the current cached semantic embedding path.",
-            "The training protocol alignment is strict; the semantic expert alignment is intentionally deferred.",
-            "The base GNN and semantic expert remain frozen; only the logistic router and the routed-node refiner MLP are trained.",
-            "Routing uses deterministic batch top-k selection with fixed K=8 at evaluation. Beta is selected on validation only from {0.1, 0.2, 0.3}.",
+            "The training protocol alignment is strict; the semantic expert alignment is intentionally deferred, and the public evaluation protocol is TwiBot20-adapted global-budget routing.",
+            "The base GNN and semantic expert remain frozen; only the router scorer MLP and the routed-node refiner MLP are trained.",
+            "The router is trained with continuous utility regression, pairwise ranking, and an auxiliary reliability objective over base-wrong prediction.",
+            f"Training uses deterministic batch top-k with K_start={int(batch_size)} and K_end={int(eval_top_k)}. Final evaluation ranks the whole split by router score, selects budget on validation, and locks the selected budget ({selected_budget:.3f}) on test. Beta is selected on validation only from {{0.1, 0.2, 0.3}}.",
         ]
         write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
         return {
@@ -9043,6 +10351,10 @@ class StageRunner:
 
         if self.execution_stage == "local_conflict_prune_diag":
             return self._run_local_conflict_prune_diag(stage_dir, base_bundle)
+
+        if self.execution_stage == "local_dignn_conflict_refine_diag":
+            from trainer_dignn_conflict import run_local_dignn_conflict_refine_diag
+            return run_local_dignn_conflict_refine_diag(self, stage_dir, base_bundle)
 
         if self.execution_stage == "joint_router_refinement":
             return self._run_glance_joint_router_refine(stage_dir, base_bundle)

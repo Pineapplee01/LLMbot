@@ -116,6 +116,18 @@ STAGE_REGISTRY: Dict[str, StageSpec] = {
         graph_data_mode="required",
         artifact_namespace="stages/local_conflict_prune_diag",
     ),
+    "local_dignn_conflict_refine_diag": _spec(
+        "local_dignn_conflict_refine_diag",
+        legacy_names=(),
+        visibility="public",
+        family="diagnostic",
+        runner_kind="stage_runner",
+        claim_grade_allowed=True,
+        requires_canonical_split=True,
+        forces_use_gnn=True,
+        graph_data_mode="required",
+        artifact_namespace="stages/local_dignn_conflict_refine_diag",
+    ),
     "joint_router_refinement": _spec(
         "joint_router_refinement",
         legacy_names=("glance_joint_router_refine",),

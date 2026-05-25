@@ -18,6 +18,38 @@ Preferred public flags:
 - `--text_encoder`
 - `--semantic_encoder`
 - `--embedding_path`
+- `--joint_refiner_embedding_path`
+
+GLANCE prompt-cache precompute entry:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode glance_concat_ego_hop1_hop2 \
+  --output_path datasets/TwiBot-20/glance_qwen3_prompt_cache.pt
+```
+
+Prompt-cache helper modes:
+
+- legacy GLANCE-style:
+  - `glance_ego`
+  - `glance_hop1`
+  - `glance_hop2`
+  - `glance_concat_ego_hop1_hop2`
+- relation-aware social-context:
+  - `relation_aware_ego`
+  - `relation_aware_1hop`
+
+Example relation-aware 1-hop cache:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode relation_aware_1hop \
+  --following_quota 3 \
+  --follower_quota 3 \
+  --output_path datasets/TwiBot-20/glance_qwen3_prompt_cache_relation_aware_1hop.pt
+```
 
 Hidden compatibility aliases still parse for one migration window:
 
@@ -40,6 +72,7 @@ The parser currently exposes these canonical public tasks:
 - `graph_calibration_prepare`
 - `local_conformal_diagnostic`
 - `local_conflict_prune_diag`
+- `local_dignn_conflict_refine_diag` (paper-faithful DIGNN-style dual-view proxy: topology-view MLP + attribute-view MLP + attention fusion + MI objective)
 - `joint_router_refinement`
 - `minimal_pipeline`
 - `estimator_ablation`
@@ -64,8 +97,50 @@ Internal-only implemented branches are not part of the public CLI contract:
 GLANCE-style implementation under the current cached semantic-embedding path,
 not a full official-pipeline reproduction. The strict router path now mirrors
 the paper more closely by fitting a lightweight auxiliary MLP `Q` on node
-features and using its predicted probabilities to build the soft local
-homophily feature for routing.
+features and training a shallow scorer MLP with continuous utility regression,
+pairwise ranking, and an auxiliary reliability head for base-wrong prediction.
+The public strict stage now also enforces
+same-run provenance: it must read the current run's own
+`preparation/graph_detector` artifact, and its semantic tensor must match that
+artifact's `feature_manifest.path` instead of mixing external backbone or
+embedding roots across seeds. For prompt-cache ablations that should not alter
+the base detector, `--joint_refiner_embedding_path` can override only the
+refiner semantic branch while keeping the backbone provenance pinned to the
+same-root `graph_detector_prepare` artifact.
+
+Its public evaluation contract is now intentionally TwiBot20-adapted:
+
+- training keeps the paper-text batch top-k routing schedule
+- final evaluation ranks the whole split by `router_score`
+- `--risk_budgets` defines the candidate global budgets
+- the final budget is selected on validation only
+- test is evaluated once under that locked validation-selected budget
+
+This means the stage is paper-text aligned at training time, but no longer
+paper-text aligned at final evaluation time.
+
+`joint_router_refinement` also exposes `--joint_train_node_cap` for controlled
+comparisons between:
+
+- `3000`: paper-style capped train subset
+- `0`: TwiBot20-adapted full train split for router/refiner training
+
+For routed-refiner diagnostics under the same strict joint stage, it also
+supports:
+
+- `--joint_refiner_explicit_gate`: add an explicit keep/change gate that mixes
+  the frozen GNN path with the routed refiner path
+- `--joint_refiner_target_mode {predict,keep_change}`: compare direct label
+  prediction against explicit keep/change learning on routed nodes
+- `--joint_refiner_weight_mode {off,base_wrong,utility_positive,base_wrong_plus_utility}`:
+  routed-node loss reweighting toward base-wrong and/or oracle-utility-positive samples
+
+The stage manifest records both the configured cap and the effective train-node
+count so capped and full-train runs remain directly distinguishable.
+
+The joint stage now also records per-epoch router diagnostics and routed-node
+refiner fix/break deltas so the training trace can show whether the router or
+the refiner saturates first.
 
 ## Command Examples
 
@@ -138,7 +213,25 @@ python main.py \
   --seeds 1 \
   --disable_wandb
 
+# DIGNN-style local conflict refiner
+python main.py \
+  --experiment_task local_dignn_conflict_refine_diag \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
+  --local_dignn_conflict_router_budget 0.10 \
+  --local_dignn_conflict_topk_per_bucket 1 \
+  --seeds 1 \
+  --disable_wandb
+
 # Public GLANCE-style router/refiner task
+# First run graph_detector_prepare for the same experiment root and seed.
+# joint_router_refinement now inherits its semantic tensor from that
+# preparation artifact and rejects cross-root backbone reuse.
+# Final public evaluation selects a global routing budget from --risk_budgets
+# on validation and locks that budget on test.
 python main.py \
   --experiment_task joint_router_refinement \
   --dataset TwiBot-20 \
@@ -146,9 +239,53 @@ python main.py \
   --use_GNN \
   --graph_backbone rgcn \
   --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
+  --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
+  --seeds 1 \
+  --disable_wandb
+
+# Refiner-only prompt-cache override on top of an unchanged qwen3 backbone
+python main.py \
+  --experiment_task joint_router_refinement \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --embedding_path datasets/TwiBot-20/qwen3_emb_last.pt \
+  --joint_refiner_embedding_path ../remote_prompt_study_20260525/ego/glance_qwen3_prompt_cache_glance_ego.pt \
+  --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
+  --seeds 1 \
+  --disable_wandb
+
+# TwiBot20-adapted full-train strict GLANCE
+python main.py \
+  --experiment_task joint_router_refinement \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
+  --joint_train_node_cap 0 \
+  --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
   --seeds 1 \
   --disable_wandb
 ```
+
+Prompt-cache experiment note:
+
+- `precompute.py` writes the selected feature tensor under `payload["embeddings"]`.
+- To use a prompt-cache run with strict GLANCE, rerun `graph_detector_prepare`
+  with that exact `--embedding_path` inside the target experiment root first.
+- `joint_router_refinement` will then reuse the same-root
+  `preparation/graph_detector` artifact and reject detached prompt caches.
+- If the goal is to test prompt caches without changing the base detector,
+  keep `graph_detector_prepare` on the original semantic tensor and pass the
+  prompt cache through `--joint_refiner_embedding_path`; prompt payloads with
+  `ego/hop1/hop2` are consumed as direct refiner views instead of being fed
+  back into the backbone.
+- When a high-performing backbone artifact already exists, the same ablation
+  can be run read-only through `--external_frozen_g0_root` together with
+  `--joint_refiner_embedding_path`, so the prompt cache changes only the
+  refiner branch and reuses the frozen backbone provenance unchanged.
 
 ## Mainline Layout
 
@@ -201,8 +338,21 @@ active naming surface.
 - runtime-only helper artifacts are still in migration and may retain
   compatibility fallbacks
 - strict GLANCE now derives its router-side soft local homophily signal from a
-  lightweight auxiliary MLP `Q`, replacing the earlier logistic-regression
-  placeholder
+  lightweight auxiliary MLP `Q`, augments router features with GNN logit-based
+  confidence signals, and trains its learned router scorer with continuous
+  utility regression, pairwise ranking, and an auxiliary reliability objective
+  rather than binary-only supervision; training uses a batch-size-32 top-k
+  budget that decays from 32 to 8, while evaluation uses validation-selected
+  global-budget routing
+- strict GLANCE can now run either in the paper-style capped mode
+  (`--joint_train_node_cap 3000`) or in a TwiBot20-adapted full-train mode
+  (`--joint_train_node_cap 0`); manifests record the distinction explicitly
+- public strict GLANCE now forbids cross-root `frozen_g0` reuse and requires
+  its semantic tensor to match the current run's `graph_detector_prepare`
+  feature provenance
+- in the counterfactual GLANCE lane, `router_score` is the learned routing
+  proxy used for deterministic top-k selection, while `oracle_advantage` is the
+  post-hoc counterfactual reward trace (`loss_gnn - loss_refiner - cost`)
 - LOGIN-style uncertainty routing remains explicitly bounded to hard-node
   selection only; manifests record `official_code_verified = false`,
   `repo_locally_verified = false`, and
