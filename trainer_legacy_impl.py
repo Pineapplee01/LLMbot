@@ -52,6 +52,11 @@ from subgroups import build_subgroup_manifests
 from utils import load_distilled_knowledge, prepare_path, read_json
 from subgroups import structural_features
 from stage_registry import resolve_stage_name
+from router import (
+    GlanceReliabilityRouterMLP,
+    build_reliability_router_feature_bundle,
+    fit_reliability_temperature,
+)
 from estimators import (
     GlanceForContextResidualRiskSelector,
     RESIDUAL_RISK_PAPER_BUDGETS,
@@ -2386,36 +2391,6 @@ def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, dev
     return refiner_features[batch_idx].to(device)
 
 
-class GlanceRouterMLP(nn.Module):
-    """Shallow scorer MLP over cheap node-wise routing features."""
-
-    def __init__(self, input_dim, hidden_dim=128, dropout=0.1):
-        super().__init__()
-        input_dim = int(input_dim)
-        hidden_dim = int(hidden_dim)
-        self.input_norm = nn.LayerNorm(input_dim)
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.reliability_head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, x):
-        normalized = self.input_norm(x)
-        logits = self.net(normalized).squeeze(-1)
-        reliability_logits = self.reliability_head(normalized).squeeze(-1)
-        prob = torch.sigmoid(logits)
-        reliability_prob = torch.sigmoid(reliability_logits)
-        return logits, prob, reliability_logits, reliability_prob
-
-
 class GlanceHomophilyQMLP(nn.Module):
     """Lightweight auxiliary classifier used to estimate GLANCE-style soft homophily."""
 
@@ -3487,114 +3462,37 @@ class StageRunner:
             "logits_shape": [int(item) for item in logits_stack.shape],
         }
 
-    def _build_strict_glance_router_features(self, logits_gnn, p_gnn, z_gnn, original_node_features, q_bundle, mc_bundle):
+    def _build_strict_glance_router_features(
+        self,
+        logits_gnn,
+        p_gnn,
+        z_gnn,
+        original_node_features,
+        q_bundle,
+        mc_bundle,
+        calibration_temperature=1.0,
+    ):
         edge_index, edge_type = self._active_graph_tensors()
-        num_nodes = int(z_gnn.shape[0])
-        if int(original_node_features.shape[0]) != num_nodes:
-            raise MissingFrozenArtifactError(
-                "glance_joint_router_refine strict router features require original node features aligned with z_gnn."
+        try:
+            feature_bundle = build_reliability_router_feature_bundle(
+                logits_gnn=logits_gnn,
+                z_gnn=z_gnn,
+                original_node_features=original_node_features,
+                q_probs=q_bundle["q_probs"],
+                uncertainty=mc_bundle["uncertainty"],
+                edge_index=edge_index,
+                edge_type=edge_type,
+                calibration_temperature=calibration_temperature,
             )
-        q_probs = q_bundle["q_probs"].detach().cpu().float()
-        if int(q_probs.shape[0]) != num_nodes:
-            raise MissingFrozenArtifactError(
-                "glance_joint_router_refine strict router features require q_probs aligned with z_gnn."
-            )
-        uncertainty = mc_bundle["uncertainty"].detach().cpu().float().reshape(-1)
-        if int(uncertainty.numel()) != num_nodes:
-            raise MissingFrozenArtifactError(
-                "glance_joint_router_refine strict router features require one MC-dropout uncertainty value per node."
-            )
-        logits_gnn = logits_gnn.detach().cpu().float()
-        p_gnn = p_gnn.detach().cpu().float()
-        if logits_gnn.dim() != 2 or int(logits_gnn.shape[0]) != num_nodes:
-            raise MissingFrozenArtifactError(
-                "glance_joint_router_refine strict router features require logits_gnn shaped [num_nodes, num_classes]."
-            )
-        if p_gnn.dim() != 2 or int(p_gnn.shape[0]) != num_nodes:
-            raise MissingFrozenArtifactError(
-                "glance_joint_router_refine strict router features require p_gnn shaped [num_nodes, num_classes]."
-            )
-        if int(logits_gnn.shape[1]) < 2 or int(p_gnn.shape[1]) < 2:
-            raise MissingFrozenArtifactError(
-                "glance_joint_router_refine strict router features require binary-class logits/probabilities."
-            )
-        logit_margin = (logits_gnn[:, 1] - logits_gnn[:, 0]).detach().cpu().numpy().astype(np.float32)
-        prob_margin = (p_gnn[:, 1] - p_gnn[:, 0]).detach().cpu().numpy().astype(np.float32)
-        pred_prob = torch.max(p_gnn, dim=1).values.detach().cpu().numpy().astype(np.float32)
-        entropy = -(p_gnn.clamp_min(1e-6) * torch.log(p_gnn.clamp_min(1e-6))).sum(dim=1).detach().cpu().numpy().astype(np.float32)
-
-        total_degree = np.zeros(num_nodes, dtype=np.float32)
-        relative_degree = np.ones(num_nodes, dtype=np.float32)
-        soft_homophily = np.zeros(num_nodes, dtype=np.float32)
-        if edge_index is not None:
-            edge_index_t = edge_index.detach().cpu().long()
-            if edge_index_t.dim() != 2 or edge_index_t.size(0) != 2:
-                raise MissingFrozenArtifactError("Strict GLANCE router expects edge_index shaped [2, num_edges].")
-            src = edge_index_t[0].numpy()
-            dst = edge_index_t[1].numpy()
-            neighbors = [[] for _ in range(num_nodes)]
-            degree = np.zeros(num_nodes, dtype=np.float32)
-            for s, d in zip(src.tolist(), dst.tolist()):
-                if 0 <= s < num_nodes and 0 <= d < num_nodes:
-                    degree[s] += 1.0
-                    degree[d] += 1.0
-                    neighbors[s].append(d)
-                    neighbors[d].append(s)
-            total_degree = degree
-            for node_idx, nbs in enumerate(neighbors):
-                if not nbs:
-                    continue
-                denom = np.sqrt(total_degree[np.asarray(nbs, dtype=np.int64)] + 1.0)
-                relative_degree[node_idx] = float(np.mean(np.sqrt(total_degree[node_idx] + 1.0) / denom))
-                neighbor_probs = q_probs[torch.tensor(nbs, dtype=torch.long)]
-                soft_homophily[node_idx] = float((q_probs[node_idx] * neighbor_probs.mean(dim=0)).sum().item())
-
-        log_total_degree = np.log1p(total_degree).astype(np.float32)
-        z_gnn_np = z_gnn.detach().cpu().numpy().astype(np.float32)
-        node_features_np = original_node_features.detach().cpu().numpy().astype(np.float32)
-        uncertainty_np = uncertainty.numpy().astype(np.float32).reshape(-1, 1)
-        homophily_np = np.clip(soft_homophily.astype(np.float32), 0.0, 1.0).reshape(-1, 1)
-        logit_margin_np = logit_margin.reshape(-1, 1)
-        prob_margin_np = prob_margin.reshape(-1, 1)
-        pred_prob_np = pred_prob.reshape(-1, 1)
-        entropy_np = entropy.reshape(-1, 1)
-        degree_np = np.column_stack(
-            [
-                log_total_degree.reshape(-1, 1),
-                np.nan_to_num(relative_degree, nan=1.0, posinf=1.0, neginf=1.0).astype(np.float32).reshape(-1, 1),
-            ]
-        ).astype(np.float32)
-        strict_features = np.concatenate(
-            [
-                z_gnn_np,
-                logit_margin_np,
-                prob_margin_np,
-                pred_prob_np,
-                entropy_np,
-                uncertainty_np,
-                homophily_np,
-                node_features_np,
-                degree_np,
-            ],
-            axis=1,
-        ).astype(np.float32)
-        selected_names = (
-            [f"z_gnn_{dim:03d}" for dim in range(z_gnn_np.shape[1])]
-            + ["gnn_logit_margin", "gnn_prob_margin", "gnn_pred_prob", "gnn_entropy"]
-            + ["mc_dropout_uncertainty", "soft_local_homophily"]
-            + [f"node_feature_{dim:03d}" for dim in range(node_features_np.shape[1])]
-            + ["log_total_degree", "relative_degree"]
-        )
-        return {
-            "features": strict_features,
-            "feature_names": selected_names,
-            "full_feature_bundle": {
-                "feature_family": "paper_text_strict_glance_router",
-                "used_edge_type": edge_type is not None,
-                "used_q_probs": True,
-                "used_mc_dropout_uncertainty": True,
-            },
-        }
+        except ValueError as exc:
+            raise MissingFrozenArtifactError(str(exc)) from exc
+        feature_bundle["full_feature_bundle"]["used_edge_type"] = edge_type is not None
+        feature_bundle["full_feature_bundle"]["used_q_probs"] = True
+        feature_bundle["full_feature_bundle"]["used_mc_dropout_uncertainty"] = True
+        feature_bundle["full_feature_bundle"]["node_feature_dim"] = int(original_node_features.shape[1])
+        feature_bundle["full_feature_bundle"]["z_gnn_dim"] = int(z_gnn.shape[1])
+        feature_bundle["full_feature_bundle"]["feature_dim"] = int(feature_bundle["features"].shape[1])
+        return feature_bundle
 
     def _glance_refiner_source_stage(self):
         source = str(getattr(self.args, "glance_refiner_source", "oracle")).lower()
@@ -4204,7 +4102,7 @@ class StageRunner:
         with torch.no_grad():
             for batch_idx_np in self._iter_glance_batches(split_idx, batch_size, shuffle=False):
                 batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
-                batch_score, batch_prob, _, _ = router_model(router_features[batch_idx].to(router_device))
+                batch_score, batch_prob = router_model(router_features[batch_idx].to(router_device))
                 batch_score = batch_score.detach().cpu()
                 batch_prob = batch_prob.detach().cpu()
                 router_score_all[batch_idx] = batch_score
@@ -4287,7 +4185,7 @@ class StageRunner:
         with torch.no_grad():
             for batch_idx_np in self._iter_glance_batches(split_idx, batch_size, shuffle=False):
                 batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
-                batch_score, batch_prob, _, _ = router_model(router_features[batch_idx].to(router_device))
+                batch_score, batch_prob = router_model(router_features[batch_idx].to(router_device))
                 batch_score = batch_score.detach().cpu()
                 batch_prob = batch_prob.detach().cpu()
                 router_score_all[batch_idx] = batch_score
@@ -4448,7 +4346,7 @@ class StageRunner:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(candidate_seed)
         np.random.seed(candidate_seed % (2**32 - 1))
-        router_model = GlanceRouterMLP(
+        router_model = GlanceReliabilityRouterMLP(
             input_dim=int(router_features.shape[1]),
             hidden_dim=128,
             dropout=0.1,
@@ -4522,7 +4420,7 @@ class StageRunner:
                     reduction="none",
                 ).detach()
 
-                route_score, route_prob, reliability_logits, reliability_prob = router_model(batch_router_x)
+                route_score, route_prob = router_model(batch_router_x)
                 k = min(max(int(train_k), 1), int(batch_idx.numel()))
                 routed_rel = torch.topk(route_score, k=k, largest=True, sorted=False).indices
                 routed_mask = torch.zeros(batch_labels.size(0), dtype=torch.bool, device=self.device)
@@ -4589,55 +4487,31 @@ class StageRunner:
                     + routed_refiner_loss.sum()
                 ) / float(batch_labels.size(0))
 
-                routed_reward = batch_base_loss - refiner_loss.detach() - float(beta)
-                non_routed_reward = -batch_base_loss
-                reward = torch.where(routed_mask, routed_reward, non_routed_reward).detach()
                 oracle_advantage = (batch_base_loss - full_refiner_loss.detach() - float(beta)).detach()
-                scaled_advantage = _scale_glance_advantage_target(oracle_advantage)
-                oracle_topk_membership = _glance_oracle_topk_membership(oracle_advantage, train_k)
-                action_prob = torch.where(
-                    routed_mask,
-                    route_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6),
-                    (1.0 - route_prob).clamp_min(1e-6).clamp_max(1.0 - 1e-6),
-                )
-                entropy = -(
-                    route_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6) * torch.log(route_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6))
-                    + (1.0 - route_prob).clamp_min(1e-6).clamp_max(1.0 - 1e-6)
-                    * torch.log((1.0 - route_prob).clamp_min(1e-6).clamp_max(1.0 - 1e-6))
-                ).mean()
-                route_loss = (-(reward * torch.log(action_prob)).mean()) - float(entropy_weight) * entropy
-                router_regression_loss = F.smooth_l1_loss(route_score, scaled_advantage)
-                router_ranking_loss = _glance_pairwise_ranking_loss(route_score, oracle_advantage)
+                route_loss = batch_base_loss.sum() * 0.0
+                router_regression_loss = batch_base_loss.sum() * 0.0
+                router_ranking_loss = _glance_pairwise_ranking_loss(route_score, base_wrong_target)
                 pos_count = int(base_wrong_target.sum().detach().cpu().item())
                 neg_count = int(base_wrong_target.numel() - pos_count)
                 if 0 < pos_count < int(base_wrong_target.numel()):
                     pos_weight = torch.tensor(
                         float(neg_count / max(pos_count, 1)),
-                        dtype=reliability_logits.dtype,
-                        device=reliability_logits.device,
+                        dtype=route_score.dtype,
+                        device=route_score.device,
                     )
                     router_selection_loss = F.binary_cross_entropy_with_logits(
-                        reliability_logits,
+                        route_score,
                         base_wrong_target,
                         pos_weight=pos_weight,
                     )
                 else:
-                    router_selection_loss = reliability_logits.sum() * 0.0
-                with torch.no_grad():
-                    utility_target = (oracle_advantage > 0.0).float()
-                    reliability_gate = reliability_prob.detach().clamp_min(1e-4).clamp_max(1.0 - 1e-4)
-                utility_consistency_loss = F.binary_cross_entropy(
-                    reliability_gate,
-                    utility_target,
-                )
+                    router_selection_loss = route_score.sum() * 0.0
+                utility_consistency_loss = batch_base_loss.sum() * 0.0
                 total_loss = (
                     pred_loss
                     + float(refiner_gate_weight) * gate_loss
-                    + float(router_weight) * route_loss
-                    + float(router_regression_weight) * router_regression_loss
                     + float(router_ranking_weight) * router_ranking_loss
                     + float(router_calibration_weight) * router_selection_loss
-                    + float(router_reliability_weight) * utility_consistency_loss
                 )
 
                 optimizer.zero_grad(set_to_none=True)
@@ -9565,6 +9439,10 @@ class StageRunner:
         )
         backbone_input_features = self._strict_glance_backbone_input_features()
         mc_bundle = self._strict_glance_mc_dropout_uncertainty(backbone_input_features)
+        router_temperature_bundle = fit_reliability_temperature(
+            logits_gnn[valid_idx],
+            labels_np[valid_idx],
+        )
         router_feature_bundle = self._build_strict_glance_router_features(
             logits_gnn=logits_gnn,
             p_gnn=p_gnn,
@@ -9572,7 +9450,9 @@ class StageRunner:
             original_node_features=original_node_features_bundle["features"],
             q_bundle=q_bundle,
             mc_bundle=mc_bundle,
+            calibration_temperature=router_temperature_bundle["temperature"],
         )
+        router_feature_bundle["full_feature_bundle"]["temperature_scaling"] = dict(router_temperature_bundle)
         router_features, scaler_state = self._standardize_glance_router_features(
             router_feature_bundle["features"],
             strict_train_idx,
@@ -9583,8 +9463,8 @@ class StageRunner:
         max_epochs = 10
         patience = 2
         decay_factor = 0.5
-        entropy_weight = 0.01
-        router_weight = 1.0
+        entropy_weight = 0.0
+        router_weight = 0.0
         learning_rate = float(getattr(self.args, "lr_GNN", 5e-4))
         weight_decay = float(getattr(self.args, "weight_decay_GNN", 1e-5))
         eval_top_k = max(int(round(batch_size / 4.0)), 1)
@@ -9613,10 +9493,10 @@ class StageRunner:
                 decay_factor=decay_factor,
                 entropy_weight=entropy_weight,
                 router_weight=router_weight,
-                router_regression_weight=1.0,
+                router_regression_weight=0.0,
                 router_ranking_weight=1.0,
                 router_calibration_weight=0.25,
-                router_reliability_weight=0.25,
+                router_reliability_weight=0.0,
                 learning_rate=learning_rate,
                 weight_decay=weight_decay,
                 beta=float(beta),
@@ -9725,8 +9605,10 @@ class StageRunner:
         metrics_payload = {
             "contract": "glance_joint_router_refine_metrics_v1",
             "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
-            "paper_faithful_glance_inspired": True,
+            "paper_faithful_glance_inspired": False,
+            "glance_style_joint_training": True,
             "strict_training_protocol_alignment": bool(configured_train_cap == 3000),
+            "paper_text_router_alignment": False,
             "twibot20_adapted_training": bool(configured_train_cap <= 0),
             "strict_dependency_provenance_alignment": True,
             "semantic_alignment": False,
@@ -9754,10 +9636,13 @@ class StageRunner:
             "beta_sweep": beta_sweep,
             "valid_budget_curve": valid_budget_curve,
             "test_budget_curve": test_budget_curve,
-            "router_training_objective": "continuous_advantage_regression_plus_pairwise_ranking_plus_reliability_auxiliary",
+            "router_training_objective": "base_wrong_reliability_bce_plus_pairwise_ranking",
             "oracle_advantage_semantics": "loss_gnn_minus_loss_refiner_minus_beta",
-            "router_score_semantics": "learned_continuous_utility_scorer_for_global_budget_routing",
-            "router_reliability_semantics": "auxiliary_base_wrong_probability_estimator",
+            "router_score_semantics": "learned_base_wrong_reliability_score_for_global_budget_routing",
+            "router_reliability_semantics": "primary_base_wrong_probability_estimator",
+            "router_feature_family": router_feature_bundle["full_feature_bundle"]["feature_family"],
+            "router_feature_names": list(router_feature_bundle["feature_names"]),
+            "router_temperature_scaling": dict(router_temperature_bundle),
             "refiner_target_mode": refiner_target_mode,
             "refiner_weight_mode": refiner_weight_mode,
             "refiner_explicit_gate": bool(refiner_explicit_gate),
@@ -9790,12 +9675,70 @@ class StageRunner:
             },
             "fit_summary": final_run["fit_summary"],
         }
+        router_performance_summary = {
+            "selected_beta": float(selected_beta),
+            "selected_budget": float(selected_budget),
+            "selected_budget_key": str(selected_budget_key),
+            "router_temperature": float(router_temperature_bundle["temperature"]),
+            "router_temperature_bundle": dict(router_temperature_bundle),
+            "router_feature_family": str(router_feature_bundle["full_feature_bundle"]["feature_family"]),
+            "router_input_dim": int(router_features.shape[1]),
+            "router_diagnostics": final_run["fit_summary"].get("router_diagnostics", {}),
+            "advantage_router_diagnostics": final_run["fit_summary"].get("advantage_router_diagnostics", {}),
+            "topk_reference_router_diagnostics": final_run["fit_summary"].get("topk_reference", {}).get("router_diagnostics", {}),
+            "topk_reference_advantage_router_diagnostics": final_run["fit_summary"].get("topk_reference", {}).get("advantage_router_diagnostics", {}),
+            "selected_valid_budget_metrics": final_run["selected_budget_metrics"]["valid"],
+            "selected_test_budget_metrics": final_run["selected_budget_metrics"]["test"],
+            "selected_valid_router_analysis": final_run["valid_rows"]["analysis"],
+            "selected_test_router_analysis": final_run["test_rows"]["analysis"],
+            "overall_delta_vs_base_gnn": metrics_payload["overall_delta_vs_base_gnn"],
+            "wrong_node_fix_rate": metrics_payload["wrong_node_fix_rate"],
+            "correct_node_break_rate": metrics_payload["correct_node_break_rate"],
+            "net_gain": metrics_payload["net_gain"],
+            "best_epoch": int(final_run["best_epoch"]),
+            "query_usage": metrics_payload["query_usage"],
+        }
+        router_performance_row = {
+            "selected_beta": float(selected_beta),
+            "selected_budget": float(selected_budget),
+            "best_epoch": int(final_run["best_epoch"]),
+            "router_temperature": float(router_temperature_bundle["temperature"]),
+            "router_valid_positive_rate": final_run["fit_summary"]["router_diagnostics"]["valid"].get("positive_rate"),
+            "router_valid_mean_score": final_run["fit_summary"]["router_diagnostics"]["valid"].get("mean_score"),
+            "router_valid_auroc": final_run["fit_summary"]["router_diagnostics"]["valid"].get("auroc"),
+            "router_valid_auprc": final_run["fit_summary"]["router_diagnostics"]["valid"].get("auprc"),
+            "router_test_positive_rate": final_run["fit_summary"]["router_diagnostics"]["test"].get("positive_rate"),
+            "router_test_mean_score": final_run["fit_summary"]["router_diagnostics"]["test"].get("mean_score"),
+            "router_test_auroc": final_run["fit_summary"]["router_diagnostics"]["test"].get("auroc"),
+            "router_test_auprc": final_run["fit_summary"]["router_diagnostics"]["test"].get("auprc"),
+            "router_valid_adv_auroc": final_run["fit_summary"]["advantage_router_diagnostics"]["valid"].get("auroc"),
+            "router_valid_adv_auprc": final_run["fit_summary"]["advantage_router_diagnostics"]["valid"].get("auprc"),
+            "router_test_adv_auroc": final_run["fit_summary"]["advantage_router_diagnostics"]["test"].get("auroc"),
+            "router_test_adv_auprc": final_run["fit_summary"]["advantage_router_diagnostics"]["test"].get("auprc"),
+            "valid_query_rate": float(final_run["selected_budget_metrics"]["valid"]["query_rate"]),
+            "valid_routed_count": int(final_run["selected_budget_metrics"]["valid"]["routed_count"]),
+            "valid_routed_wrong_precision": float(final_run["valid_rows"]["analysis"]["routed_wrong_precision"]),
+            "valid_routed_wrong_coverage": float(final_run["valid_rows"]["analysis"]["routed_wrong_coverage"]),
+            "valid_conditional_fix_rate": float(final_run["valid_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+            "test_query_rate": float(final_run["selected_budget_metrics"]["test"]["query_rate"]),
+            "test_routed_count": int(final_run["selected_budget_metrics"]["test"]["routed_count"]),
+            "test_routed_wrong_precision": float(final_run["test_rows"]["analysis"]["routed_wrong_precision"]),
+            "test_routed_wrong_coverage": float(final_run["test_rows"]["analysis"]["routed_wrong_coverage"]),
+            "test_conditional_fix_rate": float(final_run["test_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+            "test_wrong_node_fix_rate": float(metrics_payload["wrong_node_fix_rate"]),
+            "test_correct_node_break_rate": float(metrics_payload["correct_node_break_rate"]),
+            "test_net_gain": int(metrics_payload["net_gain"]),
+            "test_macro_f1": float(metrics_payload["overall_test"]["macro_f1"]),
+            "test_delta_macro_f1": float(metrics_payload["overall_delta_vs_base_gnn"]["macro_f1"]),
+        }
         manifest = {
             "contract": "glance_joint_router_refine_v1",
             "status": "completed",
             "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
-            "paper_faithful_glance_inspired": True,
+            "paper_faithful_glance_inspired": False,
+            "glance_style_joint_training": True,
             "strict_training_protocol_alignment": bool(configured_train_cap == 3000),
+            "paper_text_router_alignment": False,
             "twibot20_adapted_training": bool(configured_train_cap <= 0),
             "strict_dependency_provenance_alignment": True,
             "semantic_alignment": False,
@@ -9803,7 +9746,7 @@ class StageRunner:
             "paper_text_evaluation_alignment": False,
             "evaluation_protocol": "validation_selected_global_budget_by_router_score",
             "evaluation_alignment_note": "Batch top-k is kept only inside strict GLANCE training. Public final evaluation uses a validation-selected global budget and test-locked router ranking.",
-            "research_positioning": "paper_faithful_glance_training_contract_under_current_cached_semantic_encoder",
+            "research_positioning": "task_adapted_reliability_router_under_glance_style_joint_training",
             "selected_beta_source": "validation",
             "selected_beta": selected_beta,
             "beta_candidates": [float(item) for item in beta_candidates],
@@ -9813,7 +9756,7 @@ class StageRunner:
             "semantic_source_mode": semantic_bundle["mode"],
             "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
             "semantic_source": "semantic_single_source",
-            "semantic_alignment_note": "Training protocol follows the GLANCE paper text; semantic expert remains the current cached embedding path rather than the paper's prompt-serialized LLM route.",
+            "semantic_alignment_note": "Joint training keeps the current cached semantic embedding path; router objective is task-adapted toward reliability rather than the paper's advantage target.",
             "dependency_alignment_note": dependency_alignment_note,
             "semantic_manifest": semantic["manifest"],
             "primary_semantic_manifest": semantic_bundle["primary"]["manifest"],
@@ -9826,14 +9769,17 @@ class StageRunner:
             "full_train_node_count": int(train_idx.size),
             "train_cap_mode": train_cap_mode,
             "uncertainty_source": mc_bundle["source"],
+            "router_temperature_scaling": dict(router_temperature_bundle),
             "router_feature_family_used": list(router_feature_bundle["feature_names"]),
             "router_architecture": {
-                "type": "mlp_utility_scorer_with_reliability_auxiliary_head",
+                "type": "reliability_first_router_mlp",
                 "hidden_dim": 128,
+                "bottleneck_dim": 64,
                 "dropout": 0.1,
                 "input_dim": int(router_features.shape[1]),
                 "feature_count": int(router_features.shape[1]),
                 "feature_family": list(router_feature_bundle["feature_names"]),
+                "feature_bundle_metadata": router_feature_bundle["full_feature_bundle"],
                 "scaler": scaler_state,
             },
             "refiner_architecture": {
@@ -9867,15 +9813,16 @@ class StageRunner:
                     "k_end": int(max(int(round(batch_size / 4.0)), 1)),
                     "decay_factor": float(decay_factor),
                 },
-                "router_weight": float(router_weight),
-                "router_regression_weight": float(1.0),
+                "router_weight": 0.0,
+                "router_regression_weight": 0.0,
                 "router_ranking_weight": float(1.0),
                 "router_selection_weight": float(0.25),
                 "router_calibration_weight": float(0.25),
-                "router_reliability_weight": float(0.25),
-                "entropy_weight": float(entropy_weight),
+                "router_reliability_weight": 0.0,
+                "entropy_weight": 0.0,
                 "beta_selection": "validation_only",
-                "auxiliary_router_target": "base_wrong_probability_plus_utility_consistency",
+                "router_training_objective": "base_wrong_reliability_bce_plus_pairwise_ranking",
+                "auxiliary_router_target": "none_oracle_advantage_retained_for_diagnostics_only",
                 "refiner_target_mode": refiner_target_mode,
                 "refiner_explicit_gate": bool(refiner_explicit_gate),
                 "refiner_weight_mode": refiner_weight_mode,
@@ -9908,6 +9855,33 @@ class StageRunner:
         )
         write_json(stage_dir / "metrics.json", metrics_payload)
         write_json(stage_dir / "analysis_summary.json", analysis_summary)
+        write_json(stage_dir / "router_performance_summary.json", router_performance_summary)
+        write_csv_rows(
+            stage_dir / "router_performance_summary.csv",
+            list(router_performance_row.keys()),
+            [router_performance_row],
+        )
+        write_csv_rows(
+            stage_dir / "router_epoch_curve.csv",
+            [
+                "epoch",
+                "beta",
+                "train_top_k",
+                "eval_top_k",
+                "router_train_auroc",
+                "router_valid_auroc",
+                "router_test_auroc",
+                "router_valid_adv_auroc",
+                "router_test_adv_auroc",
+                "router_valid_auprc",
+                "router_valid_adv_auprc",
+                "refiner_valid_fix_rate",
+                "refiner_valid_break_rate",
+                "refiner_test_fix_rate",
+                "refiner_test_break_rate",
+            ],
+            final_run["fit_summary"]["component_curve_summary"]["curve"],
+        )
         write_csv_rows(
             stage_dir / "beta_sweep.csv",
             [
@@ -10036,11 +10010,13 @@ class StageRunner:
         notes = [
             "# GLANCE joint router-refiner baseline",
             "",
-            "This stage implements a paper-text-aligned GLANCE joint router+refiner contract under the current cached semantic embedding path.",
-            "The training protocol alignment is strict; the semantic expert alignment is intentionally deferred, and the public evaluation protocol is TwiBot20-adapted global-budget routing.",
+            "This stage implements a GLANCE-style joint router+refiner contract under the current cached semantic embedding path.",
+            "The public router is task-adapted for TwiBot20 reliability routing: base confidence is temperature-scaled, social features are direction-aware, and router supervision targets base-wrong reliability rather than paper-text advantage.",
+            "The semantic expert alignment is intentionally deferred, and the public evaluation protocol is TwiBot20-adapted global-budget routing.",
             "The base GNN and semantic expert remain frozen; only the router scorer MLP and the routed-node refiner MLP are trained.",
-            "The router is trained with continuous utility regression, pairwise ranking, and an auxiliary reliability objective over base-wrong prediction.",
+            "The router is trained with base-wrong reliability BCE plus pairwise ranking. Oracle advantage is still recorded as a post-hoc diagnostic trace.",
             f"Training uses deterministic batch top-k with K_start={int(batch_size)} and K_end={int(eval_top_k)}. Final evaluation ranks the whole split by router score, selects budget on validation, and locks the selected budget ({selected_budget:.3f}) on test. Beta is selected on validation only from {{0.1, 0.2, 0.3}}.",
+            "Use router_performance_summary.json/csv, router_epoch_curve.csv, and the budget-curve CSVs to inspect router quality directly.",
         ]
         write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
         return {

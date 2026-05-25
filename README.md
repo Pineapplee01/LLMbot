@@ -95,10 +95,22 @@ Internal-only implemented branches are not part of the public CLI contract:
 
 `joint_router_refinement` is the only public GLANCE-family task. It is still a
 GLANCE-style implementation under the current cached semantic-embedding path,
-not a full official-pipeline reproduction. The strict router path now mirrors
-the paper more closely by fitting a lightweight auxiliary MLP `Q` on node
-features and training a shallow scorer MLP with continuous utility regression,
-pairwise ranking, and an auxiliary reliability head for base-wrong prediction.
+not a full official-pipeline reproduction. The current public router path is
+now best understood as a TwiBot20-oriented reliability adaptation under
+GLANCE-style joint training:
+
+- a lightweight auxiliary MLP `Q` still provides the router-side soft
+  homophily proxy
+- base-detector confidence features are temperature-scaled before router
+  feature construction
+- direction-aware social features are added for TwiBot20, including `in/out`
+  degree, relation counts, directional homophily/disagreement, reciprocity,
+  and sparse-node indicators
+- the learned router scorer is now trained to rank `base_wrong` reliability
+  rather than to fit the paper's utility / advantage target directly
+- `oracle_advantage` remains recorded as a diagnostic quantity for routed-set
+  analysis, not as the primary router supervision signal
+
 The public strict stage now also enforces
 same-run provenance: it must read the current run's own
 `preparation/graph_detector` artifact, and its semantic tensor must match that
@@ -117,7 +129,8 @@ Its public evaluation contract is now intentionally TwiBot20-adapted:
 - test is evaluated once under that locked validation-selected budget
 
 This means the stage is paper-text aligned at training time, but no longer
-paper-text aligned at final evaluation time.
+paper-text aligned at final evaluation time, and its router objective is now
+task-adapted rather than a pure paper-text GLANCE advantage router.
 
 `joint_router_refinement` also exposes `--joint_train_node_cap` for controlled
 comparisons between:
@@ -141,6 +154,26 @@ count so capped and full-train runs remain directly distinguishable.
 The joint stage now also records per-epoch router diagnostics and routed-node
 refiner fix/break deltas so the training trace can show whether the router or
 the refiner saturates first.
+
+For router-focused inspection, each `joint_router_refinement` seed directory now
+also writes:
+
+- `router_performance_summary.json`
+- `router_performance_summary.csv`
+- `router_epoch_curve.csv`
+- `valid_budget_curve.csv`
+- `test_budget_curve.csv`
+
+When you run multiple seeds in one command, the experiment root also writes:
+
+- `router_seed_summary.json`
+- `router_seed_summary.csv`
+- `router_budget_curves_all_seeds.csv`
+- `router_epoch_curves_all_seeds.csv`
+
+These files are the quickest way to inspect router AUROC/AUPRC, routed wrong
+precision/coverage, selected budget, and cross-seed stability without manually
+opening every seed-level `metrics.json`.
 
 ## Command Examples
 
@@ -241,6 +274,19 @@ python main.py \
   --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
   --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
   --seeds 1 \
+  --disable_wandb
+
+# Full router experiment summary across seeds 1/2/3
+# After the run, inspect router_seed_summary.csv/json at the experiment root.
+python main.py \
+  --experiment_task joint_router_refinement \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
+  --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
+  --seeds 1,2,3 \
   --disable_wandb
 
 # Refiner-only prompt-cache override on top of an unchanged qwen3 backbone

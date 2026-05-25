@@ -30,6 +30,7 @@ from utils import (
     safe_torch_load,
     seed_setting,
     setup_wandb,
+    write_csv_rows,
     write_json,
     write_text,
     write_torch,
@@ -419,6 +420,127 @@ def _parse_seed_list(seeds):
     return [int(seed) for seed in str(seeds).strip().split(",")]
 
 
+def _experiment_base_dir(args):
+    if getattr(args, "artifact_root", None):
+        return Path(args.artifact_root)
+    return Path(args.experiment_name)
+
+
+def _summary_stats(rows, key):
+    values = [float(row[key]) for row in rows if row.get(key) is not None]
+    if not values:
+        return {"count": 0, "mean": None, "std": None, "min": None, "max": None}
+    tensor = torch.tensor(values, dtype=torch.float32)
+    return {
+        "count": int(len(values)),
+        "mean": float(tensor.mean().item()),
+        "std": float(tensor.std(unbiased=False).item()) if len(values) > 1 else 0.0,
+        "min": float(min(values)),
+        "max": float(max(values)),
+    }
+
+
+def _aggregate_joint_router_results(args, execution_stage, stage_results):
+    if execution_stage != "joint_router_refinement" or not stage_results:
+        return
+
+    seed_rows = []
+    budget_rows = []
+    epoch_rows = []
+    for result in stage_results:
+        artifact_dir = result.get("artifact_dir")
+        if not artifact_dir:
+            continue
+        stage_dir = Path(artifact_dir)
+        metrics = read_json(stage_dir / "metrics.json", default={}) or {}
+        router_summary = read_json(stage_dir / "router_performance_summary.json", default={}) or {}
+        fit_summary = metrics.get("fit_summary", {}) or {}
+        router_diag = router_summary.get("router_diagnostics", fit_summary.get("router_diagnostics", {})) or {}
+        adv_diag = router_summary.get("advantage_router_diagnostics", fit_summary.get("advantage_router_diagnostics", {})) or {}
+        valid_analysis = router_summary.get("selected_valid_router_analysis", {}) or {}
+        test_analysis = router_summary.get("selected_test_router_analysis", {}) or {}
+        seed = int(result["seed"])
+        seed_rows.append(
+            {
+                "seed": seed,
+                "stage_dir": str(stage_dir),
+                "selected_beta": router_summary.get("selected_beta", metrics.get("selected_beta")),
+                "selected_budget": router_summary.get("selected_budget", metrics.get("selected_budget")),
+                "best_epoch": router_summary.get("best_epoch"),
+                "router_temperature": router_summary.get("router_temperature"),
+                "router_valid_positive_rate": (router_diag.get("valid") or {}).get("positive_rate"),
+                "router_valid_mean_score": (router_diag.get("valid") or {}).get("mean_score"),
+                "router_valid_auroc": (router_diag.get("valid") or {}).get("auroc"),
+                "router_valid_auprc": (router_diag.get("valid") or {}).get("auprc"),
+                "router_test_positive_rate": (router_diag.get("test") or {}).get("positive_rate"),
+                "router_test_mean_score": (router_diag.get("test") or {}).get("mean_score"),
+                "router_test_auroc": (router_diag.get("test") or {}).get("auroc"),
+                "router_test_auprc": (router_diag.get("test") or {}).get("auprc"),
+                "router_valid_adv_auroc": (adv_diag.get("valid") or {}).get("auroc"),
+                "router_valid_adv_auprc": (adv_diag.get("valid") or {}).get("auprc"),
+                "router_test_adv_auroc": (adv_diag.get("test") or {}).get("auroc"),
+                "router_test_adv_auprc": (adv_diag.get("test") or {}).get("auprc"),
+                "valid_query_rate": ((router_summary.get("selected_valid_budget_metrics") or {}).get("query_rate")),
+                "valid_routed_count": ((router_summary.get("selected_valid_budget_metrics") or {}).get("routed_count")),
+                "valid_routed_wrong_precision": valid_analysis.get("routed_wrong_precision"),
+                "valid_routed_wrong_coverage": valid_analysis.get("routed_wrong_coverage"),
+                "valid_conditional_fix_rate": valid_analysis.get("conditional_fix_rate_on_selected_wrong"),
+                "test_query_rate": ((router_summary.get("selected_test_budget_metrics") or {}).get("query_rate")),
+                "test_routed_count": ((router_summary.get("selected_test_budget_metrics") or {}).get("routed_count")),
+                "test_routed_wrong_precision": test_analysis.get("routed_wrong_precision"),
+                "test_routed_wrong_coverage": test_analysis.get("routed_wrong_coverage"),
+                "test_conditional_fix_rate": test_analysis.get("conditional_fix_rate_on_selected_wrong"),
+                "test_wrong_node_fix_rate": router_summary.get("wrong_node_fix_rate", metrics.get("wrong_node_fix_rate")),
+                "test_correct_node_break_rate": router_summary.get("correct_node_break_rate", metrics.get("correct_node_break_rate")),
+                "test_net_gain": router_summary.get("net_gain", metrics.get("net_gain")),
+                "test_macro_f1": ((metrics.get("overall_test") or {}).get("macro_f1")),
+                "test_delta_macro_f1": ((metrics.get("overall_delta_vs_base_gnn") or {}).get("macro_f1")),
+            }
+        )
+
+        for split_name, curve_key in (("valid", "valid_budget_curve"), ("test", "test_budget_curve")):
+            for row in metrics.get(curve_key, []) or []:
+                budget_rows.append({"seed": seed, "split": split_name, **row})
+
+        component_curve = (((fit_summary.get("component_curve_summary") or {}).get("curve")) or [])
+        for row in component_curve:
+            epoch_rows.append({"seed": seed, **row})
+
+    if not seed_rows:
+        return
+
+    base_dir = _experiment_base_dir(args)
+    aggregate_keys = [
+        "router_valid_auroc",
+        "router_valid_auprc",
+        "router_test_auroc",
+        "router_test_auprc",
+        "valid_routed_wrong_precision",
+        "valid_routed_wrong_coverage",
+        "test_routed_wrong_precision",
+        "test_routed_wrong_coverage",
+        "test_wrong_node_fix_rate",
+        "test_correct_node_break_rate",
+        "test_net_gain",
+        "test_macro_f1",
+        "test_delta_macro_f1",
+    ]
+    aggregate = {key: _summary_stats(seed_rows, key) for key in aggregate_keys}
+    payload = {
+        "stage": execution_stage,
+        "seed_count": int(len(seed_rows)),
+        "seeds": [int(row["seed"]) for row in seed_rows],
+        "aggregate": aggregate,
+        "rows": seed_rows,
+    }
+    write_json(base_dir / "router_seed_summary.json", payload)
+    write_csv_rows(base_dir / "router_seed_summary.csv", list(seed_rows[0].keys()), seed_rows)
+    if budget_rows:
+        write_csv_rows(base_dir / "router_budget_curves_all_seeds.csv", list(budget_rows[0].keys()), budget_rows)
+    if epoch_rows:
+        write_csv_rows(base_dir / "router_epoch_curves_all_seeds.csv", list(epoch_rows[0].keys()), epoch_rows)
+
+
 def _stage_result(stage, seed, artifact_dir, **extra):
     result = {
         "stage": stage,
@@ -531,13 +653,17 @@ def main(args):
     if execution_stage not in {"distillation_pipeline", "semantic_encoder_finetune"}:
         args.use_GNN = True
 
+    stage_results = []
     for seed in _parse_seed_list(args.seeds):
         seed_setting(seed)
         data = _load_seed_data(args, execution_stage)
         run = setup_wandb(args, seed)
         experiment_root = build_experiment_root(args, seed)
-        print(_format_stage_result(_run_seed_stage(args, seed, data, run, execution_stage, experiment_root)))
+        stage_result = _run_seed_stage(args, seed, data, run, execution_stage, experiment_root)
+        stage_results.append(stage_result)
+        print(_format_stage_result(stage_result))
         run.finish()
+    _aggregate_joint_router_results(args, execution_stage, stage_results)
 
 
 if __name__ == "__main__":
