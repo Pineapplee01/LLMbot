@@ -72,6 +72,36 @@ from estimators import (
     router_budget_curve,
     stage2_acceptance_gate,
 )
+from artifact_contracts import (
+    MissingFrozenArtifactError as _contract_missing_frozen_artifact_error,
+    PHASE_A_CONTRACT as _contract_phase_a_contract,
+    PHASE_A_DISABLED_COMPONENTS as _contract_phase_a_disabled_components,
+    canonical_stage_name as _contract_canonical_stage_name,
+    canonical_stage_dir as _contract_canonical_stage_dir,
+    legacy_stage_dir as _contract_legacy_stage_dir,
+    stage_dir_read_candidates as _contract_stage_dir_read_candidates,
+    stage_artifact_reference as _contract_stage_artifact_reference,
+    preparation_artifact_reference as _contract_preparation_artifact_reference,
+    split_provenance as _contract_split_provenance,
+    frozen_g0_dir as _contract_frozen_g0_dir,
+)
+from runtime_env import (
+    _max_cuda_memory_allocated as _runtime_max_cuda_memory_allocated,
+    _reset_cuda_peak_memory_stats as _runtime_reset_cuda_peak_memory_stats,
+    _resolve_device as _runtime_resolve_device,
+    _set_cuda_device as _runtime_set_cuda_device,
+)
+from trainer_preparation import (
+    build_or_load_faithful_gats as _prep_build_or_load_faithful_gats,
+    build_or_load_frozen_g0 as _prep_build_or_load_frozen_g0,
+    load_frozen_g0 as _prep_load_frozen_g0,
+    load_gats_outputs as _prep_load_gats_outputs,
+    require_stage_gates as _prep_require_stage_gates,
+)
+from trainer_semantic import (
+    _classification_metrics_from_logits as _semantic_classification_metrics_from_logits,
+    run_semantic_finetune_seed as _semantic_run_semantic_finetune_seed,
+)
 
 
 PHASE_A_CONTRACT = "phase_a_semantic_source_x_gnn_backbone"
@@ -2054,6 +2084,7 @@ def _direct_embedding_manifest(path):
 def _normalize_semantic_payload(payload):
     payload_keys = []
     precomputed_views = None
+    prompt_expert_bundle = None
     embeddings = payload
     if isinstance(payload, dict):
         payload_keys = sorted(str(key) for key in payload.keys())
@@ -2072,6 +2103,61 @@ def _normalize_semantic_payload(payload):
             direct_views[view_name] = view_value.detach().cpu().float()
         if len(direct_views) == 3:
             precomputed_views = direct_views
+        expert_component_tensors = {}
+        for component_name in ("ego", "graph_following", "graph_follower", "tweet", "conflict"):
+            if component_name not in payload:
+                continue
+            component_value = payload[component_name]
+            if not torch.is_tensor(component_value):
+                try:
+                    component_value = torch.as_tensor(component_value)
+                except Exception:
+                    continue
+            if component_value.dim() != 2:
+                continue
+            expert_component_tensors[component_name] = component_value.detach().cpu().float()
+        expert_scalar_tensors = {}
+        for scalar_key in (
+            "count_following",
+            "count_follower",
+            "has_following",
+            "has_follower",
+            "rt_ratio",
+            "url_ratio",
+            "hashtag_ratio",
+        ):
+            if scalar_key not in payload:
+                continue
+            scalar_value = payload[scalar_key]
+            if not torch.is_tensor(scalar_value):
+                try:
+                    scalar_value = torch.as_tensor(scalar_value)
+                except Exception:
+                    continue
+            if scalar_value.dim() == 2 and int(scalar_value.shape[1]) == 1:
+                scalar_value = scalar_value.view(-1)
+            if scalar_value.dim() != 1:
+                continue
+            expert_scalar_tensors[scalar_key] = scalar_value.detach().cpu().float().view(-1)
+        payload_semantic_view_mode = str(payload.get("semantic_view_mode", "") or "").strip().lower()
+        has_nonlegacy_expert_component = any(
+            name in expert_component_tensors
+            for name in ("graph_following", "graph_follower", "tweet", "conflict")
+        )
+        if has_nonlegacy_expert_component or expert_scalar_tensors or payload_semantic_view_mode == "prompt_expert_bundle_v1":
+            active_components = payload.get("active_components")
+            if active_components is None:
+                active_components = list(expert_component_tensors.keys())
+            elif isinstance(active_components, str):
+                active_components = [active_components]
+            else:
+                active_components = [str(item) for item in active_components]
+            prompt_expert_bundle = {
+                "component_tensors": expert_component_tensors,
+                "scalar_tensors": expert_scalar_tensors,
+                "active_components": list(active_components),
+                "semantic_view_mode": "prompt_expert_bundle_v1",
+            }
         for candidate_key in ("embeddings", "features", "x"):
             if candidate_key in payload:
                 embeddings = payload[candidate_key]
@@ -2093,7 +2179,35 @@ def _normalize_semantic_payload(payload):
                 raise MissingFrozenArtifactError(
                     f"Semantic payload view {view_name} has {int(view_tensor.shape[0])} nodes, expected {expected_nodes}."
                 )
-    return embeddings, precomputed_views, payload_keys
+    if prompt_expert_bundle is not None:
+        expected_nodes = int(embeddings.shape[0]) if embeddings.dim() == 2 else None
+        if expected_nodes is None:
+            expert_components = prompt_expert_bundle["component_tensors"]
+            if expert_components:
+                expected_nodes = int(next(iter(expert_components.values())).shape[0])
+        if expected_nodes is None:
+            raise MissingFrozenArtifactError(
+                "Prompt-expert semantic payload must provide either a 2-D embeddings tensor or at least one expert component tensor."
+            )
+        for component_name, component_tensor in prompt_expert_bundle["component_tensors"].items():
+            if component_tensor.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert component {component_name} must be 2-D, got {tuple(component_tensor.shape)}."
+                )
+            if int(component_tensor.shape[0]) != expected_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert component {component_name} has {int(component_tensor.shape[0])} nodes, expected {expected_nodes}."
+                )
+        for scalar_key, scalar_tensor in prompt_expert_bundle["scalar_tensors"].items():
+            if scalar_tensor.dim() != 1:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert scalar {scalar_key} must be 1-D, got {tuple(scalar_tensor.shape)}."
+                )
+            if int(scalar_tensor.shape[0]) != expected_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert scalar {scalar_key} has {int(scalar_tensor.shape[0])} nodes, expected {expected_nodes}."
+                )
+    return embeddings, precomputed_views, prompt_expert_bundle, payload_keys
 
 
 class GlanceRefinerMLP(nn.Module):
@@ -2364,8 +2478,93 @@ class MultiSourceRelationAwareSemanticFusionMLP(nn.Module):
         return self.classifier(x)
 
 
+class PromptExpertBundleRefinerMLP(nn.Module):
+    """Strict refiner head for the prompt-expert semantic bundle v1."""
+
+    COMPONENT_ORDER = ("ego", "graph_following", "graph_follower", "tweet", "conflict")
+
+    def __init__(
+        self,
+        z_gnn_dim,
+        component_dims,
+        proj_dim=256,
+        hidden_dim=128,
+        structural_dim=4,
+        activation="leakyrelu",
+        dropout=0.1,
+    ):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act_factory = nn.LeakyReLU
+        elif activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "elu":
+            act_factory = nn.ELU
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.component_dims = {name: int(component_dims[name]) for name in self.COMPONENT_ORDER}
+        self.z_gnn_dim = int(z_gnn_dim)
+        self.proj_dim = int(proj_dim)
+        self.structural_dim = int(structural_dim)
+        self.projectors = nn.ModuleDict(
+            {
+                name: nn.Sequential(
+                    nn.Linear(self.component_dims[name], self.proj_dim),
+                    act_factory(),
+                    nn.Dropout(float(dropout)),
+                )
+                for name in self.COMPONENT_ORDER
+            }
+        )
+        self.graph_gate = nn.Linear(self.structural_dim, 2)
+        total_proj_slots = 6  # ego + following + follower + fused_graph + tweet + conflict
+        self.classifier = nn.Sequential(
+            nn.Linear(self.z_gnn_dim + total_proj_slots * self.proj_dim + self.structural_dim, int(hidden_dim)),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 2),
+        )
+
+    def forward(self, z_gnn, semantic_views, structural_features):
+        projected = {
+            name: self.projectors[name](semantic_views[name])
+            for name in self.COMPONENT_ORDER
+        }
+        gate_weights = torch.softmax(self.graph_gate(structural_features), dim=1)
+        graph_fused = (
+            gate_weights[:, 0:1] * projected["graph_following"]
+            + gate_weights[:, 1:2] * projected["graph_follower"]
+        )
+        x = torch.cat(
+            [
+                z_gnn,
+                projected["ego"],
+                projected["graph_following"],
+                projected["graph_follower"],
+                graph_fused,
+                projected["tweet"],
+                projected["conflict"],
+                structural_features,
+            ],
+            dim=1,
+        )
+        return self.classifier(x)
+
+
 def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, device):
     batch_idx = batch_idx.to(device=device)
+    if isinstance(refiner_features, dict) and refiner_features.get("feature_kind") == "prompt_expert_bundle_v1":
+        return {
+            "feature_kind": "prompt_expert_bundle_v1",
+            "z_gnn": refiner_features["z_gnn"][batch_idx].to(device),
+            "semantic_views": {
+                key: value[batch_idx].to(device)
+                for key, value in refiner_features["semantic_views"].items()
+                if torch.is_tensor(value) and value.dim() == 2
+            },
+            "structural_features": refiner_features["structural_features"][batch_idx].to(device),
+        }
     feature_kind = refiner_features.get("feature_kind") if isinstance(refiner_features, dict) else None
     if feature_kind in {"directional_gated", "directional_weighted_gated", "directional_weighted_projected"}:
         return {
@@ -2891,6 +3090,33 @@ def run_legacy_graph_seed(args, seed, data, run, runtime_paths=None):
     }
 
 
+# Compatibility rebinding: active preparation and semantic owners now live in
+# dedicated modules. Keep legacy names stable for StageRunner while routing
+# runtime behavior through the extracted implementations.
+MissingFrozenArtifactError = _contract_missing_frozen_artifact_error
+PHASE_A_CONTRACT = _contract_phase_a_contract
+PHASE_A_DISABLED_COMPONENTS = _contract_phase_a_disabled_components
+_canonical_stage_name = _contract_canonical_stage_name
+_canonical_stage_dir = _contract_canonical_stage_dir
+_legacy_stage_dir = _contract_legacy_stage_dir
+_stage_dir_read_candidates = _contract_stage_dir_read_candidates
+_stage_artifact_reference = _contract_stage_artifact_reference
+_preparation_artifact_reference = _contract_preparation_artifact_reference
+split_provenance = _contract_split_provenance
+frozen_g0_dir = _contract_frozen_g0_dir
+_resolve_device = _runtime_resolve_device
+_set_cuda_device = _runtime_set_cuda_device
+_reset_cuda_peak_memory_stats = _runtime_reset_cuda_peak_memory_stats
+_max_cuda_memory_allocated = _runtime_max_cuda_memory_allocated
+load_frozen_g0 = _prep_load_frozen_g0
+build_or_load_frozen_g0 = _prep_build_or_load_frozen_g0
+build_or_load_faithful_gats = _prep_build_or_load_faithful_gats
+require_stage_gates = _prep_require_stage_gates
+load_gats_outputs = _prep_load_gats_outputs
+run_semantic_finetune_seed = _semantic_run_semantic_finetune_seed
+_classification_metrics_from_logits = _semantic_classification_metrics_from_logits
+
+
 class StageRunner:
     def __init__(self, args, seed, data, run):
         self.args = args
@@ -3166,7 +3392,7 @@ class StageRunner:
                 f"{emb_path}."
             )
         payload = safe_torch_load(emb_path, map_location="cpu")
-        embeddings, precomputed_views, payload_keys = _normalize_semantic_payload(payload)
+        embeddings, precomputed_views, prompt_expert_bundle, payload_keys = _normalize_semantic_payload(payload)
         if embeddings.dim() != 2:
             raise MissingFrozenArtifactError(
                 f"joint_router_refinement expects --embedding_path to contain a 2-D tensor, got {tuple(embeddings.shape)}."
@@ -3181,7 +3407,12 @@ class StageRunner:
                     raise MissingFrozenArtifactError(
                         f"joint_router_refinement semantic view {view_name} does not align with the current dataset node count."
                     )
-        semantic_view_mode = "precomputed_prompt_views" if precomputed_views is not None else "legacy_inbound_khop"
+        if prompt_expert_bundle is not None:
+            semantic_view_mode = "prompt_expert_bundle_v1"
+        elif precomputed_views is not None:
+            semantic_view_mode = "precomputed_prompt_views"
+        else:
+            semantic_view_mode = "legacy_inbound_khop"
         primary = {
             "dir": emb_path.parent,
             "manifest": {
@@ -3192,9 +3423,11 @@ class StageRunner:
                 "semantic_override_role": semantic_override_role,
                 "payload_keys": payload_keys,
                 "semantic_view_mode": semantic_view_mode,
+                "active_components": list(prompt_expert_bundle.get("active_components", [])) if prompt_expert_bundle else [],
             },
             "embeddings": embeddings,
             "precomputed_views": precomputed_views,
+            "prompt_expert_bundle": prompt_expert_bundle,
             "semantic_view_mode": semantic_view_mode,
             "outputs": None,
         }
@@ -3623,6 +3856,82 @@ class StageRunner:
             "count_2hop": count_2hop,
         }
 
+    def _build_prompt_expert_semantic_views(self, expert_bundle, z_gnn):
+        if not expert_bundle:
+            raise MissingFrozenArtifactError(
+                "prompt_expert_bundle_v1 requires expert_bundle payload metadata from the semantic cache."
+            )
+        num_nodes = int(z_gnn.shape[0])
+        component_tensors = dict(expert_bundle.get("component_tensors", {}))
+        base_component = next(iter(component_tensors.values()), None)
+        if base_component is None:
+            raise MissingFrozenArtifactError(
+                "prompt_expert_bundle_v1 requires at least one of ego/graph_following/graph_follower/tweet/conflict in the prompt cache payload."
+            )
+        semantic_dim = int(base_component.shape[1])
+        zero_component = torch.zeros((num_nodes, semantic_dim), dtype=torch.float32)
+        semantic_views = {}
+        for component_name in PromptExpertBundleRefinerMLP.COMPONENT_ORDER:
+            component_value = component_tensors.get(component_name)
+            if component_value is None:
+                semantic_views[component_name] = zero_component.clone()
+                continue
+            if int(component_value.shape[0]) != num_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert component {component_name} has {int(component_value.shape[0])} nodes, expected {num_nodes}."
+                )
+            semantic_views[component_name] = component_value.detach().cpu().float()
+
+        scalar_tensors = dict(expert_bundle.get("scalar_tensors", {}))
+
+        def _scalar(name):
+            value = scalar_tensors.get(name)
+            if value is None:
+                return torch.zeros(num_nodes, dtype=torch.float32)
+            value = value.detach().cpu().float().view(-1)
+            if int(value.shape[0]) != num_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert scalar {name} has {int(value.shape[0])} nodes, expected {num_nodes}."
+                )
+            return value
+
+        count_following = _scalar("count_following")
+        count_follower = _scalar("count_follower")
+        has_following = _scalar("has_following")
+        has_follower = _scalar("has_follower")
+        structural_features = torch.stack(
+            [
+                torch.log1p(count_following),
+                torch.log1p(count_follower),
+                has_following,
+                has_follower,
+            ],
+            dim=1,
+        ).float()
+
+        analysis_views = dict(semantic_views)
+        analysis_views.update(
+            {
+                "count_following": count_following.numpy().astype(np.int64),
+                "count_follower": count_follower.numpy().astype(np.int64),
+                "has_following": has_following.numpy().astype(np.int64),
+                "has_follower": has_follower.numpy().astype(np.int64),
+                "count_1hop": (count_following + count_follower).numpy().astype(np.int64),
+                "count_2hop": np.zeros(num_nodes, dtype=np.int64),
+                "rt_ratio": _scalar("rt_ratio").numpy().astype(np.float32),
+                "url_ratio": _scalar("url_ratio").numpy().astype(np.float32),
+                "hashtag_ratio": _scalar("hashtag_ratio").numpy().astype(np.float32),
+            }
+        )
+        refiner_features = {
+            "feature_kind": "prompt_expert_bundle_v1",
+            "z_gnn": z_gnn.detach().cpu().float(),
+            "semantic_views": semantic_views,
+            "structural_features": structural_features,
+            "active_components": list(expert_bundle.get("active_components", [])),
+        }
+        return refiner_features, analysis_views
+
     def _build_relation_aware_1hop_semantic_views(self, semantic_embeddings, edge_index, edge_type, include_2hop=False):
         x_sem = semantic_embeddings.detach().cpu().float()
         num_nodes = int(x_sem.shape[0])
@@ -4020,7 +4329,30 @@ class StageRunner:
 
     @staticmethod
     def _glance_refiner_forward(refiner_model, batch_refiner, batch_base_logits=None):
-        outputs = refiner_model(batch_refiner)
+        if isinstance(batch_refiner, dict):
+            feature_kind = batch_refiner.get("feature_kind")
+            if feature_kind == "prompt_expert_bundle_v1":
+                outputs = refiner_model(
+                    batch_refiner["z_gnn"],
+                    batch_refiner["semantic_views"],
+                    batch_refiner["structural_features"],
+                )
+            elif feature_kind == "directional_gated":
+                outputs = refiner_model(
+                    batch_refiner["z_gnn"],
+                    batch_refiner["semantic_views"],
+                    batch_refiner.get("presence_features"),
+                )
+            elif feature_kind in {"directional_weighted_gated", "directional_weighted_projected", "relation_projected"}:
+                outputs = refiner_model(
+                    batch_refiner["z_gnn"],
+                    batch_refiner["semantic_views"],
+                    batch_refiner["structural_features"],
+                )
+            else:
+                raise ValueError(f"Unsupported refiner feature kind: {feature_kind}")
+        else:
+            outputs = refiner_model(batch_refiner)
         if isinstance(outputs, tuple):
             if len(outputs) == 3:
                 refiner_logits, gate_logits, gate_prob = outputs
@@ -4066,6 +4398,7 @@ class StageRunner:
         refiner_model,
         router_features,
         refiner_features,
+        semantic_view_mode,
         base_logits,
         base_prob,
         base_pred,
@@ -4113,7 +4446,7 @@ class StageRunner:
                 routed_mask[routed_idx] = True
                 routed_forward = self._glance_refiner_forward(
                     refiner_model,
-                    refiner_features[routed_idx].to(refiner_device),
+                    _refiner_feature_lookup(refiner_features, routed_idx, semantic_view_mode, refiner_device),
                     batch_base_logits=base_logits[routed_idx].to(refiner_device),
                 )
                 final_logits[routed_idx] = routed_forward["mixed_logits"].cpu()
@@ -4121,7 +4454,7 @@ class StageRunner:
                 final_pred[routed_idx] = routed_forward["mixed_logits"].cpu().argmax(dim=1)
                 full_forward = self._glance_refiner_forward(
                     refiner_model,
-                    refiner_features[batch_idx].to(refiner_device),
+                    _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, refiner_device),
                     batch_base_logits=base_logits[batch_idx].to(refiner_device),
                 )
                 full_ref_loss = F.cross_entropy(
@@ -4153,6 +4486,7 @@ class StageRunner:
         refiner_model,
         router_features,
         refiner_features,
+        semantic_view_mode,
         base_logits,
         base_prob,
         base_pred,
@@ -4193,7 +4527,7 @@ class StageRunner:
 
                 full_forward = self._glance_refiner_forward(
                     refiner_model,
-                    refiner_features[batch_idx].to(refiner_device),
+                    _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, refiner_device),
                     batch_base_logits=base_logits[batch_idx].to(refiner_device),
                 )
                 full_ref_logits = full_forward["mixed_logits"].detach().cpu()
@@ -4319,6 +4653,7 @@ class StageRunner:
         router_features,
         refiner_features,
         semantic_views,
+        semantic_view_mode,
         activation,
         batch_size,
         max_epochs,
@@ -4351,7 +4686,22 @@ class StageRunner:
             hidden_dim=128,
             dropout=0.1,
         )
-        if bool(refiner_explicit_gate):
+        refiner_feature_kind = refiner_features.get("feature_kind") if isinstance(refiner_features, dict) else None
+        if refiner_feature_kind == "prompt_expert_bundle_v1":
+            component_dims = {
+                name: int(refiner_features["semantic_views"][name].shape[1])
+                for name in PromptExpertBundleRefinerMLP.COMPONENT_ORDER
+            }
+            refiner_model = PromptExpertBundleRefinerMLP(
+                z_gnn_dim=int(refiner_features["z_gnn"].shape[1]),
+                component_dims=component_dims,
+                proj_dim=256,
+                hidden_dim=128,
+                structural_dim=int(refiner_features["structural_features"].shape[1]),
+                activation=activation,
+                dropout=0.1,
+            )
+        elif bool(refiner_explicit_gate):
             refiner_model = GatedGlanceRefinerMLP(
                 input_dim=int(refiner_features.shape[1]),
                 hidden_dim=128,
@@ -4410,7 +4760,7 @@ class StageRunner:
             ):
                 batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
                 batch_router_x = router_features[batch_idx].to(self.device)
-                batch_refiner = refiner_features[batch_idx].to(self.device)
+                batch_refiner = _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, self.device)
                 batch_labels = labels_t[batch_idx].to(self.device)
                 batch_base_logits = logits_gnn[batch_idx].to(self.device)
                 batch_base_pred = pred_gnn[batch_idx].to(self.device)
@@ -4443,7 +4793,7 @@ class StageRunner:
                 if int(routed_labels.numel()) > 0:
                     routed_forward = self._glance_refiner_forward(
                         refiner_model,
-                        batch_refiner[routed_mask],
+                        _refiner_feature_lookup(refiner_features, batch_idx[routed_mask], semantic_view_mode, self.device),
                         batch_base_logits=batch_base_logits[routed_mask],
                     )
                     routed_sample_weights = self._glance_refiner_sample_weights(
@@ -4544,6 +4894,7 @@ class StageRunner:
                 refiner_model,
                 router_features,
                 refiner_features,
+                semantic_view_mode,
                 logits_gnn,
                 p_gnn,
                 pred_gnn,
@@ -4558,6 +4909,7 @@ class StageRunner:
                 refiner_model,
                 router_features,
                 refiner_features,
+                semantic_view_mode,
                 logits_gnn,
                 p_gnn,
                 pred_gnn,
@@ -4572,6 +4924,7 @@ class StageRunner:
                 refiner_model,
                 router_features,
                 refiner_features,
+                semantic_view_mode,
                 logits_gnn,
                 p_gnn,
                 pred_gnn,
@@ -4710,6 +5063,7 @@ class StageRunner:
             refiner_model,
             router_features,
             refiner_features,
+            semantic_view_mode,
             logits_gnn,
             p_gnn,
             pred_gnn,
@@ -4724,6 +5078,7 @@ class StageRunner:
             refiner_model,
             router_features,
             refiner_features,
+            semantic_view_mode,
             logits_gnn,
             p_gnn,
             pred_gnn,
@@ -4738,6 +5093,7 @@ class StageRunner:
             refiner_model,
             router_features,
             refiner_features,
+            semantic_view_mode,
             logits_gnn,
             p_gnn,
             pred_gnn,
@@ -4857,6 +5213,7 @@ class StageRunner:
             refiner_model,
             router_features,
             refiner_features,
+            semantic_view_mode,
             logits_gnn,
             p_gnn,
             pred_gnn,
@@ -4870,6 +5227,7 @@ class StageRunner:
             refiner_model,
             router_features,
             refiner_features,
+            semantic_view_mode,
             logits_gnn,
             p_gnn,
             pred_gnn,
@@ -4883,6 +5241,7 @@ class StageRunner:
             refiner_model,
             router_features,
             refiner_features,
+            semantic_view_mode,
             logits_gnn,
             p_gnn,
             pred_gnn,
@@ -9416,20 +9775,28 @@ class StageRunner:
         strict_train_idx = self._strict_glance_train_idx(train_idx, cap=configured_train_cap)
         train_cap_mode = "full_train_split" if configured_train_cap <= 0 else "capped_train_subset"
         semantic_view_mode = semantic.get("semantic_view_mode", semantic["manifest"].get("semantic_view_mode", "legacy_inbound_khop"))
-        semantic_views = self._build_k_hop_semantic_views(
-            semantic.get("precomputed_views") if semantic.get("precomputed_views") is not None else semantic["embeddings"],
-            self.data.get("edge_index"),
-        )
+        if semantic_view_mode == "prompt_expert_bundle_v1":
+            refiner_features, semantic_views = self._build_prompt_expert_semantic_views(
+                semantic.get("prompt_expert_bundle"),
+                z_gnn,
+            )
+            prompt_expert_active_components = list(refiner_features.get("active_components", []))
+        else:
+            semantic_views = self._build_k_hop_semantic_views(
+                semantic.get("precomputed_views") if semantic.get("precomputed_views") is not None else semantic["embeddings"],
+                self.data.get("edge_index"),
+            )
+            refiner_features = torch.cat(
+                [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+                dim=1,
+            ).detach().cpu().float()
+            prompt_expert_active_components = []
         refiner_explicit_gate = bool(getattr(self.args, "joint_refiner_explicit_gate", False))
         refiner_target_mode = str(getattr(self.args, "joint_refiner_target_mode", "predict")).lower()
         refiner_weight_mode = str(getattr(self.args, "joint_refiner_weight_mode", "off")).lower()
         refiner_base_wrong_weight = float(getattr(self.args, "joint_refiner_base_wrong_weight", 2.0))
         refiner_utility_weight = float(getattr(self.args, "joint_refiner_utility_weight", 3.0))
         refiner_gate_weight = float(getattr(self.args, "joint_refiner_gate_weight", 0.5))
-        refiner_features = torch.cat(
-            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
-            dim=1,
-        ).detach().cpu().float()
 
         original_node_features_bundle = self._strict_glance_original_node_features()
         q_bundle = self._fit_strict_glance_q_probs(
@@ -9486,6 +9853,7 @@ class StageRunner:
                 router_features=router_features,
                 refiner_features=refiner_features,
                 semantic_views=semantic_views,
+                semantic_view_mode=semantic_view_mode,
                 activation=activation,
                 batch_size=batch_size,
                 max_epochs=max_epochs,
@@ -9783,17 +10151,34 @@ class StageRunner:
                 "scaler": scaler_state,
             },
             "refiner_architecture": {
-                "type": "gated_glance_joint_refiner_mlp" if refiner_explicit_gate else "glance_joint_refiner_mlp",
-                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "type": (
+                    "prompt_expert_bundle_refiner_mlp"
+                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    else ("gated_glance_joint_refiner_mlp" if refiner_explicit_gate else "glance_joint_refiner_mlp")
+                ),
+                "input": (
+                    "[z_gnn || ego_proj || graph_following_proj || graph_follower_proj || graph_fused || tweet_proj || conflict_proj || log1p(count_following) || log1p(count_follower) || has_following || has_follower]"
+                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    else "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]"
+                ),
                 "hidden_dim": 128,
                 "activation": activation,
                 "dropout": 0.1,
                 "output_dim": int(logits_gnn.shape[1]),
                 "semantic_view_mode": semantic_view_mode,
-                "feature_kind": "flat_concat",
-                "semantic_view_names": ["ego", "hop1", "hop2"],
+                "feature_kind": "prompt_expert_bundle_v1" if semantic_view_mode == "prompt_expert_bundle_v1" else "flat_concat",
+                "semantic_view_names": (
+                    ["ego", "graph_following", "graph_follower", "tweet", "conflict"]
+                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    else ["ego", "hop1", "hop2"]
+                ),
+                "active_components": prompt_expert_active_components,
+                "proj_dim": 256 if semantic_view_mode == "prompt_expert_bundle_v1" else None,
+                "graph_gate_input": ["log1p(count_following)", "log1p(count_follower)", "has_following", "has_follower"]
+                if semantic_view_mode == "prompt_expert_bundle_v1"
+                else None,
                 "target_mode": refiner_target_mode,
-                "explicit_gate": bool(refiner_explicit_gate),
+                "explicit_gate": bool(refiner_explicit_gate) if semantic_view_mode != "prompt_expert_bundle_v1" else False,
                 "weight_mode": refiner_weight_mode,
             },
             "training_contract": {
@@ -9824,7 +10209,7 @@ class StageRunner:
                 "router_training_objective": "base_wrong_reliability_bce_plus_pairwise_ranking",
                 "auxiliary_router_target": "none_oracle_advantage_retained_for_diagnostics_only",
                 "refiner_target_mode": refiner_target_mode,
-                "refiner_explicit_gate": bool(refiner_explicit_gate),
+                "refiner_explicit_gate": bool(refiner_explicit_gate) if semantic_view_mode != "prompt_expert_bundle_v1" else False,
                 "refiner_weight_mode": refiner_weight_mode,
                 "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
                 "refiner_utility_weight": float(refiner_utility_weight),

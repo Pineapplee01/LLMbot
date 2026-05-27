@@ -16,9 +16,10 @@ from sklearn.metrics import f1_score
 from model_building import _labels_to_index, _score_logits
 from parser_args import parser_args
 from stage_registry import get_stage_spec, resolve_stage_spec
-from stage_helpers import MissingFrozenArtifactError, PHASE_A_CONTRACT, PHASE_A_DISABLED_COMPONENTS, _resolve_device
+from artifact_contracts import MissingFrozenArtifactError, PHASE_A_CONTRACT, PHASE_A_DISABLED_COMPONENTS
+from runtime_env import _resolve_device
 from stage_runner import StageRunner
-from trainer import run_legacy_graph_seed
+from trainer_distillation import run_legacy_graph_seed
 from trainer_preparation import build_or_load_faithful_gats, build_or_load_frozen_g0, load_frozen_g0
 from trainer_semantic import run_semantic_finetune_seed
 from utils import (

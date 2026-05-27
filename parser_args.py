@@ -507,7 +507,8 @@ def parser_args(argv=None):
         help=(
             "Optional refiner-only semantic override for joint_router_refinement. "
             "Keeps graph_detector_prepare backbone features unchanged and only replaces the joint refiner semantic source. "
-            "Accepts either a plain [num_nodes, d] tensor or a prompt-cache payload with ego/hop1/hop2 tensors."
+            "Accepts either a plain [num_nodes, d] tensor, a prompt-cache payload with ego/hop1/hop2 tensors, "
+            "or a prompt-expert bundle payload with ego/graph_following/graph_follower/tweet/conflict components."
         ),
     )
     parser.add_argument(

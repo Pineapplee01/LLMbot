@@ -29,6 +29,39 @@ python precompute.py \
   --output_path datasets/TwiBot-20/glance_qwen3_prompt_cache.pt
 ```
 
+Support-extended raw preprocessing:
+
+```bash
+python preprocess.py \
+  --dataset_root ../datasets/TwiBot-20 \
+  --mode artifacts
+```
+
+This helper is intentionally separate from `main.py`. It reuses the current
+11826 labeled `norm_user_text.json` prefix, appends support-node texts from
+`support.json`, rebuilds the full TwiBot-20 graph from the official
+`edge.csv` with normalized `friend` / `follow` directions, and writes:
+
+- `edge_new.json`
+- `norm_user_text_new.json`
+- `edge_index_new.pt`
+- `edge_type_new.pt`
+- `support_idx.pt`
+- `preprocess_manifest_new.json`
+
+It does not rewrite `labels.pt`, `train_idx.pt`, `valid_idx.pt`, or
+`test_idx.pt`; support nodes are added to the node/semantic space while the
+supervision split stays unchanged.
+
+Optional support-only RoBERTa encoding:
+
+```bash
+python preprocess.py \
+  --dataset_root ../datasets/TwiBot-20 \
+  --mode encode_support \
+  --roberta_model_path /path/to/finetuned-roberta
+```
+
 Prompt-cache helper modes:
 
 - legacy GLANCE-style:
@@ -39,6 +72,13 @@ Prompt-cache helper modes:
 - relation-aware social-context:
   - `relation_aware_ego`
   - `relation_aware_1hop`
+- prompt-expert bundle v1:
+  - `expert_ego`
+  - `expert_graph_following`
+  - `expert_graph_follower`
+  - `expert_tweet`
+  - `expert_conflict`
+  - `expert_concat_v1`
 
 Example relation-aware 1-hop cache:
 
@@ -51,6 +91,26 @@ python precompute.py \
   --output_path datasets/TwiBot-20/glance_qwen3_prompt_cache_relation_aware_1hop.pt
 ```
 
+Example prompt-expert bundle cache:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode expert_concat_v1 \
+  --explain_model_path /path/to/qwen-instruct \
+  --output_path datasets/TwiBot-20/glance_prompt_expert_concat_v1_qwen3_embed.pt
+```
+
+For `expert_ego` and `expert_concat_v1`, `precompute.py` now resolves
+`--explain_model_path` in offline-first mode:
+
+- if the argument points to a local snapshot path, it loads that model
+- if the argument is an HF repo id that already exists in the local HF cache, it
+  resolves the cached snapshot
+- if no local explain-model snapshot is available, it falls back to the built-in
+  deterministic profile-card explanation instead of blocking on a HuggingFace
+  download attempt
+
 Hidden compatibility aliases still parse for one migration window:
 
 - `--stage`
@@ -61,6 +121,32 @@ Hidden compatibility aliases still parse for one migration window:
 - `--g0_feature_path`
 
 Use canonical flags in new commands, docs, manifests, and analysis notes.
+
+## Implementation Ownership Snapshot 2026-05-26
+
+This round changed module ownership without changing the public CLI contract.
+
+Current owner split:
+
+- `artifact_contracts.py`: artifact/path/provenance contracts used by the active mainline
+- `runtime_env.py`: device and CUDA runtime helpers
+- `stage_runner.py`: shared `StageRunner` skeleton, dependency loading, provenance wiring, and top-level dispatch
+- `trainer_graph.py`: shared graph bundle / provenance / edge-override rerun owner, plus public graph diagnostic executors
+- `trainer_glance.py`: GLANCE owner for shared semantic wiring, public `joint_router_refinement`, and migrated internal GLANCE execution lanes
+- `trainer_preparation.py`: real owner for `graph_detector_prepare` and `graph_calibration_prepare`
+- `trainer_semantic.py`: real owner for `semantic_encoder_finetune`
+- `trainer_distillation.py`: real owner for legacy distillation trainers and `run_legacy_graph_seed`
+- `trainer.py`: thin compatibility facade only
+
+Still transitional:
+
+- `trainer_legacy_impl.py` still contains remaining GLANCE helper tails
+  (especially prompt-expert / relation-aware helper clusters) and duplicate
+  legacy blocks
+
+Removed in this round:
+
+- `stage_helpers.py` is no longer part of the active mainline
 
 ## Public Task Surface
 
@@ -326,12 +412,31 @@ Prompt-cache experiment note:
 - If the goal is to test prompt caches without changing the base detector,
   keep `graph_detector_prepare` on the original semantic tensor and pass the
   prompt cache through `--joint_refiner_embedding_path`; prompt payloads with
-  `ego/hop1/hop2` are consumed as direct refiner views instead of being fed
-  back into the backbone.
+  `ego/hop1/hop2` are consumed as direct refiner views, while
+  prompt-expert payloads with `ego/graph_following/graph_follower/tweet/conflict`
+  are consumed through `semantic_view_mode=prompt_expert_bundle_v1` and kept
+  strictly on the refiner branch instead of being fed back into the backbone.
 - When a high-performing backbone artifact already exists, the same ablation
   can be run read-only through `--external_frozen_g0_root` together with
   `--joint_refiner_embedding_path`, so the prompt cache changes only the
   refiner branch and reuses the frozen backbone provenance unchanged.
+
+Prompt-expert bundle v1 note:
+
+- `expert_ego` uses a two-stage flow: generate an explanation from the
+  structured profile card, then embed that explanation with Qwen. When no local
+  explain-model snapshot is available, it falls back to the deterministic
+  profile-card explanation path rather than attempting a blocking HF download.
+- `expert_graph_following`, `expert_graph_follower`, `expert_tweet`, and
+  `expert_conflict` stay embedding-only and write component tensors plus scalar
+  side channels into one payload.
+- `expert_concat_v1` shares the same offline-first explain path for its `ego`
+  component and still concatenates `ego/graph_following/graph_follower/tweet/conflict`
+  on output.
+- `joint_router_refinement` projects each expert view before routed-node
+  refinement and uses a lightweight graph-view gate over
+  `log1p(count_following)`, `log1p(count_follower)`, `has_following`, and
+  `has_follower`.
 
 ## Mainline Layout
 

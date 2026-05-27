@@ -1,3 +1,4076 @@
-"""GLANCE-related compatibility surface for active mainline."""
+import json
+from pathlib import Path
 
-from trainer_legacy_impl import StageRunner  # noqa: F401
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, f1_score, average_precision_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
+
+from artifact_contracts import MissingFrozenArtifactError
+from estimators import GlanceForContextResidualRiskSelector
+from estimators import parse_budget_list
+from router import GlanceReliabilityRouterMLP, fit_reliability_temperature
+from trainer_semantic import _classification_metrics_from_logits
+from utils import read_json, safe_torch_load, save_stage_artifacts, write_csv_rows, write_json, write_text
+
+
+def _infer_embedding_source_identity(path):
+    path = Path(path)
+    stem = path.stem.lower()
+    name = path.name.lower()
+    token = f"{stem} {name}"
+    if "qwen" in token:
+        return {
+            "semantic_backbone": "qwen_cached",
+            "lm_model": "qwen_cached",
+            "source_identity": "qwen_cached_embedding",
+        }
+    if "roberta" in token:
+        return {
+            "semantic_backbone": "roberta_finetuned",
+            "lm_model": "roberta-f",
+            "source_identity": "roberta_finetuned_embedding",
+        }
+    return {
+        "semantic_backbone": "external_embedding_unknown",
+        "lm_model": "external_embedding_unknown",
+        "source_identity": "external_embedding_unknown",
+    }
+
+
+def _direct_embedding_manifest(path):
+    identity = _infer_embedding_source_identity(path)
+    return {
+        "contract": "direct_embedding_fallback_v2",
+        "status": "completed_external_embedding",
+        "embeddings_path": str(Path(path)),
+        "source": "direct_embedding_path",
+        **identity,
+    }
+
+
+def _idx_numpy(idx):
+    if torch.is_tensor(idx):
+        return idx.detach().cpu().long().numpy()
+    return np.asarray(idx, dtype=np.int64)
+
+
+def _score_all(labels, pred):
+    labels_np = np.asarray(labels)
+    pred_np = np.asarray(pred)
+    return {
+        "accuracy": float(accuracy_score(labels_np, pred_np)),
+        "macro_f1": float(f1_score(labels_np, pred_np, average="macro", zero_division=0)),
+        "bot_f1": float(f1_score(labels_np, pred_np, average="binary", zero_division=0)),
+        "count": int(labels_np.shape[0]),
+    }
+
+
+def _delta_table(base_pred, new_pred, labels, idx_mask):
+    labels_np = np.asarray(labels)
+    base_pred = np.asarray(base_pred)
+    new_pred = np.asarray(new_pred)
+    affected = idx_mask.astype(bool)
+    base_correct = base_pred == labels_np
+    new_correct = new_pred == labels_np
+    fix = int((~base_correct & new_correct & affected).sum())
+    broke = int((base_correct & ~new_correct & affected).sum())
+    return {
+        "fix": fix,
+        "broke": broke,
+        "net": fix - broke,
+        "touched": int(affected.sum()),
+    }
+
+
+def _node_cross_entropy_vector(prob, labels):
+    prob_t = prob.detach().cpu().float() if torch.is_tensor(prob) else torch.tensor(prob, dtype=torch.float32)
+    labels_t = labels.detach().cpu().long() if torch.is_tensor(labels) else torch.tensor(labels, dtype=torch.long)
+    row = torch.arange(labels_t.numel(), dtype=torch.long)
+    return (-torch.log(prob_t[row, labels_t].clamp_min(1e-8))).cpu()
+
+
+_PROMPT_EXPERT_COMPONENT_ORDER = ("ego", "graph_following", "graph_follower", "tweet", "conflict")
+
+
+def _mask_from_idx(num_nodes, idx):
+    mask = np.zeros(num_nodes, dtype=bool)
+    mask[_idx_numpy(idx)] = True
+    return mask
+
+
+def _normalize_glance_advantage_target(advantage):
+    if advantage.numel() == 0:
+        return advantage
+    centered = advantage - advantage.mean()
+    scale = centered.std(unbiased=False).clamp_min(1e-6)
+    return centered / scale
+
+
+def _scale_glance_advantage_target(advantage):
+    if advantage.numel() == 0:
+        return advantage
+    scale = advantage.std(unbiased=False).clamp_min(1e-6)
+    return advantage / scale
+
+
+def _glance_oracle_topk_membership(advantage, k):
+    if advantage.numel() == 0:
+        return torch.zeros_like(advantage, dtype=torch.float32)
+    k = min(max(int(k), 1), int(advantage.numel()))
+    target = torch.zeros_like(advantage, dtype=torch.float32)
+    top_idx = torch.topk(advantage.detach(), k=k, largest=True, sorted=False).indices
+    target[top_idx] = 1.0
+    return target
+
+
+def _glance_pairwise_ranking_loss(scores, targets):
+    if scores.numel() < 2:
+        return scores.sum() * 0.0
+    score_diff = scores.unsqueeze(1) - scores.unsqueeze(0)
+    target_diff = targets.unsqueeze(1) - targets.unsqueeze(0)
+    pair_mask = torch.triu(torch.ones_like(target_diff, dtype=torch.bool), diagonal=1)
+    pair_mask = pair_mask & (target_diff.abs() > 1e-6)
+    if not bool(pair_mask.any().item()):
+        return scores.sum() * 0.0
+    signed_margin = torch.sign(target_diff[pair_mask]) * score_diff[pair_mask]
+    pair_weight = target_diff[pair_mask].abs()
+    loss = F.softplus(-signed_margin)
+    return (loss * pair_weight).sum() / pair_weight.sum().clamp_min(1e-6)
+
+
+def _safe_score_corr(x, y):
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if x.size != y.size or x.size < 2:
+        return None
+    x_std = float(np.std(x))
+    y_std = float(np.std(y))
+    if x_std <= 1e-12 or y_std <= 1e-12:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _safe_binary_score_metrics(labels, scores):
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if labels.size != scores.size or labels.size == 0:
+        return {
+            "positive_rate": 0.0,
+            "mean_score": 0.0,
+            "auroc": None,
+            "auprc": None,
+        }
+    metrics = {
+        "positive_rate": float(labels.mean()),
+        "mean_score": float(scores.mean()),
+        "auroc": None,
+        "auprc": None,
+    }
+    if np.unique(labels).size < 2:
+        return metrics
+    try:
+        metrics["auroc"] = float(roc_auc_score(labels, scores))
+    except Exception:
+        metrics["auroc"] = None
+    try:
+        metrics["auprc"] = float(average_precision_score(labels, scores))
+    except Exception:
+        metrics["auprc"] = None
+    return metrics
+
+
+def _safe_advantage_router_metrics(advantage, scores, routed_mask=None):
+    advantage = np.asarray(advantage, dtype=np.float64).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if advantage.size != scores.size or advantage.size == 0:
+        return {
+            "positive_rate": 0.0,
+            "mean_advantage": 0.0,
+            "score_adv_corr": None,
+            "auroc": None,
+            "auprc": None,
+        }
+    labels = (advantage > 0.0).astype(np.int64)
+    metrics = {
+        "positive_rate": float(labels.mean()),
+        "mean_advantage": float(advantage.mean()),
+        "score_adv_corr": _safe_score_corr(scores, advantage),
+        "auroc": None,
+        "auprc": None,
+    }
+    if np.unique(labels).size >= 2:
+        try:
+            metrics["auroc"] = float(roc_auc_score(labels, scores))
+        except Exception:
+            metrics["auroc"] = None
+        try:
+            metrics["auprc"] = float(average_precision_score(labels, scores))
+        except Exception:
+            metrics["auprc"] = None
+    if routed_mask is not None:
+        routed_mask = np.asarray(routed_mask, dtype=bool).reshape(-1)
+        if routed_mask.size == labels.size and routed_mask.any():
+            routed_labels = labels[routed_mask]
+            metrics["routed_positive_precision"] = float(routed_labels.mean())
+            metrics["routed_mean_advantage"] = float(advantage[routed_mask].mean())
+            positive_count = int(labels.sum())
+            metrics["routed_positive_coverage"] = float(routed_labels.sum() / positive_count) if positive_count > 0 else 0.0
+            budget = int(routed_mask.sum())
+            oracle_idx = np.argsort(-advantage)[:budget]
+            routed_idx = np.flatnonzero(routed_mask)
+            metrics["routed_oracle_topk_overlap"] = float(
+                len(set(routed_idx.tolist()).intersection(set(oracle_idx.tolist()))) / max(budget, 1)
+            )
+        else:
+            metrics["routed_positive_precision"] = 0.0
+            metrics["routed_mean_advantage"] = 0.0
+            metrics["routed_positive_coverage"] = 0.0
+            metrics["routed_oracle_topk_overlap"] = 0.0
+    return metrics
+
+
+class GlanceRefinerMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, activation="leakyrelu", dropout=0.1):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act = nn.LeakyReLU()
+        elif activation == "relu":
+            act = nn.ReLU()
+        elif activation == "elu":
+            act = nn.ELU()
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.net = nn.Sequential(
+            nn.Linear(int(input_dim), int(hidden_dim)),
+            act,
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 2),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class GatedGlanceRefinerMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, activation="leakyrelu", dropout=0.1):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act_factory = nn.LeakyReLU
+        elif activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "elu":
+            act_factory = nn.ELU
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.shared = nn.Sequential(
+            nn.Linear(int(input_dim), int(hidden_dim)),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+        )
+        self.classifier = nn.Linear(int(hidden_dim), 2)
+        self.gate_head = nn.Linear(int(hidden_dim), 1)
+
+    def forward(self, x):
+        hidden = self.shared(x)
+        logits = self.classifier(hidden)
+        gate_logits = self.gate_head(hidden).squeeze(-1)
+        gate_prob = torch.sigmoid(gate_logits)
+        return logits, gate_logits, gate_prob
+
+
+class PromptExpertBundleRefinerMLP(nn.Module):
+    COMPONENT_ORDER = _PROMPT_EXPERT_COMPONENT_ORDER
+
+    def __init__(
+        self,
+        z_gnn_dim,
+        component_dims,
+        proj_dim=256,
+        hidden_dim=128,
+        structural_dim=4,
+        activation="leakyrelu",
+        dropout=0.1,
+    ):
+        super().__init__()
+        activation = str(activation).lower()
+        if activation == "leakyrelu":
+            act_factory = nn.LeakyReLU
+        elif activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "elu":
+            act_factory = nn.ELU
+        else:
+            raise ValueError(f"Unsupported refiner activation: {activation}")
+        self.component_dims = {name: int(component_dims[name]) for name in self.COMPONENT_ORDER}
+        self.z_gnn_dim = int(z_gnn_dim)
+        self.proj_dim = int(proj_dim)
+        self.structural_dim = int(structural_dim)
+        self.projectors = nn.ModuleDict(
+            {
+                name: nn.Sequential(
+                    nn.Linear(self.component_dims[name], self.proj_dim),
+                    act_factory(),
+                    nn.Dropout(float(dropout)),
+                )
+                for name in self.COMPONENT_ORDER
+            }
+        )
+        self.graph_gate = nn.Linear(self.structural_dim, 2)
+        total_proj_slots = 6
+        self.classifier = nn.Sequential(
+            nn.Linear(self.z_gnn_dim + total_proj_slots * self.proj_dim + self.structural_dim, int(hidden_dim)),
+            act_factory(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 2),
+        )
+
+    def forward(self, z_gnn, semantic_views, structural_features):
+        projected = {
+            name: self.projectors[name](semantic_views[name])
+            for name in self.COMPONENT_ORDER
+        }
+        gate_weights = torch.softmax(self.graph_gate(structural_features), dim=1)
+        graph_fused = (
+            gate_weights[:, 0:1] * projected["graph_following"]
+            + gate_weights[:, 1:2] * projected["graph_follower"]
+        )
+        x = torch.cat(
+            [
+                z_gnn,
+                projected["ego"],
+                projected["graph_following"],
+                projected["graph_follower"],
+                graph_fused,
+                projected["tweet"],
+                projected["conflict"],
+                structural_features,
+            ],
+            dim=1,
+        )
+        return self.classifier(x)
+
+
+def _normalize_semantic_payload(payload):
+    payload_keys = []
+    precomputed_views = None
+    prompt_expert_bundle = None
+    embeddings = payload
+    if isinstance(payload, dict):
+        payload_keys = sorted(str(key) for key in payload.keys())
+        direct_views = {}
+        for view_name in ("ego", "hop1", "hop2"):
+            if view_name not in payload:
+                continue
+            view_value = payload[view_name]
+            if not torch.is_tensor(view_value):
+                try:
+                    view_value = torch.as_tensor(view_value)
+                except Exception:
+                    continue
+            if view_value.dim() != 2:
+                continue
+            direct_views[view_name] = view_value.detach().cpu().float()
+        if len(direct_views) == 3:
+            precomputed_views = direct_views
+        expert_component_tensors = {}
+        for component_name in ("ego", "graph_following", "graph_follower", "tweet", "conflict"):
+            if component_name not in payload:
+                continue
+            component_value = payload[component_name]
+            if not torch.is_tensor(component_value):
+                try:
+                    component_value = torch.as_tensor(component_value)
+                except Exception:
+                    continue
+            if component_value.dim() != 2:
+                continue
+            expert_component_tensors[component_name] = component_value.detach().cpu().float()
+        expert_scalar_tensors = {}
+        for scalar_key in (
+            "count_following",
+            "count_follower",
+            "has_following",
+            "has_follower",
+            "rt_ratio",
+            "url_ratio",
+            "hashtag_ratio",
+        ):
+            if scalar_key not in payload:
+                continue
+            scalar_value = payload[scalar_key]
+            if not torch.is_tensor(scalar_value):
+                try:
+                    scalar_value = torch.as_tensor(scalar_value)
+                except Exception:
+                    continue
+            if scalar_value.dim() == 2 and int(scalar_value.shape[1]) == 1:
+                scalar_value = scalar_value.view(-1)
+            if scalar_value.dim() != 1:
+                continue
+            expert_scalar_tensors[scalar_key] = scalar_value.detach().cpu().float().view(-1)
+        payload_semantic_view_mode = str(payload.get("semantic_view_mode", "") or "").strip().lower()
+        if expert_component_tensors or expert_scalar_tensors or payload_semantic_view_mode == "prompt_expert_bundle_v1":
+            active_components = payload.get("active_components")
+            if active_components is None:
+                active_components = list(expert_component_tensors.keys())
+            elif isinstance(active_components, str):
+                active_components = [active_components]
+            else:
+                active_components = [str(item) for item in active_components]
+            prompt_expert_bundle = {
+                "component_tensors": expert_component_tensors,
+                "scalar_tensors": expert_scalar_tensors,
+                "active_components": list(active_components),
+                "semantic_view_mode": "prompt_expert_bundle_v1",
+            }
+        for candidate_key in ("embeddings", "features", "x"):
+            if candidate_key in payload:
+                embeddings = payload[candidate_key]
+                break
+        else:
+            if precomputed_views is not None:
+                embeddings = precomputed_views["ego"]
+    if not torch.is_tensor(embeddings):
+        embeddings = torch.as_tensor(embeddings)
+    embeddings = embeddings.detach().cpu().float()
+    if precomputed_views is not None:
+        expected_nodes = int(embeddings.shape[0]) if embeddings.dim() == 2 else int(precomputed_views["ego"].shape[0])
+        for view_name, view_tensor in precomputed_views.items():
+            if view_tensor.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"Semantic payload view {view_name} must be 2-D, got {tuple(view_tensor.shape)}."
+                )
+            if int(view_tensor.shape[0]) != expected_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Semantic payload view {view_name} has {int(view_tensor.shape[0])} nodes, expected {expected_nodes}."
+                )
+    if prompt_expert_bundle is not None:
+        expected_nodes = int(embeddings.shape[0]) if embeddings.dim() == 2 else None
+        if expected_nodes is None:
+            expert_components = prompt_expert_bundle["component_tensors"]
+            if expert_components:
+                expected_nodes = int(next(iter(expert_components.values())).shape[0])
+        if expected_nodes is None:
+            raise MissingFrozenArtifactError(
+                "Prompt-expert semantic payload must provide either a 2-D embeddings tensor or at least one expert component tensor."
+            )
+        for component_name, component_tensor in prompt_expert_bundle["component_tensors"].items():
+            if component_tensor.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert component {component_name} must be 2-D, got {tuple(component_tensor.shape)}."
+                )
+            if int(component_tensor.shape[0]) != expected_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert component {component_name} has {int(component_tensor.shape[0])} nodes, expected {expected_nodes}."
+                )
+        for scalar_key, scalar_tensor in prompt_expert_bundle["scalar_tensors"].items():
+            if scalar_tensor.dim() != 1:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert scalar {scalar_key} must be 1-D, got {tuple(scalar_tensor.shape)}."
+                )
+            if int(scalar_tensor.shape[0]) != expected_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert scalar {scalar_key} has {int(scalar_tensor.shape[0])} nodes, expected {expected_nodes}."
+                )
+    return embeddings, precomputed_views, prompt_expert_bundle, payload_keys
+
+
+def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, device):
+    batch_idx = batch_idx.to(device=device)
+    if isinstance(refiner_features, dict) and refiner_features.get("feature_kind") == "prompt_expert_bundle_v1":
+        return {
+            "feature_kind": "prompt_expert_bundle_v1",
+            "z_gnn": refiner_features["z_gnn"][batch_idx].to(device),
+            "semantic_views": {
+                key: value[batch_idx].to(device)
+                for key, value in refiner_features["semantic_views"].items()
+                if torch.is_tensor(value) and value.dim() == 2
+            },
+            "structural_features": refiner_features["structural_features"][batch_idx].to(device),
+        }
+    return refiner_features[batch_idx].to(device)
+
+
+class GlanceStageMixin:
+    """Shared GLANCE input/runtime owner for the active mainline."""
+
+    def _glance_refiner_source_stage(self):
+        source = str(getattr(self.args, "glance_refiner_source", "oracle")).lower()
+        if source == "oracle":
+            return "glance_oracle_refine"
+        if source == "full_graph":
+            return "glance_full_graph_refine"
+        raise ValueError(f"Unsupported --glance_refiner_source: {source}")
+
+    def _load_glance_refiner_artifact(self):
+        stage_name = self._glance_refiner_source_stage()
+        manifest = self._require_stage_json(stage_name, "manifest")
+        metrics = self._require_stage_json(stage_name, "metrics")
+        outputs = self._require_stage_tensor(stage_name, "outputs")
+        checkpoint = self._require_stage_tensor(stage_name, "checkpoint")
+        per_node_rows = self._require_stage_jsonl(stage_name, "per_node_test")
+        analysis_summary = self._read_stage_json(stage_name, "analysis_summary")
+        return {
+            "stage_name": stage_name,
+            "manifest": manifest,
+            "metrics": metrics,
+            "outputs": outputs,
+            "checkpoint": checkpoint,
+            "per_node_rows": per_node_rows,
+            "analysis_summary": analysis_summary,
+        }
+
+    def _oracle_wrong_node_masks(self, base_pred):
+        base_pred = np.asarray(base_pred, dtype=np.int64).reshape(-1)
+        wrong = base_pred != self.labels
+        return {
+            "train": wrong & self.train_mask,
+            "valid": wrong & self.val_mask,
+            "test": wrong & self.test_mask,
+            "all": wrong,
+        }
+
+    def _build_k_hop_semantic_views(self, semantic_embeddings, edge_index):
+        direct_views = None
+        if isinstance(semantic_embeddings, dict):
+            maybe_direct = {}
+            for view_name in ("ego", "hop1", "hop2"):
+                if view_name not in semantic_embeddings:
+                    maybe_direct = None
+                    break
+                view_tensor = semantic_embeddings[view_name]
+                if not torch.is_tensor(view_tensor):
+                    view_tensor = torch.as_tensor(view_tensor)
+                maybe_direct[view_name] = view_tensor.detach().cpu().float()
+            if maybe_direct is not None:
+                direct_views = maybe_direct
+                x_sem = direct_views["ego"]
+            else:
+                base_tensor = None
+                for key in ("embeddings", "features", "x"):
+                    if key in semantic_embeddings:
+                        base_tensor = semantic_embeddings[key]
+                        break
+                if base_tensor is None:
+                    raise ValueError("semantic_embeddings dict must provide ego/hop1/hop2 or embeddings/features/x.")
+                if not torch.is_tensor(base_tensor):
+                    base_tensor = torch.as_tensor(base_tensor)
+                x_sem = base_tensor.detach().cpu().float()
+        else:
+            x_sem = semantic_embeddings.detach().cpu().float()
+        num_nodes = int(x_sem.shape[0])
+        if edge_index is None:
+            zero = torch.zeros_like(x_sem)
+            counts = np.zeros(num_nodes, dtype=np.int64)
+            return {
+                "ego": x_sem,
+                "hop1": direct_views["hop1"].clone() if direct_views is not None else zero.clone(),
+                "hop2": direct_views["hop2"].clone() if direct_views is not None else zero.clone(),
+                "count_1hop": counts.copy(),
+                "count_2hop": counts.copy(),
+            }
+
+        edge_index_t = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        if edge_index_t.dim() != 2 or edge_index_t.size(0) != 2:
+            raise ValueError("edge_index must be shaped [2, num_edges] for glance_oracle_refine.")
+        if edge_index_t.numel() == 0:
+            zero = torch.zeros_like(x_sem)
+            counts = np.zeros(num_nodes, dtype=np.int64)
+            return {
+                "ego": x_sem,
+                "hop1": direct_views["hop1"].clone() if direct_views is not None else zero.clone(),
+                "hop2": direct_views["hop2"].clone() if direct_views is not None else zero.clone(),
+                "count_1hop": counts.copy(),
+                "count_2hop": counts.copy(),
+            }
+
+        src = edge_index_t[0].numpy()
+        dst = edge_index_t[1].numpy()
+        neighbors_in = [[] for _ in range(num_nodes)]
+        for s, d in zip(src.tolist(), dst.tolist()):
+            if 0 <= s < num_nodes and 0 <= d < num_nodes:
+                neighbors_in[d].append(s)
+
+        hop1 = direct_views["hop1"].clone() if direct_views is not None else torch.zeros_like(x_sem)
+        hop2 = direct_views["hop2"].clone() if direct_views is not None else torch.zeros_like(x_sem)
+        count_1hop = np.zeros(num_nodes, dtype=np.int64)
+        count_2hop = np.zeros(num_nodes, dtype=np.int64)
+
+        for node_idx in range(num_nodes):
+            n1 = sorted(set(int(n) for n in neighbors_in[node_idx] if int(n) != node_idx))
+            count_1hop[node_idx] = len(n1)
+            if direct_views is None and n1:
+                hop1[node_idx] = x_sem[torch.tensor(n1, dtype=torch.long)].mean(dim=0)
+
+            n1_set = set(n1)
+            n2 = set()
+            for neigh in n1:
+                for cand in neighbors_in[neigh]:
+                    cand = int(cand)
+                    if cand == node_idx or cand in n1_set:
+                        continue
+                    n2.add(cand)
+            n2 = sorted(n2)
+            count_2hop[node_idx] = len(n2)
+            if direct_views is None and n2:
+                hop2[node_idx] = x_sem[torch.tensor(n2, dtype=torch.long)].mean(dim=0)
+
+        return {
+            "ego": x_sem,
+            "hop1": hop1,
+            "hop2": hop2,
+            "count_1hop": count_1hop,
+            "count_2hop": count_2hop,
+        }
+
+    def _build_prompt_expert_semantic_views(self, expert_bundle, z_gnn):
+        if not expert_bundle:
+            raise MissingFrozenArtifactError(
+                "prompt_expert_bundle_v1 requires expert_bundle payload metadata from the semantic cache."
+            )
+        num_nodes = int(z_gnn.shape[0])
+        component_tensors = dict(expert_bundle.get("component_tensors", {}))
+        base_component = next(iter(component_tensors.values()), None)
+        if base_component is None:
+            raise MissingFrozenArtifactError(
+                "prompt_expert_bundle_v1 requires at least one of ego/graph_following/graph_follower/tweet/conflict in the prompt cache payload."
+            )
+        semantic_dim = int(base_component.shape[1])
+        zero_component = torch.zeros((num_nodes, semantic_dim), dtype=torch.float32)
+        semantic_views = {}
+        for component_name in _PROMPT_EXPERT_COMPONENT_ORDER:
+            component_value = component_tensors.get(component_name)
+            if component_value is None:
+                semantic_views[component_name] = zero_component.clone()
+                continue
+            if int(component_value.shape[0]) != num_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert component {component_name} has {int(component_value.shape[0])} nodes, expected {num_nodes}."
+                )
+            semantic_views[component_name] = component_value.detach().cpu().float()
+
+        scalar_tensors = dict(expert_bundle.get("scalar_tensors", {}))
+
+        def _scalar(name):
+            value = scalar_tensors.get(name)
+            if value is None:
+                return torch.zeros(num_nodes, dtype=torch.float32)
+            value = value.detach().cpu().float().view(-1)
+            if int(value.shape[0]) != num_nodes:
+                raise MissingFrozenArtifactError(
+                    f"Prompt-expert scalar {name} has {int(value.shape[0])} nodes, expected {num_nodes}."
+                )
+            return value
+
+        count_following = _scalar("count_following")
+        count_follower = _scalar("count_follower")
+        has_following = _scalar("has_following")
+        has_follower = _scalar("has_follower")
+        structural_features = torch.stack(
+            [
+                torch.log1p(count_following),
+                torch.log1p(count_follower),
+                has_following,
+                has_follower,
+            ],
+            dim=1,
+        ).float()
+
+        analysis_views = dict(semantic_views)
+        analysis_views.update(
+            {
+                "count_following": count_following.numpy().astype(np.int64),
+                "count_follower": count_follower.numpy().astype(np.int64),
+                "has_following": has_following.numpy().astype(np.int64),
+                "has_follower": has_follower.numpy().astype(np.int64),
+                "count_1hop": (count_following + count_follower).numpy().astype(np.int64),
+                "count_2hop": np.zeros(num_nodes, dtype=np.int64),
+                "rt_ratio": _scalar("rt_ratio").numpy().astype(np.float32),
+                "url_ratio": _scalar("url_ratio").numpy().astype(np.float32),
+                "hashtag_ratio": _scalar("hashtag_ratio").numpy().astype(np.float32),
+            }
+        )
+        refiner_features = {
+            "feature_kind": "prompt_expert_bundle_v1",
+            "z_gnn": z_gnn.detach().cpu().float(),
+            "semantic_views": semantic_views,
+            "structural_features": structural_features,
+            "active_components": list(expert_bundle.get("active_components", [])),
+        }
+        return refiner_features, analysis_views
+
+    def _build_relation_aware_1hop_semantic_views(self, semantic_embeddings, edge_index, edge_type, include_2hop=False):
+        x_sem = semantic_embeddings.detach().cpu().float()
+        num_nodes = int(x_sem.shape[0])
+        zero = torch.zeros_like(x_sem)
+        zero_counts = np.zeros(num_nodes, dtype=np.int64)
+        if edge_index is None or edge_type is None:
+            return {
+                "ego": x_sem,
+                "in_rel0": zero.clone(),
+                "in_rel1": zero.clone(),
+                "out_rel0": zero.clone(),
+                "out_rel1": zero.clone(),
+                "in_rel0_2hop": zero.clone(),
+                "in_rel1_2hop": zero.clone(),
+                "out_rel0_2hop": zero.clone(),
+                "out_rel1_2hop": zero.clone(),
+                "count_in_rel0": zero_counts.copy(),
+                "count_in_rel1": zero_counts.copy(),
+                "count_out_rel0": zero_counts.copy(),
+                "count_out_rel1": zero_counts.copy(),
+                "count_in_rel0_2hop": zero_counts.copy(),
+                "count_in_rel1_2hop": zero_counts.copy(),
+                "count_out_rel0_2hop": zero_counts.copy(),
+                "count_out_rel1_2hop": zero_counts.copy(),
+                "has_in_rel0": zero_counts.copy(),
+                "has_in_rel1": zero_counts.copy(),
+                "has_out_rel0": zero_counts.copy(),
+                "has_out_rel1": zero_counts.copy(),
+                "has_in_rel0_2hop": zero_counts.copy(),
+                "has_in_rel1_2hop": zero_counts.copy(),
+                "has_out_rel0_2hop": zero_counts.copy(),
+                "has_out_rel1_2hop": zero_counts.copy(),
+                "count_1hop": zero_counts.copy(),
+                "count_2hop": zero_counts.copy(),
+            }
+
+        edge_index_t = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type_t = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        if edge_index_t.dim() != 2 or edge_index_t.size(0) != 2:
+            raise ValueError("edge_index must be shaped [2, num_edges] for relation-aware semantic views.")
+        if edge_type_t.numel() != edge_index_t.size(1):
+            raise ValueError("edge_type must align with edge_index for relation-aware semantic views.")
+
+        src = edge_index_t[0].numpy()
+        dst = edge_index_t[1].numpy()
+        rel = edge_type_t.numpy()
+        buckets = {
+            "in_rel0": [[] for _ in range(num_nodes)],
+            "in_rel1": [[] for _ in range(num_nodes)],
+            "out_rel0": [[] for _ in range(num_nodes)],
+            "out_rel1": [[] for _ in range(num_nodes)],
+        }
+        for s, d, r in zip(src.tolist(), dst.tolist(), rel.tolist()):
+            if not (0 <= s < num_nodes and 0 <= d < num_nodes):
+                continue
+            if int(r) == 0:
+                buckets["in_rel0"][d].append(s)
+                buckets["out_rel0"][s].append(d)
+            elif int(r) == 1:
+                buckets["in_rel1"][d].append(s)
+                buckets["out_rel1"][s].append(d)
+
+        outputs = {"ego": x_sem}
+        union_1hop = [set() for _ in range(num_nodes)]
+        for key in ("in_rel0", "in_rel1", "out_rel0", "out_rel1"):
+            view_tensor = torch.zeros_like(x_sem)
+            count_arr = np.zeros(num_nodes, dtype=np.int64)
+            has_arr = np.zeros(num_nodes, dtype=np.int64)
+            for node_idx in range(num_nodes):
+                neighbors = sorted(set(int(n) for n in buckets[key][node_idx] if int(n) != node_idx))
+                union_1hop[node_idx].update(neighbors)
+                count_arr[node_idx] = len(neighbors)
+                has_arr[node_idx] = 1 if neighbors else 0
+                if neighbors:
+                    view_tensor[node_idx] = x_sem[torch.tensor(neighbors, dtype=torch.long)].mean(dim=0)
+            outputs[key] = view_tensor
+            outputs[f"count_{key}"] = count_arr
+            outputs[f"has_{key}"] = has_arr
+        outputs["count_1hop"] = np.asarray([len(item) for item in union_1hop], dtype=np.int64)
+        outputs["count_2hop"] = zero_counts.copy()
+        if include_2hop:
+            key_map = {
+                "in_rel0_2hop": "in_rel0",
+                "in_rel1_2hop": "in_rel1",
+                "out_rel0_2hop": "out_rel0",
+                "out_rel1_2hop": "out_rel1",
+            }
+            union_2hop = [set() for _ in range(num_nodes)]
+            for key, parent_key in key_map.items():
+                view_tensor = torch.zeros_like(x_sem)
+                count_arr = np.zeros(num_nodes, dtype=np.int64)
+                has_arr = np.zeros(num_nodes, dtype=np.int64)
+                parent_bucket = buckets[parent_key]
+                for node_idx in range(num_nodes):
+                    n1 = sorted(set(int(n) for n in parent_bucket[node_idx] if int(n) != node_idx))
+                    n1_set = set(n1)
+                    n2 = set()
+                    for neigh in n1:
+                        for cand in parent_bucket[neigh]:
+                            cand = int(cand)
+                            if cand == node_idx or cand in n1_set:
+                                continue
+                            n2.add(cand)
+                    neighbors = sorted(n2)
+                    union_2hop[node_idx].update(neighbors)
+                    count_arr[node_idx] = len(neighbors)
+                    has_arr[node_idx] = 1 if neighbors else 0
+                    if neighbors:
+                        view_tensor[node_idx] = x_sem[torch.tensor(neighbors, dtype=torch.long)].mean(dim=0)
+                outputs[key] = view_tensor
+                outputs[f"count_{key}"] = count_arr
+                outputs[f"has_{key}"] = has_arr
+            outputs["count_2hop"] = np.asarray([len(item) for item in union_2hop], dtype=np.int64)
+        return outputs
+
+    def _train_glance_refiner(self, model, train_features, train_labels, valid_features, valid_labels):
+        train_features = train_features.detach().cpu().float()
+        valid_features = valid_features.detach().cpu().float()
+        train_labels = train_labels.detach().cpu().long()
+        valid_labels = valid_labels.detach().cpu().long()
+
+        if train_features.size(0) == 0:
+            raise ValueError(f"{self.args.stage} requires at least one train node.")
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(getattr(self.args, "lr_LM", 1e-5)),
+            weight_decay=float(getattr(self.args, "weight_decay_LM", 0.01)),
+        )
+        batch_size = max(min(int(getattr(self.args, "batch_size_LM", 32)), int(train_features.size(0))), 1)
+        loader = DataLoader(TensorDataset(train_features, train_labels), batch_size=batch_size, shuffle=True)
+        max_epochs = max(int(getattr(self.args, "LM_pretrain_epochs", 5)), 1)
+        patience = max(int(getattr(self.args, "LM_eval_patience", 20)), 1)
+
+        best_state = None
+        best_metrics = None
+        best_score = (-1.0, float("inf"))
+        wait = 0
+        train_losses = []
+
+        model.to(self.device)
+        for epoch in range(max_epochs):
+            model.train()
+            epoch_losses = []
+            for batch_x, batch_y in loader:
+                batch_x = batch_x.to(self.device)
+                batch_y = batch_y.to(self.device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(batch_x)
+                loss = F.cross_entropy(logits, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_losses.append(float(loss.detach().cpu().item()))
+            train_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+            train_losses.append(train_loss)
+
+            model.eval()
+            with torch.no_grad():
+                train_logits = model(train_features.to(self.device)).cpu()
+                if valid_features.size(0) > 0:
+                    valid_logits = model(valid_features.to(self.device)).cpu()
+                else:
+                    valid_logits = torch.empty((0, 2), dtype=torch.float32)
+            train_metrics = _classification_metrics_from_logits(train_logits, train_labels.cpu(), torch.arange(train_labels.numel()))
+            if valid_features.size(0) > 0:
+                valid_metrics = _classification_metrics_from_logits(valid_logits, valid_labels.cpu(), torch.arange(valid_labels.numel()))
+                current_score = (float(valid_metrics["macro_f1"]), -float(valid_metrics["loss"]))
+            else:
+                valid_metrics = {"loss": float("inf"), "accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0}
+                current_score = (float(train_metrics["macro_f1"]), -float(train_metrics["loss"]))
+
+            if current_score > best_score:
+                best_score = current_score
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                best_metrics = {
+                    "epoch": epoch + 1,
+                    "train": train_metrics,
+                    "valid": valid_metrics,
+                    "train_loss": train_loss,
+                }
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+        if best_state is None:
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            best_metrics = {
+                "epoch": 0,
+                "train": _classification_metrics_from_logits(
+                    model(train_features.to(self.device)).detach().cpu(),
+                    train_labels.cpu(),
+                    torch.arange(train_labels.numel()),
+                ),
+                "valid": {"loss": float("inf"), "accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": int(valid_labels.numel())},
+                "train_loss": 0.0,
+            }
+
+        model.load_state_dict(best_state)
+        model.to("cpu")
+        return model, {
+            "best_epoch": int(best_metrics["epoch"]),
+            "train_losses": train_losses,
+            "best_train": best_metrics["train"],
+            "best_valid": best_metrics["valid"],
+            "hidden_dim": 128,
+            "dropout": 0.1,
+            "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+        }
+
+    @staticmethod
+    def _refiner_bucket_summary(rows, key):
+        buckets = {
+            "0": lambda x: x == 0,
+            "1": lambda x: x == 1,
+            "2-5": lambda x: 2 <= x <= 5,
+            "6-10": lambda x: 6 <= x <= 10,
+            "11+": lambda x: x >= 11,
+        }
+        result = {}
+        for name, fn in buckets.items():
+            subset = [row for row in rows if fn(int(row[key]))]
+            if not subset:
+                continue
+            base_wrong = sum(1 for row in subset if row["was_wrong_base"])
+            fixed = sum(1 for row in subset if row["was_wrong_base"] and not row["is_wrong_final"])
+            base_correct = sum(1 for row in subset if not row["was_wrong_base"])
+            broken = sum(1 for row in subset if (not row["was_wrong_base"]) and row["is_wrong_final"])
+            result[name] = {
+                "count": int(len(subset)),
+                "base_wrong": int(base_wrong),
+                "fixed": int(fixed),
+                "fix_rate": float(fixed / base_wrong) if base_wrong else None,
+                "base_correct": int(base_correct),
+                "broken": int(broken),
+                "break_rate": float(broken / base_correct) if base_correct else None,
+            }
+        return result
+
+    def _build_refiner_analysis_summary(self, per_node_rows, mode_name):
+        rows = list(per_node_rows)
+        base_wrong = [row for row in rows if row["was_wrong_base"]]
+        base_correct = [row for row in rows if not row["was_wrong_base"]]
+        fixed = [row for row in base_wrong if not row["is_wrong_final"]]
+        still_wrong = [row for row in base_wrong if row["is_wrong_final"]]
+        broken = [row for row in base_correct if row["is_wrong_final"]]
+        preserved = [row for row in base_correct if not row["is_wrong_final"]]
+        changed = [row for row in rows if row["base_pred"] != row["final_pred"]]
+        routed = [row for row in rows if bool(row.get("routed", True))]
+        routed_wrong = [row for row in routed if row["was_wrong_base"]]
+        routed_correct = [row for row in routed if not row["was_wrong_base"]]
+        routed_fixed = [row for row in routed_wrong if not row["is_wrong_final"]]
+        routed_broken = [row for row in routed_correct if row["is_wrong_final"]]
+
+        def _avg(items, key):
+            if not items:
+                return 0.0
+            return float(sum(float(row[key]) for row in items) / len(items))
+
+        directional_bucket_analysis = None
+        if rows and any(
+            any(key in row for key in ("has_following", "has_follower", "neighbor_count_following", "neighbor_count_follower"))
+            for row in rows
+        ):
+            directional_bucket_analysis = {}
+            directional_buckets = {
+                "no_directional_neighbors": lambda row: (int(row.get("has_following", 0)) == 0) and (int(row.get("has_follower", 0)) == 0),
+                "following_only": lambda row: (int(row.get("has_following", 0)) == 1) and (int(row.get("has_follower", 0)) == 0),
+                "follower_only": lambda row: (int(row.get("has_following", 0)) == 0) and (int(row.get("has_follower", 0)) == 1),
+                "both_present": lambda row: (int(row.get("has_following", 0)) == 1) and (int(row.get("has_follower", 0)) == 1),
+            }
+            for bucket_name, fn in directional_buckets.items():
+                subset = [row for row in rows if fn(row)]
+                if not subset:
+                    continue
+                subset_base_wrong = [row for row in subset if row["was_wrong_base"]]
+                subset_base_correct = [row for row in subset if not row["was_wrong_base"]]
+                subset_fixed = [row for row in subset_base_wrong if not row["is_wrong_final"]]
+                subset_broken = [row for row in subset_base_correct if row["is_wrong_final"]]
+                directional_bucket_analysis[bucket_name] = {
+                    "count": int(len(subset)),
+                    "wrong_node_fix_rate": float(len(subset_fixed) / len(subset_base_wrong)) if subset_base_wrong else None,
+                    "correct_node_break_rate": float(len(subset_broken) / len(subset_base_correct)) if subset_base_correct else None,
+                }
+
+        summary = {
+            "mode": str(mode_name),
+            "count": int(len(rows)),
+            "base_wrong_count": int(len(base_wrong)),
+            "base_correct_count": int(len(base_correct)),
+            "fixed_wrong_count": int(len(fixed)),
+            "still_wrong_count": int(len(still_wrong)),
+            "broken_correct_count": int(len(broken)),
+            "preserved_correct_count": int(len(preserved)),
+            "changed_prediction_count": int(len(changed)),
+            "wrong_node_fix_rate": float(len(fixed) / len(base_wrong)) if base_wrong else 0.0,
+            "correct_node_break_rate": float(len(broken) / len(base_correct)) if base_correct else 0.0,
+            "net_gain": int(len(fixed) - len(broken)),
+            "routed_count": int(len(routed)),
+            "routed_wrong_count": int(len(routed_wrong)),
+            "routed_correct_count": int(len(routed_correct)),
+            "routed_wrong_precision": float(len(routed_wrong) / len(routed)) if routed else 0.0,
+            "routed_wrong_coverage": float(len(routed_wrong) / len(base_wrong)) if base_wrong else 0.0,
+            "conditional_fix_rate_on_selected_wrong": float(len(routed_fixed) / len(routed_wrong)) if routed_wrong else 0.0,
+            "conditional_break_rate_on_selected_correct": float(len(routed_broken) / len(routed_correct)) if routed_correct else 0.0,
+            "mean_1hop_neighbors_fixed": _avg(fixed, "neighbor_count_1hop"),
+            "mean_1hop_neighbors_broken": _avg(broken, "neighbor_count_1hop"),
+            "mean_2hop_neighbors_fixed": _avg(fixed, "neighbor_count_2hop"),
+            "mean_2hop_neighbors_broken": _avg(broken, "neighbor_count_2hop"),
+            "bucket_1hop": self._refiner_bucket_summary(rows, "neighbor_count_1hop"),
+            "bucket_2hop": self._refiner_bucket_summary(rows, "neighbor_count_2hop"),
+            "directional_bucket_analysis": directional_bucket_analysis,
+        }
+        return summary
+
+    def _load_semantic_finetune_artifact(self):
+        stage_dirs = [
+            self.experiment_root / "preparation" / "semantic_encoder",
+            self.experiment_root / "stages" / "semantic_encoder_finetune",
+            self.experiment_root / "stages" / "semantic_finetune",
+        ]
+        stage_dir = None
+        manifest_path = None
+        embeddings_path = None
+        outputs_path = None
+        for candidate_dir in stage_dirs:
+            candidate_manifest = candidate_dir / "manifest.json"
+            candidate_embeddings = candidate_dir / "embeddings.pt"
+            candidate_outputs = candidate_dir / "outputs.pt"
+            if candidate_manifest.exists() and candidate_embeddings.exists() and candidate_outputs.exists():
+                stage_dir = candidate_dir
+                manifest_path = candidate_manifest
+                embeddings_path = candidate_embeddings
+                outputs_path = candidate_outputs
+                break
+        if stage_dir is None:
+            fallback_path = (
+                getattr(self.args, "embedding_path", None)
+                or getattr(self.args, "emb_path", None)
+                or getattr(self.args, "g0_feature_path", None)
+            )
+            if not fallback_path:
+                raise MissingFrozenArtifactError(
+                    "Strict GLANCE stages require same-seed semantic_encoder_finetune artifacts or an explicit "
+                    "--embedding_path tensor. Implicit seed_1 fallback is disabled."
+                )
+            fallback_path = Path(fallback_path)
+            if not fallback_path.exists():
+                raise MissingFrozenArtifactError(
+                    "Strict GLANCE stages require semantic_encoder_finetune artifacts or an explicit "
+                    f"--embedding_path tensor. Resolved path does not exist: {fallback_path}."
+                )
+            embeddings = safe_torch_load(fallback_path, map_location="cpu")
+            if not torch.is_tensor(embeddings) or embeddings.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"Fallback semantic embedding at {fallback_path} must be a 2D tensor."
+                )
+            if int(embeddings.shape[0]) != int(len(self.labels)):
+                raise MissingFrozenArtifactError(
+                    "Fallback semantic embedding does not align with the current dataset node count."
+                )
+            return {
+                "dir": fallback_path.parent,
+                "manifest": _direct_embedding_manifest(fallback_path),
+                "embeddings": embeddings.detach().cpu().float(),
+                "outputs": None,
+            }
+        manifest = read_json(manifest_path, default={}) or {}
+        semantic_backbone = str(manifest.get("semantic_backbone", "")).lower()
+        if semantic_backbone not in {"roberta_finetuned", "roberta-f"}:
+            raise MissingFrozenArtifactError(
+                "glance_oracle_refine requires semantic_finetune artifacts produced by "
+                "--semantic_backbone roberta_finetuned."
+            )
+        embeddings = safe_torch_load(embeddings_path, map_location="cpu")
+        outputs = safe_torch_load(outputs_path, map_location="cpu")
+        if not torch.is_tensor(embeddings) or embeddings.dim() != 2:
+            raise MissingFrozenArtifactError(
+                f"semantic_finetune embeddings at {embeddings_path} must be a 2D tensor."
+            )
+        if int(embeddings.shape[0]) != int(len(self.labels)):
+            raise MissingFrozenArtifactError(
+                "semantic_finetune embeddings do not align with the current dataset node count."
+            )
+        return {
+            "dir": stage_dir,
+            "manifest": manifest,
+            "embeddings": embeddings.detach().cpu().float(),
+            "outputs": outputs,
+        }
+
+    def _load_glance_semantic_source_bundle(self):
+        feature_manifest, feature_path = self._strict_joint_feature_manifest()
+        override_path = getattr(self.args, "joint_refiner_embedding_path", None)
+        requested_path = (
+            getattr(self.args, "embedding_path", None)
+            or getattr(self.args, "emb_path", None)
+            or getattr(self.args, "g0_feature_path", None)
+        )
+        if override_path:
+            emb_path = Path(override_path)
+            if requested_path:
+                requested_path = Path(requested_path)
+                if requested_path != feature_path:
+                    raise MissingFrozenArtifactError(
+                        "joint_router_refinement keeps backbone provenance pinned to the current run's "
+                        "graph_detector_prepare artifact even when --joint_refiner_embedding_path is used. "
+                        f"Requested --embedding_path {requested_path} does not match frozen_g0 feature_manifest.path {feature_path}."
+                    )
+            provenance_binding = "joint_refiner_override_same_backbone"
+            manifest_source = "joint_refiner_embedding_override"
+            semantic_override_role = "refiner_only"
+        else:
+            if requested_path:
+                requested_path = Path(requested_path)
+                if requested_path != feature_path:
+                    raise MissingFrozenArtifactError(
+                        "joint_router_refinement requires semantic input provenance to match the current run's "
+                        "graph_detector_prepare artifact. "
+                        f"Requested --embedding_path {requested_path} does not match frozen_g0 feature_manifest.path {feature_path}."
+                    )
+            emb_path = feature_path
+            provenance_binding = "strict_same_root_graph_detector_prepare"
+            manifest_source = "graph_detector_prepare_feature_manifest"
+            semantic_override_role = "shared_backbone_and_refiner"
+        if not emb_path.exists():
+            raise MissingFrozenArtifactError(
+                "joint_router_refinement could not find the requested semantic embedding tensor at "
+                f"{emb_path}."
+            )
+        payload = safe_torch_load(emb_path, map_location="cpu")
+        embeddings, precomputed_views, prompt_expert_bundle, payload_keys = _normalize_semantic_payload(payload)
+        if embeddings.dim() != 2:
+            raise MissingFrozenArtifactError(
+                f"joint_router_refinement expects --embedding_path to contain a 2-D tensor, got {tuple(embeddings.shape)}."
+            )
+        if int(embeddings.shape[0]) != int(len(self.labels)):
+            raise MissingFrozenArtifactError(
+                "joint_router_refinement semantic embeddings do not align with the current dataset node count."
+            )
+        if precomputed_views is not None:
+            for view_name, view_tensor in precomputed_views.items():
+                if int(view_tensor.shape[0]) != int(len(self.labels)):
+                    raise MissingFrozenArtifactError(
+                        f"joint_router_refinement semantic view {view_name} does not align with the current dataset node count."
+                    )
+        if prompt_expert_bundle is not None:
+            semantic_view_mode = "prompt_expert_bundle_v1"
+        elif precomputed_views is not None:
+            semantic_view_mode = "precomputed_prompt_views"
+        else:
+            semantic_view_mode = "legacy_inbound_khop"
+        primary = {
+            "dir": emb_path.parent,
+            "manifest": {
+                **_direct_embedding_manifest(emb_path),
+                "source": manifest_source,
+                "feature_manifest": feature_manifest,
+                "provenance_binding": provenance_binding,
+                "semantic_override_role": semantic_override_role,
+                "payload_keys": payload_keys,
+                "semantic_view_mode": semantic_view_mode,
+                "active_components": list(prompt_expert_bundle.get("active_components", [])) if prompt_expert_bundle else [],
+            },
+            "embeddings": embeddings,
+            "precomputed_views": precomputed_views,
+            "prompt_expert_bundle": prompt_expert_bundle,
+            "semantic_view_mode": semantic_view_mode,
+            "outputs": None,
+        }
+        bundle = {
+            "mode": "single_source",
+            "primary": primary,
+            "secondary": None,
+            "sources": [primary],
+        }
+        return bundle
+
+    def _strict_glance_train_idx(self, train_idx, cap=3000):
+        train_idx = np.asarray(train_idx, dtype=np.int64).reshape(-1)
+        cap = int(cap)
+        if cap <= 0 or train_idx.size <= cap:
+            return train_idx
+        rng = np.random.default_rng(int(self.seed))
+        selected = np.sort(rng.choice(train_idx, size=cap, replace=False))
+        return selected.astype(np.int64)
+
+    def _run_glance_joint_router_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic_bundle = self._load_glance_semantic_source_bundle()
+        semantic = semantic_bundle["primary"]
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+        labels_np = labels_t.numpy()
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        if train_idx.size == 0 or valid_idx.size == 0 or test_idx.size == 0:
+            raise MissingFrozenArtifactError(
+                "glance_joint_router_refine requires non-empty train/valid/test splits."
+            )
+
+        configured_train_cap = int(getattr(self.args, "joint_train_node_cap", 3000))
+        strict_train_idx = self._strict_glance_train_idx(train_idx, cap=configured_train_cap)
+        train_cap_mode = "full_train_split" if configured_train_cap <= 0 else "capped_train_subset"
+        semantic_view_mode = semantic.get("semantic_view_mode", semantic["manifest"].get("semantic_view_mode", "legacy_inbound_khop"))
+        if semantic_view_mode == "prompt_expert_bundle_v1":
+            refiner_features, semantic_views = self._build_prompt_expert_semantic_views(
+                semantic.get("prompt_expert_bundle"),
+                z_gnn,
+            )
+            prompt_expert_active_components = list(refiner_features.get("active_components", []))
+        else:
+            semantic_views = self._build_k_hop_semantic_views(
+                semantic.get("precomputed_views") if semantic.get("precomputed_views") is not None else semantic["embeddings"],
+                self.data.get("edge_index"),
+            )
+            refiner_features = torch.cat(
+                [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+                dim=1,
+            ).detach().cpu().float()
+            prompt_expert_active_components = []
+        refiner_explicit_gate = bool(getattr(self.args, "joint_refiner_explicit_gate", False))
+        refiner_target_mode = str(getattr(self.args, "joint_refiner_target_mode", "predict")).lower()
+        refiner_weight_mode = str(getattr(self.args, "joint_refiner_weight_mode", "off")).lower()
+        refiner_base_wrong_weight = float(getattr(self.args, "joint_refiner_base_wrong_weight", 2.0))
+        refiner_utility_weight = float(getattr(self.args, "joint_refiner_utility_weight", 3.0))
+        refiner_gate_weight = float(getattr(self.args, "joint_refiner_gate_weight", 0.5))
+
+        original_node_features_bundle = self._strict_glance_original_node_features()
+        q_bundle = self._fit_strict_glance_q_probs(
+            original_node_features_bundle["features"],
+            strict_train_idx,
+            valid_idx,
+        )
+        backbone_input_features = self._strict_glance_backbone_input_features()
+        mc_bundle = self._strict_glance_mc_dropout_uncertainty(backbone_input_features)
+        router_temperature_bundle = fit_reliability_temperature(
+            logits_gnn[valid_idx],
+            labels_np[valid_idx],
+        )
+        router_feature_bundle = self._build_strict_glance_router_features(
+            logits_gnn=logits_gnn,
+            p_gnn=p_gnn,
+            z_gnn=z_gnn,
+            original_node_features=original_node_features_bundle["features"],
+            q_bundle=q_bundle,
+            mc_bundle=mc_bundle,
+            calibration_temperature=router_temperature_bundle["temperature"],
+        )
+        router_feature_bundle["full_feature_bundle"]["temperature_scaling"] = dict(router_temperature_bundle)
+        router_features, scaler_state = self._standardize_glance_router_features(
+            router_feature_bundle["features"],
+            strict_train_idx,
+        )
+
+        activation = str(getattr(self.args, "activation", "leakyrelu")).lower()
+        batch_size = 32
+        max_epochs = 10
+        patience = 2
+        decay_factor = 0.5
+        entropy_weight = 0.0
+        router_weight = 0.0
+        learning_rate = float(getattr(self.args, "lr_GNN", 5e-4))
+        weight_decay = float(getattr(self.args, "weight_decay_GNN", 1e-5))
+        eval_top_k = max(int(round(batch_size / 4.0)), 1)
+        beta_candidates = (0.1, 0.2, 0.3)
+
+        beta_runs = []
+        selected_beta_run = None
+        selected_beta_score = None
+        for beta in beta_candidates:
+            run = self._train_glance_joint_candidate(
+                labels_t=labels_t,
+                labels_np=labels_np,
+                train_idx=strict_train_idx,
+                valid_idx=valid_idx,
+                test_idx=test_idx,
+                logits_gnn=logits_gnn,
+                p_gnn=p_gnn,
+                pred_gnn=pred_gnn,
+                router_features=router_features,
+                refiner_features=refiner_features,
+                semantic_views=semantic_views,
+                semantic_view_mode=semantic_view_mode,
+                activation=activation,
+                batch_size=batch_size,
+                max_epochs=max_epochs,
+                patience=patience,
+                decay_factor=decay_factor,
+                entropy_weight=entropy_weight,
+                router_weight=router_weight,
+                router_regression_weight=0.0,
+                router_ranking_weight=1.0,
+                router_calibration_weight=0.25,
+                router_reliability_weight=0.0,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+                beta=float(beta),
+                eval_top_k=eval_top_k,
+                refiner_explicit_gate=refiner_explicit_gate,
+                refiner_target_mode=refiner_target_mode,
+                refiner_weight_mode=refiner_weight_mode,
+                refiner_base_wrong_weight=refiner_base_wrong_weight,
+                refiner_utility_weight=refiner_utility_weight,
+                refiner_gate_weight=refiner_gate_weight,
+            )
+            beta_runs.append(run)
+            beta_score = (
+                float(run["selected_budget_metrics"]["valid"]["macro_f1"]),
+                -float(run["selected_budget_metrics"]["valid"]["loss"]),
+            )
+            if selected_beta_score is None or beta_score > selected_beta_score:
+                selected_beta_score = beta_score
+                selected_beta_run = run
+
+        if selected_beta_run is None:
+            raise MissingFrozenArtifactError("glance_joint_router_refine could not select a beta on validation.")
+
+        final_run = selected_beta_run
+        selected_beta = float(final_run["beta"])
+        selected_budget = float(final_run["selected_budget"])
+        selected_budget_key = str(final_run["selected_budget_key"])
+        train_outputs = final_run["train_outputs"]
+        valid_outputs = final_run["valid_outputs"]
+        test_outputs = final_run["test_outputs"]
+        final_logits = logits_gnn.clone()
+        final_prob = p_gnn.clone()
+        final_pred = pred_gnn.clone()
+        routed_masks = {
+            "train": train_outputs["routed_mask"],
+            "valid": valid_outputs["routed_mask"],
+            "test": test_outputs["routed_mask"],
+        }
+        router_prob = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        router_score = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        oracle_advantage = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        for split_outputs, split_idx in (
+            (train_outputs, train_idx),
+            (valid_outputs, valid_idx),
+            (test_outputs, test_idx),
+        ):
+            split_mask = split_outputs["routed_mask"]
+            split_idx_t = torch.tensor(split_idx, dtype=torch.long)
+            final_logits[split_mask] = split_outputs["logits"][split_mask]
+            final_prob[split_mask] = split_outputs["prob"][split_mask]
+            final_pred[split_mask] = split_outputs["pred"][split_mask]
+            router_prob[split_idx_t] = split_outputs["router_prob"][split_idx_t]
+            router_score[split_idx_t] = split_outputs["router_score"][split_idx_t]
+            oracle_advantage[split_idx_t] = split_outputs["oracle_advantage"][split_idx_t]
+
+        base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx])
+        overall_test = _score_all(labels_np[test_idx], final_pred.numpy()[test_idx])
+        test_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), labels_np, self.test_mask)
+        per_node_rows = final_run["test_rows"]["rows"]
+        analysis_summary = final_run["test_rows"]["analysis"]
+
+        beta_sweep = []
+        for run in beta_runs:
+            beta_sweep.append({
+                "beta": float(run["beta"]),
+                "eval_top_k": int(run["eval_top_k"]),
+                "best_epoch": int(run["best_epoch"]),
+                "selected_budget": float(run["selected_budget"]),
+                "selected_budget_key": str(run["selected_budget_key"]),
+                "valid_accuracy": float(run["selected_budget_metrics"]["valid"]["accuracy"]),
+                "valid_macro_f1": float(run["selected_budget_metrics"]["valid"]["macro_f1"]),
+                "valid_bot_f1": float(run["selected_budget_metrics"]["valid"]["bot_f1"]),
+                "valid_loss": float(run["selected_budget_metrics"]["valid"]["loss"]),
+                "valid_routed_count": int(run["selected_budget_metrics"]["valid"]["routed_count"]),
+                "valid_query_rate": float(run["selected_budget_metrics"]["valid"]["query_rate"]),
+                "valid_net_gain": int(run["valid_rows"]["analysis"]["net_gain"]),
+                "valid_routed_wrong_precision": float(run["valid_rows"]["analysis"]["routed_wrong_precision"]),
+                "valid_routed_wrong_coverage": float(run["valid_rows"]["analysis"]["routed_wrong_coverage"]),
+                "valid_conditional_fix_rate": float(run["valid_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+                "test_accuracy": float(run["selected_budget_metrics"]["test"]["accuracy"]),
+                "test_macro_f1": float(run["selected_budget_metrics"]["test"]["macro_f1"]),
+                "test_bot_f1": float(run["selected_budget_metrics"]["test"]["bot_f1"]),
+                "test_loss": float(run["selected_budget_metrics"]["test"]["loss"]),
+                "test_routed_count": int(run["selected_budget_metrics"]["test"]["routed_count"]),
+                "test_query_rate": float(run["selected_budget_metrics"]["test"]["query_rate"]),
+                "test_net_gain": int(run["test_rows"]["analysis"]["net_gain"]),
+                "test_routed_wrong_precision": float(run["test_rows"]["analysis"]["routed_wrong_precision"]),
+                "test_routed_wrong_coverage": float(run["test_rows"]["analysis"]["routed_wrong_coverage"]),
+                "test_conditional_fix_rate": float(run["test_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+            })
+
+        valid_budget_curve = final_run["valid_budget_curve"]
+        test_budget_curve = final_run["test_budget_curve"]
+        if getattr(self.args, "joint_refiner_embedding_path", None):
+            dependency_alignment_note = (
+                "joint_router_refinement keeps backbone provenance pinned to the current run's "
+                "preparation/graph_detector artifact while allowing a refiner-only semantic override through "
+                "--joint_refiner_embedding_path."
+            )
+        else:
+            dependency_alignment_note = (
+                "Public joint_router_refinement is bound to the current run's preparation/graph_detector artifact "
+                "and reuses its recorded feature_manifest.path as the semantic tensor source."
+            )
+
+        metrics_payload = {
+            "contract": "glance_joint_router_refine_metrics_v1",
+            "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
+            "paper_faithful_glance_inspired": False,
+            "glance_style_joint_training": True,
+            "strict_training_protocol_alignment": bool(configured_train_cap == 3000),
+            "paper_text_router_alignment": False,
+            "twibot20_adapted_training": bool(configured_train_cap <= 0),
+            "strict_dependency_provenance_alignment": True,
+            "semantic_alignment": False,
+            "not_official_reproduction": True,
+            "paper_text_evaluation_alignment": False,
+            "evaluation_protocol": "validation_selected_global_budget_by_router_score",
+            "evaluation_alignment_note": "Training keeps paper-text batch top-k routing; final public evaluation selects a global budget on validation and locks that budget on test for TwiBot20-suitable score-based routing.",
+            "dependency_alignment_note": dependency_alignment_note,
+            "semantic_source_mode": semantic_bundle["mode"],
+            "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
+            "primary_semantic_manifest": semantic_bundle["primary"]["manifest"],
+            "joint_refiner_embedding_path": str(getattr(self.args, "joint_refiner_embedding_path", None) or ""),
+            "semantic_view_mode": semantic_view_mode,
+            "external_frozen_g0_root": str(getattr(self.args, "external_frozen_g0_root", None) or ""),
+            "selected_beta_source": "validation",
+            "selected_beta": selected_beta,
+            "beta_candidates": [float(item) for item in beta_candidates],
+            "selected_budget_source": "validation",
+            "selected_budget": selected_budget,
+            "selected_budget_key": selected_budget_key,
+            "selected_valid_budget_metrics": final_run["selected_valid_budget_metrics"],
+            "selected_test_budget_metrics_under_valid_choice": final_run["selected_test_budget_metrics_under_valid_choice"],
+            "selected_beta_valid_metrics": final_run["selected_budget_metrics"]["valid"],
+            "selected_beta_test_metrics": final_run["selected_budget_metrics"]["test"],
+            "beta_sweep": beta_sweep,
+            "valid_budget_curve": valid_budget_curve,
+            "test_budget_curve": test_budget_curve,
+            "router_training_objective": "base_wrong_reliability_bce_plus_pairwise_ranking",
+            "oracle_advantage_semantics": "loss_gnn_minus_loss_refiner_minus_beta",
+            "router_score_semantics": "learned_base_wrong_reliability_score_for_global_budget_routing",
+            "router_reliability_semantics": "primary_base_wrong_probability_estimator",
+            "router_feature_family": router_feature_bundle["full_feature_bundle"]["feature_family"],
+            "router_feature_names": list(router_feature_bundle["feature_names"]),
+            "router_temperature_scaling": dict(router_temperature_bundle),
+            "refiner_target_mode": refiner_target_mode,
+            "refiner_weight_mode": refiner_weight_mode,
+            "refiner_explicit_gate": bool(refiner_explicit_gate),
+            "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
+            "refiner_utility_weight": float(refiner_utility_weight),
+            "refiner_gate_weight": float(refiner_gate_weight),
+            "advantage_router_diagnostics": final_run["fit_summary"].get("advantage_router_diagnostics", {}),
+            "base_test": base_test,
+            "overall_test": overall_test,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "improved_count": int(test_delta["fix"]),
+            "degraded_count": int(test_delta["broke"]),
+            "net_gain": int(test_delta["net"]),
+            "wrong_node_fix_rate": float(test_delta["fix"] / max(int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+            "correct_node_break_rate": float(
+                test_delta["broke"]
+                / max(int(test_idx.size - int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum())), 1)
+            ),
+            "query_usage": {
+                "train_routed_count": int(train_outputs["routed_count"]),
+                "valid_routed_count": int(valid_outputs["routed_count"]),
+                "test_routed_count": int(test_outputs["routed_count"]),
+                "selected_budget": selected_budget,
+                "eval_top_k": int(eval_top_k),
+                "batch_size": int(batch_size),
+            },
+            "fit_summary": final_run["fit_summary"],
+        }
+        router_performance_summary = {
+            "selected_beta": float(selected_beta),
+            "selected_budget": float(selected_budget),
+            "selected_budget_key": str(selected_budget_key),
+            "router_temperature": float(router_temperature_bundle["temperature"]),
+            "router_temperature_bundle": dict(router_temperature_bundle),
+            "router_feature_family": str(router_feature_bundle["full_feature_bundle"]["feature_family"]),
+            "router_input_dim": int(router_features.shape[1]),
+            "router_diagnostics": final_run["fit_summary"].get("router_diagnostics", {}),
+            "advantage_router_diagnostics": final_run["fit_summary"].get("advantage_router_diagnostics", {}),
+            "topk_reference_router_diagnostics": final_run["fit_summary"].get("topk_reference", {}).get("router_diagnostics", {}),
+            "topk_reference_advantage_router_diagnostics": final_run["fit_summary"].get("topk_reference", {}).get("advantage_router_diagnostics", {}),
+            "selected_valid_budget_metrics": final_run["selected_budget_metrics"]["valid"],
+            "selected_test_budget_metrics": final_run["selected_budget_metrics"]["test"],
+            "selected_valid_router_analysis": final_run["valid_rows"]["analysis"],
+            "selected_test_router_analysis": final_run["test_rows"]["analysis"],
+            "overall_delta_vs_base_gnn": metrics_payload["overall_delta_vs_base_gnn"],
+            "wrong_node_fix_rate": metrics_payload["wrong_node_fix_rate"],
+            "correct_node_break_rate": metrics_payload["correct_node_break_rate"],
+            "net_gain": metrics_payload["net_gain"],
+            "best_epoch": int(final_run["best_epoch"]),
+            "query_usage": metrics_payload["query_usage"],
+        }
+        router_performance_row = {
+            "selected_beta": float(selected_beta),
+            "selected_budget": float(selected_budget),
+            "best_epoch": int(final_run["best_epoch"]),
+            "router_temperature": float(router_temperature_bundle["temperature"]),
+            "router_valid_positive_rate": final_run["fit_summary"]["router_diagnostics"]["valid"].get("positive_rate"),
+            "router_valid_mean_score": final_run["fit_summary"]["router_diagnostics"]["valid"].get("mean_score"),
+            "router_valid_auroc": final_run["fit_summary"]["router_diagnostics"]["valid"].get("auroc"),
+            "router_valid_auprc": final_run["fit_summary"]["router_diagnostics"]["valid"].get("auprc"),
+            "router_test_positive_rate": final_run["fit_summary"]["router_diagnostics"]["test"].get("positive_rate"),
+            "router_test_mean_score": final_run["fit_summary"]["router_diagnostics"]["test"].get("mean_score"),
+            "router_test_auroc": final_run["fit_summary"]["router_diagnostics"]["test"].get("auroc"),
+            "router_test_auprc": final_run["fit_summary"]["router_diagnostics"]["test"].get("auprc"),
+            "router_valid_adv_auroc": final_run["fit_summary"]["advantage_router_diagnostics"]["valid"].get("auroc"),
+            "router_valid_adv_auprc": final_run["fit_summary"]["advantage_router_diagnostics"]["valid"].get("auprc"),
+            "router_test_adv_auroc": final_run["fit_summary"]["advantage_router_diagnostics"]["test"].get("auroc"),
+            "router_test_adv_auprc": final_run["fit_summary"]["advantage_router_diagnostics"]["test"].get("auprc"),
+            "valid_query_rate": float(final_run["selected_budget_metrics"]["valid"]["query_rate"]),
+            "valid_routed_count": int(final_run["selected_budget_metrics"]["valid"]["routed_count"]),
+            "valid_routed_wrong_precision": float(final_run["valid_rows"]["analysis"]["routed_wrong_precision"]),
+            "valid_routed_wrong_coverage": float(final_run["valid_rows"]["analysis"]["routed_wrong_coverage"]),
+            "valid_conditional_fix_rate": float(final_run["valid_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+            "test_query_rate": float(final_run["selected_budget_metrics"]["test"]["query_rate"]),
+            "test_routed_count": int(final_run["selected_budget_metrics"]["test"]["routed_count"]),
+            "test_routed_wrong_precision": float(final_run["test_rows"]["analysis"]["routed_wrong_precision"]),
+            "test_routed_wrong_coverage": float(final_run["test_rows"]["analysis"]["routed_wrong_coverage"]),
+            "test_conditional_fix_rate": float(final_run["test_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+            "test_wrong_node_fix_rate": float(metrics_payload["wrong_node_fix_rate"]),
+            "test_correct_node_break_rate": float(metrics_payload["correct_node_break_rate"]),
+            "test_net_gain": int(metrics_payload["net_gain"]),
+            "test_macro_f1": float(metrics_payload["overall_test"]["macro_f1"]),
+            "test_delta_macro_f1": float(metrics_payload["overall_delta_vs_base_gnn"]["macro_f1"]),
+        }
+        manifest = {
+            "contract": "glance_joint_router_refine_v1",
+            "status": "completed",
+            "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
+            "paper_faithful_glance_inspired": False,
+            "glance_style_joint_training": True,
+            "strict_training_protocol_alignment": bool(configured_train_cap == 3000),
+            "paper_text_router_alignment": False,
+            "twibot20_adapted_training": bool(configured_train_cap <= 0),
+            "strict_dependency_provenance_alignment": True,
+            "semantic_alignment": False,
+            "not_official_reproduction": True,
+            "paper_text_evaluation_alignment": False,
+            "evaluation_protocol": "validation_selected_global_budget_by_router_score",
+            "evaluation_alignment_note": "Batch top-k is kept only inside strict GLANCE training. Public final evaluation uses a validation-selected global budget and test-locked router ranking.",
+            "research_positioning": "task_adapted_reliability_router_under_glance_style_joint_training",
+            "selected_beta_source": "validation",
+            "selected_beta": selected_beta,
+            "beta_candidates": [float(item) for item in beta_candidates],
+            "selected_budget_source": "validation",
+            "selected_budget": selected_budget,
+            "selected_budget_key": selected_budget_key,
+            "semantic_source_mode": semantic_bundle["mode"],
+            "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
+            "semantic_source": "semantic_single_source",
+            "semantic_alignment_note": "Joint training keeps the current cached semantic embedding path; router objective is task-adapted toward reliability rather than the paper's advantage target.",
+            "dependency_alignment_note": dependency_alignment_note,
+            "semantic_manifest": semantic["manifest"],
+            "primary_semantic_manifest": semantic_bundle["primary"]["manifest"],
+            "joint_refiner_embedding_path": str(getattr(self.args, "joint_refiner_embedding_path", None) or ""),
+            "external_frozen_g0_root": str(getattr(self.args, "external_frozen_g0_root", None) or ""),
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "train_node_cap": int(configured_train_cap),
+            "effective_train_node_count": int(strict_train_idx.size),
+            "full_train_node_count": int(train_idx.size),
+            "train_cap_mode": train_cap_mode,
+            "uncertainty_source": mc_bundle["source"],
+            "router_temperature_scaling": dict(router_temperature_bundle),
+            "router_feature_family_used": list(router_feature_bundle["feature_names"]),
+            "router_architecture": {
+                "type": "reliability_first_router_mlp",
+                "hidden_dim": 128,
+                "bottleneck_dim": 64,
+                "dropout": 0.1,
+                "input_dim": int(router_features.shape[1]),
+                "feature_count": int(router_features.shape[1]),
+                "feature_family": list(router_feature_bundle["feature_names"]),
+                "feature_bundle_metadata": router_feature_bundle["full_feature_bundle"],
+                "scaler": scaler_state,
+            },
+            "refiner_architecture": {
+                "type": (
+                    "prompt_expert_bundle_refiner_mlp"
+                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    else ("gated_glance_joint_refiner_mlp" if refiner_explicit_gate else "glance_joint_refiner_mlp")
+                ),
+                "input": (
+                    "[z_gnn || ego_proj || graph_following_proj || graph_follower_proj || graph_fused || tweet_proj || conflict_proj || log1p(count_following) || log1p(count_follower) || has_following || has_follower]"
+                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    else "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]"
+                ),
+                "hidden_dim": 128,
+                "activation": activation,
+                "dropout": 0.1,
+                "output_dim": int(logits_gnn.shape[1]),
+                "semantic_view_mode": semantic_view_mode,
+                "feature_kind": "prompt_expert_bundle_v1" if semantic_view_mode == "prompt_expert_bundle_v1" else "flat_concat",
+                "semantic_view_names": (
+                    ["ego", "graph_following", "graph_follower", "tweet", "conflict"]
+                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    else ["ego", "hop1", "hop2"]
+                ),
+                "active_components": prompt_expert_active_components,
+                "proj_dim": 256 if semantic_view_mode == "prompt_expert_bundle_v1" else None,
+                "graph_gate_input": ["log1p(count_following)", "log1p(count_follower)", "has_following", "has_follower"]
+                if semantic_view_mode == "prompt_expert_bundle_v1"
+                else None,
+                "target_mode": refiner_target_mode,
+                "explicit_gate": bool(refiner_explicit_gate) if semantic_view_mode != "prompt_expert_bundle_v1" else False,
+                "weight_mode": refiner_weight_mode,
+            },
+            "training_contract": {
+                "frozen_gnn": True,
+                "frozen_semantic_encoder": True,
+                "train_router": True,
+                "train_refiner": True,
+                "batch_size": int(batch_size),
+                "max_epochs": int(max_epochs),
+                "patience": int(patience),
+                "train_node_cap": int(configured_train_cap),
+                "effective_train_node_count": int(strict_train_idx.size),
+                "full_train_node_count": int(train_idx.size),
+                "train_cap_mode": train_cap_mode,
+                "training_budget_schedule": {
+                    "k_start": int(batch_size),
+                    "k_end": int(max(int(round(batch_size / 4.0)), 1)),
+                    "decay_factor": float(decay_factor),
+                },
+                "router_weight": 0.0,
+                "router_regression_weight": 0.0,
+                "router_ranking_weight": float(1.0),
+                "router_selection_weight": float(0.25),
+                "router_calibration_weight": float(0.25),
+                "router_reliability_weight": 0.0,
+                "entropy_weight": 0.0,
+                "beta_selection": "validation_only",
+                "router_training_objective": "base_wrong_reliability_bce_plus_pairwise_ranking",
+                "auxiliary_router_target": "none_oracle_advantage_retained_for_diagnostics_only",
+                "refiner_target_mode": refiner_target_mode,
+                "refiner_explicit_gate": bool(refiner_explicit_gate) if semantic_view_mode != "prompt_expert_bundle_v1" else False,
+                "refiner_weight_mode": refiner_weight_mode,
+                "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
+                "refiner_utility_weight": float(refiner_utility_weight),
+                "refiner_gate_weight": float(refiner_gate_weight),
+            },
+            "q_estimator": {
+                **q_bundle["classifier"],
+                "train_count": int(q_bundle["train_count"]),
+                "valid_count": int(q_bundle["valid_count"]),
+                "temperature": float(q_bundle["temperature"]),
+            },
+            "mc_dropout": {
+                "num_passes": int(mc_bundle["num_passes"]),
+                "logits_shape": list(mc_bundle["logits_shape"]),
+            },
+            "original_node_features": {
+                "path": str(original_node_features_bundle["path"]),
+                "feature_manifest": original_node_features_bundle["feature_manifest"],
+            },
+        }
+
+        self._write_stage_manifest(
+            stage_dir,
+            manifest,
+            artifact_namespace="stages/joint_router_refinement",
+            visibility="public",
+            resolved_task="joint_router_refinement",
+        )
+        write_json(stage_dir / "metrics.json", metrics_payload)
+        write_json(stage_dir / "analysis_summary.json", analysis_summary)
+        write_json(stage_dir / "router_performance_summary.json", router_performance_summary)
+        write_csv_rows(
+            stage_dir / "router_performance_summary.csv",
+            list(router_performance_row.keys()),
+            [router_performance_row],
+        )
+        write_csv_rows(
+            stage_dir / "router_epoch_curve.csv",
+            [
+                "epoch",
+                "beta",
+                "train_top_k",
+                "eval_top_k",
+                "router_train_auroc",
+                "router_valid_auroc",
+                "router_test_auroc",
+                "router_valid_adv_auroc",
+                "router_test_adv_auroc",
+                "router_valid_auprc",
+                "router_valid_adv_auprc",
+                "refiner_valid_fix_rate",
+                "refiner_valid_break_rate",
+                "refiner_test_fix_rate",
+                "refiner_test_break_rate",
+            ],
+            final_run["fit_summary"]["component_curve_summary"]["curve"],
+        )
+        write_csv_rows(
+            stage_dir / "beta_sweep.csv",
+            [
+                "beta",
+                "eval_top_k",
+                "best_epoch",
+                "selected_budget",
+                "selected_budget_key",
+                "valid_accuracy",
+                "valid_macro_f1",
+                "valid_bot_f1",
+                "valid_loss",
+                "valid_routed_count",
+                "valid_query_rate",
+                "valid_net_gain",
+                "valid_routed_wrong_precision",
+                "valid_routed_wrong_coverage",
+                "valid_conditional_fix_rate",
+                "test_accuracy",
+                "test_macro_f1",
+                "test_bot_f1",
+                "test_loss",
+                "test_routed_count",
+                "test_query_rate",
+                "test_net_gain",
+                "test_routed_wrong_precision",
+                "test_routed_wrong_coverage",
+                "test_conditional_fix_rate",
+            ],
+            beta_sweep,
+        )
+        write_csv_rows(
+            stage_dir / "valid_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            valid_budget_curve,
+        )
+        write_csv_rows(
+            stage_dir / "test_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            test_budget_curve,
+        )
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": final_logits,
+                    "prob": final_prob,
+                    "pred": final_pred,
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "routed_masks": routed_masks,
+                    "router_prob": router_prob,
+                    "router_score": router_score,
+                    "oracle_advantage": oracle_advantage,
+                    "neighbor_count_1hop": torch.tensor(semantic_views.get("count_1hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views.get("count_2hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "router_model": final_run["router_state"],
+                    "refiner_model": final_run["refiner_state"],
+                    "fit_summary": final_run["fit_summary"],
+                    "selected_beta": selected_beta,
+                    "selected_budget": selected_budget,
+                    "selected_eval_top_k": int(eval_top_k),
+                },
+                "beta_sweep": beta_sweep,
+                "valid_budget_curve": valid_budget_curve,
+                "test_budget_curve": test_budget_curve,
+                **base_bundle,
+            },
+        )
+        notes = [
+            "# GLANCE joint router-refiner baseline",
+            "",
+            "This stage implements a GLANCE-style joint router+refiner contract under the current cached semantic embedding path.",
+            "The public router is task-adapted for TwiBot20 reliability routing: base confidence is temperature-scaled, social features are direction-aware, and router supervision targets base-wrong reliability rather than paper-text advantage.",
+            "The semantic expert alignment is intentionally deferred, and the public evaluation protocol is TwiBot20-adapted global-budget routing.",
+            "The base GNN and semantic expert remain frozen; only the router scorer MLP and the routed-node refiner MLP are trained.",
+            "The router is trained with base-wrong reliability BCE plus pairwise ranking. Oracle advantage is still recorded as a post-hoc diagnostic trace.",
+            f"Training uses deterministic batch top-k with K_start={int(batch_size)} and K_end={int(eval_top_k)}. Final evaluation ranks the whole split by router score, selects budget on validation, and locks the selected budget ({selected_budget:.3f}) on test. Beta is selected on validation only from {{0.1, 0.2, 0.3}}.",
+            "Use router_performance_summary.json/csv, router_epoch_curve.csv, and the budget-curve CSVs to inspect router quality directly.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_joint_router_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    @staticmethod
+    def _budget_key(budget):
+        return int(round(float(budget) * 100))
+
+    def _build_counterfactual_budget_rows(
+        self,
+        budgets,
+        risk_score,
+        pred_gnn,
+        pred_refiner,
+        labels_np,
+        eval_idx,
+        prob_gnn,
+        prob_refiner,
+    ):
+        risk_score = np.asarray(risk_score, dtype=np.float64)
+        pred_gnn_np = np.asarray(pred_gnn, dtype=np.int64)
+        pred_ref_np = np.asarray(pred_refiner, dtype=np.int64)
+        labels_np = np.asarray(labels_np, dtype=np.int64)
+        eval_idx = np.asarray(eval_idx, dtype=np.int64)
+        prob_gnn_t = prob_gnn.detach().cpu().float() if torch.is_tensor(prob_gnn) else torch.tensor(prob_gnn, dtype=torch.float32)
+        prob_ref_t = prob_refiner.detach().cpu().float() if torch.is_tensor(prob_refiner) else torch.tensor(prob_refiner, dtype=torch.float32)
+
+        order = eval_idx[np.argsort(-risk_score[eval_idx])] if eval_idx.size else np.asarray([], dtype=np.int64)
+        base_eval = _score_all(labels_np[eval_idx], pred_gnn_np[eval_idx]) if eval_idx.size else {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "bot_f1": 0.0,
+            "count": 0,
+        }
+        base_wrong_count = int((pred_gnn_np[eval_idx] != labels_np[eval_idx]).sum()) if eval_idx.size else 0
+        base_correct_count = int(eval_idx.size - base_wrong_count)
+        rows = []
+        payloads = {}
+        for budget in parse_budget_list(budgets):
+            k = min(max(int(eval_idx.size * float(budget)), 1), eval_idx.size) if eval_idx.size else 0
+            routed = order[:k]
+            routed_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            routed_mask[routed] = True
+            final_pred = pred_gnn_np.copy()
+            final_pred[routed] = pred_ref_np[routed]
+            test_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            test_mask[eval_idx] = True
+            delta = _delta_table(pred_gnn_np, final_pred, labels_np, test_mask)
+            routed_delta = _delta_table(pred_gnn_np, final_pred, labels_np, routed_mask)
+            final_eval = _score_all(labels_np[eval_idx], final_pred[eval_idx]) if eval_idx.size else dict(base_eval)
+            row = {
+                "budget": float(budget),
+                "routed_count": int(k),
+                "fix": int(delta["fix"]),
+                "break": int(delta["broke"]),
+                "net": int(delta["net"]),
+                "routed_fix": int(routed_delta["fix"]),
+                "routed_break": int(routed_delta["broke"]),
+                "routed_net": int(routed_delta["net"]),
+                "wrong_node_fix_rate": float(delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+                "correct_node_break_rate": float(delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+                "accuracy": float(final_eval["accuracy"]),
+                "macro_f1": float(final_eval["macro_f1"]),
+                "bot_f1": float(final_eval["bot_f1"]),
+                "delta_accuracy": float(final_eval["accuracy"] - base_eval["accuracy"]),
+                "delta_macro_f1": float(final_eval["macro_f1"] - base_eval["macro_f1"]),
+                "delta_bot_f1": float(final_eval["bot_f1"] - base_eval["bot_f1"]),
+                "mean_base_confidence_routed": float(prob_gnn_t[routed].max(dim=1).values.mean().item()) if k else 0.0,
+                "mean_refiner_confidence_routed": float(prob_ref_t[routed].max(dim=1).values.mean().item()) if k else 0.0,
+            }
+            rows.append(row)
+            payloads[str(self._budget_key(budget))] = {
+                "metrics": final_eval,
+                "delta_vs_base": {
+                    "accuracy": row["delta_accuracy"],
+                    "macro_f1": row["delta_macro_f1"],
+                    "bot_f1": row["delta_bot_f1"],
+                },
+                "routed_node_ids": [int(item) for item in routed.tolist()],
+                "final_pred": torch.tensor(final_pred, dtype=torch.long),
+                "routed_mask": torch.tensor(routed_mask, dtype=torch.bool),
+            }
+        return rows, payloads
+
+    def _load_glance_counterfactual_router_artifact(self):
+        manifest = self._require_stage_json("glance_counterfactual_router", "manifest")
+        metrics = self._require_stage_json("glance_counterfactual_router", "metrics")
+        comparison = self._read_stage_json("glance_counterfactual_router", "comparison")
+        risk_manifest = self._require_stage_json("glance_counterfactual_router", "risk_manifest")
+        outputs = self._require_stage_tensor("glance_counterfactual_router", "outputs")
+        router_scores = outputs.get("risk_score")
+        if router_scores is None:
+            raise MissingFrozenArtifactError(
+                "glance_counterfactual_router outputs.pt must contain risk_score for budgeted refine."
+            )
+
+        def _read_budget_curve_rows(filename):
+            budget_curve_path = self.experiment_root / "stages" / "glance_counterfactual_router" / filename
+            if not budget_curve_path.exists():
+                return []
+            import csv
+
+            with open(budget_curve_path, "r", encoding="utf-8") as handle:
+                return list(csv.DictReader(handle))
+
+        return {
+            "manifest": manifest,
+            "metrics": metrics,
+            "comparison": comparison,
+            "risk_manifest": risk_manifest,
+            "outputs": outputs,
+            "risk_score": router_scores,
+            "router_scores": router_scores,
+            "valid_budget_curve": _read_budget_curve_rows("valid_budget_curve.csv"),
+            "test_budget_curve": _read_budget_curve_rows("test_budget_curve.csv"),
+        }
+
+    def _run_glance_refiner_analysis(self, stage_dir, base_bundle):
+        oracle_metrics = self._require_stage_json("glance_oracle_refine", "metrics")
+        oracle_manifest = self._require_stage_json("glance_oracle_refine", "manifest")
+        oracle_rows = self._require_stage_jsonl("glance_oracle_refine", "per_node_test")
+        full_metrics = self._require_stage_json("glance_full_graph_refine", "metrics")
+        full_manifest = self._require_stage_json("glance_full_graph_refine", "manifest")
+        full_rows = self._require_stage_jsonl("glance_full_graph_refine", "per_node_test")
+        budgeted_metrics = self._read_stage_json("glance_budgeted_refine", "metrics")
+        budgeted_manifest = self._read_stage_json("glance_budgeted_refine", "manifest")
+        budgeted_rows = self._require_stage_jsonl("glance_budgeted_refine", "per_node_test") if budgeted_metrics and budgeted_manifest else []
+
+        oracle_analysis = self._build_refiner_analysis_summary(oracle_rows, "oracle_wrong_nodes")
+        full_analysis = self._build_refiner_analysis_summary(full_rows, "full_graph_supervised_refiner")
+        budgeted_analysis = self._build_refiner_analysis_summary(budgeted_rows, "router_routed_fixed_budget_refiner") if budgeted_rows else None
+        comparison = {
+            "contract": "glance_refiner_analysis_v1",
+            "oracle_upper_bound": {
+                "manifest": oracle_manifest,
+                "metrics": oracle_metrics,
+                "analysis": oracle_analysis,
+            },
+            "full_graph_lower_bound": {
+                "manifest": full_manifest,
+                "metrics": full_metrics,
+                "analysis": full_analysis,
+            },
+            "budgeted_router_refine": (
+                {
+                    "manifest": budgeted_manifest,
+                    "metrics": budgeted_metrics,
+                    "analysis": budgeted_analysis,
+                }
+                if budgeted_metrics and budgeted_manifest and budgeted_analysis
+                else None
+            ),
+            "comparison_summary": {
+                "oracle_wrong_fix_rate": float(oracle_analysis["wrong_node_fix_rate"]),
+                "full_graph_wrong_fix_rate": float(full_analysis["wrong_node_fix_rate"]),
+                "full_graph_correct_break_rate": float(full_analysis["correct_node_break_rate"]),
+                "oracle_vs_full_graph_fix_gap": float(oracle_analysis["wrong_node_fix_rate"] - full_analysis["wrong_node_fix_rate"]),
+                "full_graph_net_gain": int(full_metrics.get("net_gain", 0)),
+                "budgeted_wrong_fix_rate": float(budgeted_analysis["wrong_node_fix_rate"]) if budgeted_analysis else None,
+                "budgeted_correct_break_rate": float(budgeted_analysis["correct_node_break_rate"]) if budgeted_analysis else None,
+                "budgeted_net_gain": int(budgeted_analysis["net_gain"]) if budgeted_analysis else None,
+                "budgeted_routed_wrong_coverage": float(budgeted_analysis["routed_wrong_coverage"]) if budgeted_analysis else None,
+                "budgeted_routed_wrong_precision": float(budgeted_analysis["routed_wrong_precision"]) if budgeted_analysis else None,
+                "budgeted_conditional_fix_rate_on_selected_wrong": (
+                    float(budgeted_analysis["conditional_fix_rate_on_selected_wrong"]) if budgeted_analysis else None
+                ),
+                "router_ablation_interpretation": (
+                    "oracle upper bound isolates what the correction refiner can do on true hard nodes; "
+                    "full-graph lower bound shows the cost of removing node selection; "
+                    "budgeted refine under the router-selected validation budget is the deployable operating point."
+                ),
+            },
+        }
+        write_json(stage_dir / "analysis_summary.json", comparison)
+        notes = [
+            "# GLANCE refiner analysis",
+            "",
+            "This stage compares the error-only oracle upper bound, the no-router full-graph lower bound, and the router-selected budgeted refine operating point when present.",
+            "Use the oracle stage to estimate refiner headroom on true hard nodes.",
+            "Use the full-graph stage to diagnose where a missing router causes correct nodes to be harmed.",
+            "When present, glance_budgeted_refine is interpreted under the router's validation-selected fixed budget, not a test-selected optimum.",
+            "The gap between oracle wrong-node fix rate and full-graph wrong-node fix rate is the main signal for router necessity.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "comparison": comparison,
+                **base_bundle,
+            },
+        )
+        return {
+            "stage": "glance_refiner_analysis",
+            "stage_dir": str(stage_dir),
+            "metrics": comparison["comparison_summary"],
+        }
+
+    def _run_glance_budgeted_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        router_artifact = self._load_glance_counterfactual_router_artifact()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_budgeted_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+        labels_np = labels_t.numpy()
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            self.data.get("edge_index"),
+        )
+        refiner_features = torch.cat(
+            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+            dim=1,
+        )
+
+        risk_scores = router_artifact["router_scores"].detach().cpu().numpy().astype(np.float32)
+        budgets = self._router_budgets()
+        train_order = train_idx[np.argsort(-risk_scores[train_idx])] if train_idx.size else np.asarray([], dtype=np.int64)
+        valid_order = valid_idx[np.argsort(-risk_scores[valid_idx])] if valid_idx.size else np.asarray([], dtype=np.int64)
+        test_order = test_idx[np.argsort(-risk_scores[test_idx])] if test_idx.size else np.asarray([], dtype=np.int64)
+        base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx]) if test_idx.size else {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "bot_f1": 0.0,
+            "count": 0,
+        }
+        base_wrong_count = int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()) if test_idx.size else 0
+        base_correct_count = int(test_idx.size - base_wrong_count)
+
+        budget_rows = []
+        budget_payload_json = {}
+        analysis_by_budget = {}
+        candidate_outputs_by_key = {}
+        router_selected_budget = router_artifact["metrics"].get(
+            "selected_budget_valid",
+            router_artifact["metrics"].get("selected_budget"),
+        )
+        if router_selected_budget is None:
+            raise MissingFrozenArtifactError(
+                "glance_budgeted_refine requires glance_counterfactual_router to persist a validation-selected budget."
+            )
+        router_selected_key = str(self._budget_key(router_selected_budget))
+
+        for budget in budgets:
+            train_k = min(max(int(train_idx.size * float(budget)), 1), train_idx.size) if train_idx.size else 0
+            valid_k = min(max(int(valid_idx.size * float(budget)), 1), valid_idx.size) if valid_idx.size else 0
+            test_k = min(max(int(test_idx.size * float(budget)), 1), test_idx.size) if test_idx.size else 0
+            train_routed = train_order[:train_k]
+            valid_routed = valid_order[:valid_k]
+            test_routed = test_order[:test_k]
+            if train_routed.size == 0:
+                continue
+
+            model = GlanceRefinerMLP(
+                input_dim=int(refiner_features.shape[1]),
+                hidden_dim=128,
+                activation=str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                dropout=0.1,
+            )
+            model, fit_summary = self._train_glance_refiner(
+                model,
+                refiner_features[train_routed],
+                labels_t[train_routed],
+                refiner_features[valid_routed],
+                labels_t[valid_routed],
+            )
+            model.eval()
+            with torch.no_grad():
+                train_logits_ref = model(refiner_features[train_routed]).cpu() if train_routed.size else torch.empty((0, 2), dtype=torch.float32)
+                valid_logits_ref = model(refiner_features[valid_routed]).cpu() if valid_routed.size else torch.empty((0, 2), dtype=torch.float32)
+                test_logits_ref = model(refiner_features[test_routed]).cpu() if test_routed.size else torch.empty((0, 2), dtype=torch.float32)
+
+            final_logits = logits_gnn.clone()
+            final_prob = p_gnn.clone()
+            final_pred = pred_gnn.clone()
+            if train_routed.size:
+                final_logits[train_routed] = train_logits_ref
+                final_prob[train_routed] = torch.softmax(train_logits_ref, dim=1)
+                final_pred[train_routed] = train_logits_ref.argmax(dim=1)
+            if valid_routed.size:
+                final_logits[valid_routed] = valid_logits_ref
+                final_prob[valid_routed] = torch.softmax(valid_logits_ref, dim=1)
+                final_pred[valid_routed] = valid_logits_ref.argmax(dim=1)
+            if test_routed.size:
+                final_logits[test_routed] = test_logits_ref
+                final_prob[test_routed] = torch.softmax(test_logits_ref, dim=1)
+                final_pred[test_routed] = test_logits_ref.argmax(dim=1)
+
+            test_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            test_mask[test_idx] = True
+            routed_test_mask = np.zeros(labels_np.shape[0], dtype=bool)
+            routed_test_mask[test_routed] = True
+            delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), labels_np, test_mask)
+            routed_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), labels_np, routed_test_mask)
+            overall_test = _score_all(labels_np[test_idx], final_pred.numpy()[test_idx]) if test_idx.size else dict(base_test)
+            row = {
+                "budget": float(budget),
+                "train_routed_count": int(train_routed.size),
+                "valid_routed_count": int(valid_routed.size),
+                "test_routed_count": int(test_routed.size),
+                "fix": int(delta["fix"]),
+                "break": int(delta["broke"]),
+                "net": int(delta["net"]),
+                "routed_fix": int(routed_delta["fix"]),
+                "routed_break": int(routed_delta["broke"]),
+                "routed_net": int(routed_delta["net"]),
+                "wrong_node_fix_rate": float(delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+                "correct_node_break_rate": float(delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+                "accuracy": float(overall_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"]),
+                "delta_accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "delta_macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "delta_bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            }
+            budget_rows.append(row)
+            budget_key = str(self._budget_key(budget))
+            budget_payload_json[budget_key] = {
+                "metrics": overall_test,
+                "delta_vs_base": {
+                    "accuracy": row["delta_accuracy"],
+                    "macro_f1": row["delta_macro_f1"],
+                    "bot_f1": row["delta_bot_f1"],
+                },
+                "routed_node_ids_train": [int(item) for item in train_routed.tolist()],
+                "routed_node_ids_valid": [int(item) for item in valid_routed.tolist()],
+                "routed_node_ids_test": [int(item) for item in test_routed.tolist()],
+            }
+            per_node_rows = []
+            test_routed_np = routed_test_mask
+            for node_idx in test_idx.tolist():
+                per_node_rows.append({
+                    "node_id": int(node_idx),
+                    "base_pred": int(pred_gnn[node_idx].item()),
+                    "final_pred": int(final_pred[node_idx].item()),
+                    "label": int(labels_np[node_idx]),
+                    "routed": bool(test_routed_np[node_idx]),
+                    "was_wrong_base": bool(pred_gnn[node_idx].item() != labels_np[node_idx]),
+                    "is_wrong_final": bool(final_pred[node_idx].item() != labels_np[node_idx]),
+                    "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                    "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+                })
+            analysis_by_budget[budget_key] = self._build_refiner_analysis_summary(per_node_rows, f"budget_{budget_key}")
+            candidate_outputs_by_key[budget_key] = {
+                "budget": float(budget),
+                "logits": final_logits,
+                "prob": final_prob,
+                "pred": final_pred,
+                "model_state": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
+                "fit_summary": fit_summary,
+                "per_node_rows": per_node_rows,
+                "analysis_summary": analysis_by_budget[budget_key],
+                "row": row,
+                "routed_masks": {
+                    "train": torch.zeros(labels_t.numel(), dtype=torch.bool).scatter_(0, torch.tensor(train_routed, dtype=torch.long), True) if train_routed.size else torch.zeros(labels_t.numel(), dtype=torch.bool),
+                    "valid": torch.zeros(labels_t.numel(), dtype=torch.bool).scatter_(0, torch.tensor(valid_routed, dtype=torch.long), True) if valid_routed.size else torch.zeros(labels_t.numel(), dtype=torch.bool),
+                    "test": torch.tensor(test_routed_np, dtype=torch.bool),
+                },
+            }
+
+        if not budget_rows:
+            raise MissingFrozenArtifactError("glance_budgeted_refine could not build any budgeted routed subset.")
+
+        if router_selected_key not in candidate_outputs_by_key:
+            raise MissingFrozenArtifactError(
+                "glance_budgeted_refine could not match the router-selected validation budget "
+                f"{router_selected_budget} to a local budgeted refiner run."
+            )
+        selected_budget = float(router_selected_budget)
+        selected_key = router_selected_key
+        selected_outputs = candidate_outputs_by_key[selected_key]
+        metrics_payload = {
+            "contract": "glance_budgeted_refine_metrics_v1",
+            "routing_mode": "router_routed_fixed_budget_refiner",
+            "paper_faithful_glance_inspired": True,
+            "not_deployable": False,
+            "counterfactual_source_refiner": router_artifact["manifest"].get("counterfactual_source_refiner"),
+            "selected_budget_source": "valid",
+            "budget_source_stage": "glance_counterfactual_router",
+            "selected_budget": float(selected_budget),
+            "selected_budget_valid": float(selected_budget),
+            "selected_budget_key": selected_key,
+            "selected_budget_metrics": selected_outputs["row"],
+            "selected_test_budget_metrics_under_valid_choice": selected_outputs["row"],
+            "base_test": base_test,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(selected_outputs["row"]["delta_accuracy"]),
+                "macro_f1": float(selected_outputs["row"]["delta_macro_f1"]),
+                "bot_f1": float(selected_outputs["row"]["delta_bot_f1"]),
+            },
+            "wrong_node_fix_rate": float(selected_outputs["row"]["wrong_node_fix_rate"]),
+            "correct_node_break_rate": float(selected_outputs["row"]["correct_node_break_rate"]),
+            "improved_count": int(selected_outputs["row"]["fix"]),
+            "degraded_count": int(selected_outputs["row"]["break"]),
+            "net_gain": int(selected_outputs["row"]["net"]),
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "budget_curve": budget_rows,
+            "budget_curve_scope": "test_sweep_diagnostic_only",
+            "fit_summary": selected_outputs["fit_summary"],
+            "split_scope": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+            },
+        }
+        manifest = {
+            "contract": "glance_budgeted_refine_v1",
+            "status": "completed",
+            "routing_mode": "router_routed_fixed_budget_refiner",
+            "paper_faithful_glance_inspired": True,
+            "diagnostic_lane_only": True,
+            "not_deployable": False,
+            "research_positioning": "selector_gated_correction_refiner_under_fixed_budget",
+            "counterfactual_source_refiner": router_artifact["manifest"].get("counterfactual_source_refiner"),
+            "router_manifest": router_artifact["manifest"],
+            "budget_source_stage": "glance_counterfactual_router",
+            "selected_budget_source": "valid",
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "selected_budget": float(selected_budget),
+            "selected_budget_valid": float(selected_budget),
+            "budgets": [float(item) for item in budgets],
+            "refiner_architecture": {
+                "type": "glance_budgeted_refine_mlp",
+                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "hidden_dim": 128,
+                "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                "dropout": 0.1,
+                "output_dim": int(logits_gnn.shape[1]),
+            },
+        }
+        self._write_stage_manifest(
+            stage_dir,
+            manifest,
+            artifact_namespace="stages/joint_router_refinement",
+            visibility="public",
+            resolved_task="joint_router_refinement",
+        )
+        write_json(stage_dir / "metrics.json", metrics_payload)
+        write_json(stage_dir / "budget_payloads.json", budget_payload_json)
+        write_json(stage_dir / "analysis_summary.json", selected_outputs["analysis_summary"])
+        write_csv_rows(
+            stage_dir / "budget_curve.csv",
+            [
+                "budget",
+                "train_routed_count",
+                "valid_routed_count",
+                "test_routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+            ],
+            budget_rows,
+        )
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in selected_outputs["per_node_rows"]) + "\n",
+        )
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": selected_outputs["logits"],
+                    "prob": selected_outputs["prob"],
+                    "pred": selected_outputs["pred"],
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "routed_masks": selected_outputs["routed_masks"],
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "model": selected_outputs["model_state"],
+                    "fit_summary": selected_outputs["fit_summary"],
+                },
+                "router_budget_payloads": budget_payload_json,
+                **base_bundle,
+            },
+        )
+        notes = [
+            "# GLANCE budgeted refine",
+            "",
+            "This stage is a diagnostic routed-set correction lane, not the main strict GLANCE baseline.",
+            "It consumes routed node selections from glance_counterfactual_router and trains a routed-only correction refiner.",
+            "For each budget, the refiner is trained on train_routed(B), selected on valid_routed(B), and applied only to test_routed(B).",
+            "The final artifact is locked to the router's validation-selected budget; the per-budget curve is diagnostic only.",
+            "Non-routed nodes strictly preserve the base GNN prediction.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_budgeted_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    def _run_glance_oracle_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        active_edge_index, active_edge_type = self._active_graph_tensors()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_oracle_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+
+        routed_masks = self._oracle_wrong_node_masks(pred_gnn.numpy())
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            active_edge_index,
+        )
+        refiner_features = torch.cat(
+            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+            dim=1,
+        )
+
+        train_idx = np.flatnonzero(routed_masks["train"])
+        valid_idx = np.flatnonzero(routed_masks["valid"])
+        test_idx = np.flatnonzero(routed_masks["test"])
+        if train_idx.size == 0:
+            raise MissingFrozenArtifactError(
+                "glance_oracle_refine found zero oracle-routed train nodes. "
+                "This upper-bound stage requires at least one train error node."
+            )
+
+        model = GlanceRefinerMLP(
+            input_dim=int(refiner_features.shape[1]),
+            hidden_dim=128,
+            activation=str(getattr(self.args, "activation", "leakyrelu")).lower(),
+            dropout=0.1,
+        )
+        model, fit_summary = self._train_glance_refiner(
+            model,
+            refiner_features[train_idx],
+            labels_t[train_idx],
+            refiner_features[valid_idx],
+            labels_t[valid_idx],
+        )
+
+        model.eval()
+        with torch.no_grad():
+            if train_idx.size > 0:
+                train_logits_ref = model(refiner_features[train_idx]).cpu()
+            else:
+                train_logits_ref = torch.empty((0, 2), dtype=torch.float32)
+            if valid_idx.size > 0:
+                valid_logits_ref = model(refiner_features[valid_idx]).cpu()
+            else:
+                valid_logits_ref = torch.empty((0, 2), dtype=torch.float32)
+            if test_idx.size > 0:
+                test_logits_ref = model(refiner_features[test_idx]).cpu()
+            else:
+                test_logits_ref = torch.empty((0, 2), dtype=torch.float32)
+
+        final_logits = logits_gnn.clone()
+        final_prob = p_gnn.clone()
+        final_pred = pred_gnn.clone()
+        if train_idx.size > 0:
+            final_logits[train_idx] = train_logits_ref
+            final_prob[train_idx] = torch.softmax(train_logits_ref, dim=1)
+            final_pred[train_idx] = train_logits_ref.argmax(dim=1)
+        if valid_idx.size > 0:
+            final_logits[valid_idx] = valid_logits_ref
+            final_prob[valid_idx] = torch.softmax(valid_logits_ref, dim=1)
+            final_pred[valid_idx] = valid_logits_ref.argmax(dim=1)
+        if test_idx.size > 0:
+            final_logits[test_idx] = test_logits_ref
+            final_prob[test_idx] = torch.softmax(test_logits_ref, dim=1)
+            final_pred[test_idx] = test_logits_ref.argmax(dim=1)
+
+        test_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), self.labels, self.test_mask)
+        routed_test_ratio = float(test_idx.size / max(int(self.test_mask.sum()), 1))
+        non_routed_test_mask = self.test_mask & ~routed_masks["test"]
+        preservation = float(
+            (final_pred.numpy()[non_routed_test_mask] == pred_gnn.numpy()[non_routed_test_mask]).mean()
+        ) if non_routed_test_mask.any() else 1.0
+
+        overall_test = _score_all(self.labels[self.test_mask], final_pred.numpy()[self.test_mask])
+        routed_test = _score_all(self.labels[test_idx], final_pred.numpy()[test_idx]) if test_idx.size else {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "bot_f1": 0.0,
+            "count": 0,
+        }
+        base_test = _score_all(self.labels[self.test_mask], pred_gnn.numpy()[self.test_mask])
+        base_wrong_count = int(test_idx.size)
+        base_correct_count = int(int(self.test_mask.sum()) - base_wrong_count)
+
+        metrics_payload = {
+            "contract": "glance_oracle_refine_metrics_v1",
+            "routing_mode": "oracle_wrong_nodes",
+            "upper_bound_only": True,
+            "not_deployable": True,
+            "overall_test": overall_test,
+            "routed_test": routed_test,
+            "base_test": base_test,
+            "non_routed_test_preservation_accuracy": preservation,
+            "routed_test_ratio": routed_test_ratio,
+            "fixed_wrong_to_right": int(test_delta["fix"]),
+            "fixed_right_to_wrong": int(test_delta["broke"]),
+            "net_gain_on_routed": int(test_delta["net"]),
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "wrong_node_fix_rate": float(test_delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+            "correct_node_break_rate": 0.0,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "oracle_routed_counts": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+                "all": int(routed_masks["all"].sum()),
+            },
+            "fit_summary": fit_summary,
+        }
+
+        manifest = {
+            "contract": "glance_oracle_refine_v1",
+            "status": "completed",
+            "routing_mode": "oracle_wrong_nodes",
+            "upper_bound_only": True,
+            "not_deployable": True,
+            "research_positioning": "error_only_oracle_upper_bound_for_correction_refiner",
+            "no_router_training": True,
+            "no_llm_generation": True,
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "semantic_stage_dir": str(semantic["dir"]),
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "graph_source": context["graph_bundle"]["source"],
+            "graph_source_root": context["graph_bundle"]["source_root"],
+            "text_encoder_identity": str(semantic["manifest"].get("lm_model", semantic["manifest"].get("semantic_backbone", "roberta_finetuned"))),
+            "refiner_architecture": {
+                "type": "oracle_glance_refiner_mlp",
+                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "hidden_dim": 128,
+                "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                "dropout": 0.1,
+                "output_dim": 2,
+                "hard_switch": True,
+            },
+            "oracle_routed_counts": metrics_payload["oracle_routed_counts"],
+        }
+        self._write_stage_manifest(
+            stage_dir,
+            manifest,
+            artifact_namespace="stages/local_conformal_diagnostic",
+            visibility="public",
+            resolved_task="local_conformal_diagnostic",
+        )
+        write_json(stage_dir / "metrics.json", metrics_payload)
+
+        per_node_rows = []
+        for node_idx in np.flatnonzero(self.test_mask):
+            per_node_rows.append({
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn[node_idx].item()),
+                "final_pred": int(final_pred[node_idx].item()),
+                "label": int(self.labels[node_idx]),
+                "routed": bool(routed_masks["test"][node_idx]),
+                "was_wrong_base": bool(pred_gnn[node_idx].item() != self.labels[node_idx]),
+                "is_wrong_final": bool(final_pred[node_idx].item() != self.labels[node_idx]),
+                "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+            })
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        analysis_summary = self._build_refiner_analysis_summary(per_node_rows, "oracle_wrong_nodes")
+        write_json(stage_dir / "analysis_summary.json", analysis_summary)
+
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": final_logits,
+                    "prob": final_prob,
+                    "pred": final_pred,
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "routed_masks": {key: torch.tensor(value, dtype=torch.bool) for key, value in routed_masks.items()},
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "model": model.state_dict(),
+                    "fit_summary": fit_summary,
+                },
+                "oracle_summary": {
+                    "routing_mode": "oracle_wrong_nodes",
+                    "warning": "upper bound only; routed masks use ground-truth errors in every split",
+                },
+                "analysis_summary": analysis_summary,
+                **base_bundle,
+            },
+        )
+
+        notes = [
+            "# GLANCE oracle upper bound",
+            "",
+            "This stage is an oracle upper-bound ablation.",
+            "Routed nodes are defined by ground-truth base-GNN errors within each split.",
+            "No router is trained and no generative LLM is queried.",
+            "Routed-node refinement uses semantic_finetune roberta-f embeddings with ego/1-hop/2-hop mean pooling.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_oracle_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    def _run_glance_full_graph_refine(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        active_edge_index, active_edge_type = self._active_graph_tensors()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_full_graph_refine requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            active_edge_index,
+        )
+        refiner_features = torch.cat(
+            [z_gnn, semantic_views["ego"], semantic_views["hop1"], semantic_views["hop2"]],
+            dim=1,
+        )
+
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        if train_idx.size == 0:
+            raise MissingFrozenArtifactError("glance_full_graph_refine requires a non-empty train_idx.")
+
+        model = GlanceRefinerMLP(
+            input_dim=int(refiner_features.shape[1]),
+            hidden_dim=128,
+            activation=str(getattr(self.args, "activation", "leakyrelu")).lower(),
+            dropout=0.1,
+        )
+        model, fit_summary = self._train_glance_refiner(
+            model,
+            refiner_features[train_idx],
+            labels_t[train_idx],
+            refiner_features[valid_idx],
+            labels_t[valid_idx],
+        )
+
+        model.eval()
+        with torch.no_grad():
+            final_logits = model(refiner_features).cpu()
+            final_prob = torch.softmax(final_logits, dim=1)
+            final_pred = final_logits.argmax(dim=1)
+
+        test_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), self.labels, self.test_mask)
+        overall_test = _score_all(self.labels[self.test_mask], final_pred.numpy()[self.test_mask])
+        base_test = _score_all(self.labels[self.test_mask], pred_gnn.numpy()[self.test_mask])
+        lm_only_test = None
+        overall_delta_vs_lm_only = None
+        lm_only_pred = None
+        if semantic.get("outputs") is not None:
+            lm_outputs = semantic["outputs"]
+            lm_prob = lm_outputs.get("prob_cal", lm_outputs.get("prob"))
+            lm_pred_t = lm_outputs.get("pred")
+            if lm_pred_t is None and lm_prob is not None:
+                lm_pred_t = lm_prob.argmax(dim=1)
+            if lm_pred_t is not None:
+                lm_only_pred = lm_pred_t.detach().cpu().long() if torch.is_tensor(lm_pred_t) else torch.tensor(lm_pred_t, dtype=torch.long)
+                lm_only_test = _score_all(self.labels[self.test_mask], lm_only_pred.numpy()[self.test_mask])
+                overall_delta_vs_lm_only = {
+                    "accuracy": float(overall_test["accuracy"] - lm_only_test["accuracy"]),
+                    "macro_f1": float(overall_test["macro_f1"] - lm_only_test["macro_f1"]),
+                    "bot_f1": float(overall_test["bot_f1"] - lm_only_test["bot_f1"]),
+                }
+
+        base_wrong_count = int((pred_gnn.numpy()[self.test_mask] != self.labels[self.test_mask]).sum())
+        base_correct_count = int(int(self.test_mask.sum()) - base_wrong_count)
+
+        metrics_payload = {
+            "contract": "glance_full_graph_refine_metrics_v1",
+            "routing_mode": "full_graph_supervised_refiner",
+            "upper_bound_only": False,
+            "not_deployable": False,
+            "overall_test": overall_test,
+            "base_test": base_test,
+            "lm_only_test": lm_only_test,
+            "overall_delta_vs_base_gnn": {
+                "accuracy": float(overall_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(overall_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(overall_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "overall_delta_vs_lm_only": overall_delta_vs_lm_only,
+            "improved_count": int(test_delta["fix"]),
+            "degraded_count": int(test_delta["broke"]),
+            "net_gain": int(test_delta["net"]),
+            "count": int(test_delta["touched"]),
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "wrong_node_fix_rate": float(test_delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+            "correct_node_break_rate": float(test_delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+            "fit_summary": fit_summary,
+            "split_scope": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+            },
+        }
+
+        manifest = {
+            "contract": "glance_full_graph_refine_v1",
+            "status": "completed",
+            "routing_mode": "full_graph_supervised_refiner",
+            "upper_bound_only": False,
+            "not_deployable": False,
+            "research_positioning": "no_router_lower_bound_router_ablation_for_refiner_diagnosis",
+            "no_router_training": True,
+            "no_llm_generation": True,
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "semantic_stage_dir": str(semantic["dir"]),
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "graph_source": context["graph_bundle"]["source"],
+            "graph_source_root": context["graph_bundle"]["source_root"],
+            "text_encoder_identity": str(semantic["manifest"].get("lm_model", semantic["manifest"].get("semantic_backbone", "roberta_finetuned"))),
+            "refiner_architecture": {
+                "type": "glance_full_graph_refiner_mlp",
+                "input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+                "hidden_dim": 128,
+                "activation": str(getattr(self.args, "activation", "leakyrelu")).lower(),
+                "dropout": 0.1,
+                "output_dim": 2,
+                "full_graph": True,
+            },
+            "split_scope": metrics_payload["split_scope"],
+            "lm_only_reference_available": bool(lm_only_test is not None),
+            "seed_scope_note": "current local validation path is seed_1; multi-seed requires matching frozen_g0 per seed",
+        }
+        self._write_stage_manifest(
+            stage_dir,
+            manifest,
+            artifact_namespace="stages/local_conflict_prune_diag",
+            visibility="public",
+            resolved_task="local_conflict_prune_diag",
+        )
+        write_json(stage_dir / "metrics.json", metrics_payload)
+
+        per_node_rows = []
+        for node_idx in np.flatnonzero(self.test_mask):
+            row = {
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn[node_idx].item()),
+                "final_pred": int(final_pred[node_idx].item()),
+                "label": int(self.labels[node_idx]),
+                "routed": True,
+                "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+                "was_wrong_base": bool(pred_gnn[node_idx].item() != self.labels[node_idx]),
+                "is_wrong_final": bool(final_pred[node_idx].item() != self.labels[node_idx]),
+            }
+            if lm_only_pred is not None:
+                row["lm_only_pred"] = int(lm_only_pred[node_idx].item())
+            per_node_rows.append(row)
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        analysis_summary = self._build_refiner_analysis_summary(per_node_rows, "full_graph_supervised_refiner")
+        write_json(stage_dir / "analysis_summary.json", analysis_summary)
+
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "logits": final_logits,
+                    "prob": final_prob,
+                    "pred": final_pred,
+                    "labels": labels_t,
+                    "base_pred": pred_gnn,
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "model": model.state_dict(),
+                    "fit_summary": fit_summary,
+                },
+                "refiner_summary": {
+                    "scope": "full_graph_supervised_refiner",
+                    "warning": "seed_1 local validation path uses shared LM embedding and per-seed frozen_g0 backbone",
+                },
+                "analysis_summary": analysis_summary,
+                **base_bundle,
+            },
+        )
+
+        notes = [
+            "# GLANCE full-graph refiner",
+            "",
+            "This stage trains a full-graph supervised refiner on train_idx and selects the best epoch on valid_idx.",
+            "The refiner input is [z_gnn || z_sem_0 || z_sem_1 || z_sem_2] with semantic embeddings from semantic_finetune or explicit --emb_path.",
+            "No router is trained and no generative LLM is queried.",
+            "Research positioning: no-router lower-bound / router ablation for diagnosing where the refiner helps or harms.",
+            "Current local validation path is seed_1 only; multi-seed requires matching frozen_g0 artifacts per seed.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_full_graph_refine",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    def _run_glance_counterfactual_router(self, stage_dir, base_bundle):
+        context = self.ensure_backbone_context()
+        semantic = self._load_semantic_finetune_artifact()
+        refiner_artifact = self._load_glance_refiner_artifact()
+        gnn_outputs = context["gnn_outputs"]
+        p_gnn = gnn_outputs.get("prob")
+        logits_gnn = gnn_outputs.get("logits")
+        pred_gnn = gnn_outputs.get("pred")
+        z_gnn = gnn_outputs.get("node_repr")
+        if any(item is None for item in (p_gnn, logits_gnn, pred_gnn, z_gnn)):
+            raise MissingFrozenArtifactError(
+                "glance_counterfactual_router requires frozen_g0 outputs with prob/logits/pred/node_repr."
+            )
+
+        p_gnn = p_gnn.detach().cpu().float()
+        logits_gnn = logits_gnn.detach().cpu().float()
+        pred_gnn = pred_gnn.detach().cpu().long()
+        z_gnn = z_gnn.detach().cpu().float()
+        labels_t = torch.tensor(self.labels, dtype=torch.long)
+        labels_np = labels_t.numpy()
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        semantic_views = self._build_k_hop_semantic_views(
+            semantic["embeddings"],
+            self.data.get("edge_index"),
+        )
+        if train_idx.size == 0:
+            raise MissingFrozenArtifactError("glance_counterfactual_router requires a non-empty train_idx.")
+        ref_outputs = refiner_artifact["outputs"]
+        prob_ref = ref_outputs.get("prob")
+        pred_ref = ref_outputs.get("pred")
+        logits_ref = ref_outputs.get("logits")
+        if prob_ref is None or pred_ref is None:
+            raise MissingFrozenArtifactError(
+                f"{refiner_artifact['stage_name']} outputs must include 'prob' and 'pred' for counterfactual routing."
+            )
+        prob_ref = prob_ref.detach().cpu().float() if torch.is_tensor(prob_ref) else torch.tensor(prob_ref, dtype=torch.float32)
+        pred_ref = pred_ref.detach().cpu().long() if torch.is_tensor(pred_ref) else torch.tensor(pred_ref, dtype=torch.long)
+        logits_ref = logits_ref.detach().cpu().float() if torch.is_tensor(logits_ref) else (
+            torch.log(prob_ref.clamp_min(1e-8)) if logits_ref is None else torch.tensor(logits_ref, dtype=torch.float32)
+        )
+
+        gnn_loss = _node_cross_entropy_vector(p_gnn, labels_t)
+        refiner_loss = _node_cross_entropy_vector(prob_ref, labels_t)
+        gnn_correct = pred_gnn.eq(labels_t).float()
+        refiner_correct = pred_ref.eq(labels_t).float()
+        advantage = (gnn_loss - refiner_loss - float(getattr(self.args, "glance_llm_query_cost", 0.2))).numpy()
+
+        budgets = self._router_budgets()
+        router = GlanceForContextResidualRiskSelector(
+            budgets=budgets,
+            training_objective="glance_advantage",
+            llm_query_cost=float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+        )
+        router.fit(
+            logits_gnn,
+            p_gnn,
+            labels_t,
+            train_idx=train_idx,
+            val_idx=valid_idx,
+            edge_index=self.data.get("edge_index"),
+            edge_type=self.data.get("edge_type"),
+            node_repr=z_gnn,
+            fit_idx=train_idx,
+            gnn_loss=gnn_loss,
+            llm_loss=refiner_loss,
+            gnn_correct=gnn_correct,
+            llm_correct=refiner_correct,
+            training_objective="glance_advantage",
+            llm_query_cost=float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+        )
+        risk_manifest = router.build_manifest(
+            logits_gnn,
+            p_gnn,
+            labels_t,
+            val_idx=valid_idx,
+            test_idx=test_idx,
+            edge_index=self.data.get("edge_index"),
+            edge_type=self.data.get("edge_type"),
+            node_repr=z_gnn,
+            q_probs=p_gnn,
+            gnn_loss=gnn_loss,
+            llm_loss=refiner_loss,
+            gnn_correct=gnn_correct,
+            llm_correct=refiner_correct,
+            training_objective="glance_advantage",
+            llm_query_cost=float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+        )
+        risk_score = np.asarray(risk_manifest["risk_score"], dtype=np.float32)
+        calibration_metadata = dict(risk_manifest.get("calibration_metadata", {}))
+        split_audit = {
+            "train_count": int(train_idx.size),
+            "valid_count": int(valid_idx.size),
+            "test_count": int(test_idx.size),
+            "train_valid_overlap": int(np.intersect1d(train_idx, valid_idx).size),
+            "train_test_overlap": int(np.intersect1d(train_idx, test_idx).size),
+            "valid_test_overlap": int(np.intersect1d(valid_idx, test_idx).size),
+        }
+        calibration_metadata.update({
+            "source": "glance_counterfactual_router",
+            "paper_identity": "GLANCE-inspired counterfactual advantage router",
+            "paper_faithful_glance_inspired": True,
+            "official_code_verified": False,
+            "counterfactual_outcome_used": True,
+            "llm_counterfactual_outcome_used": True,
+            "not_a_new_bot_classifier": True,
+            "risk_score_semantics": "learned_router_score_proxy_for_counterfactual_advantage",
+            "router_score_semantics": "deterministic_top_k_proxy_for_routing",
+            "oracle_advantage_semantics": "counterfactual_reward_loss_gnn_minus_loss_refiner_minus_query_cost",
+            "test_labels_used_for_training": False,
+            "test_labels_used_for_threshold": False,
+            "train_target": "1[loss_gnn - loss_refiner - cost > 0]",
+            "refiner_input": "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]",
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "split_audit": split_audit,
+            "counterfactual_source_refiner": refiner_artifact["stage_name"],
+        })
+        risk_manifest["calibration_metadata"] = calibration_metadata
+
+        valid_budget_rows, valid_budget_payloads = self._build_counterfactual_budget_rows(
+            budgets=budgets,
+            risk_score=risk_score,
+            pred_gnn=pred_gnn.numpy(),
+            pred_refiner=pred_ref.numpy(),
+            labels_np=labels_np,
+            eval_idx=valid_idx,
+            prob_gnn=p_gnn,
+            prob_refiner=prob_ref,
+        )
+        test_budget_rows, test_budget_payloads = self._build_counterfactual_budget_rows(
+            budgets=budgets,
+            risk_score=risk_score,
+            pred_gnn=pred_gnn.numpy(),
+            pred_refiner=pred_ref.numpy(),
+            labels_np=labels_np,
+            eval_idx=test_idx,
+            prob_gnn=p_gnn,
+            prob_refiner=prob_ref,
+        )
+        base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx])
+        full_refiner_test = _score_all(labels_np[test_idx], pred_ref.numpy()[test_idx])
+        full_delta = _delta_table(pred_gnn.numpy(), pred_ref.numpy(), labels_np, self.test_mask)
+        base_wrong_count = int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum())
+        base_correct_count = int(test_idx.size - base_wrong_count)
+        selected_valid_row, best_key, valid_rows_by_key = self._select_best_budget_row(valid_budget_rows)
+        test_rows_by_key = {str(self._budget_key(item["budget"])): item for item in test_budget_rows}
+        selected_test_row = test_rows_by_key.get(best_key) if best_key is not None else None
+        best_payload = test_budget_payloads.get(best_key, {}) if best_key is not None else {}
+        best_final_pred = best_payload.get("final_pred", pred_gnn)
+        best_routed_mask = best_payload.get("routed_mask", torch.zeros_like(pred_gnn, dtype=torch.bool))
+
+        metrics_payload = {
+            "contract": "glance_counterfactual_router_metrics_v1",
+            "routing_mode": "glance_counterfactual_advantage",
+            "paper_faithful_glance_inspired": True,
+            "official_code_verified": False,
+            "test_labels_used_for_training": False,
+            "test_labels_used_for_threshold": False,
+            "base_test": base_test,
+            "full_refiner_test": full_refiner_test,
+            "full_refiner_delta_vs_base": {
+                "accuracy": float(full_refiner_test["accuracy"] - base_test["accuracy"]),
+                "macro_f1": float(full_refiner_test["macro_f1"] - base_test["macro_f1"]),
+                "bot_f1": float(full_refiner_test["bot_f1"] - base_test["bot_f1"]),
+            },
+            "full_refiner_fix_break": {
+                "fix": int(full_delta["fix"]),
+                "break": int(full_delta["broke"]),
+                "net": int(full_delta["net"]),
+                "wrong_node_fix_rate": float(full_delta["fix"] / base_wrong_count) if base_wrong_count else 0.0,
+                "correct_node_break_rate": float(full_delta["broke"] / base_correct_count) if base_correct_count else 0.0,
+            },
+            "router_score_semantics": "learned_router_score_proxy_for_counterfactual_advantage",
+            "oracle_advantage_semantics": "counterfactual_reward_loss_gnn_minus_loss_refiner_minus_query_cost",
+            "selected_budget_source": "valid",
+            "selected_budget": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "selected_budget_valid": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "selected_budget_key": best_key,
+            "selected_valid_budget_metrics": selected_valid_row,
+            "selected_test_budget_metrics_under_valid_choice": selected_test_row,
+            "selected_budget_metrics": selected_test_row,
+            "overall_delta_vs_base_gnn": selected_test_row and {
+                "accuracy": float(selected_test_row["delta_accuracy"]),
+                "macro_f1": float(selected_test_row["delta_macro_f1"]),
+                "bot_f1": float(selected_test_row["delta_bot_f1"]),
+            },
+            "wrong_node_fix_rate": float(selected_test_row["wrong_node_fix_rate"]) if selected_test_row else 0.0,
+            "correct_node_break_rate": float(selected_test_row["correct_node_break_rate"]) if selected_test_row else 0.0,
+            "improved_count": int(selected_test_row["fix"]) if selected_test_row else 0,
+            "degraded_count": int(selected_test_row["break"]) if selected_test_row else 0,
+            "net_gain": int(selected_test_row["net"]) if selected_test_row else 0,
+            "base_wrong_count": base_wrong_count,
+            "base_correct_count": base_correct_count,
+            "budget_curve": test_budget_rows,
+            "budget_curve_legacy_scope": "test_sweep_diagnostic_only",
+            "valid_budget_curve": valid_budget_rows,
+            "test_budget_curve": test_budget_rows,
+            "counterfactual_refiner_fit_summary": refiner_artifact["checkpoint"].get("fit_summary", {}),
+            "router_training_summary": router.training_summary,
+            "split_scope": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+            },
+        }
+        manifest = {
+            "contract": "glance_counterfactual_router_v1",
+            "status": "completed",
+            "routing_mode": "glance_counterfactual_advantage",
+            "paper_faithful_glance_inspired": True,
+            "diagnostic_lane_only": True,
+            "official_code_verified": False,
+            "not_official_reproduction": True,
+            "test_labels_used_for_training": False,
+            "test_labels_used_for_threshold": False,
+            "selected_budget_source": "valid",
+            "counterfactual_outcome_used": True,
+            "not_a_new_bot_classifier": True,
+            "research_positioning": "paper_faithful_glance_inspired_counterfactual_router_for_refiner_utility",
+            "no_llm_generation": True,
+            "semantic_source": "semantic_finetune_roberta_finetuned",
+            "semantic_stage_dir": str(semantic["dir"]),
+            "semantic_manifest": semantic["manifest"],
+            "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
+            "frozen_g0_manifest": context["frozen_g0"]["manifest"],
+            "counterfactual_source_refiner": refiner_artifact["stage_name"],
+            "counterfactual_source_refiner_manifest": refiner_artifact["manifest"],
+            "router_training_target": "1[loss_gnn - loss_refiner - cost > 0]",
+            "glance_llm_query_cost": float(getattr(self.args, "glance_llm_query_cost", 0.2)),
+            "budgets": [float(item) for item in budgets],
+            "selected_budget": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "selected_budget_valid": float(selected_valid_row["budget"]) if selected_valid_row else None,
+            "split_audit": split_audit,
+            "refiner_architecture": {
+                "type": str(refiner_artifact["manifest"].get("refiner_architecture", {}).get("type", "external_refiner")),
+                "input": str(refiner_artifact["manifest"].get("refiner_architecture", {}).get("input", "external_refiner_input")),
+                "hidden_dim": refiner_artifact["manifest"].get("refiner_architecture", {}).get("hidden_dim"),
+                "activation": refiner_artifact["manifest"].get("refiner_architecture", {}).get("activation"),
+                "dropout": refiner_artifact["manifest"].get("refiner_architecture", {}).get("dropout"),
+                "output_dim": int(logits_gnn.shape[1]),
+            },
+        }
+        self._write_stage_manifest(
+            stage_dir,
+            manifest,
+            artifact_namespace="stages/glance_budgeted_refinement_internal",
+            visibility="internal",
+            resolved_task="glance_budgeted_refinement_internal",
+        )
+        write_json(stage_dir / "metrics.json", metrics_payload)
+        write_json(stage_dir / "risk_manifest.json", risk_manifest)
+        budget_payload_json = {}
+        budget_payload_tensors = {}
+        for budget_key, payload in test_budget_payloads.items():
+            budget_payload_json[budget_key] = {
+                "metrics": payload["metrics"],
+                "delta_vs_base": payload["delta_vs_base"],
+                "routed_node_ids": payload["routed_node_ids"],
+            }
+            budget_payload_tensors[f"budget_payload_{budget_key}.pt"] = {
+                "final_pred": payload["final_pred"],
+                "routed_mask": payload["routed_mask"],
+                "routed_node_ids": torch.tensor(payload["routed_node_ids"], dtype=torch.long),
+            }
+        write_json(stage_dir / "budget_payloads.json", budget_payload_json)
+        write_csv_rows(
+            stage_dir / "budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            test_budget_rows,
+        )
+        write_csv_rows(
+            stage_dir / "valid_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            valid_budget_rows,
+        )
+        write_csv_rows(
+            stage_dir / "test_budget_curve.csv",
+            [
+                "budget",
+                "routed_count",
+                "fix",
+                "break",
+                "net",
+                "routed_fix",
+                "routed_break",
+                "routed_net",
+                "wrong_node_fix_rate",
+                "correct_node_break_rate",
+                "accuracy",
+                "macro_f1",
+                "bot_f1",
+                "delta_accuracy",
+                "delta_macro_f1",
+                "delta_bot_f1",
+                "mean_base_confidence_routed",
+                "mean_refiner_confidence_routed",
+            ],
+            test_budget_rows,
+        )
+
+        per_node_rows = []
+        best_routed_np = best_routed_mask.detach().cpu().numpy().astype(bool)
+        best_final_np = best_final_pred.detach().cpu().numpy().astype(np.int64)
+        gnn_loss_np = gnn_loss.numpy()
+        ref_loss_np = refiner_loss.numpy()
+        for node_idx in test_idx.tolist():
+            base_correct = bool(pred_gnn[node_idx].item() == int(labels_np[node_idx]))
+            ref_correct = bool(pred_ref[node_idx].item() == int(labels_np[node_idx]))
+            final_correct = bool(best_final_np[node_idx] == int(labels_np[node_idx]))
+            per_node_rows.append({
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn[node_idx].item()),
+                "refiner_pred": int(pred_ref[node_idx].item()),
+                "final_pred": int(best_final_np[node_idx]),
+                "label": int(labels_np[node_idx]),
+                "routed": bool(best_routed_np[node_idx]),
+                "advantage_score": float(risk_score[node_idx]),
+                "oracle_advantage": float(advantage[node_idx]),
+                "base_loss": float(gnn_loss_np[node_idx]),
+                "refiner_loss": float(ref_loss_np[node_idx]),
+                "base_correct": base_correct,
+                "refiner_correct": ref_correct,
+                "final_correct": final_correct,
+                "fix": bool((not base_correct) and final_correct),
+                "break": bool(base_correct and (not final_correct)),
+                "neighbor_count_1hop": int(semantic_views["count_1hop"][node_idx]),
+                "neighbor_count_2hop": int(semantic_views["count_2hop"][node_idx]),
+            })
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows) + "\n",
+        )
+        save_stage_artifacts(
+            stage_dir,
+            {
+                "outputs.pt": {
+                    "base_logits": logits_gnn,
+                    "base_prob": p_gnn,
+                    "base_pred": pred_gnn,
+                    "refiner_logits": logits_ref,
+                    "refiner_prob": prob_ref,
+                    "refiner_pred": pred_ref,
+                    "final_pred": best_final_pred,
+                    "labels": labels_t,
+                    "risk_score": torch.tensor(risk_score, dtype=torch.float32),
+                    "router_score": torch.tensor(risk_score, dtype=torch.float32),
+                    "selected_routed_mask": best_routed_mask,
+                    "gnn_loss": gnn_loss,
+                    "refiner_loss": refiner_loss,
+                    "oracle_advantage": torch.tensor(advantage, dtype=torch.float32),
+                    "neighbor_count_1hop": torch.tensor(semantic_views["count_1hop"], dtype=torch.long),
+                    "neighbor_count_2hop": torch.tensor(semantic_views["count_2hop"], dtype=torch.long),
+                },
+                "checkpoint.pt": {
+                    "counterfactual_source_refiner": refiner_artifact["stage_name"],
+                    "counterfactual_source_refiner_fit_summary": refiner_artifact["checkpoint"].get("fit_summary", {}),
+                    "router_state": router.state_dict_payload(),
+                },
+                "risk_manifest": risk_manifest,
+                "valid_budget_curve": valid_budget_rows,
+                "test_budget_curve": test_budget_rows,
+                "budget_payloads": budget_payload_json,
+                **budget_payload_tensors,
+                **base_bundle,
+            },
+        )
+        notes = [
+            "# GLANCE counterfactual router",
+            "",
+            "This stage is a diagnostic utility-selector lane, not the main strict GLANCE baseline.",
+            "It is a paper-faithful GLANCE-inspired adaptation for offline routed-set analysis, not an official reproduction.",
+            "The learned router score is the proxy used for deterministic top-k routing.",
+            "The oracle_advantage tensor is the post-hoc counterfactual reward trace: loss_gnn - loss_refiner - query_cost.",
+            "The legacy risk_score field is retained as a compatibility alias of router_score.",
+            "Budget sweeps are computed on both validation and test, but the final operating budget is selected on validation only and then locked for test reporting.",
+            "No generative LLM is queried; semantic views come from cached/fine-tuned RoBERTa embeddings.",
+        ]
+        write_text(stage_dir / "notes.md", "\n".join(notes) + "\n")
+        return {
+            "stage": "glance_counterfactual_router",
+            "stage_dir": str(stage_dir),
+            "metrics": metrics_payload,
+        }
+
+    @staticmethod
+    def _iter_glance_batches(idx, batch_size, shuffle=False, seed=0):
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        if idx.size == 0:
+            return
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive for GLANCE routing batches.")
+        if shuffle:
+            rng = np.random.default_rng(int(seed))
+            idx = idx[rng.permutation(idx.size)]
+        for start in range(0, idx.size, int(batch_size)):
+            yield idx[start : start + int(batch_size)]
+
+    @staticmethod
+    def _glance_training_top_k(batch_size, epoch_index, decay_factor=0.5):
+        batch_size = max(int(batch_size), 1)
+        k_start = batch_size
+        k_end = max(int(round(batch_size / 4.0)), 1)
+        value = k_end + (k_start - k_end) * (float(decay_factor) ** int(epoch_index))
+        return max(min(int(round(value)), batch_size), 1)
+
+    @staticmethod
+    def _glance_refiner_forward(refiner_model, batch_refiner, batch_base_logits=None):
+        if isinstance(batch_refiner, dict):
+            feature_kind = batch_refiner.get("feature_kind")
+            if feature_kind == "prompt_expert_bundle_v1":
+                outputs = refiner_model(
+                    batch_refiner["z_gnn"],
+                    batch_refiner["semantic_views"],
+                    batch_refiner["structural_features"],
+                )
+            else:
+                raise ValueError(f"Unsupported refiner feature kind: {feature_kind}")
+        else:
+            outputs = refiner_model(batch_refiner)
+        if isinstance(outputs, tuple):
+            if len(outputs) == 3:
+                refiner_logits, gate_logits, gate_prob = outputs
+            elif len(outputs) == 2:
+                refiner_logits, gate_prob = outputs
+                gate_logits = torch.logit(gate_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6))
+            else:
+                raise ValueError("Unsupported gated refiner output arity.")
+        else:
+            refiner_logits = outputs
+            gate_logits = None
+            gate_prob = None
+        mixed_logits = refiner_logits
+        if gate_prob is not None:
+            if batch_base_logits is None:
+                raise ValueError("Gated refiner requires batch_base_logits for mixed inference.")
+            base_prob = torch.softmax(batch_base_logits, dim=1)
+            ref_prob = torch.softmax(refiner_logits, dim=1)
+            mixed_prob = (1.0 - gate_prob.unsqueeze(1)) * base_prob + gate_prob.unsqueeze(1) * ref_prob
+            mixed_prob = mixed_prob.clamp_min(1e-8)
+            mixed_prob = mixed_prob / mixed_prob.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            mixed_logits = torch.log(mixed_prob)
+        return {
+            "refiner_logits": refiner_logits,
+            "mixed_logits": mixed_logits,
+            "gate_logits": gate_logits,
+            "gate_prob": gate_prob,
+        }
+
+    @staticmethod
+    def _glance_refiner_sample_weights(base_wrong_target, utility_target, mode, base_wrong_weight=2.0, utility_weight=3.0):
+        mode = str(mode or "off").lower()
+        weights = torch.ones_like(base_wrong_target, dtype=torch.float32)
+        if mode in {"base_wrong", "base_wrong_plus_utility"}:
+            weights = weights + base_wrong_target.float() * max(float(base_wrong_weight) - 1.0, 0.0)
+        if mode in {"utility_positive", "base_wrong_plus_utility"}:
+            weights = weights + utility_target.float() * max(float(utility_weight) - 1.0, 0.0)
+        return weights
+
+    def _apply_glance_joint_policy(
+        self,
+        router_model,
+        refiner_model,
+        router_features,
+        refiner_features,
+        semantic_view_mode,
+        base_logits,
+        base_prob,
+        base_pred,
+        labels_t,
+        beta,
+        split_idx,
+        batch_size,
+        top_k,
+    ):
+        split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
+        final_logits = base_logits.clone()
+        final_prob = base_prob.clone()
+        final_pred = base_pred.clone()
+        routed_mask = torch.zeros(base_pred.numel(), dtype=torch.bool)
+        router_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        router_score_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        oracle_advantage_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        if split_idx.size == 0:
+            return {
+                "logits": final_logits,
+                "prob": final_prob,
+                "pred": final_pred,
+                "routed_mask": routed_mask,
+                "router_prob": router_prob_all,
+                "router_score": router_score_all,
+                "oracle_advantage": oracle_advantage_all,
+                "routed_count": 0,
+            }
+
+        router_model.eval()
+        refiner_model.eval()
+        router_device = next(router_model.parameters()).device
+        refiner_device = next(refiner_model.parameters()).device
+        with torch.no_grad():
+            for batch_idx_np in self._iter_glance_batches(split_idx, batch_size, shuffle=False):
+                batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
+                batch_score, batch_prob = router_model(router_features[batch_idx].to(router_device))
+                batch_score = batch_score.detach().cpu()
+                batch_prob = batch_prob.detach().cpu()
+                router_score_all[batch_idx] = batch_score
+                router_prob_all[batch_idx] = batch_prob
+                k = min(max(int(top_k), 1), int(batch_idx.numel()))
+                routed_rel = torch.topk(batch_score, k=k, largest=True, sorted=False).indices
+                routed_idx = batch_idx[routed_rel]
+                routed_mask[routed_idx] = True
+                routed_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    _refiner_feature_lookup(refiner_features, routed_idx, semantic_view_mode, refiner_device),
+                    batch_base_logits=base_logits[routed_idx].to(refiner_device),
+                )
+                final_logits[routed_idx] = routed_forward["mixed_logits"].cpu()
+                final_prob[routed_idx] = torch.softmax(routed_forward["mixed_logits"].cpu(), dim=1)
+                final_pred[routed_idx] = routed_forward["mixed_logits"].cpu().argmax(dim=1)
+                full_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, refiner_device),
+                    batch_base_logits=base_logits[batch_idx].to(refiner_device),
+                )
+                full_ref_loss = F.cross_entropy(
+                    full_forward["mixed_logits"].cpu(),
+                    labels_t[batch_idx].to(refiner_device).cpu(),
+                    reduction="none",
+                )
+                base_loss = F.cross_entropy(
+                    base_logits[batch_idx],
+                    labels_t[batch_idx],
+                    reduction="none",
+                )
+                oracle_advantage_all[batch_idx] = base_loss.detach().cpu() - full_ref_loss.detach().cpu() - float(beta)
+
+        return {
+            "logits": final_logits,
+            "prob": final_prob,
+            "pred": final_pred,
+            "routed_mask": routed_mask,
+            "router_prob": router_prob_all,
+            "router_score": router_score_all,
+            "oracle_advantage": oracle_advantage_all,
+            "routed_count": int(routed_mask[torch.tensor(split_idx, dtype=torch.long)].sum().item()),
+        }
+
+    def _build_glance_joint_per_node_rows(
+        self,
+        split_idx,
+        pred_gnn,
+        final_pred,
+        labels_np,
+        routed_mask,
+        router_prob,
+        router_score,
+        oracle_advantage,
+        semantic_views,
+        mode_name,
+        route_prob_by_epoch=None,
+        route_score_by_epoch=None,
+        refiner_pred_by_epoch=None,
+        base_pred_by_epoch=None,
+    ):
+        split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
+        rows = []
+        final_pred_np = final_pred.detach().cpu().numpy().astype(np.int64)
+        pred_gnn_np = pred_gnn.detach().cpu().numpy().astype(np.int64)
+        routed_mask_np = routed_mask.detach().cpu().numpy().astype(bool)
+        router_prob_np = router_prob.detach().cpu().numpy().astype(np.float32)
+        router_score_np = router_score.detach().cpu().numpy().astype(np.float32) if router_score is not None else None
+        oracle_advantage_np = oracle_advantage.detach().cpu().numpy().astype(np.float32) if oracle_advantage is not None else None
+        count_1hop = semantic_views.get("count_1hop")
+        count_2hop = semantic_views.get("count_2hop")
+        if count_1hop is None:
+            count_1hop = semantic_views.get("count_following")
+        if count_2hop is None:
+            count_2hop = semantic_views.get("count_follower")
+        for node_idx in split_idx.tolist():
+            row = {
+                "node_id": int(node_idx),
+                "base_pred": int(pred_gnn_np[node_idx]),
+                "final_pred": int(final_pred_np[node_idx]),
+                "label": int(labels_np[node_idx]),
+                "routed": bool(routed_mask_np[node_idx]),
+                "router_prob": float(router_prob_np[node_idx]),
+                "router_score": float(router_score_np[node_idx]) if router_score_np is not None else 0.0,
+                "oracle_advantage": float(oracle_advantage_np[node_idx]) if oracle_advantage_np is not None else 0.0,
+                "was_wrong_base": bool(pred_gnn_np[node_idx] != labels_np[node_idx]),
+                "is_wrong_final": bool(final_pred_np[node_idx] != labels_np[node_idx]),
+                "neighbor_count_1hop": int(count_1hop[node_idx]) if count_1hop is not None else 0,
+                "neighbor_count_2hop": int(count_2hop[node_idx]) if count_2hop is not None else 0,
+                "neighbor_count_following": int(semantic_views["count_following"][node_idx]) if "count_following" in semantic_views else 0,
+                "neighbor_count_follower": int(semantic_views["count_follower"][node_idx]) if "count_follower" in semantic_views else 0,
+                "has_following": int(semantic_views["has_following"][node_idx]) if "has_following" in semantic_views else 0,
+                "has_follower": int(semantic_views["has_follower"][node_idx]) if "has_follower" in semantic_views else 0,
+            }
+            if route_prob_by_epoch is not None:
+                row["router_prob_by_epoch"] = [float(v[node_idx]) for v in route_prob_by_epoch]
+            if route_score_by_epoch is not None:
+                row["router_score_by_epoch"] = [float(v[node_idx]) for v in route_score_by_epoch]
+            if refiner_pred_by_epoch is not None:
+                row["refiner_pred_by_epoch"] = [int(v[node_idx]) for v in refiner_pred_by_epoch]
+            if base_pred_by_epoch is not None:
+                row["base_pred_by_epoch"] = [int(v[node_idx]) for v in base_pred_by_epoch]
+            rows.append(row)
+        return {
+            "rows": rows,
+            "analysis": self._build_refiner_analysis_summary(rows, mode_name),
+        }
+
+    def _train_glance_joint_candidate(
+        self,
+        *,
+        labels_t,
+        labels_np,
+        train_idx,
+        valid_idx,
+        test_idx,
+        logits_gnn,
+        p_gnn,
+        pred_gnn,
+        router_features,
+        refiner_features,
+        semantic_views,
+        semantic_view_mode,
+        activation,
+        batch_size,
+        max_epochs,
+        patience,
+        decay_factor,
+        entropy_weight,
+        router_weight,
+        router_regression_weight,
+        router_ranking_weight,
+        router_calibration_weight,
+        router_reliability_weight,
+        learning_rate,
+        weight_decay,
+        beta,
+        eval_top_k,
+        refiner_explicit_gate=False,
+        refiner_target_mode="predict",
+        refiner_weight_mode="off",
+        refiner_base_wrong_weight=2.0,
+        refiner_utility_weight=3.0,
+        refiner_gate_weight=0.5,
+    ):
+        candidate_seed = int(self.seed) * 100000 + int(round(float(beta) * 1000)) * 10 + int(eval_top_k)
+        torch.manual_seed(candidate_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(candidate_seed)
+        np.random.seed(candidate_seed % (2**32 - 1))
+        router_model = GlanceReliabilityRouterMLP(
+            input_dim=int(router_features.shape[1]),
+            hidden_dim=128,
+            dropout=0.1,
+        )
+        refiner_feature_kind = refiner_features.get("feature_kind") if isinstance(refiner_features, dict) else None
+        if refiner_feature_kind == "prompt_expert_bundle_v1":
+            component_dims = {
+                name: int(refiner_features["semantic_views"][name].shape[1])
+                for name in PromptExpertBundleRefinerMLP.COMPONENT_ORDER
+            }
+            refiner_model = PromptExpertBundleRefinerMLP(
+                z_gnn_dim=int(refiner_features["z_gnn"].shape[1]),
+                component_dims=component_dims,
+                proj_dim=256,
+                hidden_dim=128,
+                structural_dim=int(refiner_features["structural_features"].shape[1]),
+                activation=activation,
+                dropout=0.1,
+            )
+        elif bool(refiner_explicit_gate):
+            refiner_model = GatedGlanceRefinerMLP(
+                input_dim=int(refiner_features.shape[1]),
+                hidden_dim=128,
+                activation=activation,
+                dropout=0.1,
+            )
+        else:
+            refiner_model = GlanceRefinerMLP(
+                input_dim=int(refiner_features.shape[1]),
+                hidden_dim=128,
+                activation=activation,
+                dropout=0.1,
+            )
+        router_model.to(self.device)
+        refiner_model.to(self.device)
+        optimizer = torch.optim.AdamW(
+            list(router_model.parameters()) + list(refiner_model.parameters()),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+        best_state = None
+        best_epoch_summary = None
+        best_score = (-1.0, float("inf"))
+        wait = 0
+        epoch_history = []
+        epoch_component_curves = []
+        train_wrong = (pred_gnn.numpy()[train_idx] != labels_np[train_idx]).astype(np.int64)
+        valid_wrong = (pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).astype(np.int64)
+        test_wrong = (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).astype(np.int64)
+
+        for epoch in range(max_epochs):
+            router_model.train()
+            refiner_model.train()
+            train_loss_history = []
+            train_pred_history = []
+            train_route_history = []
+            train_router_regression_history = []
+            train_router_ranking_history = []
+            train_router_selection_history = []
+            train_router_reliability_history = []
+            train_gate_history = []
+            train_routed_weight_history = []
+            train_adv_corr_history = []
+
+            train_k = self._glance_training_top_k(batch_size, epoch, decay_factor=decay_factor)
+            for batch_idx_np in self._iter_glance_batches(train_idx, batch_size, shuffle=True, seed=candidate_seed + epoch):
+                batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
+                batch_labels = labels_t[batch_idx].to(self.device)
+                batch_router = router_features[batch_idx].to(self.device)
+                batch_base_logits = logits_gnn[batch_idx].to(self.device)
+                batch_base_prob = p_gnn[batch_idx].to(self.device)
+                batch_base_pred = pred_gnn[batch_idx].to(self.device)
+                batch_route_score, batch_route_prob = router_model(batch_router)
+                k = min(max(int(train_k), 1), int(batch_idx.numel()))
+                routed_rel = torch.topk(batch_route_score, k=k, largest=True, sorted=False).indices
+                routed_mask = torch.zeros(batch_idx.numel(), dtype=torch.bool, device=self.device)
+                routed_mask[routed_rel] = True
+                routed_idx = batch_idx[routed_rel]
+                routed_labels = labels_t[routed_idx].to(self.device)
+                routed_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    _refiner_feature_lookup(refiner_features, routed_idx, semantic_view_mode, self.device),
+                    batch_base_logits=batch_base_logits[routed_rel],
+                )
+                full_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, self.device),
+                    batch_base_logits=batch_base_logits,
+                )
+
+                batch_base_loss = F.cross_entropy(batch_base_logits, batch_labels, reduction="none")
+                routed_refiner_loss = F.cross_entropy(routed_forward["mixed_logits"], routed_labels, reduction="none")
+                full_refiner_loss = F.cross_entropy(full_forward["mixed_logits"], batch_labels, reduction="none")
+                base_wrong_target = batch_base_pred.ne(batch_labels).float()
+                utility_target = (batch_base_loss.detach() - full_refiner_loss.detach() - float(beta) > 0.0).float()
+                routed_sample_weights = self._glance_refiner_sample_weights(
+                    base_wrong_target[routed_rel],
+                    utility_target[routed_rel],
+                    refiner_weight_mode,
+                    base_wrong_weight=refiner_base_wrong_weight,
+                    utility_weight=refiner_utility_weight,
+                )
+
+                if refiner_target_mode == "keep_change":
+                    keep_change_target = batch_base_pred[routed_rel].ne(routed_labels).float()
+                    refiner_gate_logits = routed_forward.get("gate_logits")
+                    if refiner_gate_logits is None:
+                        raise ValueError("keep_change target mode requires a gated refiner.")
+                    gate_loss = F.binary_cross_entropy_with_logits(
+                        refiner_gate_logits,
+                        keep_change_target,
+                        weight=routed_sample_weights,
+                    )
+                    routed_refiner_loss = routed_refiner_loss * routed_sample_weights
+                else:
+                    gate_loss = batch_base_loss.sum() * 0.0
+                    routed_refiner_loss = routed_refiner_loss * routed_sample_weights
+                refiner_loss = batch_base_loss.detach().clone()
+                refiner_loss[routed_mask] = routed_refiner_loss
+                pred_loss = (
+                    batch_base_loss[~routed_mask].sum()
+                    + routed_refiner_loss.sum()
+                ) / float(batch_labels.size(0))
+
+                oracle_advantage = (batch_base_loss - full_refiner_loss.detach() - float(beta)).detach()
+                route_loss = batch_base_loss.sum() * 0.0
+                router_regression_loss = batch_base_loss.sum() * 0.0
+                router_ranking_loss = _glance_pairwise_ranking_loss(batch_route_score, base_wrong_target)
+                pos_count = int(base_wrong_target.sum().detach().cpu().item())
+                neg_count = int(base_wrong_target.numel() - pos_count)
+                if 0 < pos_count < int(base_wrong_target.numel()):
+                    pos_weight = torch.tensor(
+                        float(neg_count / max(pos_count, 1)),
+                        dtype=batch_route_score.dtype,
+                        device=batch_route_score.device,
+                    )
+                    router_selection_loss = F.binary_cross_entropy_with_logits(
+                        batch_route_score,
+                        base_wrong_target,
+                        pos_weight=pos_weight,
+                    )
+                else:
+                    router_selection_loss = batch_route_score.sum() * 0.0
+                utility_consistency_loss = batch_base_loss.sum() * 0.0
+                total_loss = (
+                    pred_loss
+                    + float(refiner_gate_weight) * gate_loss
+                    + float(router_ranking_weight) * router_ranking_loss
+                    + float(router_calibration_weight) * router_selection_loss
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
+                optimizer.step()
+
+                train_loss_history.append(float(total_loss.detach().cpu().item()))
+                train_pred_history.append(float(pred_loss.detach().cpu().item()))
+                train_route_history.append(float(route_loss.detach().cpu().item()))
+                train_router_regression_history.append(float(router_regression_loss.detach().cpu().item()))
+                train_router_ranking_history.append(float(router_ranking_loss.detach().cpu().item()))
+                train_router_selection_history.append(float(router_selection_loss.detach().cpu().item()))
+                train_router_reliability_history.append(float(utility_consistency_loss.detach().cpu().item()))
+                train_gate_history.append(float(gate_loss.detach().cpu().item()))
+                train_routed_weight_history.append(float(routed_sample_weights.mean().detach().cpu().item()) if int(routed_sample_weights.numel()) > 0 else 0.0)
+                train_adv_corr_history.append(
+                    float(
+                        _safe_score_corr(
+                            batch_route_score.detach().cpu().numpy(),
+                            oracle_advantage.detach().cpu().numpy(),
+                        )
+                        or 0.0
+                    )
+                )
+
+            router_model.to("cpu")
+            refiner_model.to("cpu")
+            train_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                train_idx,
+                batch_size,
+                eval_top_k,
+            )
+            valid_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                valid_idx,
+                batch_size,
+                eval_top_k,
+            )
+            test_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                test_idx,
+                batch_size,
+                eval_top_k,
+            )
+            valid_metrics = _classification_metrics_from_logits(
+                valid_outputs["logits"],
+                labels_t,
+                torch.tensor(valid_idx, dtype=torch.long),
+            )
+            valid_metrics["routed_count"] = int(valid_outputs["routed_count"])
+            valid_metrics["query_rate"] = float(valid_outputs["routed_count"] / max(int(valid_idx.size), 1))
+            train_metrics_epoch = _classification_metrics_from_logits(
+                train_outputs["logits"],
+                labels_t,
+                torch.tensor(train_idx, dtype=torch.long),
+            )
+            train_metrics_epoch["routed_count"] = int(train_outputs["routed_count"])
+            train_metrics_epoch["query_rate"] = float(train_outputs["routed_count"] / max(int(train_idx.size), 1))
+            train_router_diag_epoch = _safe_binary_score_metrics(train_wrong, train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy())
+            valid_router_diag_epoch = _safe_binary_score_metrics(valid_wrong, valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy())
+            test_router_diag_epoch = _safe_binary_score_metrics(test_wrong, test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy())
+            train_adv_diag_epoch = _safe_advantage_router_metrics(
+                train_outputs["oracle_advantage"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+                train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+                train_outputs["routed_mask"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            )
+            valid_adv_diag_epoch = _safe_advantage_router_metrics(
+                valid_outputs["oracle_advantage"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+                valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+                valid_outputs["routed_mask"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            )
+            test_adv_diag_epoch = _safe_advantage_router_metrics(
+                test_outputs["oracle_advantage"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+                test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+                test_outputs["routed_mask"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            )
+            train_delta_epoch = _delta_table(pred_gnn.numpy(), train_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], train_idx))
+            valid_delta_epoch = _delta_table(pred_gnn.numpy(), valid_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], valid_idx))
+            test_delta_epoch = _delta_table(pred_gnn.numpy(), test_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], test_idx))
+
+            epoch_summary = {
+                "epoch": int(epoch + 1),
+                "beta": float(beta),
+                "eval_top_k": int(eval_top_k),
+                "train_top_k": int(train_k),
+                "avg_total_loss": float(np.mean(train_loss_history)) if train_loss_history else 0.0,
+                "avg_pred_loss": float(np.mean(train_pred_history)) if train_pred_history else 0.0,
+                "avg_route_loss": float(np.mean(train_route_history)) if train_route_history else 0.0,
+                "avg_router_regression_loss": float(np.mean(train_router_regression_history)) if train_router_regression_history else 0.0,
+                "avg_router_ranking_loss": float(np.mean(train_router_ranking_history)) if train_router_ranking_history else 0.0,
+                "avg_router_selection_loss": float(np.mean(train_router_selection_history)) if train_router_selection_history else 0.0,
+                "avg_router_calibration_loss": float(np.mean(train_router_selection_history)) if train_router_selection_history else 0.0,
+                "avg_router_reliability_loss": float(np.mean(train_router_reliability_history)) if train_router_reliability_history else 0.0,
+                "avg_refiner_gate_loss": float(np.mean(train_gate_history)) if train_gate_history else 0.0,
+                "avg_routed_sample_weight": float(np.mean(train_routed_weight_history)) if train_routed_weight_history else 0.0,
+                "avg_router_advantage_corr": float(np.mean(train_adv_corr_history)) if train_adv_corr_history else 0.0,
+                "train": train_metrics_epoch,
+                "valid": valid_metrics,
+                "router_diagnostics": {
+                    "train": train_router_diag_epoch,
+                    "valid": valid_router_diag_epoch,
+                    "test": test_router_diag_epoch,
+                },
+                "advantage_router_diagnostics": {
+                    "train": train_adv_diag_epoch,
+                    "valid": valid_adv_diag_epoch,
+                    "test": test_adv_diag_epoch,
+                },
+                "component_deltas": {
+                    "train": train_delta_epoch,
+                    "valid": valid_delta_epoch,
+                    "test": test_delta_epoch,
+                },
+            }
+            epoch_history.append(epoch_summary)
+            epoch_component_curves.append({
+                "epoch": int(epoch + 1),
+                "beta": float(beta),
+                "eval_top_k": int(eval_top_k),
+                "train_top_k": int(train_k),
+                "router": {
+                    "train": train_router_diag_epoch,
+                    "valid": valid_router_diag_epoch,
+                    "test": test_router_diag_epoch,
+                },
+                "refiner": {
+                    "train": {
+                        "wrong_node_fix_rate": float(train_delta_epoch["fix"] / max(int((pred_gnn.numpy()[train_idx] != labels_np[train_idx]).sum()), 1)),
+                        "correct_node_break_rate": float(train_delta_epoch["broke"] / max(int(train_idx.size - (pred_gnn.numpy()[train_idx] != labels_np[train_idx]).sum()), 1)),
+                        "net_gain": int(train_delta_epoch["net"]),
+                    },
+                    "valid": {
+                        "wrong_node_fix_rate": float(valid_delta_epoch["fix"] / max(int((pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).sum()), 1)),
+                        "correct_node_break_rate": float(valid_delta_epoch["broke"] / max(int(valid_idx.size - (pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).sum()), 1)),
+                        "net_gain": int(valid_delta_epoch["net"]),
+                    },
+                    "test": {
+                        "wrong_node_fix_rate": float(test_delta_epoch["fix"] / max(int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+                        "correct_node_break_rate": float(test_delta_epoch["broke"] / max(int(test_idx.size - (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+                        "net_gain": int(test_delta_epoch["net"]),
+                    },
+                },
+            })
+            current_score = (float(valid_metrics["macro_f1"]), -float(valid_metrics["loss"]))
+            if current_score > best_score:
+                best_score = current_score
+                best_state = {
+                    "router": {key: value.detach().cpu().clone() for key, value in router_model.state_dict().items()},
+                    "refiner": {key: value.detach().cpu().clone() for key, value in refiner_model.state_dict().items()},
+                }
+                best_epoch_summary = epoch_summary
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+            router_model.to(self.device)
+            refiner_model.to(self.device)
+
+        if best_state is None or best_epoch_summary is None:
+            raise MissingFrozenArtifactError("glance_joint_router_refine failed to produce a valid checkpoint.")
+
+        router_model.load_state_dict(best_state["router"])
+        refiner_model.load_state_dict(best_state["refiner"])
+        router_model.to("cpu")
+        refiner_model.to("cpu")
+
+        topk_train_outputs = self._apply_glance_joint_policy(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            semantic_view_mode,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            labels_t,
+            beta,
+            train_idx,
+            batch_size,
+            eval_top_k,
+        )
+        topk_valid_outputs = self._apply_glance_joint_policy(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            semantic_view_mode,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            labels_t,
+            beta,
+            valid_idx,
+            batch_size,
+            eval_top_k,
+        )
+        topk_test_outputs = self._apply_glance_joint_policy(
+            router_model,
+            refiner_model,
+            router_features,
+            refiner_features,
+            semantic_view_mode,
+            logits_gnn,
+            p_gnn,
+            pred_gnn,
+            labels_t,
+            beta,
+            test_idx,
+            batch_size,
+            eval_top_k,
+        )
+
+        topk_train_metrics = _classification_metrics_from_logits(
+            topk_train_outputs["logits"],
+            labels_t,
+            torch.tensor(train_idx, dtype=torch.long),
+        )
+        topk_valid_metrics = _classification_metrics_from_logits(
+            topk_valid_outputs["logits"],
+            labels_t,
+            torch.tensor(valid_idx, dtype=torch.long),
+        )
+        topk_test_metrics = _classification_metrics_from_logits(
+            topk_test_outputs["logits"],
+            labels_t,
+            torch.tensor(test_idx, dtype=torch.long),
+        )
+        for split_metrics, split_outputs, split_idx in (
+            (topk_train_metrics, topk_train_outputs, train_idx),
+            (topk_valid_metrics, topk_valid_outputs, valid_idx),
+            (topk_test_metrics, topk_test_outputs, test_idx),
+        ):
+            split_metrics["routed_count"] = int(split_outputs["routed_count"])
+            split_metrics["query_rate"] = float(split_outputs["routed_count"] / max(int(split_idx.size), 1))
+
+        topk_train_rows = self._build_glance_joint_per_node_rows(
+            train_idx,
+            pred_gnn,
+            topk_train_outputs["pred"],
+            labels_np,
+            topk_train_outputs["routed_mask"],
+            topk_train_outputs["router_prob"],
+            topk_train_outputs["router_score"],
+            topk_train_outputs["oracle_advantage"],
+            semantic_views,
+            "glance_joint_router_refine_train",
+        )
+        topk_valid_rows = self._build_glance_joint_per_node_rows(
+            valid_idx,
+            pred_gnn,
+            topk_valid_outputs["pred"],
+            labels_np,
+            topk_valid_outputs["routed_mask"],
+            topk_valid_outputs["router_prob"],
+            topk_valid_outputs["router_score"],
+            topk_valid_outputs["oracle_advantage"],
+            semantic_views,
+            "glance_joint_router_refine_valid",
+        )
+        topk_test_rows = self._build_glance_joint_per_node_rows(
+            test_idx,
+            pred_gnn,
+            topk_test_outputs["pred"],
+            labels_np,
+            topk_test_outputs["routed_mask"],
+            topk_test_outputs["router_prob"],
+            topk_test_outputs["router_score"],
+            topk_test_outputs["oracle_advantage"],
+            semantic_views,
+            "glance_joint_router_refine_test",
+        )
+        train_wrong = (pred_gnn.numpy()[train_idx] != labels_np[train_idx]).astype(np.int64)
+        valid_wrong = (pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).astype(np.int64)
+        test_wrong = (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).astype(np.int64)
+        topk_train_router_diag = _safe_binary_score_metrics(train_wrong, topk_train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy())
+        topk_valid_router_diag = _safe_binary_score_metrics(valid_wrong, topk_valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy())
+        topk_test_router_diag = _safe_binary_score_metrics(test_wrong, topk_test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy())
+        topk_train_adv_diag = _safe_advantage_router_metrics(
+            topk_train_outputs["oracle_advantage"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            topk_train_outputs["router_score"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+            topk_train_outputs["routed_mask"][torch.tensor(train_idx, dtype=torch.long)].numpy(),
+        )
+        topk_valid_adv_diag = _safe_advantage_router_metrics(
+            topk_valid_outputs["oracle_advantage"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            topk_valid_outputs["router_score"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+            topk_valid_outputs["routed_mask"][torch.tensor(valid_idx, dtype=torch.long)].numpy(),
+        )
+        topk_test_adv_diag = _safe_advantage_router_metrics(
+            topk_test_outputs["oracle_advantage"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            topk_test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+            topk_test_outputs["routed_mask"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
+        )
+        component_curve_summary = {
+            "best_epoch": int(best_epoch_summary["epoch"]),
+            "curve": [
+                {
+                    "epoch": int(item["epoch"]),
+                    "beta": float(item["beta"]),
+                    "train_top_k": int(item["train_top_k"]),
+                    "eval_top_k": int(item["eval_top_k"]),
+                    "router_train_auroc": item["router"]["train"].get("auroc"),
+                    "router_valid_auroc": item["router"]["valid"].get("auroc"),
+                    "router_test_auroc": item["router"]["test"].get("auroc"),
+                    "router_valid_adv_auroc": item.get("advantage_router_diagnostics", {}).get("valid", {}).get("auroc"),
+                    "router_test_adv_auroc": item.get("advantage_router_diagnostics", {}).get("test", {}).get("auroc"),
+                    "router_valid_auprc": item["router"]["valid"].get("auprc"),
+                    "router_valid_adv_auprc": item.get("advantage_router_diagnostics", {}).get("valid", {}).get("auprc"),
+                    "refiner_valid_fix_rate": item["refiner"]["valid"].get("wrong_node_fix_rate"),
+                    "refiner_valid_break_rate": item["refiner"]["valid"].get("correct_node_break_rate"),
+                    "refiner_test_fix_rate": item["refiner"]["test"].get("wrong_node_fix_rate"),
+                    "refiner_test_break_rate": item["refiner"]["test"].get("correct_node_break_rate"),
+                }
+                for item in epoch_component_curves
+            ],
+        }
+
+        valid_budget_curve, valid_budget_payloads = self._build_counterfactual_budget_rows(
+            budgets=self._router_budgets(),
+            risk_score=topk_valid_outputs["router_score"].numpy(),
+            pred_gnn=pred_gnn.numpy(),
+            pred_refiner=topk_valid_outputs["pred"].numpy(),
+            labels_np=labels_np,
+            eval_idx=valid_idx,
+            prob_gnn=p_gnn,
+            prob_refiner=topk_valid_outputs["prob"],
+        )
+        test_budget_curve, test_budget_payloads = self._build_counterfactual_budget_rows(
+            budgets=self._router_budgets(),
+            risk_score=topk_test_outputs["router_score"].numpy(),
+            pred_gnn=pred_gnn.numpy(),
+            pred_refiner=topk_test_outputs["pred"].numpy(),
+            labels_np=labels_np,
+            eval_idx=test_idx,
+            prob_gnn=p_gnn,
+            prob_refiner=topk_test_outputs["prob"],
+        )
+        selected_valid_row, selected_budget_key, _ = self._select_best_budget_row(valid_budget_curve)
+        selected_test_row = {str(self._budget_key(item["budget"])): item for item in test_budget_curve}.get(selected_budget_key)
+
+        fit_summary = {
+            "best_epoch": int(best_epoch_summary["epoch"]),
+            "best_valid": best_epoch_summary["valid"],
+            "best_train": best_epoch_summary["train"],
+            "epoch_history": epoch_history,
+            "component_curve_summary": component_curve_summary,
+            "router_diagnostics": {
+                "train": topk_train_router_diag,
+                "valid": topk_valid_router_diag,
+                "test": topk_test_router_diag,
+            },
+            "advantage_router_diagnostics": {
+                "train": topk_train_adv_diag,
+                "valid": topk_valid_adv_diag,
+                "test": topk_test_adv_diag,
+            },
+            "topk_reference": {
+                "router_diagnostics": {
+                    "train": topk_train_router_diag,
+                    "valid": topk_valid_router_diag,
+                    "test": topk_test_router_diag,
+                },
+                "advantage_router_diagnostics": {
+                    "train": topk_train_adv_diag,
+                    "valid": topk_valid_adv_diag,
+                    "test": topk_test_adv_diag,
+                },
+            },
+        }
+        return {
+            "beta": float(beta),
+            "best_epoch": int(best_epoch_summary["epoch"]),
+            "router_state": best_state["router"],
+            "refiner_state": best_state["refiner"],
+            "fit_summary": fit_summary,
+            "train_outputs": topk_train_outputs,
+            "valid_outputs": topk_valid_outputs,
+            "test_outputs": topk_test_outputs,
+            "selected_budget": float(selected_valid_row["budget"]) if selected_valid_row else float(self._router_budgets()[0]),
+            "selected_budget_key": selected_budget_key,
+            "selected_budget_metrics": {
+                "train": topk_train_metrics,
+                "valid": topk_valid_metrics,
+                "test": topk_test_metrics,
+            },
+            "selected_valid_budget_metrics": selected_valid_row,
+            "selected_test_budget_metrics_under_valid_choice": selected_test_row,
+            "train_rows": topk_train_rows,
+            "valid_rows": topk_valid_rows,
+            "test_rows": topk_test_rows,
+            "valid_budget_curve": valid_budget_curve,
+            "test_budget_curve": test_budget_curve,
+            "eval_top_k": int(eval_top_k),
+        }
