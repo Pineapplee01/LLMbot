@@ -58,6 +58,7 @@ EXPERT_SCALAR_KEYS = (
     "url_ratio",
     "hashtag_ratio",
 )
+GRAPH_DATA_VARIANT_CHOICES = ("labeled", "full_graph_support")
 
 
 def last_token_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -88,6 +89,26 @@ def _load_texts(dataset_path: Path, text_path: Path | None):
     if not isinstance(texts, list):
         raise ValueError(f"Expected a list of node texts in {path}, got {type(texts).__name__}.")
     return texts, path
+
+
+def _resolve_graph_variant_paths(dataset_path: Path, graph_data_variant: str, text_path: Path | None):
+    variant = str(graph_data_variant or "labeled").lower()
+    if variant not in GRAPH_DATA_VARIANT_CHOICES:
+        raise ValueError(f"Unsupported graph_data_variant: {graph_data_variant}")
+    if variant == "full_graph_support":
+        resolved_text_path = Path(text_path) if text_path else dataset_path / "norm_user_text_new.json"
+        edge_index_path = dataset_path / "edge_index_new.pt"
+        edge_type_path = dataset_path / "edge_type_new.pt"
+    else:
+        resolved_text_path = Path(text_path) if text_path else dataset_path / "norm_user_text.json"
+        edge_index_path = dataset_path / "edge_index.pt"
+        edge_type_path = dataset_path / "edge_type.pt"
+    return {
+        "variant": variant,
+        "text_path": resolved_text_path,
+        "edge_index_path": edge_index_path,
+        "edge_type_path": edge_type_path,
+    }
 
 
 def _hash_strings(values):
