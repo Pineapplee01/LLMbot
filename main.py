@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 from sklearn.metrics import f1_score
 
-from model_building import _labels_to_index, _score_logits
+from model_building import _labels_to_index, _score_logits, resolve_seed_aware_roberta_embedding_path
 from parser_args import parser_args
 from stage_registry import get_stage_spec, resolve_stage_spec
 from artifact_contracts import MissingFrozenArtifactError, PHASE_A_CONTRACT, PHASE_A_DISABLED_COMPONENTS
@@ -122,7 +122,11 @@ def _resolve_semantic_backbone_embedding_path(args, data, experiment_root=None, 
         candidates.extend(sorted(dataset_path.glob("**/qwen3_emb_last.pt")))
         candidates.extend(sorted(dataset_path.glob("**/qwen3_emb_L-1.pt")))
     elif semantic_encoder in {"roberta", "roberta_finetuned"}:
-        candidates = [dataset_path / "embeddings_roberta.pt"]
+        candidate = resolve_seed_aware_roberta_embedding_path(data, seed=seed)
+        if candidate is not None:
+            resolver = "semantic_encoder_roberta_seed_aware_iter_-1" if candidate.name.startswith("embeddings_iter_-1_seed_") else f"semantic_encoder_{semantic_encoder}"
+            return candidate, resolver
+        candidates = []
     else:
         candidates = []
     for candidate in candidates:
@@ -583,10 +587,28 @@ def _stage_uses_graph_data(args, execution_stage):
     return resolve_stage_spec(execution_stage).graph_data_mode != "none"
 
 
+def _validate_graph_data_variant(args, execution_stage):
+    variant = str(getattr(args, "graph_data_variant", "labeled")).lower()
+    if variant == "labeled":
+        return
+    supported = {"graph_detector_prepare", "joint_router_refinement"}
+    if execution_stage not in supported:
+        raise ValueError(
+            "graph_data_variant=full_graph_support is currently supported only for "
+            "graph_detector_prepare and joint_router_refinement."
+        )
+
+
 def _load_seed_data(args, execution_stage):
-    data = load_raw_data(args.dataset, use_GNN=_stage_uses_graph_data(args, execution_stage))
+    _validate_graph_data_variant(args, execution_stage)
+    data = load_raw_data(
+        args.dataset,
+        use_GNN=_stage_uses_graph_data(args, execution_stage),
+        graph_data_variant=getattr(args, "graph_data_variant", "labeled"),
+    )
     if args.reset_split != "-1":
-        train_idx, valid_idx, test_idx = reset_split(len(data["user_text"]), args.reset_split)
+        split_node_count = int(data.get("labeled_node_count", len(data["user_text"])))
+        train_idx, valid_idx, test_idx = reset_split(split_node_count, args.reset_split)
         data["train_idx"], data["valid_idx"], data["test_idx"] = train_idx, valid_idx, test_idx
     return data
 
@@ -657,6 +679,7 @@ def main(args):
     stage_results = []
     for seed in _parse_seed_list(args.seeds):
         seed_setting(seed)
+        args.active_seed = int(seed)
         data = _load_seed_data(args, execution_stage)
         run = setup_wandb(args, seed)
         experiment_root = build_experiment_root(args, seed)

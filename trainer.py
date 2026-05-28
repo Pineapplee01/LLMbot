@@ -22,6 +22,12 @@ from stage_runner import StageRunner  # noqa: F401
 from trainer_distillation import run_legacy_graph_seed  # noqa: F401
 from trainer_preparation import build_or_load_faithful_gats, build_or_load_frozen_g0, load_frozen_g0  # noqa: F401
 from trainer_semantic import run_semantic_finetune_seed  # noqa: F401
-import trainer_legacy_impl as _legacy_impl
 
-run_phase_a_matrix = _legacy_impl.run_phase_a_matrix
+
+def run_phase_a_matrix(args, seed, data, stage_dir, base_bundle):
+    raise NotImplementedError(
+        "Phase A matrix via StageRunner is not yet implemented. "
+        "Use main.py module-controls entry: "
+        "python main.py --embedding_path /path/to/emb.pt "
+        "--use_GNN --graph_backbone rgcn --seeds 1"
+    )

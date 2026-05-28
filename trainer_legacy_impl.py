@@ -10,6 +10,7 @@ import numpy as np
 from time import perf_counter
 from model_building import (
     PhaseAInputAdapter,
+    _runtime_concat_full_graph_support_embeddings,
     build_GNN_model,
     build_LM_model,
     build_estimator,
@@ -3250,7 +3251,7 @@ class StageRunner:
         if edge_type.numel() != edge_index.size(1):
             raise MissingFrozenArtifactError("Resolved graph edge_type must align with edge_index.")
         relation_cardinality = int(torch.unique(edge_type).numel()) if edge_type.numel() else 0
-        num_nodes = int(len(self.labels))
+        num_nodes = int(getattr(self, "graph_node_count", len(self.labels)))
         num_edges = int(edge_index.size(1))
         return {
             "edge_index": edge_index.contiguous(),
@@ -3267,7 +3268,7 @@ class StageRunner:
                 "source": source,
                 "source_root": source_root,
                 "source_stage": source_stage,
-                "dataset_node_count_match": bool(num_nodes == int(len(self.labels))),
+                "dataset_node_count_match": bool(num_nodes == int(getattr(self, "graph_node_count", len(self.labels)))),
             },
         }
 
@@ -3466,20 +3467,25 @@ class StageRunner:
             raise MissingFrozenArtifactError(
                 f"glance_joint_router_refine could not read the frozen_g0 original node features at {feature_path}."
             )
-        raw_features = safe_torch_load(feature_path, map_location="cpu")
-        if isinstance(raw_features, dict):
-            for key in ("embeddings", "features", "x"):
-                if key in raw_features:
-                    raw_features = raw_features[key]
-                    break
-        if not torch.is_tensor(raw_features):
-            raw_features = torch.tensor(raw_features)
-        raw_features = raw_features.detach().cpu().float()
+        if str(getattr(self, "graph_data_variant", "labeled")).lower() == "full_graph_support":
+            concat_bundle = _runtime_concat_full_graph_support_embeddings(self.args, self.data, feature_path)
+            raw_features = concat_bundle["features"].detach().cpu().float()
+        else:
+            raw_features = safe_torch_load(feature_path, map_location="cpu")
+            if isinstance(raw_features, dict):
+                for key in ("embeddings", "features", "x"):
+                    if key in raw_features:
+                        raw_features = raw_features[key]
+                        break
+            if not torch.is_tensor(raw_features):
+                raw_features = torch.tensor(raw_features)
+            raw_features = raw_features.detach().cpu().float()
         if raw_features.dim() != 2:
             raise MissingFrozenArtifactError(
                 f"glance_joint_router_refine expects original node features to be 2-D, got {tuple(raw_features.shape)}."
             )
-        if int(raw_features.shape[0]) != int(len(self.labels)):
+        expected_nodes = int(getattr(self, "graph_node_count", len(self.labels)))
+        if int(raw_features.shape[0]) != expected_nodes:
             raise MissingFrozenArtifactError(
                 "glance_joint_router_refine original node features do not align with the current dataset node count."
             )

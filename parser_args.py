@@ -135,6 +135,8 @@ def normalize_args(args, raw_args=None):
     args.embedding_path = getattr(args, "embedding_path", None)
     args.emb_path = args.embedding_path
     args.g0_feature_path = args.embedding_path
+    args.graph_data_variant = getattr(args, "graph_data_variant", "labeled")
+    args.support_embedding_path = getattr(args, "support_embedding_path", "support_roberta_embeddings_new.pt")
 
     if getattr(args, "risk_budgets", None) is None and getattr(args, "router_budgets", None) is not None:
         args.risk_budgets = args.router_budgets
@@ -180,6 +182,19 @@ def parser_args(argv=None):
     )
 
     parser.add_argument("--dataset", type=str, default="TwiBot-20", help="Dataset name")
+    parser.add_argument(
+        "--graph_data_variant",
+        type=str,
+        default="labeled",
+        choices=["labeled", "full_graph_support"],
+        help="Graph-data contract: original labeled-only graph or full graph with support-node neighbors.",
+    )
+    parser.add_argument(
+        "--support_embedding_path",
+        type=str,
+        default="support_roberta_embeddings_new.pt",
+        help="Support-node semantic embedding tensor used by full_graph_support runtime concatenation.",
+    )
     parser.add_argument("--lm_batch_size", dest="batch_size_LM", type=int, default=32)
     parser.add_argument("--batch_size_LM", dest="batch_size_LM", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--gnn_batch_size", dest="batch_size_GNN", type=int, default=300000)
@@ -457,6 +472,16 @@ def parser_args(argv=None):
         help=(
             "Training target for the strict joint refiner. "
             "'predict' keeps direct label prediction, while 'keep_change' learns whether the routed node should flip the base detector decision."
+        ),
+    )
+    parser.add_argument(
+        "--joint_refiner_gate_target",
+        type=str,
+        default="base_wrong",
+        choices=["base_wrong", "utility_positive"],
+        help=(
+            "Gate supervision target for explicit-gate joint refiners. "
+            "'base_wrong' preserves the old keep/change target, while 'utility_positive' trains the gate to change only when raw refiner utility is positive."
         ),
     )
     parser.add_argument(

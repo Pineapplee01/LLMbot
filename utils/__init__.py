@@ -255,36 +255,64 @@ def resolve_dataset_path(dataset):
     return candidates[0]
 
 
-def load_raw_data(dataset, use_GNN):
+def load_raw_data(dataset, use_GNN, graph_data_variant="labeled"):
     data_filepath = resolve_dataset_path(dataset)
     print(f"Loading data from {data_filepath} ...")
     train_idx = safe_torch_load(data_filepath / "train_idx.pt")
     valid_idx = safe_torch_load(data_filepath / "valid_idx.pt")
     test_idx = safe_torch_load(data_filepath / "test_idx.pt")
-    with open(data_filepath / "norm_user_text.json", "r", encoding="utf-8") as handle:
-        user_text = json.load(handle)
+    variant = str(graph_data_variant or "labeled").lower()
+    if variant == "full_graph_support":
+        user_text_path = data_filepath / "norm_user_text_new.json"
+        edge_index_path = data_filepath / "edge_index_new.pt"
+        edge_type_path = data_filepath / "edge_type_new.pt"
+        support_idx_path = data_filepath / "support_idx.pt"
+    else:
+        user_text_path = data_filepath / "norm_user_text.json"
+        edge_index_path = data_filepath / "edge_index.pt"
+        edge_type_path = data_filepath / "edge_type.pt"
+        support_idx_path = None
     labels = safe_torch_load(data_filepath / "labels.pt")
-    if use_GNN:
-        edge_index = safe_torch_load(data_filepath / "edge_index.pt")
-        edge_type = safe_torch_load(data_filepath / "edge_type.pt")
-        return {
-            "dataset_path": data_filepath,
-            "train_idx": train_idx,
-            "valid_idx": valid_idx,
-            "test_idx": test_idx,
-            "user_text": user_text,
-            "labels": labels,
-            "edge_index": edge_index,
-            "edge_type": edge_type,
-        }
-    return {
+    labeled_node_count = int(labels.shape[0]) if torch.is_tensor(labels) and labels.dim() >= 1 else int(len(labels))
+    support_idx = safe_torch_load(support_idx_path) if support_idx_path is not None and support_idx_path.exists() else None
+    if variant == "full_graph_support":
+        if support_idx is None:
+            raise FileNotFoundError(
+                f"graph_data_variant=full_graph_support requires support_idx.pt at {support_idx_path}."
+            )
+        support_idx_flat = support_idx.detach().cpu().long().view(-1)
+        graph_node_count = labeled_node_count + int(support_idx_flat.numel())
+        if support_idx_flat.numel() > 0 and int(support_idx_flat[0]) != labeled_node_count:
+            raise ValueError(
+                "full_graph_support requires labeled nodes to remain the prefix of the full graph. "
+                f"support_idx starts at {int(support_idx_flat[0])}, expected {labeled_node_count}."
+            )
+        user_text = []
+        user_text_loaded = False
+    else:
+        with open(user_text_path, "r", encoding="utf-8") as handle:
+            user_text = json.load(handle)
+        graph_node_count = int(len(user_text))
+        user_text_loaded = True
+    payload = {
         "dataset_path": data_filepath,
         "train_idx": train_idx,
         "valid_idx": valid_idx,
         "test_idx": test_idx,
         "user_text": user_text,
+        "user_text_path": str(user_text_path),
+        "user_text_loaded": bool(user_text_loaded),
         "labels": labels,
+        "graph_data_variant": variant,
+        "graph_node_count": graph_node_count,
+        "labeled_node_count": labeled_node_count,
+        "support_node_count": max(graph_node_count - labeled_node_count, 0),
+        "support_idx": support_idx,
     }
+    if use_GNN:
+        payload["edge_index"] = safe_torch_load(edge_index_path)
+        payload["edge_type"] = safe_torch_load(edge_type_path)
+    return payload
 
 
 def load_distilled_knowledge(from_which_model, intermediate_data_filepath, iter):

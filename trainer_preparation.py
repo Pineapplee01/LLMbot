@@ -103,8 +103,16 @@ def train_frozen_g0(args, seed, data, experiment_root):
     projector_state = feature_bundle["projector_state"]
     refine_request = _graph_refine_request(args)
     labels = _labels_to_index(data["labels"])
-    if features.shape[0] != labels.numel():
-        raise ValueError(f"G0 feature rows ({features.shape[0]}) must match labels ({labels.numel()}).")
+    graph_node_count = int(data.get("graph_node_count", int(features.shape[0])))
+    labeled_node_count = int(data.get("labeled_node_count", int(labels.numel())))
+    support_node_count = int(data.get("support_node_count", max(graph_node_count - labeled_node_count, 0)))
+    graph_data_variant = str(data.get("graph_data_variant", "labeled"))
+    if int(features.shape[0]) != graph_node_count:
+        raise ValueError(f"G0 feature rows ({int(features.shape[0])}) must match graph_node_count ({graph_node_count}).")
+    if int(raw_features.shape[0]) != graph_node_count:
+        raise ValueError(f"G0 raw feature rows ({int(raw_features.shape[0])}) must match graph_node_count ({graph_node_count}).")
+    if int(labels.numel()) != labeled_node_count:
+        raise ValueError(f"Label rows ({int(labels.numel())}) must match labeled_node_count ({labeled_node_count}).")
 
     device = getattr(args, "device", torch.device("cpu"))
     if not isinstance(device, torch.device):
@@ -276,9 +284,13 @@ def train_frozen_g0(args, seed, data, experiment_root):
             "input_adapter": feature_manifest.get("peft", {"enabled": False}),
             "split_provenance": split_provenance(data),
             "node_id_manifest": {
-                "num_nodes": int(labels.numel()),
+                "num_nodes": int(graph_node_count),
+                "graph_node_count": int(graph_node_count),
+                "labeled_node_count": int(labeled_node_count),
+                "support_node_count": int(support_node_count),
                 "labels_sha256": tensor_sha256(data["labels"]),
             },
+            "graph_data_variant": graph_data_variant,
             **(
                 {
                     "graph_refine": {
@@ -703,7 +715,8 @@ class GraphGATSCalibrator:
 
 def _structural_tensor(data):
     labels = _labels_to_index(data["labels"])
-    features = structural_features(data["edge_index"], data["edge_type"], int(labels.numel()))
+    graph_node_count = int(data.get("graph_node_count", int(labels.numel())))
+    features = structural_features(data["edge_index"], data["edge_type"], graph_node_count)
     table = np.column_stack(
         [
             features["in_degree"],

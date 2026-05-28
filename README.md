@@ -18,6 +18,8 @@ Preferred public flags:
 - `--text_encoder`
 - `--semantic_encoder`
 - `--embedding_path`
+- `--graph_data_variant`
+- `--support_embedding_path`
 - `--joint_refiner_embedding_path`
 
 GLANCE prompt-cache precompute entry:
@@ -52,6 +54,33 @@ This helper is intentionally separate from `main.py`. It reuses the current
 It does not rewrite `labels.pt`, `train_idx.pt`, `valid_idx.pt`, or
 `test_idx.pt`; support nodes are added to the node/semantic space while the
 supervision split stays unchanged.
+
+First-round full-graph support:
+
+- `graph_data_variant=full_graph_support` is currently supported only for:
+  - `graph_detector_prepare`
+  - `joint_router_refinement`
+- full-graph mode keeps supervision on the original labeled split only
+- the graph comes from:
+  - `edge_index_new.pt`
+  - `edge_type_new.pt`
+- the semantic tensor is built at runtime by concatenating:
+  - labeled RoBERTa embeddings from `--embedding_path`
+  - support RoBERTa embeddings from `--support_embedding_path`
+
+Example full-graph Phase A smoke:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant full_graph_support \
+  --graph_backbone rgcn \
+  --support_embedding_path datasets/TwiBot-20/support_roberta_embeddings_new.pt \
+  --graph_detector_epochs 1 \
+  --seeds 1 \
+  --disable_wandb
+```
 
 Optional support-only RoBERTa encoding:
 
@@ -231,6 +260,8 @@ supports:
   the frozen GNN path with the routed refiner path
 - `--joint_refiner_target_mode {predict,keep_change}`: compare direct label
   prediction against explicit keep/change learning on routed nodes
+- `--joint_refiner_gate_target {base_wrong,utility_positive}`: choose whether
+  the explicit gate learns base-wrong routing or raw-refiner positive utility
 - `--joint_refiner_weight_mode {off,base_wrong,utility_positive,base_wrong_plus_utility}`:
   routed-node loss reweighting toward base-wrong and/or oracle-utility-positive samples
 
@@ -289,6 +320,17 @@ python main.py \
   --disable_wandb
 
 # Graph detector preparation artifact
+# Default RoBERTa semantic regime: seed-aware pre-iter
+# seed 1 -> embeddings_iter_-1_seed_1.pt
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --seeds 1 \
+  --disable_wandb
+
+# Iter-2 compatibility regime: explicit cross-seed compat branch
 python main.py \
   --experiment_task graph_detector_prepare \
   --dataset TwiBot-20 \
@@ -304,7 +346,6 @@ python main.py \
   --dataset TwiBot-20 \
   --use_GNN \
   --graph_backbone rgcn \
-  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
   --seeds 1 \
   --disable_wandb
 
@@ -315,7 +356,6 @@ python main.py \
   --reset_split -1 \
   --use_GNN \
   --graph_backbone rgcn \
-  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
   --seeds 1 \
   --disable_wandb
 
@@ -326,7 +366,6 @@ python main.py \
   --reset_split -1 \
   --use_GNN \
   --graph_backbone rgcn \
-  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
   --conflict_router_budget 0.10 \
   --conflict_topk_per_bucket 1 \
   --seeds 1 \
@@ -339,7 +378,6 @@ python main.py \
   --reset_split -1 \
   --use_GNN \
   --graph_backbone rgcn \
-  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
   --local_dignn_conflict_router_budget 0.10 \
   --local_dignn_conflict_topk_per_bucket 1 \
   --seeds 1 \
@@ -351,6 +389,18 @@ python main.py \
 # preparation artifact and rejects cross-root backbone reuse.
 # Final public evaluation selects a global routing budget from --risk_budgets
 # on validation and locks that budget on test.
+# Default RoBERTa regime again uses seed-aware embeddings_iter_-1_seed_{seed}.pt
+python main.py \
+  --experiment_task joint_router_refinement \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
+  --seeds 1 \
+  --disable_wandb
+
+# Iter-2 compatibility branch under the same backbone / refiner family
 python main.py \
   --experiment_task joint_router_refinement \
   --dataset TwiBot-20 \
@@ -370,7 +420,6 @@ python main.py \
   --reset_split -1 \
   --use_GNN \
   --graph_backbone rgcn \
-  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
   --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
   --seeds 1,2,3 \
   --disable_wandb
@@ -395,7 +444,6 @@ python main.py \
   --reset_split -1 \
   --use_GNN \
   --graph_backbone rgcn \
-  --embedding_path datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt \
   --joint_train_node_cap 0 \
   --risk_budgets 0.05,0.10,0.15,0.20,0.25 \
   --seeds 1 \
@@ -409,6 +457,10 @@ Prompt-cache experiment note:
   with that exact `--embedding_path` inside the target experiment root first.
 - `joint_router_refinement` will then reuse the same-root
   `preparation/graph_detector` artifact and reject detached prompt caches.
+- For the default RoBERTa backbone family, omitting `--embedding_path` now
+  resolves `datasets/TwiBot-20/embeddings_iter_-1_seed_{seed}.pt` per seed.
+- `datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt` remains a
+  supported explicit compatibility branch for pre-iter vs iter-2 comparisons.
 - If the goal is to test prompt caches without changing the base detector,
   keep `graph_detector_prepare` on the original semantic tensor and pass the
   prompt cache through `--joint_refiner_embedding_path`; prompt payloads with
@@ -437,6 +489,11 @@ Prompt-expert bundle v1 note:
   refinement and uses a lightweight graph-view gate over
   `log1p(count_following)`, `log1p(count_follower)`, `has_following`, and
   `has_follower`.
+- When `--joint_refiner_explicit_gate --joint_refiner_target_mode keep_change`
+  is used with `prompt_expert_bundle_v1`, the prompt-expert refiner also emits
+  an abstain gate. `--joint_refiner_gate_target utility_positive` trains that
+  gate to prefer the expert path only when raw refiner utility is positive;
+  artifacts record gate rates and write per-node `gate_prob` / `gate_decision`.
 
 ## Mainline Layout
 

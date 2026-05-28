@@ -12,9 +12,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from artifact_contracts import MissingFrozenArtifactError
 from estimators import GlanceForContextResidualRiskSelector
 from estimators import parse_budget_list
+from model_building import _runtime_concat_full_graph_support_embeddings, resolve_seed_aware_roberta_embedding_path
 from router import GlanceReliabilityRouterMLP, fit_reliability_temperature
 from trainer_semantic import _classification_metrics_from_logits
-from utils import read_json, safe_torch_load, save_stage_artifacts, write_csv_rows, write_json, write_text
+from utils import read_json, safe_torch_load, save_stage_artifacts, tensor_sha256, write_csv_rows, write_json, write_text
 
 
 def _infer_embedding_source_identity(path):
@@ -84,6 +85,11 @@ def _delta_table(base_pred, new_pred, labels, idx_mask):
         "net": fix - broke,
         "touched": int(affected.sum()),
     }
+
+
+def _labeled_prefix_pred(pred, labeled_count):
+    pred_np = np.asarray(pred)
+    return pred_np[: int(labeled_count)]
 
 
 def _node_cross_entropy_vector(prob, labels):
@@ -296,6 +302,7 @@ class PromptExpertBundleRefinerMLP(nn.Module):
         structural_dim=4,
         activation="leakyrelu",
         dropout=0.1,
+        explicit_gate=False,
     ):
         super().__init__()
         activation = str(activation).lower()
@@ -311,6 +318,7 @@ class PromptExpertBundleRefinerMLP(nn.Module):
         self.z_gnn_dim = int(z_gnn_dim)
         self.proj_dim = int(proj_dim)
         self.structural_dim = int(structural_dim)
+        self.explicit_gate = bool(explicit_gate)
         self.projectors = nn.ModuleDict(
             {
                 name: nn.Sequential(
@@ -323,12 +331,13 @@ class PromptExpertBundleRefinerMLP(nn.Module):
         )
         self.graph_gate = nn.Linear(self.structural_dim, 2)
         total_proj_slots = 6
-        self.classifier = nn.Sequential(
+        self.shared = nn.Sequential(
             nn.Linear(self.z_gnn_dim + total_proj_slots * self.proj_dim + self.structural_dim, int(hidden_dim)),
             act_factory(),
             nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden_dim), 2),
         )
+        self.classifier = nn.Linear(int(hidden_dim), 2)
+        self.gate_head = nn.Linear(int(hidden_dim), 1) if self.explicit_gate else None
 
     def forward(self, z_gnn, semantic_views, structural_features):
         projected = {
@@ -353,7 +362,13 @@ class PromptExpertBundleRefinerMLP(nn.Module):
             ],
             dim=1,
         )
-        return self.classifier(x)
+        hidden = self.shared(x)
+        logits = self.classifier(hidden)
+        if self.gate_head is None:
+            return logits
+        gate_logits = self.gate_head(hidden).squeeze(-1)
+        gate_prob = torch.sigmoid(gate_logits)
+        return logits, gate_logits, gate_prob
 
 
 def _normalize_semantic_payload(payload):
@@ -959,6 +974,14 @@ class GlanceStageMixin:
         routed_correct = [row for row in routed if not row["was_wrong_base"]]
         routed_fixed = [row for row in routed_wrong if not row["is_wrong_final"]]
         routed_broken = [row for row in routed_correct if row["is_wrong_final"]]
+        routed_gate_rows = [row for row in routed if "gate_prob" in row]
+        gate_positive = [row for row in routed_gate_rows if bool(row.get("gate_decision", False))]
+        utility_positive = [row for row in routed_gate_rows if float(row.get("oracle_advantage", 0.0)) > 0.0]
+        gate_true_positive = [
+            row
+            for row in routed_gate_rows
+            if bool(row.get("gate_decision", False)) and float(row.get("oracle_advantage", 0.0)) > 0.0
+        ]
 
         def _avg(items, key):
             if not items:
@@ -1011,6 +1034,10 @@ class GlanceStageMixin:
             "routed_wrong_coverage": float(len(routed_wrong) / len(base_wrong)) if base_wrong else 0.0,
             "conditional_fix_rate_on_selected_wrong": float(len(routed_fixed) / len(routed_wrong)) if routed_wrong else 0.0,
             "conditional_break_rate_on_selected_correct": float(len(routed_broken) / len(routed_correct)) if routed_correct else 0.0,
+            "gate_positive_rate": float(len(gate_positive) / len(routed_gate_rows)) if routed_gate_rows else 0.0,
+            "mean_gate_prob_routed": _avg(routed_gate_rows, "gate_prob") if routed_gate_rows else 0.0,
+            "gate_precision": float(len(gate_true_positive) / len(gate_positive)) if gate_positive else 0.0,
+            "gate_recall": float(len(gate_true_positive) / len(utility_positive)) if utility_positive else 0.0,
             "mean_1hop_neighbors_fixed": _avg(fixed, "neighbor_count_1hop"),
             "mean_1hop_neighbors_broken": _avg(broken, "neighbor_count_1hop"),
             "mean_2hop_neighbors_fixed": _avg(fixed, "neighbor_count_2hop"),
@@ -1047,6 +1074,10 @@ class GlanceStageMixin:
                 or getattr(self.args, "emb_path", None)
                 or getattr(self.args, "g0_feature_path", None)
             )
+            if not fallback_path:
+                candidate = resolve_seed_aware_roberta_embedding_path(self.data, seed=self.seed)
+                if candidate is not None:
+                    fallback_path = candidate
             if not fallback_path:
                 raise MissingFrozenArtifactError(
                     "Strict GLANCE stages require same-seed semantic_encoder_finetune artifacts or an explicit "
@@ -1105,7 +1136,12 @@ class GlanceStageMixin:
             or getattr(self.args, "emb_path", None)
             or getattr(self.args, "g0_feature_path", None)
         )
+        full_graph_support = str(getattr(self, "graph_data_variant", "labeled")).lower() == "full_graph_support"
         if override_path:
+            if full_graph_support:
+                raise MissingFrozenArtifactError(
+                    "full_graph_support does not support --joint_refiner_embedding_path in the first rollout."
+                )
             emb_path = Path(override_path)
             if requested_path:
                 requested_path = Path(requested_path)
@@ -1136,28 +1172,50 @@ class GlanceStageMixin:
                 "joint_router_refinement could not find the requested semantic embedding tensor at "
                 f"{emb_path}."
             )
-        payload = safe_torch_load(emb_path, map_location="cpu")
-        embeddings, precomputed_views, prompt_expert_bundle, payload_keys = _normalize_semantic_payload(payload)
-        if embeddings.dim() != 2:
-            raise MissingFrozenArtifactError(
-                f"joint_router_refinement expects --embedding_path to contain a 2-D tensor, got {tuple(embeddings.shape)}."
-            )
-        if int(embeddings.shape[0]) != int(len(self.labels)):
-            raise MissingFrozenArtifactError(
-                "joint_router_refinement semantic embeddings do not align with the current dataset node count."
-            )
-        if precomputed_views is not None:
-            for view_name, view_tensor in precomputed_views.items():
-                if int(view_tensor.shape[0]) != int(len(self.labels)):
-                    raise MissingFrozenArtifactError(
-                        f"joint_router_refinement semantic view {view_name} does not align with the current dataset node count."
-                    )
-        if prompt_expert_bundle is not None:
-            semantic_view_mode = "prompt_expert_bundle_v1"
-        elif precomputed_views is not None:
-            semantic_view_mode = "precomputed_prompt_views"
-        else:
+        if full_graph_support:
+            concat_bundle = _runtime_concat_full_graph_support_embeddings(self.args, self.data, emb_path)
+            embeddings = concat_bundle["features"].detach().cpu().float()
+            precomputed_views = None
+            prompt_expert_bundle = None
+            payload_keys = ["runtime_full_graph_concat"]
+            if int(embeddings.shape[0]) != int(getattr(self, "graph_node_count", embeddings.shape[0])):
+                raise MissingFrozenArtifactError(
+                    "joint_router_refinement full_graph_support semantic embeddings do not align with graph_node_count."
+                )
             semantic_view_mode = "legacy_inbound_khop"
+            extra_manifest = {
+                "runtime_concat": True,
+                "graph_data_variant": "full_graph_support",
+                "labeled_embedding_path": str(concat_bundle["labeled_feature_path"]),
+                "support_embedding_path": str(concat_bundle["support_feature_path"]),
+                "graph_node_count": int(embeddings.shape[0]),
+                "labeled_node_count": int(concat_bundle["labeled_features"].shape[0]),
+                "support_node_count": int(concat_bundle["support_features"].shape[0]),
+            }
+        else:
+            payload = safe_torch_load(emb_path, map_location="cpu")
+            embeddings, precomputed_views, prompt_expert_bundle, payload_keys = _normalize_semantic_payload(payload)
+            if embeddings.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"joint_router_refinement expects --embedding_path to contain a 2-D tensor, got {tuple(embeddings.shape)}."
+                )
+            if int(embeddings.shape[0]) != int(len(self.labels)):
+                raise MissingFrozenArtifactError(
+                    "joint_router_refinement semantic embeddings do not align with the current dataset node count."
+                )
+            if precomputed_views is not None:
+                for view_name, view_tensor in precomputed_views.items():
+                    if int(view_tensor.shape[0]) != int(len(self.labels)):
+                        raise MissingFrozenArtifactError(
+                            f"joint_router_refinement semantic view {view_name} does not align with the current dataset node count."
+                        )
+            if prompt_expert_bundle is not None:
+                semantic_view_mode = "prompt_expert_bundle_v1"
+            elif precomputed_views is not None:
+                semantic_view_mode = "precomputed_prompt_views"
+            else:
+                semantic_view_mode = "legacy_inbound_khop"
+            extra_manifest = {}
         primary = {
             "dir": emb_path.parent,
             "manifest": {
@@ -1169,6 +1227,7 @@ class GlanceStageMixin:
                 "payload_keys": payload_keys,
                 "semantic_view_mode": semantic_view_mode,
                 "active_components": list(prompt_expert_bundle.get("active_components", [])) if prompt_expert_bundle else [],
+                **extra_manifest,
             },
             "embeddings": embeddings,
             "precomputed_views": precomputed_views,
@@ -1243,6 +1302,7 @@ class GlanceStageMixin:
             prompt_expert_active_components = []
         refiner_explicit_gate = bool(getattr(self.args, "joint_refiner_explicit_gate", False))
         refiner_target_mode = str(getattr(self.args, "joint_refiner_target_mode", "predict")).lower()
+        refiner_gate_target = str(getattr(self.args, "joint_refiner_gate_target", "base_wrong")).lower()
         refiner_weight_mode = str(getattr(self.args, "joint_refiner_weight_mode", "off")).lower()
         refiner_base_wrong_weight = float(getattr(self.args, "joint_refiner_base_wrong_weight", 2.0))
         refiner_utility_weight = float(getattr(self.args, "joint_refiner_utility_weight", 3.0))
@@ -1321,6 +1381,7 @@ class GlanceStageMixin:
                 eval_top_k=eval_top_k,
                 refiner_explicit_gate=refiner_explicit_gate,
                 refiner_target_mode=refiner_target_mode,
+                refiner_gate_target=refiner_gate_target,
                 refiner_weight_mode=refiner_weight_mode,
                 refiner_base_wrong_weight=refiner_base_wrong_weight,
                 refiner_utility_weight=refiner_utility_weight,
@@ -1356,6 +1417,7 @@ class GlanceStageMixin:
         router_prob = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
         router_score = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
         oracle_advantage = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        gate_prob = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
         for split_outputs, split_idx in (
             (train_outputs, train_idx),
             (valid_outputs, valid_idx),
@@ -1369,10 +1431,14 @@ class GlanceStageMixin:
             router_prob[split_idx_t] = split_outputs["router_prob"][split_idx_t]
             router_score[split_idx_t] = split_outputs["router_score"][split_idx_t]
             oracle_advantage[split_idx_t] = split_outputs["oracle_advantage"][split_idx_t]
+            if split_outputs.get("gate_prob") is not None:
+                gate_prob[split_idx_t] = split_outputs["gate_prob"][split_idx_t]
 
-        base_test = _score_all(labels_np[test_idx], pred_gnn.numpy()[test_idx])
-        overall_test = _score_all(labels_np[test_idx], final_pred.numpy()[test_idx])
-        test_delta = _delta_table(pred_gnn.numpy(), final_pred.numpy(), labels_np, self.test_mask)
+        pred_gnn_labeled = _labeled_prefix_pred(pred_gnn.numpy(), labels_np.shape[0])
+        final_pred_labeled = _labeled_prefix_pred(final_pred.numpy(), labels_np.shape[0])
+        base_test = _score_all(labels_np[test_idx], pred_gnn_labeled[test_idx])
+        overall_test = _score_all(labels_np[test_idx], final_pred_labeled[test_idx])
+        test_delta = _delta_table(pred_gnn_labeled, final_pred_labeled, labels_np, self.test_mask)
         per_node_rows = final_run["test_rows"]["rows"]
         analysis_summary = final_run["test_rows"]["analysis"]
 
@@ -1394,6 +1460,10 @@ class GlanceStageMixin:
                 "valid_routed_wrong_precision": float(run["valid_rows"]["analysis"]["routed_wrong_precision"]),
                 "valid_routed_wrong_coverage": float(run["valid_rows"]["analysis"]["routed_wrong_coverage"]),
                 "valid_conditional_fix_rate": float(run["valid_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+                "valid_gate_positive_rate": float(run["valid_rows"]["analysis"].get("gate_positive_rate", 0.0)),
+                "valid_mean_gate_prob_routed": float(run["valid_rows"]["analysis"].get("mean_gate_prob_routed", 0.0)),
+                "valid_gate_precision": float(run["valid_rows"]["analysis"].get("gate_precision", 0.0)),
+                "valid_gate_recall": float(run["valid_rows"]["analysis"].get("gate_recall", 0.0)),
                 "test_accuracy": float(run["selected_budget_metrics"]["test"]["accuracy"]),
                 "test_macro_f1": float(run["selected_budget_metrics"]["test"]["macro_f1"]),
                 "test_bot_f1": float(run["selected_budget_metrics"]["test"]["bot_f1"]),
@@ -1404,6 +1474,10 @@ class GlanceStageMixin:
                 "test_routed_wrong_precision": float(run["test_rows"]["analysis"]["routed_wrong_precision"]),
                 "test_routed_wrong_coverage": float(run["test_rows"]["analysis"]["routed_wrong_coverage"]),
                 "test_conditional_fix_rate": float(run["test_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
+                "test_gate_positive_rate": float(run["test_rows"]["analysis"].get("gate_positive_rate", 0.0)),
+                "test_mean_gate_prob_routed": float(run["test_rows"]["analysis"].get("mean_gate_prob_routed", 0.0)),
+                "test_gate_precision": float(run["test_rows"]["analysis"].get("gate_precision", 0.0)),
+                "test_gate_recall": float(run["test_rows"]["analysis"].get("gate_recall", 0.0)),
             })
 
         valid_budget_curve = final_run["valid_budget_curve"]
@@ -1422,6 +1496,10 @@ class GlanceStageMixin:
 
         metrics_payload = {
             "contract": "glance_joint_router_refine_metrics_v1",
+            "graph_data_variant": str(getattr(self, "graph_data_variant", "labeled")),
+            "graph_node_count": int(getattr(self, "graph_node_count", len(self.labels))),
+            "labeled_node_count": int(getattr(self, "labeled_node_count", len(self.labels))),
+            "support_node_count": int(getattr(self, "support_node_count", 0)),
             "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
             "paper_faithful_glance_inspired": False,
             "glance_style_joint_training": True,
@@ -1462,6 +1540,7 @@ class GlanceStageMixin:
             "router_feature_names": list(router_feature_bundle["feature_names"]),
             "router_temperature_scaling": dict(router_temperature_bundle),
             "refiner_target_mode": refiner_target_mode,
+            "joint_refiner_gate_target": refiner_gate_target,
             "refiner_weight_mode": refiner_weight_mode,
             "refiner_explicit_gate": bool(refiner_explicit_gate),
             "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
@@ -1478,11 +1557,15 @@ class GlanceStageMixin:
             "improved_count": int(test_delta["fix"]),
             "degraded_count": int(test_delta["broke"]),
             "net_gain": int(test_delta["net"]),
-            "wrong_node_fix_rate": float(test_delta["fix"] / max(int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+            "wrong_node_fix_rate": float(test_delta["fix"] / max(int((pred_gnn_labeled[test_idx] != labels_np[test_idx]).sum()), 1)),
             "correct_node_break_rate": float(
                 test_delta["broke"]
-                / max(int(test_idx.size - int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum())), 1)
+                / max(int(test_idx.size - int((pred_gnn_labeled[test_idx] != labels_np[test_idx]).sum())), 1)
             ),
+            "gate_positive_rate": float(analysis_summary.get("gate_positive_rate", 0.0)),
+            "mean_gate_prob_routed": float(analysis_summary.get("mean_gate_prob_routed", 0.0)),
+            "gate_precision": float(analysis_summary.get("gate_precision", 0.0)),
+            "gate_recall": float(analysis_summary.get("gate_recall", 0.0)),
             "query_usage": {
                 "train_routed_count": int(train_outputs["routed_count"]),
                 "valid_routed_count": int(valid_outputs["routed_count"]),
@@ -1512,6 +1595,10 @@ class GlanceStageMixin:
             "overall_delta_vs_base_gnn": metrics_payload["overall_delta_vs_base_gnn"],
             "wrong_node_fix_rate": metrics_payload["wrong_node_fix_rate"],
             "correct_node_break_rate": metrics_payload["correct_node_break_rate"],
+            "gate_positive_rate": metrics_payload["gate_positive_rate"],
+            "mean_gate_prob_routed": metrics_payload["mean_gate_prob_routed"],
+            "gate_precision": metrics_payload["gate_precision"],
+            "gate_recall": metrics_payload["gate_recall"],
             "net_gain": metrics_payload["net_gain"],
             "best_epoch": int(final_run["best_epoch"]),
             "query_usage": metrics_payload["query_usage"],
@@ -1545,6 +1632,10 @@ class GlanceStageMixin:
             "test_conditional_fix_rate": float(final_run["test_rows"]["analysis"]["conditional_fix_rate_on_selected_wrong"]),
             "test_wrong_node_fix_rate": float(metrics_payload["wrong_node_fix_rate"]),
             "test_correct_node_break_rate": float(metrics_payload["correct_node_break_rate"]),
+            "test_gate_positive_rate": float(metrics_payload["gate_positive_rate"]),
+            "test_mean_gate_prob_routed": float(metrics_payload["mean_gate_prob_routed"]),
+            "test_gate_precision": float(metrics_payload["gate_precision"]),
+            "test_gate_recall": float(metrics_payload["gate_recall"]),
             "test_net_gain": int(metrics_payload["net_gain"]),
             "test_macro_f1": float(metrics_payload["overall_test"]["macro_f1"]),
             "test_delta_macro_f1": float(metrics_payload["overall_delta_vs_base_gnn"]["macro_f1"]),
@@ -1552,6 +1643,14 @@ class GlanceStageMixin:
         manifest = {
             "contract": "glance_joint_router_refine_v1",
             "status": "completed",
+            "graph_data_variant": str(getattr(self, "graph_data_variant", "labeled")),
+            "node_id_manifest": {
+                "num_nodes": int(getattr(self, "graph_node_count", len(self.labels))),
+                "graph_node_count": int(getattr(self, "graph_node_count", len(self.labels))),
+                "labeled_node_count": int(getattr(self, "labeled_node_count", len(self.labels))),
+                "support_node_count": int(getattr(self, "support_node_count", 0)),
+                "labels_sha256": tensor_sha256(self.data["labels"]),
+            },
             "routing_mode": "joint_topk_train_global_budget_eval_router_refiner",
             "paper_faithful_glance_inspired": False,
             "glance_style_joint_training": True,
@@ -1628,7 +1727,8 @@ class GlanceStageMixin:
                 if semantic_view_mode == "prompt_expert_bundle_v1"
                 else None,
                 "target_mode": refiner_target_mode,
-                "explicit_gate": bool(refiner_explicit_gate) if semantic_view_mode != "prompt_expert_bundle_v1" else False,
+                "explicit_gate": bool(refiner_explicit_gate),
+                "gate_target": refiner_gate_target,
                 "weight_mode": refiner_weight_mode,
             },
             "training_contract": {
@@ -1659,7 +1759,8 @@ class GlanceStageMixin:
                 "router_training_objective": "base_wrong_reliability_bce_plus_pairwise_ranking",
                 "auxiliary_router_target": "none_oracle_advantage_retained_for_diagnostics_only",
                 "refiner_target_mode": refiner_target_mode,
-                "refiner_explicit_gate": bool(refiner_explicit_gate) if semantic_view_mode != "prompt_expert_bundle_v1" else False,
+                "joint_refiner_gate_target": refiner_gate_target,
+                "refiner_explicit_gate": bool(refiner_explicit_gate),
                 "refiner_weight_mode": refiner_weight_mode,
                 "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
                 "refiner_utility_weight": float(refiner_utility_weight),
@@ -1735,6 +1836,10 @@ class GlanceStageMixin:
                 "valid_routed_wrong_precision",
                 "valid_routed_wrong_coverage",
                 "valid_conditional_fix_rate",
+                "valid_gate_positive_rate",
+                "valid_mean_gate_prob_routed",
+                "valid_gate_precision",
+                "valid_gate_recall",
                 "test_accuracy",
                 "test_macro_f1",
                 "test_bot_f1",
@@ -1745,6 +1850,10 @@ class GlanceStageMixin:
                 "test_routed_wrong_precision",
                 "test_routed_wrong_coverage",
                 "test_conditional_fix_rate",
+                "test_gate_positive_rate",
+                "test_mean_gate_prob_routed",
+                "test_gate_precision",
+                "test_gate_recall",
             ],
             beta_sweep,
         )
@@ -1813,8 +1922,15 @@ class GlanceStageMixin:
                     "router_prob": router_prob,
                     "router_score": router_score,
                     "oracle_advantage": oracle_advantage,
-                    "neighbor_count_1hop": torch.tensor(semantic_views.get("count_1hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
-                    "neighbor_count_2hop": torch.tensor(semantic_views.get("count_2hop", np.zeros(len(self.labels), dtype=np.int64)), dtype=torch.long),
+                    "gate_prob": gate_prob,
+                    "neighbor_count_1hop": torch.tensor(
+                        semantic_views.get("count_1hop", np.zeros(int(getattr(self, "graph_node_count", len(self.labels))), dtype=np.int64)),
+                        dtype=torch.long,
+                    ),
+                    "neighbor_count_2hop": torch.tensor(
+                        semantic_views.get("count_2hop", np.zeros(int(getattr(self, "graph_node_count", len(self.labels))), dtype=np.int64)),
+                        dtype=torch.long,
+                    ),
                 },
                 "checkpoint.pt": {
                     "router_model": final_run["router_state"],
@@ -1864,9 +1980,9 @@ class GlanceStageMixin:
         prob_refiner,
     ):
         risk_score = np.asarray(risk_score, dtype=np.float64)
-        pred_gnn_np = np.asarray(pred_gnn, dtype=np.int64)
-        pred_ref_np = np.asarray(pred_refiner, dtype=np.int64)
         labels_np = np.asarray(labels_np, dtype=np.int64)
+        pred_gnn_np = _labeled_prefix_pred(pred_gnn, labels_np.shape[0]).astype(np.int64)
+        pred_ref_np = _labeled_prefix_pred(pred_refiner, labels_np.shape[0]).astype(np.int64)
         eval_idx = np.asarray(eval_idx, dtype=np.int64)
         prob_gnn_t = prob_gnn.detach().cpu().float() if torch.is_tensor(prob_gnn) else torch.tensor(prob_gnn, dtype=torch.float32)
         prob_ref_t = prob_refiner.detach().cpu().float() if torch.is_tensor(prob_refiner) else torch.tensor(prob_refiner, dtype=torch.float32)
@@ -3306,6 +3422,46 @@ class GlanceStageMixin:
             weights = weights + utility_target.float() * max(float(utility_weight) - 1.0, 0.0)
         return weights
 
+    @staticmethod
+    def _glance_gate_output_metrics(outputs, eval_idx):
+        gate_prob = outputs.get("gate_prob") if isinstance(outputs, dict) else None
+        oracle_advantage = outputs.get("oracle_advantage") if isinstance(outputs, dict) else None
+        routed_mask = outputs.get("routed_mask") if isinstance(outputs, dict) else None
+        if gate_prob is None or oracle_advantage is None or routed_mask is None:
+            return {
+                "gate_positive_rate": 0.0,
+                "mean_gate_prob_routed": 0.0,
+                "gate_precision": 0.0,
+                "gate_recall": 0.0,
+            }
+        idx = torch.tensor(np.asarray(eval_idx, dtype=np.int64).reshape(-1), dtype=torch.long)
+        if idx.numel() == 0:
+            return {
+                "gate_positive_rate": 0.0,
+                "mean_gate_prob_routed": 0.0,
+                "gate_precision": 0.0,
+                "gate_recall": 0.0,
+            }
+        routed = routed_mask[idx].bool()
+        if int(routed.sum().item()) == 0:
+            return {
+                "gate_positive_rate": 0.0,
+                "mean_gate_prob_routed": 0.0,
+                "gate_precision": 0.0,
+                "gate_recall": 0.0,
+            }
+        gate_routed = gate_prob[idx][routed].detach().cpu().float()
+        adv_routed = oracle_advantage[idx][routed].detach().cpu().float()
+        gate_decision = gate_routed >= 0.5
+        utility_positive = adv_routed > 0.0
+        true_positive = gate_decision & utility_positive
+        return {
+            "gate_positive_rate": float(gate_decision.float().mean().item()),
+            "mean_gate_prob_routed": float(gate_routed.mean().item()),
+            "gate_precision": float(true_positive.sum().item() / max(int(gate_decision.sum().item()), 1)),
+            "gate_recall": float(true_positive.sum().item() / max(int(utility_positive.sum().item()), 1)),
+        }
+
     def _apply_glance_joint_policy(
         self,
         router_model,
@@ -3330,6 +3486,7 @@ class GlanceStageMixin:
         router_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
         router_score_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
         oracle_advantage_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        gate_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
         if split_idx.size == 0:
             return {
                 "logits": final_logits,
@@ -3339,6 +3496,7 @@ class GlanceStageMixin:
                 "router_prob": router_prob_all,
                 "router_score": router_score_all,
                 "oracle_advantage": oracle_advantage_all,
+                "gate_prob": gate_prob_all,
                 "routed_count": 0,
             }
 
@@ -3366,13 +3524,15 @@ class GlanceStageMixin:
                 final_logits[routed_idx] = routed_forward["mixed_logits"].cpu()
                 final_prob[routed_idx] = torch.softmax(routed_forward["mixed_logits"].cpu(), dim=1)
                 final_pred[routed_idx] = routed_forward["mixed_logits"].cpu().argmax(dim=1)
+                if routed_forward.get("gate_prob") is not None:
+                    gate_prob_all[routed_idx] = routed_forward["gate_prob"].detach().cpu()
                 full_forward = self._glance_refiner_forward(
                     refiner_model,
                     _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, refiner_device),
                     batch_base_logits=base_logits[batch_idx].to(refiner_device),
                 )
-                full_ref_loss = F.cross_entropy(
-                    full_forward["mixed_logits"].cpu(),
+                raw_full_ref_loss = F.cross_entropy(
+                    full_forward["refiner_logits"].cpu(),
                     labels_t[batch_idx].to(refiner_device).cpu(),
                     reduction="none",
                 )
@@ -3381,7 +3541,7 @@ class GlanceStageMixin:
                     labels_t[batch_idx],
                     reduction="none",
                 )
-                oracle_advantage_all[batch_idx] = base_loss.detach().cpu() - full_ref_loss.detach().cpu() - float(beta)
+                oracle_advantage_all[batch_idx] = base_loss.detach().cpu() - raw_full_ref_loss.detach().cpu() - float(beta)
 
         return {
             "logits": final_logits,
@@ -3389,10 +3549,11 @@ class GlanceStageMixin:
             "pred": final_pred,
             "routed_mask": routed_mask,
             "router_prob": router_prob_all,
-            "router_score": router_score_all,
-            "oracle_advantage": oracle_advantage_all,
-            "routed_count": int(routed_mask[torch.tensor(split_idx, dtype=torch.long)].sum().item()),
-        }
+                "router_score": router_score_all,
+                "oracle_advantage": oracle_advantage_all,
+                "gate_prob": gate_prob_all,
+                "routed_count": int(routed_mask[torch.tensor(split_idx, dtype=torch.long)].sum().item()),
+            }
 
     def _build_glance_joint_per_node_rows(
         self,
@@ -3404,6 +3565,7 @@ class GlanceStageMixin:
         router_prob,
         router_score,
         oracle_advantage,
+        gate_prob,
         semantic_views,
         mode_name,
         route_prob_by_epoch=None,
@@ -3419,6 +3581,7 @@ class GlanceStageMixin:
         router_prob_np = router_prob.detach().cpu().numpy().astype(np.float32)
         router_score_np = router_score.detach().cpu().numpy().astype(np.float32) if router_score is not None else None
         oracle_advantage_np = oracle_advantage.detach().cpu().numpy().astype(np.float32) if oracle_advantage is not None else None
+        gate_prob_np = gate_prob.detach().cpu().numpy().astype(np.float32) if gate_prob is not None else None
         count_1hop = semantic_views.get("count_1hop")
         count_2hop = semantic_views.get("count_2hop")
         if count_1hop is None:
@@ -3435,6 +3598,8 @@ class GlanceStageMixin:
                 "router_prob": float(router_prob_np[node_idx]),
                 "router_score": float(router_score_np[node_idx]) if router_score_np is not None else 0.0,
                 "oracle_advantage": float(oracle_advantage_np[node_idx]) if oracle_advantage_np is not None else 0.0,
+                "gate_prob": float(gate_prob_np[node_idx]) if gate_prob_np is not None else 0.0,
+                "gate_decision": bool(gate_prob_np[node_idx] >= 0.5) if gate_prob_np is not None else False,
                 "was_wrong_base": bool(pred_gnn_np[node_idx] != labels_np[node_idx]),
                 "is_wrong_final": bool(final_pred_np[node_idx] != labels_np[node_idx]),
                 "neighbor_count_1hop": int(count_1hop[node_idx]) if count_1hop is not None else 0,
@@ -3490,6 +3655,7 @@ class GlanceStageMixin:
         eval_top_k,
         refiner_explicit_gate=False,
         refiner_target_mode="predict",
+        refiner_gate_target="base_wrong",
         refiner_weight_mode="off",
         refiner_base_wrong_weight=2.0,
         refiner_utility_weight=3.0,
@@ -3519,6 +3685,7 @@ class GlanceStageMixin:
                 structural_dim=int(refiner_features["structural_features"].shape[1]),
                 activation=activation,
                 dropout=0.1,
+                explicit_gate=bool(refiner_explicit_gate),
             )
         elif bool(refiner_explicit_gate):
             refiner_model = GatedGlanceRefinerMLP(
@@ -3596,7 +3763,8 @@ class GlanceStageMixin:
                 routed_refiner_loss = F.cross_entropy(routed_forward["mixed_logits"], routed_labels, reduction="none")
                 full_refiner_loss = F.cross_entropy(full_forward["mixed_logits"], batch_labels, reduction="none")
                 base_wrong_target = batch_base_pred.ne(batch_labels).float()
-                utility_target = (batch_base_loss.detach() - full_refiner_loss.detach() - float(beta) > 0.0).float()
+                raw_full_refiner_loss = F.cross_entropy(full_forward["refiner_logits"], batch_labels, reduction="none")
+                utility_target = (batch_base_loss.detach() - raw_full_refiner_loss.detach() - float(beta) > 0.0).float()
                 routed_sample_weights = self._glance_refiner_sample_weights(
                     base_wrong_target[routed_rel],
                     utility_target[routed_rel],
@@ -3606,7 +3774,13 @@ class GlanceStageMixin:
                 )
 
                 if refiner_target_mode == "keep_change":
-                    keep_change_target = batch_base_pred[routed_rel].ne(routed_labels).float()
+                    gate_target_mode = str(refiner_gate_target or "base_wrong").lower()
+                    if gate_target_mode == "utility_positive":
+                        keep_change_target = utility_target[routed_rel].float()
+                    elif gate_target_mode == "base_wrong":
+                        keep_change_target = batch_base_pred[routed_rel].ne(routed_labels).float()
+                    else:
+                        raise ValueError(f"Unsupported joint_refiner_gate_target: {refiner_gate_target}")
                     refiner_gate_logits = routed_forward.get("gate_logits")
                     if refiner_gate_logits is None:
                         raise ValueError("keep_change target mode requires a gated refiner.")
@@ -3626,7 +3800,7 @@ class GlanceStageMixin:
                     + routed_refiner_loss.sum()
                 ) / float(batch_labels.size(0))
 
-                oracle_advantage = (batch_base_loss - full_refiner_loss.detach() - float(beta)).detach()
+                oracle_advantage = (batch_base_loss - raw_full_refiner_loss.detach() - float(beta)).detach()
                 route_loss = batch_base_loss.sum() * 0.0
                 router_regression_loss = batch_base_loss.sum() * 0.0
                 router_ranking_loss = _glance_pairwise_ranking_loss(batch_route_score, base_wrong_target)
@@ -3755,9 +3929,13 @@ class GlanceStageMixin:
                 test_outputs["router_score"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
                 test_outputs["routed_mask"][torch.tensor(test_idx, dtype=torch.long)].numpy(),
             )
-            train_delta_epoch = _delta_table(pred_gnn.numpy(), train_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], train_idx))
-            valid_delta_epoch = _delta_table(pred_gnn.numpy(), valid_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], valid_idx))
-            test_delta_epoch = _delta_table(pred_gnn.numpy(), test_outputs["pred"].numpy(), labels_np, _mask_from_idx(labels_np.shape[0], test_idx))
+            pred_gnn_labeled = _labeled_prefix_pred(pred_gnn.numpy(), labels_np.shape[0])
+            train_pred_labeled = _labeled_prefix_pred(train_outputs["pred"].numpy(), labels_np.shape[0])
+            valid_pred_labeled = _labeled_prefix_pred(valid_outputs["pred"].numpy(), labels_np.shape[0])
+            test_pred_labeled = _labeled_prefix_pred(test_outputs["pred"].numpy(), labels_np.shape[0])
+            train_delta_epoch = _delta_table(pred_gnn_labeled, train_pred_labeled, labels_np, _mask_from_idx(labels_np.shape[0], train_idx))
+            valid_delta_epoch = _delta_table(pred_gnn_labeled, valid_pred_labeled, labels_np, _mask_from_idx(labels_np.shape[0], valid_idx))
+            test_delta_epoch = _delta_table(pred_gnn_labeled, test_pred_labeled, labels_np, _mask_from_idx(labels_np.shape[0], test_idx))
 
             epoch_summary = {
                 "epoch": int(epoch + 1),
@@ -3806,18 +3984,18 @@ class GlanceStageMixin:
                 },
                 "refiner": {
                     "train": {
-                        "wrong_node_fix_rate": float(train_delta_epoch["fix"] / max(int((pred_gnn.numpy()[train_idx] != labels_np[train_idx]).sum()), 1)),
-                        "correct_node_break_rate": float(train_delta_epoch["broke"] / max(int(train_idx.size - (pred_gnn.numpy()[train_idx] != labels_np[train_idx]).sum()), 1)),
+                    "wrong_node_fix_rate": float(train_delta_epoch["fix"] / max(int((pred_gnn_labeled[train_idx] != labels_np[train_idx]).sum()), 1)),
+                    "correct_node_break_rate": float(train_delta_epoch["broke"] / max(int(train_idx.size - (pred_gnn_labeled[train_idx] != labels_np[train_idx]).sum()), 1)),
                         "net_gain": int(train_delta_epoch["net"]),
                     },
                     "valid": {
-                        "wrong_node_fix_rate": float(valid_delta_epoch["fix"] / max(int((pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).sum()), 1)),
-                        "correct_node_break_rate": float(valid_delta_epoch["broke"] / max(int(valid_idx.size - (pred_gnn.numpy()[valid_idx] != labels_np[valid_idx]).sum()), 1)),
+                    "wrong_node_fix_rate": float(valid_delta_epoch["fix"] / max(int((pred_gnn_labeled[valid_idx] != labels_np[valid_idx]).sum()), 1)),
+                    "correct_node_break_rate": float(valid_delta_epoch["broke"] / max(int(valid_idx.size - (pred_gnn_labeled[valid_idx] != labels_np[valid_idx]).sum()), 1)),
                         "net_gain": int(valid_delta_epoch["net"]),
                     },
                     "test": {
-                        "wrong_node_fix_rate": float(test_delta_epoch["fix"] / max(int((pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
-                        "correct_node_break_rate": float(test_delta_epoch["broke"] / max(int(test_idx.size - (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).sum()), 1)),
+                    "wrong_node_fix_rate": float(test_delta_epoch["fix"] / max(int((pred_gnn_labeled[test_idx] != labels_np[test_idx]).sum()), 1)),
+                    "correct_node_break_rate": float(test_delta_epoch["broke"] / max(int(test_idx.size - (pred_gnn_labeled[test_idx] != labels_np[test_idx]).sum()), 1)),
                         "net_gain": int(test_delta_epoch["net"]),
                     },
                 },
@@ -3915,6 +4093,7 @@ class GlanceStageMixin:
         ):
             split_metrics["routed_count"] = int(split_outputs["routed_count"])
             split_metrics["query_rate"] = float(split_outputs["routed_count"] / max(int(split_idx.size), 1))
+            split_metrics.update(self._glance_gate_output_metrics(split_outputs, split_idx))
 
         topk_train_rows = self._build_glance_joint_per_node_rows(
             train_idx,
@@ -3925,6 +4104,7 @@ class GlanceStageMixin:
             topk_train_outputs["router_prob"],
             topk_train_outputs["router_score"],
             topk_train_outputs["oracle_advantage"],
+            topk_train_outputs.get("gate_prob"),
             semantic_views,
             "glance_joint_router_refine_train",
         )
@@ -3937,6 +4117,7 @@ class GlanceStageMixin:
             topk_valid_outputs["router_prob"],
             topk_valid_outputs["router_score"],
             topk_valid_outputs["oracle_advantage"],
+            topk_valid_outputs.get("gate_prob"),
             semantic_views,
             "glance_joint_router_refine_valid",
         )
@@ -3949,6 +4130,7 @@ class GlanceStageMixin:
             topk_test_outputs["router_prob"],
             topk_test_outputs["router_score"],
             topk_test_outputs["oracle_advantage"],
+            topk_test_outputs.get("gate_prob"),
             semantic_views,
             "glance_joint_router_refine_test",
         )

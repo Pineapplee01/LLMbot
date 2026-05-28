@@ -318,7 +318,8 @@ def _score_logits(logits, labels, idx):
 
 def _fallback_structural_node_features(data):
     labels = _labels_to_index(data["labels"])
-    features = structural_features(data["edge_index"], data["edge_type"], int(labels.numel()))
+    graph_node_count = int(data.get("graph_node_count", int(labels.numel())))
+    features = structural_features(data["edge_index"], data["edge_type"], graph_node_count)
     table = np.column_stack(
         [
             features["in_degree"],
@@ -343,6 +344,71 @@ def _load_tensor_features(feature_path):
     if features.dim() != 2:
         raise ValueError(f"G0 feature tensor must be 2D [num_nodes, dim], got shape {tuple(features.shape)}.")
     return features
+
+
+def _resolve_support_embedding_path(args, data):
+    support_path = getattr(args, "support_embedding_path", None) or "support_roberta_embeddings_new.pt"
+    support_path = Path(support_path)
+    if not support_path.is_absolute():
+        support_path = Path(data.get("dataset_path", ".")) / support_path
+    return support_path
+
+
+def resolve_seed_aware_roberta_embedding_path(data, seed=None):
+    dataset_path = Path(data.get("dataset_path", "."))
+    candidates = []
+    if seed is not None:
+        candidates.append(dataset_path / f"embeddings_iter_-1_seed_{int(seed)}.pt")
+    candidates.append(dataset_path / "embeddings_roberta.pt")
+    return next((candidate for candidate in candidates if candidate.exists()), None)
+
+
+def _runtime_concat_full_graph_support_embeddings(args, data, labeled_feature_path):
+    labeled_feature_path = Path(labeled_feature_path)
+    labeled_features = _load_tensor_features(labeled_feature_path)
+    labeled_node_count = int(data.get("labeled_node_count", 0))
+    graph_node_count = int(data.get("graph_node_count", labeled_node_count))
+    support_idx = data.get("support_idx")
+    if labeled_node_count <= 0 or graph_node_count <= labeled_node_count or support_idx is None:
+        raise ValueError(
+            "full_graph_support requires labeled_node_count, graph_node_count, and support_idx from load_raw_data()."
+        )
+    if int(labeled_features.shape[0]) != labeled_node_count:
+        raise ValueError(
+            "full_graph_support expects --embedding_path to point to a labeled-node embedding tensor "
+            f"with {labeled_node_count} rows, got {int(labeled_features.shape[0])}."
+        )
+    support_feature_path = _resolve_support_embedding_path(args, data)
+    if not support_feature_path.exists():
+        raise FileNotFoundError(
+            "full_graph_support could not find the support embedding tensor at "
+            f"{support_feature_path}."
+        )
+    support_features = _load_tensor_features(support_feature_path)
+    support_count = int(len(support_idx))
+    if int(support_features.shape[0]) != support_count:
+        raise ValueError(
+            "full_graph_support support embedding rows must match len(support_idx): "
+            f"{int(support_features.shape[0])} vs {support_count}."
+        )
+    if int(support_features.shape[1]) != int(labeled_features.shape[1]):
+        raise ValueError(
+            "full_graph_support requires labeled and support embeddings to have the same feature dimension: "
+            f"{int(labeled_features.shape[1])} vs {int(support_features.shape[1])}."
+        )
+    full_features = torch.cat([labeled_features, support_features], dim=0).contiguous()
+    if int(full_features.shape[0]) != graph_node_count:
+        raise ValueError(
+            "full_graph_support runtime concatenation produced the wrong graph node count: "
+            f"{int(full_features.shape[0])} vs expected {graph_node_count}."
+        )
+    return {
+        "features": full_features,
+        "labeled_features": labeled_features,
+        "support_features": support_features,
+        "labeled_feature_path": labeled_feature_path,
+        "support_feature_path": support_feature_path,
+    }
 
 
 def phase_a_project_dim(args):
@@ -422,12 +488,25 @@ def _project_semantic_features(features, args):
 
 def resolve_g0_feature_bundle(args, data):
     feature_path = getattr(args, "emb_path", None) or getattr(args, "g0_feature_path", None)
+    graph_data_variant = str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower()
     if feature_path:
         feature_path = Path(feature_path)
     else:
         dataset_path = Path(data.get("dataset_path", "."))
-        candidates = [dataset_path / "qwen3_emb_last.pt", dataset_path / "embeddings_roberta.pt"]
-        feature_path = next((candidate for candidate in candidates if candidate.exists()), None)
+        semantic_encoder = str(
+            getattr(args, "semantic_encoder", getattr(args, "semantic_backbone", "auto"))
+        ).lower()
+        active_seed = getattr(args, "active_seed", None)
+        if semantic_encoder in {"auto", "roberta", "roberta_finetuned"}:
+            feature_path = resolve_seed_aware_roberta_embedding_path(data, seed=active_seed)
+        else:
+            candidates = [dataset_path / "qwen3_emb_last.pt", dataset_path / "embeddings_roberta.pt"]
+            feature_path = next((candidate for candidate in candidates if candidate.exists()), None)
+
+    if graph_data_variant == "full_graph_support" and feature_path is None:
+        raise ValueError(
+            "full_graph_support requires --embedding_path to point to the labeled RoBERTa embedding tensor."
+        )
 
     if feature_path is None:
         features, manifest = _fallback_structural_node_features(data)
@@ -451,13 +530,18 @@ def resolve_g0_feature_bundle(args, data):
             "projector_state": {"projector": "structural_fallback"},
         }
 
-    raw_features = _load_tensor_features(feature_path)
+    if graph_data_variant == "full_graph_support":
+        concat_bundle = _runtime_concat_full_graph_support_embeddings(args, data, feature_path)
+        raw_features = concat_bundle["features"]
+    else:
+        raw_features = _load_tensor_features(feature_path)
     projected, projection_manifest, projector_state = _project_semantic_features(raw_features, args)
     feature_manifest = {
         "source": "tensor_file",
         "path": str(feature_path),
         "sha256": projection_manifest["projected_sha256"],
         **projection_manifest,
+        "graph_data_variant": graph_data_variant,
         "peft": {
             "enabled": bool(getattr(args, "peft", False)),
             "rank": int(getattr(args, "peft_rank", 8)),
@@ -465,6 +549,17 @@ def resolve_g0_feature_bundle(args, data):
             "trainable_parameter_count": 0,
         },
     }
+    if graph_data_variant == "full_graph_support":
+        feature_manifest.update(
+            {
+                "runtime_concat": True,
+                "labeled_embedding_path": str(concat_bundle["labeled_feature_path"]),
+                "support_embedding_path": str(concat_bundle["support_feature_path"]),
+                "graph_node_count": int(raw_features.shape[0]),
+                "labeled_node_count": int(concat_bundle["labeled_features"].shape[0]),
+                "support_node_count": int(concat_bundle["support_features"].shape[0]),
+            }
+        )
     return {
         "features": projected,
         "raw_features": raw_features,

@@ -48,6 +48,10 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
         self.experiment_root = build_experiment_root(args, seed)
         self.runtime_root = self.experiment_root / "runtime"
         self.labels = _labels_to_index(data["labels"]).cpu().numpy()
+        self.graph_data_variant = str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower()
+        self.graph_node_count = int(data.get("graph_node_count", len(self.labels)))
+        self.labeled_node_count = int(data.get("labeled_node_count", len(self.labels)))
+        self.support_node_count = int(data.get("support_node_count", max(self.graph_node_count - self.labeled_node_count, 0)))
         self.train_mask = _mask_from_idx(len(self.labels), data["train_idx"])
         self.val_mask = _mask_from_idx(len(self.labels), data["valid_idx"])
         self.test_mask = _mask_from_idx(len(self.labels), data["test_idx"])
@@ -99,7 +103,13 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
                 "test_size": int(self.test_mask.sum()),
             },
             "fold_manifest": {"type": "single_split", "seed": self.seed},
-            "node_id_manifest": {"num_nodes": int(len(self.labels))},
+            "node_id_manifest": {
+                "num_nodes": int(self.graph_node_count),
+                "graph_node_count": int(self.graph_node_count),
+                "labeled_node_count": int(self.labeled_node_count),
+                "support_node_count": int(self.support_node_count),
+            },
+            "graph_data_variant": self.graph_data_variant,
             "code_commit": code_provenance["commit"],
             "code_provenance": code_provenance,
         }
@@ -199,10 +209,10 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
         node_manifest = manifest.get("node_id_manifest", {}) or {}
         split_manifest = manifest.get("split_provenance", {}) or {}
         current_labels_sha = tensor_sha256(self.data["labels"])
-        if int(node_manifest.get("num_nodes", -1)) != int(len(self.labels)):
+        if int(node_manifest.get("num_nodes", -1)) != int(self.graph_node_count):
             raise MissingFrozenArtifactError(
                 f"External frozen_g0 at {frozen_root} has num_nodes={node_manifest.get('num_nodes')} "
-                f"but current dataset has {len(self.labels)}."
+                f"but current dataset has graph_node_count={self.graph_node_count}."
             )
         if node_manifest.get("labels_sha256") and str(node_manifest.get("labels_sha256")) != str(current_labels_sha):
             raise MissingFrozenArtifactError(
