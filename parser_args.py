@@ -228,6 +228,7 @@ def parser_args(argv=None):
             "none",
             "msp_ts",
             "posthoc_calibrated_ranker",
+            "calibrated_local_risk_router",
             "login_uncertainty_router",
             "graph_conformal_set_estimator",
             "gnn_2hop_conformal",
@@ -513,6 +514,17 @@ def parser_args(argv=None):
         help="Loss weight for explicit keep/change gate supervision when joint_refiner_explicit_gate is enabled.",
     )
     parser.add_argument(
+        "--joint_prompt_expert_fusion",
+        type=str,
+        default="projector_concat",
+        choices=["projector_concat", "mpe_gated"],
+        help=(
+            "Fusion head for prompt-expert joint refiners. "
+            "'projector_concat' preserves the existing projected concat path; "
+            "'mpe_gated' uses a GAugLLM-style node-conditioned softmax over graph_following, graph_follower, tweet, and conflict experts."
+        ),
+    )
+    parser.add_argument(
         "--embedding_path",
         dest="embedding_path",
         type=str,
@@ -534,6 +546,26 @@ def parser_args(argv=None):
             "Keeps graph_detector_prepare backbone features unchanged and only replaces the joint refiner semantic source. "
             "Accepts either a plain [num_nodes, d] tensor, a prompt-cache payload with ego/hop1/hop2 tensors, "
             "or a prompt-expert bundle payload with ego/graph_following/graph_follower/tweet/conflict components."
+        ),
+    )
+    parser.add_argument(
+        "--joint_routing_protocol",
+        type=str,
+        default="joint_train",
+        choices=["joint_train", "frozen_router_reuse"],
+        help=(
+            "Routing protocol for joint_router_refinement. "
+            "'joint_train' keeps the current jointly trained router+refiner path; "
+            "'frozen_router_reuse' freezes the router and reuses a prior joint_router_refinement routing artifact."
+        ),
+    )
+    parser.add_argument(
+        "--joint_router_reuse_root",
+        type=str,
+        default=None,
+        help=(
+            "Root or stage directory containing the router artifact reused when "
+            "--joint_routing_protocol frozen_router_reuse."
         ),
     )
     parser.add_argument(

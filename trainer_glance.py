@@ -100,6 +100,20 @@ def _node_cross_entropy_vector(prob, labels):
 
 
 _PROMPT_EXPERT_COMPONENT_ORDER = ("ego", "graph_following", "graph_follower", "tweet", "conflict")
+_PROMPT_EXPERT_SEMANTIC_VIEW_MODES = {
+    "prompt_expert_bundle_v1",
+    "prompt_expert_bundle_center_induced_v1",
+    "prompt_expert_bundle_v2",
+}
+
+
+def _is_prompt_expert_semantic_view_mode(value):
+    return str(value or "").strip().lower() in _PROMPT_EXPERT_SEMANTIC_VIEW_MODES
+
+
+def _is_prompt_expert_feature_kind(value):
+    token = str(value or "").strip().lower()
+    return token in {"prompt_expert_bundle", "prompt_expert_bundle_v1"} or token in _PROMPT_EXPERT_SEMANTIC_VIEW_MODES
 
 
 def _mask_from_idx(num_nodes, idx):
@@ -239,6 +253,22 @@ def _safe_advantage_router_metrics(advantage, scores, routed_mask=None):
     return metrics
 
 
+def _apply_glance_router_scaler(feature_matrix, scaler_state):
+    feature_matrix = np.asarray(feature_matrix, dtype=np.float32)
+    if feature_matrix.ndim != 2:
+        raise ValueError("GLANCE router feature matrix must be 2-D.")
+    mean = np.asarray((scaler_state or {}).get("mean", []), dtype=np.float32).reshape(-1)
+    scale = np.asarray((scaler_state or {}).get("scale", []), dtype=np.float32).reshape(-1)
+    if mean.size != feature_matrix.shape[1] or scale.size != feature_matrix.shape[1]:
+        raise ValueError(
+            "Frozen-router scaler state does not align with the current router feature dimension: "
+            f"expected {feature_matrix.shape[1]}, got mean={mean.size}, scale={scale.size}."
+        )
+    scaled = (feature_matrix - mean) / np.clip(scale, 1e-6, None)
+    scaled = np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return torch.tensor(scaled, dtype=torch.float32)
+
+
 class GlanceRefinerMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, activation="leakyrelu", dropout=0.1):
         super().__init__()
@@ -292,6 +322,7 @@ class GatedGlanceRefinerMLP(nn.Module):
 
 class PromptExpertBundleRefinerMLP(nn.Module):
     COMPONENT_ORDER = _PROMPT_EXPERT_COMPONENT_ORDER
+    MPE_COMPONENT_ORDER = ("graph_following", "graph_follower", "tweet", "conflict")
 
     def __init__(
         self,
@@ -300,9 +331,12 @@ class PromptExpertBundleRefinerMLP(nn.Module):
         proj_dim=256,
         hidden_dim=128,
         structural_dim=4,
+        graph_gate_dim=None,
         activation="leakyrelu",
         dropout=0.1,
         explicit_gate=False,
+        fusion_mode="projector_concat",
+        mpe_gate_dim=None,
     ):
         super().__init__()
         activation = str(activation).lower()
@@ -318,7 +352,11 @@ class PromptExpertBundleRefinerMLP(nn.Module):
         self.z_gnn_dim = int(z_gnn_dim)
         self.proj_dim = int(proj_dim)
         self.structural_dim = int(structural_dim)
+        self.graph_gate_dim = int(graph_gate_dim if graph_gate_dim is not None else structural_dim)
         self.explicit_gate = bool(explicit_gate)
+        self.fusion_mode = str(fusion_mode or "projector_concat").lower()
+        if self.fusion_mode not in {"projector_concat", "mpe_gated"}:
+            raise ValueError(f"Unsupported prompt-expert fusion mode: {fusion_mode}")
         self.projectors = nn.ModuleDict(
             {
                 name: nn.Sequential(
@@ -329,8 +367,19 @@ class PromptExpertBundleRefinerMLP(nn.Module):
                 for name in self.COMPONENT_ORDER
             }
         )
-        self.graph_gate = nn.Linear(self.structural_dim, 2)
-        total_proj_slots = 6
+        self.graph_gate = nn.Linear(self.graph_gate_dim, 2)
+        self.mpe_gate_dim = int(mpe_gate_dim if mpe_gate_dim is not None else self.z_gnn_dim + self.structural_dim)
+        self.mpe_gate = (
+            nn.Sequential(
+                nn.Linear(self.mpe_gate_dim, int(hidden_dim)),
+                act_factory(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden_dim), len(self.MPE_COMPONENT_ORDER)),
+            )
+            if self.fusion_mode == "mpe_gated"
+            else None
+        )
+        total_proj_slots = 1 if self.fusion_mode == "mpe_gated" else 6
         self.shared = nn.Sequential(
             nn.Linear(self.z_gnn_dim + total_proj_slots * self.proj_dim + self.structural_dim, int(hidden_dim)),
             act_factory(),
@@ -339,36 +388,50 @@ class PromptExpertBundleRefinerMLP(nn.Module):
         self.classifier = nn.Linear(int(hidden_dim), 2)
         self.gate_head = nn.Linear(int(hidden_dim), 1) if self.explicit_gate else None
 
-    def forward(self, z_gnn, semantic_views, structural_features):
+    def forward(self, z_gnn, semantic_views, structural_features, graph_gate_features=None, mpe_gate_features=None):
         projected = {
             name: self.projectors[name](semantic_views[name])
             for name in self.COMPONENT_ORDER
         }
-        gate_weights = torch.softmax(self.graph_gate(structural_features), dim=1)
+        if graph_gate_features is None:
+            graph_gate_features = structural_features[:, : self.graph_gate_dim]
+        gate_weights = torch.softmax(self.graph_gate(graph_gate_features), dim=1)
         graph_fused = (
             gate_weights[:, 0:1] * projected["graph_following"]
             + gate_weights[:, 1:2] * projected["graph_follower"]
         )
-        x = torch.cat(
-            [
-                z_gnn,
-                projected["ego"],
-                projected["graph_following"],
-                projected["graph_follower"],
-                graph_fused,
-                projected["tweet"],
-                projected["conflict"],
-                structural_features,
-            ],
-            dim=1,
-        )
+        mpe_weights = None
+        if self.fusion_mode == "mpe_gated":
+            if mpe_gate_features is None:
+                mpe_gate_features = torch.cat([z_gnn, structural_features], dim=1)
+            expert_stack = torch.stack(
+                [projected[name] for name in self.MPE_COMPONENT_ORDER],
+                dim=1,
+            )
+            mpe_weights = torch.softmax(self.mpe_gate(mpe_gate_features), dim=1)
+            expert_fused = torch.sum(mpe_weights.unsqueeze(-1) * expert_stack, dim=1)
+            x = torch.cat([z_gnn, expert_fused, structural_features], dim=1)
+        else:
+            x = torch.cat(
+                [
+                    z_gnn,
+                    projected["ego"],
+                    projected["graph_following"],
+                    projected["graph_follower"],
+                    graph_fused,
+                    projected["tweet"],
+                    projected["conflict"],
+                    structural_features,
+                ],
+                dim=1,
+            )
         hidden = self.shared(x)
         logits = self.classifier(hidden)
         if self.gate_head is None:
-            return logits
+            return (logits, mpe_weights) if mpe_weights is not None else logits
         gate_logits = self.gate_head(hidden).squeeze(-1)
         gate_prob = torch.sigmoid(gate_logits)
-        return logits, gate_logits, gate_prob
+        return logits, gate_logits, gate_prob, mpe_weights
 
 
 def _normalize_semantic_payload(payload):
@@ -412,6 +475,16 @@ def _normalize_semantic_payload(payload):
             "count_follower",
             "has_following",
             "has_follower",
+            "candidate_count_following",
+            "candidate_count_follower",
+            "selected_count_following",
+            "selected_count_follower",
+            "mean_sim_following_support",
+            "mean_sim_following_contrast",
+            "mean_sim_follower_support",
+            "mean_sim_follower_contrast",
+            "reciprocal_ratio_following_selected",
+            "reciprocal_ratio_follower_selected",
             "rt_ratio",
             "url_ratio",
             "hashtag_ratio",
@@ -430,7 +503,7 @@ def _normalize_semantic_payload(payload):
                 continue
             expert_scalar_tensors[scalar_key] = scalar_value.detach().cpu().float().view(-1)
         payload_semantic_view_mode = str(payload.get("semantic_view_mode", "") or "").strip().lower()
-        if expert_component_tensors or expert_scalar_tensors or payload_semantic_view_mode == "prompt_expert_bundle_v1":
+        if expert_component_tensors or expert_scalar_tensors or _is_prompt_expert_semantic_view_mode(payload_semantic_view_mode):
             active_components = payload.get("active_components")
             if active_components is None:
                 active_components = list(expert_component_tensors.keys())
@@ -442,7 +515,12 @@ def _normalize_semantic_payload(payload):
                 "component_tensors": expert_component_tensors,
                 "scalar_tensors": expert_scalar_tensors,
                 "active_components": list(active_components),
-                "semantic_view_mode": "prompt_expert_bundle_v1",
+                "semantic_view_mode": payload_semantic_view_mode if _is_prompt_expert_semantic_view_mode(payload_semantic_view_mode) else "prompt_expert_bundle_v1",
+                "graph_data_variant": str(payload.get("graph_data_variant", "labeled")),
+                "target_node_count": int(payload.get("target_node_count", 0) or 0),
+                "full_graph_node_count": int(payload.get("full_graph_node_count", 0) or 0),
+                "labeled_node_count": int(payload.get("labeled_node_count", 0) or 0),
+                "target_node_scope": str(payload.get("target_node_scope", "all_nodes")),
             }
         for candidate_key in ("embeddings", "features", "x"):
             if candidate_key in payload:
@@ -498,9 +576,10 @@ def _normalize_semantic_payload(payload):
 
 def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, device):
     batch_idx = batch_idx.to(device=device)
-    if isinstance(refiner_features, dict) and refiner_features.get("feature_kind") == "prompt_expert_bundle_v1":
+    if isinstance(refiner_features, dict) and _is_prompt_expert_feature_kind(refiner_features.get("feature_kind")):
         return {
-            "feature_kind": "prompt_expert_bundle_v1",
+            "feature_kind": str(refiner_features.get("feature_kind", "prompt_expert_bundle")),
+            "semantic_view_mode": str(refiner_features.get("semantic_view_mode", semantic_view_mode)),
             "z_gnn": refiner_features["z_gnn"][batch_idx].to(device),
             "semantic_views": {
                 key: value[batch_idx].to(device)
@@ -508,6 +587,10 @@ def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, dev
                 if torch.is_tensor(value) and value.dim() == 2
             },
             "structural_features": refiner_features["structural_features"][batch_idx].to(device),
+            "graph_gate_features": refiner_features["graph_gate_features"][batch_idx].to(device),
+            "mpe_gate_features": refiner_features["mpe_gate_features"][batch_idx].to(device)
+            if "mpe_gate_features" in refiner_features
+            else None,
         }
     return refiner_features[batch_idx].to(device)
 
@@ -644,31 +727,60 @@ class GlanceStageMixin:
             "count_2hop": count_2hop,
         }
 
-    def _build_prompt_expert_semantic_views(self, expert_bundle, z_gnn):
+    def _build_prompt_expert_semantic_views(self, expert_bundle, z_gnn, base_prob=None):
         if not expert_bundle:
             raise MissingFrozenArtifactError(
-                "prompt_expert_bundle_v1 requires expert_bundle payload metadata from the semantic cache."
+                "Prompt-expert semantic views require expert_bundle payload metadata from the semantic cache."
             )
+        semantic_view_mode = str(expert_bundle.get("semantic_view_mode", "prompt_expert_bundle_v1"))
         num_nodes = int(z_gnn.shape[0])
         component_tensors = dict(expert_bundle.get("component_tensors", {}))
         base_component = next(iter(component_tensors.values()), None)
         if base_component is None:
             raise MissingFrozenArtifactError(
-                "prompt_expert_bundle_v1 requires at least one of ego/graph_following/graph_follower/tweet/conflict in the prompt cache payload."
+                "Prompt-expert semantic payload requires at least one of ego/graph_following/graph_follower/tweet/conflict in the prompt cache payload."
             )
         semantic_dim = int(base_component.shape[1])
         zero_component = torch.zeros((num_nodes, semantic_dim), dtype=torch.float32)
+        target_scope = str(expert_bundle.get("target_node_scope", "all_nodes")).lower()
+        target_node_count = int(expert_bundle.get("target_node_count", 0) or 0)
+        full_graph_node_count = int(expert_bundle.get("full_graph_node_count", 0) or 0)
+        if full_graph_node_count and full_graph_node_count != num_nodes:
+            raise MissingFrozenArtifactError(
+                f"Prompt-expert payload expects full_graph_node_count={full_graph_node_count}, but routed backbone exposes {num_nodes} nodes."
+            )
+
+        def _expand_component_to_graph(value, name):
+            rows = int(value.shape[0])
+            if rows == num_nodes:
+                return value.detach().cpu().float()
+            if target_scope in {"labeled_prefix", "labeled"} and target_node_count > 0 and rows == target_node_count and rows <= num_nodes:
+                out = torch.zeros((num_nodes, int(value.shape[1])), dtype=torch.float32)
+                out[:rows] = value.detach().cpu().float()
+                return out
+            raise MissingFrozenArtifactError(
+                f"Prompt-expert component {name} has {rows} rows, expected either {num_nodes} full-graph rows or {target_node_count} labeled-prefix rows."
+            )
+
+        def _expand_scalar_to_graph(value, name):
+            rows = int(value.shape[0])
+            if rows == num_nodes:
+                return value.detach().cpu().float().view(-1)
+            if target_scope in {"labeled_prefix", "labeled"} and target_node_count > 0 and rows == target_node_count and rows <= num_nodes:
+                out = torch.zeros((num_nodes,), dtype=torch.float32)
+                out[:rows] = value.detach().cpu().float().view(-1)
+                return out
+            raise MissingFrozenArtifactError(
+                f"Prompt-expert scalar {name} has {rows} rows, expected either {num_nodes} full-graph rows or {target_node_count} labeled-prefix rows."
+            )
+
         semantic_views = {}
         for component_name in _PROMPT_EXPERT_COMPONENT_ORDER:
             component_value = component_tensors.get(component_name)
             if component_value is None:
                 semantic_views[component_name] = zero_component.clone()
                 continue
-            if int(component_value.shape[0]) != num_nodes:
-                raise MissingFrozenArtifactError(
-                    f"Prompt-expert component {component_name} has {int(component_value.shape[0])} nodes, expected {num_nodes}."
-                )
-            semantic_views[component_name] = component_value.detach().cpu().float()
+            semantic_views[component_name] = _expand_component_to_graph(component_value, component_name)
 
         scalar_tensors = dict(expert_bundle.get("scalar_tensors", {}))
 
@@ -676,26 +788,85 @@ class GlanceStageMixin:
             value = scalar_tensors.get(name)
             if value is None:
                 return torch.zeros(num_nodes, dtype=torch.float32)
-            value = value.detach().cpu().float().view(-1)
-            if int(value.shape[0]) != num_nodes:
-                raise MissingFrozenArtifactError(
-                    f"Prompt-expert scalar {name} has {int(value.shape[0])} nodes, expected {num_nodes}."
-                )
-            return value
+            return _expand_scalar_to_graph(value, name)
 
-        count_following = _scalar("count_following")
-        count_follower = _scalar("count_follower")
-        has_following = _scalar("has_following")
-        has_follower = _scalar("has_follower")
-        structural_features = torch.stack(
+        scalar_feature_order = [
+            "count_following",
+            "count_follower",
+            "has_following",
+            "has_follower",
+            "candidate_count_following",
+            "candidate_count_follower",
+            "selected_count_following",
+            "selected_count_follower",
+            "mean_sim_following_support",
+            "mean_sim_following_contrast",
+            "mean_sim_follower_support",
+            "mean_sim_follower_contrast",
+            "reciprocal_ratio_following_selected",
+            "reciprocal_ratio_follower_selected",
+            "rt_ratio",
+            "url_ratio",
+            "hashtag_ratio",
+        ]
+        scalar_feature_tensors = {
+            name: _scalar(name)
+            for name in scalar_feature_order
+            if name in scalar_tensors or name in {"count_following", "count_follower", "has_following", "has_follower"}
+        }
+        count_following = scalar_feature_tensors["count_following"]
+        count_follower = scalar_feature_tensors["count_follower"]
+        has_following = scalar_feature_tensors["has_following"]
+        has_follower = scalar_feature_tensors["has_follower"]
+        active_structural_feature_names = [name for name in scalar_feature_order if name in scalar_feature_tensors]
+        structural_columns = []
+        for name in active_structural_feature_names:
+            value = scalar_feature_tensors.get(name)
+            if value is None:
+                continue
+            if name.startswith("count_") or name.startswith("candidate_count_") or name.startswith("selected_count_"):
+                structural_columns.append(torch.log1p(value))
+            else:
+                structural_columns.append(value)
+        structural_features = torch.stack(structural_columns, dim=1).float()
+        if base_prob is None:
+            base_prob = torch.softmax(z_gnn.float(), dim=1)
+        else:
+            base_prob = base_prob.detach().cpu().float()
+        base_entropy = -(base_prob * base_prob.clamp_min(1e-8).log()).sum(dim=1, keepdim=True)
+        mpe_gate_features = torch.cat(
             [
-                torch.log1p(count_following),
-                torch.log1p(count_follower),
-                has_following,
-                has_follower,
+                z_gnn.detach().cpu().float(),
+                base_prob,
+                base_entropy,
+                structural_features,
             ],
             dim=1,
-        ).float()
+        )
+        if semantic_view_mode == "prompt_expert_bundle_v2":
+            graph_gate_feature_names = [
+                "log1p(count_following)",
+                "log1p(count_follower)",
+                "has_following",
+                "has_follower",
+            ]
+            graph_gate_features = torch.stack(
+                [
+                    torch.log1p(count_following),
+                    torch.log1p(count_follower),
+                    has_following,
+                    has_follower,
+                ],
+                dim=1,
+            ).float()
+        else:
+            graph_gate_feature_names = [
+                f"log1p({name})"
+                if name.startswith("count_") or name.startswith("candidate_count_") or name.startswith("selected_count_")
+                else name
+                for name in active_structural_feature_names
+            ]
+            graph_gate_features = structural_features
 
         analysis_views = dict(semantic_views)
         analysis_views.update(
@@ -706,17 +877,32 @@ class GlanceStageMixin:
                 "has_follower": has_follower.numpy().astype(np.int64),
                 "count_1hop": (count_following + count_follower).numpy().astype(np.int64),
                 "count_2hop": np.zeros(num_nodes, dtype=np.int64),
-                "rt_ratio": _scalar("rt_ratio").numpy().astype(np.float32),
-                "url_ratio": _scalar("url_ratio").numpy().astype(np.float32),
-                "hashtag_ratio": _scalar("hashtag_ratio").numpy().astype(np.float32),
+                "structural_feature_names": active_structural_feature_names,
             }
         )
+        for name, value in scalar_feature_tensors.items():
+            array = value.numpy()
+            if name.startswith("count_") or name.startswith("candidate_count_") or name.startswith("selected_count_"):
+                analysis_views[name] = array.astype(np.int64)
+            else:
+                analysis_views[name] = array.astype(np.float32)
         refiner_features = {
-            "feature_kind": "prompt_expert_bundle_v1",
+            "feature_kind": "prompt_expert_bundle",
+            "semantic_view_mode": semantic_view_mode,
             "z_gnn": z_gnn.detach().cpu().float(),
             "semantic_views": semantic_views,
             "structural_features": structural_features,
+            "graph_gate_features": graph_gate_features,
+            "mpe_gate_features": mpe_gate_features,
             "active_components": list(expert_bundle.get("active_components", [])),
+            "structural_feature_names": active_structural_feature_names,
+            "graph_gate_feature_names": graph_gate_feature_names,
+            "mpe_gate_feature_names": (
+                [f"z_gnn[{idx}]" for idx in range(int(z_gnn.shape[1]))]
+                + [f"base_prob[{idx}]" for idx in range(int(base_prob.shape[1]))]
+                + ["base_entropy"]
+                + active_structural_feature_names
+            ),
         }
         return refiner_features, analysis_views
 
@@ -1138,10 +1324,6 @@ class GlanceStageMixin:
         )
         full_graph_support = str(getattr(self, "graph_data_variant", "labeled")).lower() == "full_graph_support"
         if override_path:
-            if full_graph_support:
-                raise MissingFrozenArtifactError(
-                    "full_graph_support does not support --joint_refiner_embedding_path in the first rollout."
-                )
             emb_path = Path(override_path)
             if requested_path:
                 requested_path = Path(requested_path)
@@ -1172,7 +1354,7 @@ class GlanceStageMixin:
                 "joint_router_refinement could not find the requested semantic embedding tensor at "
                 f"{emb_path}."
             )
-        if full_graph_support:
+        if full_graph_support and not override_path:
             concat_bundle = _runtime_concat_full_graph_support_embeddings(self.args, self.data, emb_path)
             embeddings = concat_bundle["features"].detach().cpu().float()
             precomputed_views = None
@@ -1199,23 +1381,40 @@ class GlanceStageMixin:
                 raise MissingFrozenArtifactError(
                     f"joint_router_refinement expects --embedding_path to contain a 2-D tensor, got {tuple(embeddings.shape)}."
                 )
-            if int(embeddings.shape[0]) != int(len(self.labels)):
+            expected_rows = int(getattr(self, "graph_node_count", len(self.labels))) if full_graph_support else int(len(self.labels))
+            labeled_rows = int(getattr(self, "labeled_node_count", len(self.labels)))
+            if full_graph_support:
+                valid_rows = {expected_rows, labeled_rows}
+                if int(embeddings.shape[0]) not in valid_rows:
+                    raise MissingFrozenArtifactError(
+                        "joint_router_refinement full_graph_support semantic override must align with either "
+                        f"graph_node_count={expected_rows} or labeled_node_count={labeled_rows}, got {int(embeddings.shape[0])}."
+                    )
+            elif int(embeddings.shape[0]) != int(len(self.labels)):
                 raise MissingFrozenArtifactError(
                     "joint_router_refinement semantic embeddings do not align with the current dataset node count."
                 )
             if precomputed_views is not None:
                 for view_name, view_tensor in precomputed_views.items():
-                    if int(view_tensor.shape[0]) != int(len(self.labels)):
+                    if int(view_tensor.shape[0]) != int(embeddings.shape[0]):
                         raise MissingFrozenArtifactError(
-                            f"joint_router_refinement semantic view {view_name} does not align with the current dataset node count."
+                            f"joint_router_refinement semantic view {view_name} does not align with the semantic override row count."
                         )
             if prompt_expert_bundle is not None:
-                semantic_view_mode = "prompt_expert_bundle_v1"
+                semantic_view_mode = str(prompt_expert_bundle.get("semantic_view_mode", "prompt_expert_bundle_v1"))
             elif precomputed_views is not None:
                 semantic_view_mode = "precomputed_prompt_views"
             else:
                 semantic_view_mode = "legacy_inbound_khop"
-            extra_manifest = {}
+            extra_manifest = {
+                "graph_data_variant": str(getattr(self, "graph_data_variant", "labeled")),
+                "semantic_row_count": int(embeddings.shape[0]),
+                "semantic_row_scope": (
+                    "graph_wide"
+                    if int(embeddings.shape[0]) == int(getattr(self, "graph_node_count", len(self.labels)))
+                    else "labeled_prefix"
+                ),
+            }
         primary = {
             "dir": emb_path.parent,
             "manifest": {
@@ -1252,6 +1451,102 @@ class GlanceStageMixin:
         selected = np.sort(rng.choice(train_idx, size=cap, replace=False))
         return selected.astype(np.int64)
 
+    def _resolve_joint_router_reuse_stage_dir(self):
+        reuse_root = getattr(self.args, "joint_router_reuse_root", None)
+        if not reuse_root:
+            raise MissingFrozenArtifactError(
+                "--joint_routing_protocol frozen_router_reuse requires --joint_router_reuse_root."
+            )
+        root = Path(reuse_root)
+        candidates = [
+            root,
+            root / "stages" / "joint_router_refinement",
+            root / f"seed_{int(self.seed)}" / "stages" / "joint_router_refinement",
+        ]
+        for candidate in candidates:
+            if (candidate / "checkpoint.pt").exists() and (candidate / "manifest.json").exists():
+                return candidate
+        raise MissingFrozenArtifactError(
+            "Could not resolve a joint_router_refinement stage directory from --joint_router_reuse_root. "
+            f"Tried: {', '.join(str(item) for item in candidates)}."
+        )
+
+    def _load_joint_router_reuse_bundle(self, router_feature_matrix):
+        stage_dir = self._resolve_joint_router_reuse_stage_dir()
+        manifest = read_json(stage_dir / "manifest.json", default={}) or {}
+        metrics = read_json(stage_dir / "metrics.json", default={}) or {}
+        checkpoint = safe_torch_load(stage_dir / "checkpoint.pt", map_location="cpu")
+        router_state = checkpoint.get("router_model") if isinstance(checkpoint, dict) else None
+        if router_state is None:
+            raise MissingFrozenArtifactError(
+                f"Frozen-router reuse checkpoint at {stage_dir / 'checkpoint.pt'} does not contain router_model."
+            )
+        router_arch = manifest.get("router_architecture", {}) or {}
+        input_dim = int(router_arch.get("input_dim", router_feature_matrix.shape[1]))
+        if input_dim != int(router_feature_matrix.shape[1]):
+            raise MissingFrozenArtifactError(
+                "Frozen-router reuse artifact input_dim does not match the current router feature dimension: "
+                f"{input_dim} vs {int(router_feature_matrix.shape[1])}."
+            )
+        scaler_state = router_arch.get("scaler", {}) or {}
+        router_temperature = metrics.get("router_temperature_scaling", {}) or manifest.get("router_temperature_scaling", {}) or {}
+        router_model = GlanceReliabilityRouterMLP(
+            input_dim=input_dim,
+            hidden_dim=int(router_arch.get("hidden_dim", 128)),
+            bottleneck_dim=int(router_arch.get("bottleneck_dim", 64)),
+            dropout=float(router_arch.get("dropout", 0.1)),
+        )
+        router_model.load_state_dict(router_state)
+        router_model.to("cpu")
+        selected_budget = metrics.get("selected_budget")
+        if selected_budget is None:
+            selected_budget = manifest.get("selected_budget")
+        selected_beta = checkpoint.get("selected_beta") if isinstance(checkpoint, dict) else None
+        if selected_beta is None:
+            selected_beta = metrics.get("selected_beta", manifest.get("selected_beta"))
+        if selected_budget is None or selected_beta is None:
+            raise MissingFrozenArtifactError(
+                "Frozen-router reuse artifact must record selected_budget and selected_beta."
+            )
+        scaled_router_features = _apply_glance_router_scaler(router_feature_matrix, scaler_state)
+        return {
+            "stage_dir": stage_dir,
+            "manifest": manifest,
+            "metrics": metrics,
+            "checkpoint": checkpoint,
+            "router_model": router_model,
+            "router_state": router_state,
+            "scaled_router_features": scaled_router_features,
+            "scaler_state": scaler_state,
+            "selected_budget": float(selected_budget),
+            "selected_beta": float(selected_beta),
+            "selected_eval_top_k": int(checkpoint.get("selected_eval_top_k", max(int(round(32 / 4.0)), 1))),
+            "router_temperature_bundle": router_temperature,
+        }
+
+    def _read_joint_router_reuse_metadata(self):
+        stage_dir = self._resolve_joint_router_reuse_stage_dir()
+        manifest = read_json(stage_dir / "manifest.json", default={}) or {}
+        metrics = read_json(stage_dir / "metrics.json", default={}) or {}
+        checkpoint = safe_torch_load(stage_dir / "checkpoint.pt", map_location="cpu")
+        selected_budget = metrics.get("selected_budget", manifest.get("selected_budget"))
+        selected_beta = checkpoint.get("selected_beta") if isinstance(checkpoint, dict) else None
+        if selected_beta is None:
+            selected_beta = metrics.get("selected_beta", manifest.get("selected_beta"))
+        if selected_budget is None or selected_beta is None:
+            raise MissingFrozenArtifactError(
+                "Frozen-router reuse artifact must record selected_budget and selected_beta."
+            )
+        return {
+            "stage_dir": stage_dir,
+            "manifest": manifest,
+            "metrics": metrics,
+            "checkpoint": checkpoint,
+            "router_temperature_bundle": metrics.get("router_temperature_scaling", {}) or manifest.get("router_temperature_scaling", {}) or {},
+            "selected_budget": float(selected_budget),
+            "selected_beta": float(selected_beta),
+        }
+
     def _run_glance_joint_router_refine(self, stage_dir, base_bundle):
         context = self.ensure_backbone_context()
         semantic_bundle = self._load_glance_semantic_source_bundle()
@@ -1284,10 +1579,11 @@ class GlanceStageMixin:
         strict_train_idx = self._strict_glance_train_idx(train_idx, cap=configured_train_cap)
         train_cap_mode = "full_train_split" if configured_train_cap <= 0 else "capped_train_subset"
         semantic_view_mode = semantic.get("semantic_view_mode", semantic["manifest"].get("semantic_view_mode", "legacy_inbound_khop"))
-        if semantic_view_mode == "prompt_expert_bundle_v1":
+        if _is_prompt_expert_semantic_view_mode(semantic_view_mode):
             refiner_features, semantic_views = self._build_prompt_expert_semantic_views(
                 semantic.get("prompt_expert_bundle"),
                 z_gnn,
+                base_prob=p_gnn,
             )
             prompt_expert_active_components = list(refiner_features.get("active_components", []))
         else:
@@ -1307,6 +1603,11 @@ class GlanceStageMixin:
         refiner_base_wrong_weight = float(getattr(self.args, "joint_refiner_base_wrong_weight", 2.0))
         refiner_utility_weight = float(getattr(self.args, "joint_refiner_utility_weight", 3.0))
         refiner_gate_weight = float(getattr(self.args, "joint_refiner_gate_weight", 0.5))
+        prompt_expert_fusion = str(getattr(self.args, "joint_prompt_expert_fusion", "projector_concat")).lower()
+        if prompt_expert_fusion != "projector_concat" and not _is_prompt_expert_semantic_view_mode(semantic_view_mode):
+            raise ValueError("--joint_prompt_expert_fusion only applies to prompt-expert semantic payloads.")
+        joint_routing_protocol = str(getattr(self.args, "joint_routing_protocol", "joint_train")).lower()
+        frozen_router_metadata = self._read_joint_router_reuse_metadata() if joint_routing_protocol == "frozen_router_reuse" else None
 
         original_node_features_bundle = self._strict_glance_original_node_features()
         q_bundle = self._fit_strict_glance_q_probs(
@@ -1316,10 +1617,13 @@ class GlanceStageMixin:
         )
         backbone_input_features = self._strict_glance_backbone_input_features()
         mc_bundle = self._strict_glance_mc_dropout_uncertainty(backbone_input_features)
-        router_temperature_bundle = fit_reliability_temperature(
-            logits_gnn[valid_idx],
-            labels_np[valid_idx],
-        )
+        if frozen_router_metadata is not None and frozen_router_metadata.get("router_temperature_bundle", {}).get("temperature") is not None:
+            router_temperature_bundle = dict(frozen_router_metadata["router_temperature_bundle"])
+        else:
+            router_temperature_bundle = fit_reliability_temperature(
+                logits_gnn[valid_idx],
+                labels_np[valid_idx],
+            )
         router_feature_bundle = self._build_strict_glance_router_features(
             logits_gnn=logits_gnn,
             p_gnn=p_gnn,
@@ -1330,10 +1634,16 @@ class GlanceStageMixin:
             calibration_temperature=router_temperature_bundle["temperature"],
         )
         router_feature_bundle["full_feature_bundle"]["temperature_scaling"] = dict(router_temperature_bundle)
-        router_features, scaler_state = self._standardize_glance_router_features(
-            router_feature_bundle["features"],
-            strict_train_idx,
-        )
+        if frozen_router_metadata is not None:
+            frozen_router_bundle = self._load_joint_router_reuse_bundle(router_feature_bundle["features"])
+            router_features = frozen_router_bundle["scaled_router_features"]
+            scaler_state = frozen_router_bundle["scaler_state"]
+        else:
+            frozen_router_bundle = None
+            router_features, scaler_state = self._standardize_glance_router_features(
+                router_feature_bundle["features"],
+                strict_train_idx,
+            )
 
         activation = str(getattr(self.args, "activation", "leakyrelu")).lower()
         batch_size = 32
@@ -1344,8 +1654,16 @@ class GlanceStageMixin:
         router_weight = 0.0
         learning_rate = float(getattr(self.args, "lr_GNN", 5e-4))
         weight_decay = float(getattr(self.args, "weight_decay_GNN", 1e-5))
-        eval_top_k = max(int(round(batch_size / 4.0)), 1)
-        beta_candidates = (0.1, 0.2, 0.3)
+        eval_top_k = (
+            int(frozen_router_bundle["selected_eval_top_k"])
+            if frozen_router_bundle is not None
+            else max(int(round(batch_size / 4.0)), 1)
+        )
+        beta_candidates = (
+            (float(frozen_router_bundle["selected_beta"]),)
+            if frozen_router_bundle is not None
+            else (0.1, 0.2, 0.3)
+        )
 
         beta_runs = []
         selected_beta_run = None
@@ -1386,6 +1704,10 @@ class GlanceStageMixin:
                 refiner_base_wrong_weight=refiner_base_wrong_weight,
                 refiner_utility_weight=refiner_utility_weight,
                 refiner_gate_weight=refiner_gate_weight,
+                prompt_expert_fusion=prompt_expert_fusion,
+                routing_protocol=joint_routing_protocol,
+                frozen_router_bundle=frozen_router_bundle,
+                selected_budget_override=(float(frozen_router_bundle["selected_budget"]) if frozen_router_bundle is not None else None),
             )
             beta_runs.append(run)
             beta_score = (
@@ -1418,6 +1740,7 @@ class GlanceStageMixin:
         router_score = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
         oracle_advantage = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
         gate_prob = torch.zeros(pred_gnn.numel(), dtype=torch.float32)
+        mpe_gate_weights = torch.zeros((pred_gnn.numel(), len(PromptExpertBundleRefinerMLP.MPE_COMPONENT_ORDER)), dtype=torch.float32)
         for split_outputs, split_idx in (
             (train_outputs, train_idx),
             (valid_outputs, valid_idx),
@@ -1433,6 +1756,8 @@ class GlanceStageMixin:
             oracle_advantage[split_idx_t] = split_outputs["oracle_advantage"][split_idx_t]
             if split_outputs.get("gate_prob") is not None:
                 gate_prob[split_idx_t] = split_outputs["gate_prob"][split_idx_t]
+            if split_outputs.get("mpe_gate_weights") is not None:
+                mpe_gate_weights[split_idx_t] = split_outputs["mpe_gate_weights"][split_idx_t]
 
         pred_gnn_labeled = _labeled_prefix_pred(pred_gnn.numpy(), labels_np.shape[0])
         final_pred_labeled = _labeled_prefix_pred(final_pred.numpy(), labels_np.shape[0])
@@ -1496,6 +1821,7 @@ class GlanceStageMixin:
 
         metrics_payload = {
             "contract": "glance_joint_router_refine_metrics_v1",
+            "routing_protocol": joint_routing_protocol,
             "graph_data_variant": str(getattr(self, "graph_data_variant", "labeled")),
             "graph_node_count": int(getattr(self, "graph_node_count", len(self.labels))),
             "labeled_node_count": int(getattr(self, "labeled_node_count", len(self.labels))),
@@ -1525,6 +1851,10 @@ class GlanceStageMixin:
             "selected_budget_source": "validation",
             "selected_budget": selected_budget,
             "selected_budget_key": selected_budget_key,
+            "router_reuse_root": str(getattr(self.args, "joint_router_reuse_root", None) or ""),
+            "router_reuse_selected_budget": float(frozen_router_bundle["selected_budget"]) if frozen_router_bundle is not None else None,
+            "router_reuse_selected_beta": float(frozen_router_bundle["selected_beta"]) if frozen_router_bundle is not None else None,
+            "fixed_router_comparable": bool(joint_routing_protocol == "frozen_router_reuse"),
             "selected_valid_budget_metrics": final_run["selected_valid_budget_metrics"],
             "selected_test_budget_metrics_under_valid_choice": final_run["selected_test_budget_metrics_under_valid_choice"],
             "selected_beta_valid_metrics": final_run["selected_budget_metrics"]["valid"],
@@ -1546,6 +1876,8 @@ class GlanceStageMixin:
             "refiner_base_wrong_weight": float(refiner_base_wrong_weight),
             "refiner_utility_weight": float(refiner_utility_weight),
             "refiner_gate_weight": float(refiner_gate_weight),
+            "joint_prompt_expert_fusion": prompt_expert_fusion,
+            "mpe_gate_component_order": list(PromptExpertBundleRefinerMLP.MPE_COMPONENT_ORDER),
             "advantage_router_diagnostics": final_run["fit_summary"].get("advantage_router_diagnostics", {}),
             "base_test": base_test,
             "overall_test": overall_test,
@@ -1580,6 +1912,7 @@ class GlanceStageMixin:
             "selected_beta": float(selected_beta),
             "selected_budget": float(selected_budget),
             "selected_budget_key": str(selected_budget_key),
+            "routing_protocol": joint_routing_protocol,
             "router_temperature": float(router_temperature_bundle["temperature"]),
             "router_temperature_bundle": dict(router_temperature_bundle),
             "router_feature_family": str(router_feature_bundle["full_feature_bundle"]["feature_family"]),
@@ -1664,12 +1997,17 @@ class GlanceStageMixin:
             "evaluation_protocol": "validation_selected_global_budget_by_router_score",
             "evaluation_alignment_note": "Batch top-k is kept only inside strict GLANCE training. Public final evaluation uses a validation-selected global budget and test-locked router ranking.",
             "research_positioning": "task_adapted_reliability_router_under_glance_style_joint_training",
+            "routing_protocol": joint_routing_protocol,
             "selected_beta_source": "validation",
             "selected_beta": selected_beta,
             "beta_candidates": [float(item) for item in beta_candidates],
             "selected_budget_source": "validation",
             "selected_budget": selected_budget,
             "selected_budget_key": selected_budget_key,
+            "router_reuse_root": str(getattr(self.args, "joint_router_reuse_root", None) or ""),
+            "router_reuse_selected_budget": float(frozen_router_bundle["selected_budget"]) if frozen_router_bundle is not None else None,
+            "router_reuse_selected_beta": float(frozen_router_bundle["selected_beta"]) if frozen_router_bundle is not None else None,
+            "fixed_router_comparable": bool(joint_routing_protocol == "frozen_router_reuse"),
             "semantic_source_mode": semantic_bundle["mode"],
             "semantic_sources": [item["manifest"].get("source_identity", item["manifest"].get("lm_model")) for item in semantic_bundle["sources"]],
             "semantic_source": "semantic_single_source",
@@ -1702,12 +2040,14 @@ class GlanceStageMixin:
             "refiner_architecture": {
                 "type": (
                     "prompt_expert_bundle_refiner_mlp"
-                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode)
                     else ("gated_glance_joint_refiner_mlp" if refiner_explicit_gate else "glance_joint_refiner_mlp")
                 ),
                 "input": (
-                    "[z_gnn || ego_proj || graph_following_proj || graph_follower_proj || graph_fused || tweet_proj || conflict_proj || log1p(count_following) || log1p(count_follower) || has_following || has_follower]"
-                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    "[z_gnn || mpe_gated_sum(graph_following, graph_follower, tweet, conflict) || structural_side_channel]"
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode) and prompt_expert_fusion == "mpe_gated"
+                    else "[z_gnn || ego_proj || graph_following_proj || graph_follower_proj || graph_fused || tweet_proj || conflict_proj || structural_side_channel]"
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode)
                     else "[z_gnn || z_sem_0 || z_sem_1 || z_sem_2]"
                 ),
                 "hidden_dim": 128,
@@ -1715,17 +2055,37 @@ class GlanceStageMixin:
                 "dropout": 0.1,
                 "output_dim": int(logits_gnn.shape[1]),
                 "semantic_view_mode": semantic_view_mode,
-                "feature_kind": "prompt_expert_bundle_v1" if semantic_view_mode == "prompt_expert_bundle_v1" else "flat_concat",
+                "feature_kind": (
+                    refiner_features.get("feature_kind", "prompt_expert_bundle")
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode) and isinstance(refiner_features, dict)
+                    else "flat_concat"
+                ),
                 "semantic_view_names": (
                     ["ego", "graph_following", "graph_follower", "tweet", "conflict"]
-                    if semantic_view_mode == "prompt_expert_bundle_v1"
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode)
                     else ["ego", "hop1", "hop2"]
                 ),
                 "active_components": prompt_expert_active_components,
-                "proj_dim": 256 if semantic_view_mode == "prompt_expert_bundle_v1" else None,
-                "graph_gate_input": ["log1p(count_following)", "log1p(count_follower)", "has_following", "has_follower"]
-                if semantic_view_mode == "prompt_expert_bundle_v1"
+                "proj_dim": 256 if _is_prompt_expert_semantic_view_mode(semantic_view_mode) else None,
+                "fusion_mode": prompt_expert_fusion,
+                "mpe_gate_component_order": list(PromptExpertBundleRefinerMLP.MPE_COMPONENT_ORDER)
+                if _is_prompt_expert_semantic_view_mode(semantic_view_mode)
                 else None,
+                "mpe_gate_input": (
+                    list(refiner_features.get("mpe_gate_feature_names", []))
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode) and isinstance(refiner_features, dict)
+                    else None
+                ),
+                "graph_gate_input": (
+                    list(refiner_features.get("graph_gate_feature_names", []))
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode) and isinstance(refiner_features, dict)
+                    else None
+                ),
+                "structural_side_channel": (
+                    list(refiner_features.get("structural_feature_names", []))
+                    if _is_prompt_expert_semantic_view_mode(semantic_view_mode) and isinstance(refiner_features, dict)
+                    else None
+                ),
                 "target_mode": refiner_target_mode,
                 "explicit_gate": bool(refiner_explicit_gate),
                 "gate_target": refiner_gate_target,
@@ -1923,6 +2283,8 @@ class GlanceStageMixin:
                     "router_score": router_score,
                     "oracle_advantage": oracle_advantage,
                     "gate_prob": gate_prob,
+                    "mpe_gate_weights": mpe_gate_weights,
+                    "mpe_gate_component_order": list(PromptExpertBundleRefinerMLP.MPE_COMPONENT_ORDER),
                     "neighbor_count_1hop": torch.tensor(
                         semantic_views.get("count_1hop", np.zeros(int(getattr(self, "graph_node_count", len(self.labels))), dtype=np.int64)),
                         dtype=torch.long,
@@ -1952,7 +2314,11 @@ class GlanceStageMixin:
             "This stage implements a GLANCE-style joint router+refiner contract under the current cached semantic embedding path.",
             "The public router is task-adapted for TwiBot20 reliability routing: base confidence is temperature-scaled, social features are direction-aware, and router supervision targets base-wrong reliability rather than paper-text advantage.",
             "The semantic expert alignment is intentionally deferred, and the public evaluation protocol is TwiBot20-adapted global-budget routing.",
-            "The base GNN and semantic expert remain frozen; only the router scorer MLP and the routed-node refiner MLP are trained.",
+            (
+                "The base GNN and semantic expert remain frozen; only the routed-node refiner MLP is trained while the router is reused read-only from a prior joint stage."
+                if joint_routing_protocol == "frozen_router_reuse"
+                else "The base GNN and semantic expert remain frozen; only the router scorer MLP and the routed-node refiner MLP are trained."
+            ),
             "The router is trained with base-wrong reliability BCE plus pairwise ranking. Oracle advantage is still recorded as a post-hoc diagnostic trace.",
             f"Training uses deterministic batch top-k with K_start={int(batch_size)} and K_end={int(eval_top_k)}. Final evaluation ranks the whole split by router score, selects budget on validation, and locks the selected budget ({selected_budget:.3f}) on test. Beta is selected on validation only from {{0.1, 0.2, 0.3}}.",
             "Use router_performance_summary.json/csv, router_epoch_curve.csv, and the budget-curve CSVs to inspect router quality directly.",
@@ -3373,28 +3739,40 @@ class GlanceStageMixin:
     def _glance_refiner_forward(refiner_model, batch_refiner, batch_base_logits=None):
         if isinstance(batch_refiner, dict):
             feature_kind = batch_refiner.get("feature_kind")
-            if feature_kind == "prompt_expert_bundle_v1":
+            if _is_prompt_expert_feature_kind(feature_kind) or _is_prompt_expert_semantic_view_mode(batch_refiner.get("semantic_view_mode")):
                 outputs = refiner_model(
                     batch_refiner["z_gnn"],
                     batch_refiner["semantic_views"],
                     batch_refiner["structural_features"],
+                    batch_refiner.get("graph_gate_features"),
+                    batch_refiner.get("mpe_gate_features"),
                 )
             else:
                 raise ValueError(f"Unsupported refiner feature kind: {feature_kind}")
         else:
             outputs = refiner_model(batch_refiner)
         if isinstance(outputs, tuple):
-            if len(outputs) == 3:
+            mpe_gate_weights = None
+            if len(outputs) == 4:
+                refiner_logits, gate_logits, gate_prob, mpe_gate_weights = outputs
+            elif len(outputs) == 3:
                 refiner_logits, gate_logits, gate_prob = outputs
             elif len(outputs) == 2:
-                refiner_logits, gate_prob = outputs
-                gate_logits = torch.logit(gate_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6))
+                refiner_logits, second = outputs
+                if second is not None and second.dim() == 2:
+                    mpe_gate_weights = second
+                    gate_prob = None
+                    gate_logits = None
+                else:
+                    gate_prob = second
+                    gate_logits = torch.logit(gate_prob.clamp_min(1e-6).clamp_max(1.0 - 1e-6))
             else:
                 raise ValueError("Unsupported gated refiner output arity.")
         else:
             refiner_logits = outputs
             gate_logits = None
             gate_prob = None
+            mpe_gate_weights = None
         mixed_logits = refiner_logits
         if gate_prob is not None:
             if batch_base_logits is None:
@@ -3410,6 +3788,7 @@ class GlanceStageMixin:
             "mixed_logits": mixed_logits,
             "gate_logits": gate_logits,
             "gate_prob": gate_prob,
+            "mpe_gate_weights": mpe_gate_weights,
         }
 
     @staticmethod
@@ -3487,6 +3866,7 @@ class GlanceStageMixin:
         router_score_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
         oracle_advantage_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
         gate_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        mpe_gate_weights_all = torch.zeros((base_pred.numel(), len(PromptExpertBundleRefinerMLP.MPE_COMPONENT_ORDER)), dtype=torch.float32)
         if split_idx.size == 0:
             return {
                 "logits": final_logits,
@@ -3497,6 +3877,7 @@ class GlanceStageMixin:
                 "router_score": router_score_all,
                 "oracle_advantage": oracle_advantage_all,
                 "gate_prob": gate_prob_all,
+                "mpe_gate_weights": mpe_gate_weights_all,
                 "routed_count": 0,
             }
 
@@ -3526,6 +3907,8 @@ class GlanceStageMixin:
                 final_pred[routed_idx] = routed_forward["mixed_logits"].cpu().argmax(dim=1)
                 if routed_forward.get("gate_prob") is not None:
                     gate_prob_all[routed_idx] = routed_forward["gate_prob"].detach().cpu()
+                if routed_forward.get("mpe_gate_weights") is not None:
+                    mpe_gate_weights_all[routed_idx] = routed_forward["mpe_gate_weights"].detach().cpu()
                 full_forward = self._glance_refiner_forward(
                     refiner_model,
                     _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, refiner_device),
@@ -3552,8 +3935,110 @@ class GlanceStageMixin:
                 "router_score": router_score_all,
                 "oracle_advantage": oracle_advantage_all,
                 "gate_prob": gate_prob_all,
+                "mpe_gate_weights": mpe_gate_weights_all,
                 "routed_count": int(routed_mask[torch.tensor(split_idx, dtype=torch.long)].sum().item()),
             }
+
+    def _apply_glance_global_budget_policy(
+        self,
+        router_model,
+        refiner_model,
+        router_features,
+        refiner_features,
+        semantic_view_mode,
+        base_logits,
+        base_prob,
+        base_pred,
+        labels_t,
+        beta,
+        split_idx,
+        batch_size,
+        budget,
+    ):
+        split_idx = np.asarray(split_idx, dtype=np.int64).reshape(-1)
+        final_logits = base_logits.clone()
+        final_prob = base_prob.clone()
+        final_pred = base_pred.clone()
+        routed_mask = torch.zeros(base_pred.numel(), dtype=torch.bool)
+        router_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        router_score_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        oracle_advantage_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        gate_prob_all = torch.zeros(base_pred.numel(), dtype=torch.float32)
+        mpe_gate_weights_all = torch.zeros((base_pred.numel(), len(PromptExpertBundleRefinerMLP.MPE_COMPONENT_ORDER)), dtype=torch.float32)
+        if split_idx.size == 0:
+            return {
+                "logits": final_logits,
+                "prob": final_prob,
+                "pred": final_pred,
+                "routed_mask": routed_mask,
+                "router_prob": router_prob_all,
+                "router_score": router_score_all,
+                "oracle_advantage": oracle_advantage_all,
+                "gate_prob": gate_prob_all,
+                "mpe_gate_weights": mpe_gate_weights_all,
+                "routed_count": 0,
+            }
+
+        router_model.eval()
+        refiner_model.eval()
+        router_device = next(router_model.parameters()).device
+        refiner_device = next(refiner_model.parameters()).device
+        split_scores = []
+        split_probs = []
+        with torch.no_grad():
+            for batch_idx_np in self._iter_glance_batches(split_idx, batch_size, shuffle=False):
+                batch_idx = torch.tensor(batch_idx_np, dtype=torch.long)
+                batch_score, batch_prob = router_model(router_features[batch_idx].to(router_device))
+                batch_score = batch_score.detach().cpu()
+                batch_prob = batch_prob.detach().cpu()
+                router_score_all[batch_idx] = batch_score
+                router_prob_all[batch_idx] = batch_prob
+                split_scores.append(batch_score)
+                split_probs.append(batch_prob)
+                full_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, refiner_device),
+                    batch_base_logits=base_logits[batch_idx].to(refiner_device),
+                )
+                raw_full_ref_loss = F.cross_entropy(
+                    full_forward["refiner_logits"].cpu(),
+                    labels_t[batch_idx].to(refiner_device).cpu(),
+                    reduction="none",
+                )
+                base_loss = F.cross_entropy(base_logits[batch_idx], labels_t[batch_idx], reduction="none")
+                oracle_advantage_all[batch_idx] = base_loss.detach().cpu() - raw_full_ref_loss.detach().cpu() - float(beta)
+
+            order = split_idx[np.argsort(-router_score_all[split_idx].numpy())] if split_idx.size else np.asarray([], dtype=np.int64)
+            k = min(max(int(round(split_idx.size * float(budget))), 1), int(split_idx.size))
+            routed = order[:k]
+            if routed.size:
+                routed_idx = torch.tensor(routed, dtype=torch.long)
+                routed_mask[routed_idx] = True
+                routed_forward = self._glance_refiner_forward(
+                    refiner_model,
+                    _refiner_feature_lookup(refiner_features, routed_idx, semantic_view_mode, refiner_device),
+                    batch_base_logits=base_logits[routed_idx].to(refiner_device),
+                )
+                final_logits[routed_idx] = routed_forward["mixed_logits"].cpu()
+                final_prob[routed_idx] = torch.softmax(routed_forward["mixed_logits"].cpu(), dim=1)
+                final_pred[routed_idx] = routed_forward["mixed_logits"].cpu().argmax(dim=1)
+                if routed_forward.get("gate_prob") is not None:
+                    gate_prob_all[routed_idx] = routed_forward["gate_prob"].detach().cpu()
+                if routed_forward.get("mpe_gate_weights") is not None:
+                    mpe_gate_weights_all[routed_idx] = routed_forward["mpe_gate_weights"].detach().cpu()
+
+        return {
+            "logits": final_logits,
+            "prob": final_prob,
+            "pred": final_pred,
+            "routed_mask": routed_mask,
+            "router_prob": router_prob_all,
+            "router_score": router_score_all,
+            "oracle_advantage": oracle_advantage_all,
+            "gate_prob": gate_prob_all,
+            "mpe_gate_weights": mpe_gate_weights_all,
+            "routed_count": int(routed_mask[torch.tensor(split_idx, dtype=torch.long)].sum().item()),
+        }
 
     def _build_glance_joint_per_node_rows(
         self,
@@ -3566,6 +4051,7 @@ class GlanceStageMixin:
         router_score,
         oracle_advantage,
         gate_prob,
+        mpe_gate_weights,
         semantic_views,
         mode_name,
         route_prob_by_epoch=None,
@@ -3582,6 +4068,11 @@ class GlanceStageMixin:
         router_score_np = router_score.detach().cpu().numpy().astype(np.float32) if router_score is not None else None
         oracle_advantage_np = oracle_advantage.detach().cpu().numpy().astype(np.float32) if oracle_advantage is not None else None
         gate_prob_np = gate_prob.detach().cpu().numpy().astype(np.float32) if gate_prob is not None else None
+        mpe_gate_weights_np = (
+            mpe_gate_weights.detach().cpu().numpy().astype(np.float32)
+            if mpe_gate_weights is not None
+            else None
+        )
         count_1hop = semantic_views.get("count_1hop")
         count_2hop = semantic_views.get("count_2hop")
         if count_1hop is None:
@@ -3600,6 +4091,10 @@ class GlanceStageMixin:
                 "oracle_advantage": float(oracle_advantage_np[node_idx]) if oracle_advantage_np is not None else 0.0,
                 "gate_prob": float(gate_prob_np[node_idx]) if gate_prob_np is not None else 0.0,
                 "gate_decision": bool(gate_prob_np[node_idx] >= 0.5) if gate_prob_np is not None else False,
+                "mpe_gate_graph_following": float(mpe_gate_weights_np[node_idx, 0]) if mpe_gate_weights_np is not None else 0.0,
+                "mpe_gate_graph_follower": float(mpe_gate_weights_np[node_idx, 1]) if mpe_gate_weights_np is not None else 0.0,
+                "mpe_gate_tweet": float(mpe_gate_weights_np[node_idx, 2]) if mpe_gate_weights_np is not None else 0.0,
+                "mpe_gate_conflict": float(mpe_gate_weights_np[node_idx, 3]) if mpe_gate_weights_np is not None else 0.0,
                 "was_wrong_base": bool(pred_gnn_np[node_idx] != labels_np[node_idx]),
                 "is_wrong_final": bool(final_pred_np[node_idx] != labels_np[node_idx]),
                 "neighbor_count_1hop": int(count_1hop[node_idx]) if count_1hop is not None else 0,
@@ -3660,19 +4155,35 @@ class GlanceStageMixin:
         refiner_base_wrong_weight=2.0,
         refiner_utility_weight=3.0,
         refiner_gate_weight=0.5,
+        prompt_expert_fusion="projector_concat",
+        routing_protocol="joint_train",
+        frozen_router_bundle=None,
+        selected_budget_override=None,
     ):
         candidate_seed = int(self.seed) * 100000 + int(round(float(beta) * 1000)) * 10 + int(eval_top_k)
         torch.manual_seed(candidate_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(candidate_seed)
         np.random.seed(candidate_seed % (2**32 - 1))
-        router_model = GlanceReliabilityRouterMLP(
-            input_dim=int(router_features.shape[1]),
-            hidden_dim=128,
-            dropout=0.1,
-        )
+        routing_protocol = str(routing_protocol or "joint_train").lower()
+        if routing_protocol == "frozen_router_reuse":
+            if frozen_router_bundle is None:
+                raise MissingFrozenArtifactError("frozen_router_reuse requires a loaded frozen_router_bundle.")
+            router_model = frozen_router_bundle["router_model"]
+            for parameter in router_model.parameters():
+                parameter.requires_grad_(False)
+        else:
+            router_model = GlanceReliabilityRouterMLP(
+                input_dim=int(router_features.shape[1]),
+                hidden_dim=128,
+                dropout=0.1,
+            )
         refiner_feature_kind = refiner_features.get("feature_kind") if isinstance(refiner_features, dict) else None
-        if refiner_feature_kind == "prompt_expert_bundle_v1":
+        prompt_expert_fusion = str(prompt_expert_fusion or "projector_concat").lower()
+        if _is_prompt_expert_feature_kind(refiner_feature_kind) or (
+            isinstance(refiner_features, dict)
+            and _is_prompt_expert_semantic_view_mode(refiner_features.get("semantic_view_mode"))
+        ):
             component_dims = {
                 name: int(refiner_features["semantic_views"][name].shape[1])
                 for name in PromptExpertBundleRefinerMLP.COMPONENT_ORDER
@@ -3683,9 +4194,14 @@ class GlanceStageMixin:
                 proj_dim=256,
                 hidden_dim=128,
                 structural_dim=int(refiner_features["structural_features"].shape[1]),
+                graph_gate_dim=int(refiner_features["graph_gate_features"].shape[1]),
                 activation=activation,
                 dropout=0.1,
                 explicit_gate=bool(refiner_explicit_gate),
+                fusion_mode=prompt_expert_fusion,
+                mpe_gate_dim=int(refiner_features.get("mpe_gate_features", torch.empty((0, 0))).shape[1])
+                if "mpe_gate_features" in refiner_features
+                else None,
             )
         elif bool(refiner_explicit_gate):
             refiner_model = GatedGlanceRefinerMLP(
@@ -3703,11 +4219,10 @@ class GlanceStageMixin:
             )
         router_model.to(self.device)
         refiner_model.to(self.device)
-        optimizer = torch.optim.AdamW(
-            list(router_model.parameters()) + list(refiner_model.parameters()),
-            lr=learning_rate,
-            weight_decay=weight_decay,
-        )
+        trainable_params = list(refiner_model.parameters())
+        if routing_protocol != "frozen_router_reuse":
+            trainable_params = list(router_model.parameters()) + trainable_params
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
 
         best_state = None
         best_epoch_summary = None
@@ -3720,7 +4235,10 @@ class GlanceStageMixin:
         test_wrong = (pred_gnn.numpy()[test_idx] != labels_np[test_idx]).astype(np.int64)
 
         for epoch in range(max_epochs):
-            router_model.train()
+            if routing_protocol == "frozen_router_reuse":
+                router_model.eval()
+            else:
+                router_model.train()
             refiner_model.train()
             train_loss_history = []
             train_pred_history = []
@@ -3741,7 +4259,11 @@ class GlanceStageMixin:
                 batch_base_logits = logits_gnn[batch_idx].to(self.device)
                 batch_base_prob = p_gnn[batch_idx].to(self.device)
                 batch_base_pred = pred_gnn[batch_idx].to(self.device)
-                batch_route_score, batch_route_prob = router_model(batch_router)
+                if routing_protocol == "frozen_router_reuse":
+                    with torch.no_grad():
+                        batch_route_score, batch_route_prob = router_model(batch_router)
+                else:
+                    batch_route_score, batch_route_prob = router_model(batch_router)
                 k = min(max(int(train_k), 1), int(batch_idx.numel()))
                 routed_rel = torch.topk(batch_route_score, k=k, largest=True, sorted=False).indices
                 routed_mask = torch.zeros(batch_idx.numel(), dtype=torch.bool, device=self.device)
@@ -3803,22 +4325,26 @@ class GlanceStageMixin:
                 oracle_advantage = (batch_base_loss - raw_full_refiner_loss.detach() - float(beta)).detach()
                 route_loss = batch_base_loss.sum() * 0.0
                 router_regression_loss = batch_base_loss.sum() * 0.0
-                router_ranking_loss = _glance_pairwise_ranking_loss(batch_route_score, base_wrong_target)
-                pos_count = int(base_wrong_target.sum().detach().cpu().item())
-                neg_count = int(base_wrong_target.numel() - pos_count)
-                if 0 < pos_count < int(base_wrong_target.numel()):
-                    pos_weight = torch.tensor(
-                        float(neg_count / max(pos_count, 1)),
-                        dtype=batch_route_score.dtype,
-                        device=batch_route_score.device,
-                    )
-                    router_selection_loss = F.binary_cross_entropy_with_logits(
-                        batch_route_score,
-                        base_wrong_target,
-                        pos_weight=pos_weight,
-                    )
+                if routing_protocol == "frozen_router_reuse":
+                    router_ranking_loss = batch_base_loss.sum() * 0.0
+                    router_selection_loss = batch_base_loss.sum() * 0.0
                 else:
-                    router_selection_loss = batch_route_score.sum() * 0.0
+                    router_ranking_loss = _glance_pairwise_ranking_loss(batch_route_score, base_wrong_target)
+                    pos_count = int(base_wrong_target.sum().detach().cpu().item())
+                    neg_count = int(base_wrong_target.numel() - pos_count)
+                    if 0 < pos_count < int(base_wrong_target.numel()):
+                        pos_weight = torch.tensor(
+                            float(neg_count / max(pos_count, 1)),
+                            dtype=batch_route_score.dtype,
+                            device=batch_route_score.device,
+                        )
+                        router_selection_loss = F.binary_cross_entropy_with_logits(
+                            batch_route_score,
+                            base_wrong_target,
+                            pos_weight=pos_weight,
+                        )
+                    else:
+                        router_selection_loss = batch_route_score.sum() * 0.0
                 utility_consistency_loss = batch_base_loss.sum() * 0.0
                 total_loss = (
                     pred_loss
@@ -4000,7 +4526,25 @@ class GlanceStageMixin:
                     },
                 },
             })
-            current_score = (float(valid_metrics["macro_f1"]), -float(valid_metrics["loss"]))
+            if routing_protocol == "frozen_router_reuse":
+                valid_budget_curve_epoch, _ = self._build_counterfactual_budget_rows(
+                    budgets=[float(selected_budget_override)],
+                    risk_score=valid_outputs["router_score"].numpy(),
+                    pred_gnn=pred_gnn.numpy(),
+                    pred_refiner=valid_outputs["pred"].numpy(),
+                    labels_np=labels_np,
+                    eval_idx=valid_idx,
+                    prob_gnn=p_gnn,
+                    prob_refiner=valid_outputs["prob"],
+                )
+                frozen_valid_row = valid_budget_curve_epoch[0] if valid_budget_curve_epoch else None
+                current_score = (
+                    float(frozen_valid_row["macro_f1"]) if frozen_valid_row else float(valid_metrics["macro_f1"]),
+                    -float(frozen_valid_row["break"]) if frozen_valid_row else -float(valid_metrics["loss"]),
+                )
+                epoch_summary["frozen_router_valid_budget_metrics"] = frozen_valid_row
+            else:
+                current_score = (float(valid_metrics["macro_f1"]), -float(valid_metrics["loss"]))
             if current_score > best_score:
                 best_score = current_score
                 best_state = {
@@ -4024,52 +4568,99 @@ class GlanceStageMixin:
         refiner_model.load_state_dict(best_state["refiner"])
         router_model.to("cpu")
         refiner_model.to("cpu")
-
-        topk_train_outputs = self._apply_glance_joint_policy(
-            router_model,
-            refiner_model,
-            router_features,
-            refiner_features,
-            semantic_view_mode,
-            logits_gnn,
-            p_gnn,
-            pred_gnn,
-            labels_t,
-            beta,
-            train_idx,
-            batch_size,
-            eval_top_k,
-        )
-        topk_valid_outputs = self._apply_glance_joint_policy(
-            router_model,
-            refiner_model,
-            router_features,
-            refiner_features,
-            semantic_view_mode,
-            logits_gnn,
-            p_gnn,
-            pred_gnn,
-            labels_t,
-            beta,
-            valid_idx,
-            batch_size,
-            eval_top_k,
-        )
-        topk_test_outputs = self._apply_glance_joint_policy(
-            router_model,
-            refiner_model,
-            router_features,
-            refiner_features,
-            semantic_view_mode,
-            logits_gnn,
-            p_gnn,
-            pred_gnn,
-            labels_t,
-            beta,
-            test_idx,
-            batch_size,
-            eval_top_k,
-        )
+        if routing_protocol == "frozen_router_reuse":
+            frozen_budget = float(selected_budget_override)
+            topk_train_outputs = self._apply_glance_global_budget_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                train_idx,
+                batch_size,
+                frozen_budget,
+            )
+            topk_valid_outputs = self._apply_glance_global_budget_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                valid_idx,
+                batch_size,
+                frozen_budget,
+            )
+            topk_test_outputs = self._apply_glance_global_budget_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                test_idx,
+                batch_size,
+                frozen_budget,
+            )
+        else:
+            topk_train_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                train_idx,
+                batch_size,
+                eval_top_k,
+            )
+            topk_valid_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                valid_idx,
+                batch_size,
+                eval_top_k,
+            )
+            topk_test_outputs = self._apply_glance_joint_policy(
+                router_model,
+                refiner_model,
+                router_features,
+                refiner_features,
+                semantic_view_mode,
+                logits_gnn,
+                p_gnn,
+                pred_gnn,
+                labels_t,
+                beta,
+                test_idx,
+                batch_size,
+                eval_top_k,
+            )
 
         topk_train_metrics = _classification_metrics_from_logits(
             topk_train_outputs["logits"],
@@ -4105,6 +4696,7 @@ class GlanceStageMixin:
             topk_train_outputs["router_score"],
             topk_train_outputs["oracle_advantage"],
             topk_train_outputs.get("gate_prob"),
+            topk_train_outputs.get("mpe_gate_weights"),
             semantic_views,
             "glance_joint_router_refine_train",
         )
@@ -4118,6 +4710,7 @@ class GlanceStageMixin:
             topk_valid_outputs["router_score"],
             topk_valid_outputs["oracle_advantage"],
             topk_valid_outputs.get("gate_prob"),
+            topk_valid_outputs.get("mpe_gate_weights"),
             semantic_views,
             "glance_joint_router_refine_valid",
         )
@@ -4131,6 +4724,7 @@ class GlanceStageMixin:
             topk_test_outputs["router_score"],
             topk_test_outputs["oracle_advantage"],
             topk_test_outputs.get("gate_prob"),
+            topk_test_outputs.get("mpe_gate_weights"),
             semantic_views,
             "glance_joint_router_refine_test",
         )
@@ -4179,8 +4773,9 @@ class GlanceStageMixin:
             ],
         }
 
+        budget_grid = [float(selected_budget_override)] if routing_protocol == "frozen_router_reuse" else self._router_budgets()
         valid_budget_curve, valid_budget_payloads = self._build_counterfactual_budget_rows(
-            budgets=self._router_budgets(),
+            budgets=budget_grid,
             risk_score=topk_valid_outputs["router_score"].numpy(),
             pred_gnn=pred_gnn.numpy(),
             pred_refiner=topk_valid_outputs["pred"].numpy(),
@@ -4190,7 +4785,7 @@ class GlanceStageMixin:
             prob_refiner=topk_valid_outputs["prob"],
         )
         test_budget_curve, test_budget_payloads = self._build_counterfactual_budget_rows(
-            budgets=self._router_budgets(),
+            budgets=budget_grid,
             risk_score=topk_test_outputs["router_score"].numpy(),
             pred_gnn=pred_gnn.numpy(),
             pred_refiner=topk_test_outputs["pred"].numpy(),
@@ -4255,4 +4850,5 @@ class GlanceStageMixin:
             "valid_budget_curve": valid_budget_curve,
             "test_budget_curve": test_budget_curve,
             "eval_top_k": int(eval_top_k),
+            "routing_protocol": routing_protocol,
         }

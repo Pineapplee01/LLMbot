@@ -59,6 +59,7 @@ First-round full-graph support:
 
 - `graph_data_variant=full_graph_support` is currently supported only for:
   - `graph_detector_prepare`
+  - `estimator_ablation` (conformal-style router ablations only)
   - `joint_router_refinement`
 - full-graph mode keeps supervision on the original labeled split only
 - the graph comes from:
@@ -101,13 +102,90 @@ Prompt-cache helper modes:
 - relation-aware social-context:
   - `relation_aware_ego`
   - `relation_aware_1hop`
-- prompt-expert bundle v1:
+- prompt-expert bundles:
   - `expert_ego`
   - `expert_graph_following`
   - `expert_graph_follower`
   - `expert_tweet`
   - `expert_conflict`
   - `expert_concat_v1`
+
+Prompt-family versioning:
+
+- `--prompt_family_version v1` preserves the older mixed prompt-expert cache
+  contract
+- `--prompt_family_version v2` upgrades the expert path to a literature-aligned
+  explanation-first family
+- `expert_concat_v1 + --prompt_family_version v2` is the new four-expert
+  mainline and writes `semantic_view_mode=prompt_expert_bundle_v2`
+- v2 keeps `following` and `follower` split as separate experts, keeps raw
+  metadata mostly out of prompt bodies, and uses encoder-aware output naming
+  such as `glance_prompt_expert_concat_v2_roberta_finetuned_embed.pt`
+- when `--model_path` is omitted in v2 expert modes, explanation embeddings now
+  default to the SimTeG finetuned RoBERTa family
+  (`--model_path roberta_finetuned`, resolved offline to
+  `yzxjb/roberta-finetuned-20`) instead of `roberta-base`
+- if the `roberta_finetuned` model source is not available as a local path or
+  cached HF snapshot, precompute fails fast; it never silently substitutes
+  `roberta-base`
+- if a frozen SimTeG LM checkpoint is available at
+  `TwiBot-20_seed_<seed>/checkpoints/LM_pretrain/best.pkl`, v2 loads that
+  encoder state after resolving the real finetuned-RoBERTa source; use
+  `--finetuned_roberta_checkpoint_path` to pin a specific checkpoint
+- that default follows the frozen SimTeG text-consumption contract:
+  `padding=True`, `truncation=True`, effective max length `512`, final
+  hidden-state plain mean pooling, no added special tokens, and no l2
+  normalization unless `--normalize true` is explicitly passed
+
+Raw tweet source compatibility:
+
+- `--tweet_source_mode {norm_user_text,raw_post_edges}`
+- `--node_source_path`
+- `--edge_source_path`
+- `--tweet_sample_size`
+- `--tweet_clean_level {light,norm_compatible}`
+- `--tweet_keep_hashtag_surface`
+- `--tweet_keep_emoji_surface`
+- `raw_post_edges` is a precompute-only compatibility path:
+  - it upgrades `expert_tweet`
+  - and tweet-dependent `conflict` generation
+  - while leaving `ego / graph_following / graph_follower` source handling
+    unchanged
+- raw mode uses:
+  - `node_new.json` as the raw node object store
+  - `edge_new.json` when present as the grouped `post`-edge cache
+  - otherwise the authoritative `edge.csv` `post` relations
+  - fallback to `norm_user_text(.json/.new.json)` when a user has no
+    recoverable raw tweets
+
+Relation-aware center-induced prompt-expert selection:
+
+- `precompute.py` now supports
+  `--neighbor_sampling_policy center_induced_relation_aware`
+- it can build prompt-expert evidence from either:
+  - `--context_graph_variant labeled`
+  - `--context_graph_variant full_graph_support`
+- center scope is explicit:
+  - `--center_node_scope labeled`
+  - `--center_node_scope all_graph_nodes`
+- routed-node-only precompute is also supported through
+  `--routed_nodes_path <file>`:
+  - accepts `.jsonl`, `.json`, `.pt`, or plain-text node-id lists
+  - interprets ids in graph-global node-index space
+  - only those nodes go through prompt-expert building, explanation generation,
+    and encoder inference
+  - saved tensors are still scattered back to full-graph row shape with zeros on
+    unselected nodes so `--joint_refiner_embedding_path` stays alignment-safe
+- for `expert_*` prompt modes, each direction is split into:
+  - support neighbors
+  - contrast neighbors
+- ranking is centered on cosine similarity between the center node and
+  candidate neighbor embeddings, with deterministic tie-breakers from
+  reciprocity, common-neighbor count, degree, and text length
+- the output payload keeps the same expert-component contract
+  (`ego/graph_following/graph_follower/tweet/conflict`) but upgrades the
+  semantic marker to `prompt_expert_bundle_center_induced_v1` and adds
+  selection statistics as scalar side channels
 
 Example relation-aware 1-hop cache:
 
@@ -126,19 +204,110 @@ Example prompt-expert bundle cache:
 python precompute.py \
   --dataset TwiBot-20 \
   --prompt_mode expert_concat_v1 \
+  --prompt_family_version v1 \
   --explain_model_path /path/to/qwen-instruct \
   --output_path datasets/TwiBot-20/glance_prompt_expert_concat_v1_qwen3_embed.pt
 ```
 
-For `expert_ego` and `expert_concat_v1`, `precompute.py` now resolves
+Example literature-aligned prompt-expert bundle v2:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode expert_concat_v1 \
+  --prompt_family_version v2 \
+  --explain_model_path /path/to/qwen-instruct \
+  --routed_nodes_path /path/to/routed_nodes.jsonl \
+  --explain_batch_size 0 \
+  --explain_max_new_tokens 128 \
+  --explain_log_every 50 \
+  --project_name llmbot-precompute \
+  --experiment_name prompt_expert_v2 \
+  --output_path datasets/TwiBot-20/glance_prompt_expert_concat_v2_roberta_finetuned_embed.pt
+```
+
+Use `--model_path roberta_finetuned` or `--model_path /path/to/local/finetuned-roberta`
+when you want to make the encoder choice explicit. Passing `--model_path
+roberta-base` remains a valid ablation, but it is no longer the v2 default.
+
+Example raw tweet smoke:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode expert_tweet \
+  --tweet_source_mode raw_post_edges \
+  --tweet_sample_size 6 \
+  --tweet_clean_level light \
+  --limit 8 \
+  --output_path datasets/TwiBot-20/glance_prompt_expert_tweet_raw_post_edges_qwen3_embed.pt
+```
+
+Example center-induced prompt-expert bundle on the full graph:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --graph_data_variant full_graph_support \
+  --context_graph_variant full_graph_support \
+  --center_node_scope labeled \
+  --prompt_mode expert_concat_v1 \
+  --neighbor_sampling_policy center_induced_relation_aware \
+  --selection_embedding_path datasets/TwiBot-20/embeddings_iter_-1_seed_1.pt \
+  --support_selection_embedding_path datasets/TwiBot-20/support_roberta_embeddings_new.pt \
+  --following_quota 3 \
+  --follower_quota 3 \
+  --output_path datasets/TwiBot-20/glance_prompt_expert_center_induced_qwen3_embed.pt
+```
+
+For prompt-expert explanation generation, `precompute.py` resolves
 `--explain_model_path` in offline-first mode:
 
 - if the argument points to a local snapshot path, it loads that model
+- if the argument points to a local model parent directory with exactly one
+  snapshot/model child, it resolves that child automatically
 - if the argument is an HF repo id that already exists in the local HF cache, it
   resolves the cached snapshot
 - if no local explain-model snapshot is available, it falls back to the built-in
   deterministic profile-card explanation instead of blocking on a HuggingFace
   download attempt
+- pass `--explain_required` for real LLM-as-explainer experiments; this fails
+  fast instead of writing a deterministic-fallback cache when the local explain
+  model is missing or generation fails
+- in `--prompt_family_version v2`, this explanation-first path applies to all
+  four mainline experts: `tweet`, `graph_following`, `graph_follower`, and
+  `conflict`
+- Qwen model handling in `precompute.py` now follows the official model-card
+  split explicitly:
+  - `Qwen2.5-7B-Instruct` is treated as a chat-generation model via
+    `apply_chat_template(..., add_generation_prompt=True)` and continuation is
+    sliced from `output_ids[len(input_ids):]`
+  - `Qwen3-Embedding-8B` is treated as an embedding encoder with
+    left-padding-compatible `last_token_pool` plus optional l2 normalization
+- long v2 runs are resumable at the component level:
+  - each generated expert explanation is appended to
+    `<output_stem>_<component>_explanations.jsonl`
+  - reruns skip rows with matching `node_id` and prompt hash
+  - `--explain_component_cache_dir` can move these sidecars away from the final
+    cache directory
+- the default `--explain_max_new_tokens` is `128`; raise it only when the
+  explanation prompt genuinely needs longer output
+- the default `--explain_batch_size 0` enables a conservative auto policy
+  (`2` on CUDA, `1` on CPU); pass `4` manually only after confirming GPU memory
+- `--explain_log_every` controls per-component progress logging and wandb
+  updates during long generation loops
+
+For the current local/server layout, `LLMbot/models/` is a Python package, not a
+pretrained model snapshot. Use the actual instruct model snapshot path instead,
+for example `../models/Qwen2.5-7B-Instruct` locally or
+`/root/workspace/LMbot/hf_models/Qwen2.5-7B-Instruct` on the GPU server.
+
+Prompt precompute wandb monitoring is optional. Passing `--project_name` starts
+a wandb run and logs prompt-bundle construction, per-batch explanation progress,
+per-component explanation completion, per-component encoder progress, and the
+final artifact summary.
+`--experiment_name` and `--wandb_run_name` control the run label, while
+`--disable_wandb` forces no-op behavior for offline smoke checks.
 
 Hidden compatibility aliases still parse for one migration window:
 
@@ -424,6 +593,41 @@ python main.py \
   --seeds 1,2,3 \
   --disable_wandb
 
+# Full-graph conformal router ablation on top of a frozen SimTeG backbone
+# Reuses an existing full-graph graph_detector_prepare root through --external_frozen_g0_root.
+# Current full-graph estimator_ablation support is intentionally narrow:
+#   - posthoc_calibrated_ranker
+#   - calibrated_local_risk_router
+#   - graph_conformal_set_estimator
+#   - gnn_2hop_conformal
+python main.py \
+  --experiment_task estimator_ablation \
+  --dataset TwiBot-20 \
+  --graph_data_variant full_graph_support \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --estimator_mode posthoc_calibrated_ranker \
+  --external_frozen_g0_root tmp_iterm1_forward_fullgraph/seed_1 \
+  --experiment_name fullgraph_conformal_posthoc_seed1 \
+  --seeds 1 \
+  --disable_wandb
+
+# Calibrated posterior + localized 1-hop relation-aware scalar risk ablation
+# Same public estimator mode, but the current contract is the stronger v2 path:
+# score-family selection uses valid_tune, conformal calibration uses valid_cal,
+# and local risk can use node_repr similarity weights when available.
+python main.py \
+  --experiment_task estimator_ablation \
+  --dataset TwiBot-20 \
+  --graph_data_variant full_graph_support \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --estimator_mode calibrated_local_risk_router \
+  --external_frozen_g0_root tmp_iterm1_forward_fullgraph/seed_1 \
+  --experiment_name fullgraph_conformal_localrisk_seed1 \
+  --seeds 1 \
+  --disable_wandb
+
 # Refiner-only prompt-cache override on top of an unchanged qwen3 backbone
 python main.py \
   --experiment_task joint_router_refinement \
@@ -466,8 +670,18 @@ Prompt-cache experiment note:
   prompt cache through `--joint_refiner_embedding_path`; prompt payloads with
   `ego/hop1/hop2` are consumed as direct refiner views, while
   prompt-expert payloads with `ego/graph_following/graph_follower/tweet/conflict`
-  are consumed through `semantic_view_mode=prompt_expert_bundle_v1` and kept
-  strictly on the refiner branch instead of being fed back into the backbone.
+  are consumed through `semantic_view_mode=prompt_expert_bundle_v1`,
+  `prompt_expert_bundle_center_induced_v1`, or `prompt_expert_bundle_v2` and
+  kept strictly on the refiner branch instead of being fed back into the
+  backbone.
+- LLM-as-explainer execution is a `precompute.py` cache-construction concern,
+  not a router feature. No router code changes are required unless a future
+  experiment intentionally feeds explainer-derived signals into the router.
+- `full_graph_support` now also accepts `--joint_refiner_embedding_path` for
+  prompt-expert refiner-only overrides, as long as the payload is either:
+  - graph-wide
+  - or a labeled-prefix prompt-expert bundle aligned to the routed labeled
+    nodes
 - When a high-performing backbone artifact already exists, the same ablation
   can be run read-only through `--external_frozen_g0_root` together with
   `--joint_refiner_embedding_path`, so the prompt cache changes only the
@@ -485,15 +699,74 @@ Prompt-expert bundle v1 note:
 - `expert_concat_v1` shares the same offline-first explain path for its `ego`
   component and still concatenates `ego/graph_following/graph_follower/tweet/conflict`
   on output.
+- `center_induced_relation_aware` upgrades the graph-side evidence for
+  `expert_graph_following`, `expert_graph_follower`, `expert_conflict`, and
+  `expert_concat_v1`:
+  - each direction is partitioned into support and contrast subsets
+  - sidecar JSONL rows record selected neighbor ids, support/contrast
+    assignment, similarity summary, and fallback usage
 - `joint_router_refinement` projects each expert view before routed-node
   refinement and uses a lightweight graph-view gate over
-  `log1p(count_following)`, `log1p(count_follower)`, `has_following`, and
-  `has_follower`.
+  relation-aware structural side channels. The base set remains
+  `count_following/count_follower/has_following/has_follower`, and
+  center-induced bundles append candidate-count, selected-count, mean-similarity,
+  and reciprocal-ratio statistics.
 - When `--joint_refiner_explicit_gate --joint_refiner_target_mode keep_change`
   is used with `prompt_expert_bundle_v1`, the prompt-expert refiner also emits
   an abstain gate. `--joint_refiner_gate_target utility_positive` trains that
   gate to prefer the expert path only when raw refiner utility is positive;
   artifacts record gate rates and write per-node `gate_prob` / `gate_decision`.
+
+Prompt-expert bundle v2 note:
+
+- `prompt_expert_bundle_v2` is the literature-aligned explanation-first mainline
+  for prompt experts in this repo.
+- It keeps four experts on the semantic branch:
+  - `tweet`
+  - `graph_following`
+  - `graph_follower`
+  - `conflict`
+- All four components follow `explanation -> embedding`:
+  - a local instruct model writes an evidence-grounded explanation
+  - the current finetuned RoBERTa encoder embeds that explanation
+- v2 explanation generation now reuses one loaded explain model for the whole
+  precompute run instead of reloading it once per component.
+- `graph_following` and `graph_follower` remain separate because the two
+  directions represent different social evidence roles: who the account chooses
+  to follow versus who chooses to follow it.
+- v2 keeps prompt-side metadata compressed into natural-language-friendly cues
+  (`account_age_bucket`, `follow_ratio_bucket`, `posting_density_bucket`,
+  `verified/protected`, `bio_present`) while exact counts and rates stay in the
+  refiner side channel.
+- The strict refiner still uses the same routed projector architecture, but it
+  now accepts `prompt_expert_bundle_v2`, keeps the graph-fusion gate on
+  directional count/presence features only, and appends the full scalar
+  side-channel after the projected expert embeddings.
+- Prompt-expert runs can choose the expert fusion head with
+  `--joint_prompt_expert_fusion {projector_concat,mpe_gated}`. The default
+  `projector_concat` preserves the existing projected-concat refiner;
+  `mpe_gated` is a GAugLLM-style refiner-only ablation that learns a
+  node-conditioned softmax over `graph_following`, `graph_follower`, `tweet`,
+  and `conflict` experts before classification. It does not change router
+  features, graph propagation, or prompt-cache construction.
+- When `--routed_nodes_path` is used, the prompt cache records the explicit
+  target source in the manifest, but still writes a full-graph tensor layout so
+  the strict refiner can consume the cache without a separate scatter step.
+
+Frozen-router reuse note:
+
+- `joint_router_refinement` now supports
+  `--joint_routing_protocol frozen_router_reuse`
+- when enabled, the stage reads a prior `joint_router_refinement` artifact
+  through `--joint_router_reuse_root`
+- the reused artifact supplies:
+  - frozen router weights
+  - router scaler
+  - selected validation budget
+  - selected beta
+- this path is the claim-grade comparison mode for refiner-only evidence
+  upgrades because it keeps the routed set fixed while changing only the
+  routed-node evidence/refiner branch
 
 ## Mainline Layout
 

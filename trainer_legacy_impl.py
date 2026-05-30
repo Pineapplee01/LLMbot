@@ -41,6 +41,7 @@ from utils import (
     build_stage_dir,
     capture_code_metadata,
     ensure_dir,
+    resolve_dataset_path,
     save_stage_artifacts,
     safe_torch_load,
     tensor_sha256,
@@ -1846,6 +1847,11 @@ def _safe_advantage_router_metrics(advantage, scores, routed_mask=None):
         "auroc": None,
         "auprc": None,
     }
+
+
+def _labeled_prefix_array(values, labeled_count):
+    values_np = np.asarray(values)
+    return values_np[: int(labeled_count)]
     if np.unique(labels).size >= 2:
         try:
             metrics["auroc"] = float(roc_auc_score(labels, scores))
@@ -5604,6 +5610,14 @@ class StageRunner:
         high_group = strata.get("high") or strata.get("top_15") or {}
         return np.asarray(high_group.get("mask", np.zeros(len(self.labels), dtype=bool)), dtype=bool)
 
+    def _stage2_structural_graph(self):
+        if str(getattr(self, "graph_data_variant", "labeled")).lower() != "full_graph_support":
+            return self.data["edge_index"], self.data["edge_type"], int(len(self.labels))
+        dataset_path = resolve_dataset_path(self.args.dataset)
+        edge_index = safe_torch_load(dataset_path / "edge_index.pt", map_location="cpu")
+        edge_type = safe_torch_load(dataset_path / "edge_type.pt", map_location="cpu")
+        return edge_index, edge_type, int(len(self.labels))
+
     def _policy_masks(self, risk_bundle):
         operational = risk_bundle["subgroup_manifest_operational"]
         if operational.get("selector_safe") is not True:
@@ -5744,6 +5758,7 @@ class StageRunner:
         return str(getattr(self.args, "estimator_mode", "none")).lower() in {
             "msp_ts",
             "posthoc_calibrated_ranker",
+            "calibrated_local_risk_router",
             "graph_conformal_set_estimator",
             "gnn_2hop_conformal",
         }
@@ -6573,7 +6588,7 @@ class StageRunner:
         requested_mode = str(getattr(self.args, "estimator_mode", "none")).lower()
         risk_bundle = self._build_graph_conformal_estimator_bundle(requested_mode)
         context = self.ensure_backbone_context()
-        base_pred = context["gnn_outputs"]["pred"].detach().cpu().numpy()
+        base_pred = _labeled_prefix_array(context["gnn_outputs"]["pred"].detach().cpu().numpy(), len(self.labels))
         triggered_mask = self._validation_frozen_high_mask(risk_bundle) & self.test_mask
         budgets = self._router_budgets()
         metrics_payload, budget_curve = self._build_metrics_payload(
@@ -6809,7 +6824,8 @@ class StageRunner:
         gnn_outputs = context["gnn_outputs"]
         risk_score = np.asarray(risk_score, dtype=np.float32)
         pred = gnn_outputs["pred"].detach().cpu().numpy()
-        wrong = (pred != self.labels).astype(np.int32)
+        pred_labeled = _labeled_prefix_array(pred, len(self.labels))
+        wrong = (pred_labeled != self.labels).astype(np.int32)
         val_idx = _idx_numpy(self.data["valid_idx"])
         test_idx = _idx_numpy(self.data["test_idx"])
         if val_idx.size:
@@ -6818,7 +6834,8 @@ class StageRunner:
         else:
             validation_threshold = float("inf")
         confidence = gnn_outputs["prob"].detach().cpu().max(dim=1)[0].numpy()
-        hcw_mask = ((1.0 - confidence) < 0.1) & (wrong == 1)
+        confidence_labeled = _labeled_prefix_array(confidence, len(self.labels))
+        hcw_mask = ((1.0 - confidence_labeled) < 0.1) & (wrong == 1)
         return {
             "risk_score": risk_score,
             "thresholds": {"validation_risk_threshold": validation_threshold},
@@ -6831,21 +6848,28 @@ class StageRunner:
     def _bundle_from_risk_manifest(self, mode, risk_manifest, structural_manifest=None, subgroup_op=None, subgroup_analysis=None):
         context = self.ensure_backbone_context()
         gnn_outputs = context["gnn_outputs"]
+        labeled_count = int(len(self.labels))
+        risk_manifest_local = dict(risk_manifest)
+        if "risk_score" in risk_manifest_local:
+            risk_manifest_local["risk_score"] = _labeled_prefix_array(risk_manifest_local["risk_score"], labeled_count).astype(np.float32)
+        if "hcw_mask" in risk_manifest_local:
+            risk_manifest_local["hcw_mask"] = _labeled_prefix_array(risk_manifest_local["hcw_mask"], labeled_count).astype(bool).tolist()
+        edge_index_stage2, edge_type_stage2, num_nodes_stage2 = self._stage2_structural_graph()
         probe_features = build_probe_features(
-            logits=gnn_outputs["logits"],
-            probs=gnn_outputs["prob"],
-            edge_index=self.data["edge_index"],
-            edge_type=self.data["edge_type"],
-            node_repr=gnn_outputs["node_repr"],
+            logits=gnn_outputs["logits"][:labeled_count],
+            probs=gnn_outputs["prob"][:labeled_count],
+            edge_index=edge_index_stage2,
+            edge_type=edge_type_stage2,
+            node_repr=gnn_outputs["node_repr"][:labeled_count],
         )
         if structural_manifest is None or subgroup_op is None or subgroup_analysis is None:
             structural_manifest, subgroup_op, subgroup_analysis = build_subgroup_manifests(
-                edge_index=self.data["edge_index"],
-                edge_type=self.data["edge_type"],
-                num_nodes=len(self.labels),
-                risk_manifest=risk_manifest,
+                edge_index=edge_index_stage2,
+                edge_type=edge_type_stage2,
+                num_nodes=num_nodes_stage2,
+                risk_manifest=risk_manifest_local,
                 labels=self.labels,
-                predictions=gnn_outputs["pred"].numpy(),
+                predictions=gnn_outputs["pred"][:labeled_count].numpy(),
                 probe_features=probe_features,
                 degree_quantile=self.args.sparse_degree_quantile,
                 propagation_quantile=self.args.propagation_quantile,
@@ -6853,7 +6877,7 @@ class StageRunner:
             )
         return {
             "metadata": mode_metadata(mode),
-            "risk_manifest": risk_manifest,
+            "risk_manifest": risk_manifest_local,
             "structural_manifest": structural_manifest,
             "subgroup_manifest_operational": subgroup_op,
             "subgroup_manifest_analysis": subgroup_analysis,
@@ -6864,17 +6888,19 @@ class StageRunner:
         probs = final_outputs.get("prob")
         if probs is None:
             probs = torch.softmax(final_outputs["logits"].float(), dim=1)
-        return probs.detach().cpu().float()
+        probs = probs.detach().cpu().float()
+        return probs[: int(len(self.labels))]
 
     def _stage2_predictions(self, final_outputs):
         pred = final_outputs.get("pred")
         if pred is None:
             pred = self._stage2_probabilities(final_outputs).argmax(dim=1)
-        return pred.detach().cpu().long().numpy()
+        return pred.detach().cpu().long().numpy()[: int(len(self.labels))]
 
     def _stage2_logits(self, final_outputs):
         logits = final_outputs.get("logits")
-        return logits.detach().cpu().float() if logits is not None else torch.log(self._stage2_probabilities(final_outputs).clamp_min(1e-8))
+        logits_t = logits.detach().cpu().float() if logits is not None else torch.log(self._stage2_probabilities(final_outputs).clamp_min(1e-8))
+        return logits_t[: int(len(self.labels))]
 
     @staticmethod
     def _minmax_score(values):
@@ -6921,8 +6947,8 @@ class StageRunner:
         pred = probs.argmax(axis=1)
         msp = 1.0 - probs.max(axis=1)
         entropy = (-probs * np.log(np.clip(probs, 1e-8, 1.0))).sum(axis=1) / max(math.log(probs.shape[1]), 1e-8)
-        edge_index = _idx_numpy(self.data["edge_index"])
-        num_nodes = int(len(self.labels))
+        edge_index, _edge_type, num_nodes = self._stage2_structural_graph()
+        edge_index = _idx_numpy(edge_index)
         if edge_index.size == 0:
             return (0.65 * msp + 0.35 * entropy).astype(np.float32), {"status": "available_no_edges"}
         src, dst = edge_index
@@ -6980,7 +7006,8 @@ class StageRunner:
         return scores
 
     def _stage2_neighbor_label_masks(self, eval_mask):
-        edge_index = _idx_numpy(self.data["edge_index"])
+        edge_index, _edge_type, _num_nodes = self._stage2_structural_graph()
+        edge_index = _idx_numpy(edge_index)
         if edge_index.size == 0:
             return None, None
         labels = np.asarray(self.labels, dtype=np.int64)
@@ -7005,8 +7032,8 @@ class StageRunner:
         eval_mask = np.asarray(eval_mask, dtype=bool)
         probs = self._stage2_probabilities(final_outputs).numpy()
         pred = probs.argmax(axis=1)
-        edge_index = _idx_numpy(self.data["edge_index"])
-        num_nodes = int(len(self.labels))
+        edge_index, _edge_type, num_nodes = self._stage2_structural_graph()
+        edge_index = _idx_numpy(edge_index)
         hcw_mask = (probs.max(axis=1) >= 0.90) & (y_wrong == 1)
         low_degree_mask = None
         disagreement_mask = None
@@ -10540,6 +10567,11 @@ class StageRunner:
         return {"stage": self.args.stage, "best_mode": best_mode}
 
     def _run_estimator_matrix(self, stage_dir, base_bundle):
+        if str(getattr(self, "graph_data_variant", "labeled")).lower() == "full_graph_support" and not self._graph_conformal_estimator_requested():
+            raise MissingFrozenArtifactError(
+                "graph_data_variant=full_graph_support currently supports only conformal-style estimator_ablation modes "
+                "(`graph_conformal_set_estimator`, `posthoc_calibrated_ranker`, `calibrated_local_risk_router`, `gnn_2hop_conformal`)."
+            )
         if self._login_uncertainty_router_requested():
             return self._run_login_uncertainty_router_matrix(stage_dir, base_bundle)
         if self._graph_conformal_estimator_requested():

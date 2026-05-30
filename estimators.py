@@ -1667,8 +1667,10 @@ class GraphConformalSetEstimator(BaseRiskEstimator):
         payload = self._prediction_set_payload(posterior)
         risk_score = payload["abstain_risk"].astype(np.float32)
         labels_np = _labels_to_numpy(labels)
+        labeled_count = int(labels_np.shape[0])
         preds = posterior.argmax(axis=1)
-        wrong = (preds != labels_np).astype(np.int32)
+        preds_labeled = preds[:labeled_count]
+        wrong = (preds_labeled != labels_np).astype(np.int32)
         val_idx_np = _valid_index_array(val_idx, wrong.shape[0])
         test_idx_np = _valid_index_array(test_idx, wrong.shape[0])
         if self.val_threshold is None:
@@ -1693,7 +1695,7 @@ class GraphConformalSetEstimator(BaseRiskEstimator):
                 "conformal_nonconformity_threshold": float(self.threshold if self.threshold is not None else 1.0),
             },
             "calibration_metadata": metadata,
-            "hcw_mask": ((1.0 - posterior.max(axis=1)) < 0.1) & (wrong == 1),
+            "hcw_mask": ((1.0 - posterior[:labeled_count].max(axis=1)) < 0.1) & (wrong == 1),
             "validation_metrics": _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets) if val_idx_np.size else {},
             "test_metrics": _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets) if test_idx_np.size else {},
         }
@@ -1803,9 +1805,11 @@ class PostHocCalibratedRanker(GraphConformalSetEstimator):
         payload = self._prediction_set_payload(posterior)
         risk_score = payload["abstain_risk"].astype(np.float32)
         labels_np = _labels_to_numpy(labels).astype(np.int64)
+        labeled_count = int(labels_np.shape[0])
         preds = posterior.argmax(axis=1)
         pred_label_score = posterior[np.arange(posterior.shape[0]), preds]
-        wrong = (preds != labels_np).astype(np.int32)
+        preds_labeled = preds[:labeled_count]
+        wrong = (preds_labeled != labels_np).astype(np.int32)
         val_idx_np = _valid_index_array(val_idx, wrong.shape[0])
         test_idx_np = _valid_index_array(test_idx, wrong.shape[0])
         budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
@@ -1842,7 +1846,7 @@ class PostHocCalibratedRanker(GraphConformalSetEstimator):
                 "conformal_nonconformity_threshold": float(self.threshold if self.threshold is not None else 1.0),
             },
             "calibration_metadata": metadata,
-            "hcw_mask": ((1.0 - posterior.max(axis=1)) < 0.1) & (wrong == 1),
+            "hcw_mask": ((1.0 - posterior[:labeled_count].max(axis=1)) < 0.1) & (wrong == 1),
             "validation_metrics": _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=budgets) if val_idx_np.size else {},
             "test_metrics": _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=budgets) if test_idx_np.size else {},
         }
@@ -1854,6 +1858,423 @@ class PostHocCalibratedRanker(GraphConformalSetEstimator):
             "threshold": float(self.threshold if self.threshold is not None else 1.0),
             "num_classes": self.num_classes,
             "fit_summary": self.fit_summary,
+        }
+
+
+def _relation_aware_scalar_risk_features(
+    base_risk,
+    edge_index=None,
+    edge_type=None,
+    node_repr=None,
+    *,
+    similarity_temperature=4.0,
+    shrinkage_tau=3.0,
+    high_quantile=0.80,
+    low_quantile=0.35,
+):
+    risk = np.asarray(base_risk, dtype=np.float32).reshape(-1)
+    num_nodes = int(risk.shape[0])
+    zero = np.zeros(num_nodes, dtype=np.float32)
+    if edge_index is None:
+        return {
+            "mean_in_rel0_risk": zero.copy(),
+            "mean_in_rel1_risk": zero.copy(),
+            "mean_out_rel0_risk": zero.copy(),
+            "mean_out_rel1_risk": zero.copy(),
+            "mean_in_risk": zero.copy(),
+            "mean_out_risk": zero.copy(),
+            "neighbor_risk_std": zero.copy(),
+            "neighbor_risk_max": zero.copy(),
+            "risk_gap_in_out": zero.copy(),
+            "relation_gap_in": zero.copy(),
+            "relation_gap_out": zero.copy(),
+            "channel_peak_risk": zero.copy(),
+            "channel_peak_std": zero.copy(),
+            "high_risk_mass_peak": zero.copy(),
+            "low_risk_mass_peak": zero.copy(),
+            "channel_conflict_peak": zero.copy(),
+            "similarity_weight_mean": zero.copy(),
+            "effective_neighbor_count": zero.copy(),
+        }
+
+    edge_np = _to_numpy(edge_index).astype(np.int64)
+    if edge_np.ndim != 2 or edge_np.shape[0] != 2:
+        raise ValueError("calibrated_local_risk_router expects edge_index shaped [2, num_edges].")
+    src, dst = edge_np
+    valid = (src >= 0) & (src < num_nodes) & (dst >= 0) & (dst < num_nodes)
+    src = src[valid]
+    dst = dst[valid]
+
+    if edge_type is None:
+        rel = np.zeros(src.shape[0], dtype=np.int64)
+    else:
+        rel_all = _to_numpy(edge_type).astype(np.int64).reshape(-1)
+        rel = rel_all[valid]
+
+    rel = np.clip(rel, 0, 1)
+    src_risk = risk[src].astype(np.float64)
+    dst_risk = risk[dst].astype(np.float64)
+
+    if node_repr is None:
+        edge_weight = np.ones(src.shape[0], dtype=np.float64)
+    else:
+        repr_np = _to_numpy(node_repr).astype(np.float32)
+        if repr_np.ndim != 2 or repr_np.shape[0] != num_nodes:
+            raise ValueError(
+                "calibrated_local_risk_router expects node_repr shaped [num_nodes, hidden_dim] "
+                "and aligned with the graph-wide node count."
+            )
+        src_repr = repr_np[src]
+        dst_repr = repr_np[dst]
+        src_norm = np.linalg.norm(src_repr, axis=1)
+        dst_norm = np.linalg.norm(dst_repr, axis=1)
+        cosine = np.sum(src_repr * dst_repr, axis=1) / np.clip(src_norm * dst_norm, 1e-8, None)
+        cosine = np.clip(cosine, -1.0, 1.0)
+        localized_similarity = 0.5 * (cosine + 1.0)
+        edge_weight = np.exp(float(similarity_temperature) * localized_similarity).astype(np.float64)
+
+    channel_idx_in = rel
+    channel_idx_out = rel + 2
+    high_threshold = float(np.quantile(risk.astype(np.float64), float(high_quantile))) if risk.size else 0.0
+    low_threshold = float(np.quantile(risk.astype(np.float64), float(low_quantile))) if risk.size else 0.0
+
+    channel_weight = np.zeros((4, num_nodes), dtype=np.float64)
+    channel_sum = np.zeros((4, num_nodes), dtype=np.float64)
+    channel_sq_sum = np.zeros((4, num_nodes), dtype=np.float64)
+    channel_count = np.zeros((4, num_nodes), dtype=np.float64)
+    channel_high_weight = np.zeros((4, num_nodes), dtype=np.float64)
+    channel_low_weight = np.zeros((4, num_nodes), dtype=np.float64)
+    channel_max_risk = np.zeros((4, num_nodes), dtype=np.float64)
+
+    np.add.at(channel_weight, (channel_idx_in, dst), edge_weight)
+    np.add.at(channel_sum, (channel_idx_in, dst), edge_weight * src_risk)
+    np.add.at(channel_sq_sum, (channel_idx_in, dst), edge_weight * (src_risk**2))
+    np.add.at(channel_count, (channel_idx_in, dst), 1.0)
+    np.add.at(channel_high_weight, (channel_idx_in, dst), edge_weight * (src_risk >= high_threshold).astype(np.float64))
+    np.add.at(channel_low_weight, (channel_idx_in, dst), edge_weight * (src_risk <= low_threshold).astype(np.float64))
+    np.maximum.at(channel_max_risk, (channel_idx_in, dst), src_risk)
+
+    np.add.at(channel_weight, (channel_idx_out, src), edge_weight)
+    np.add.at(channel_sum, (channel_idx_out, src), edge_weight * dst_risk)
+    np.add.at(channel_sq_sum, (channel_idx_out, src), edge_weight * (dst_risk**2))
+    np.add.at(channel_count, (channel_idx_out, src), 1.0)
+    np.add.at(channel_high_weight, (channel_idx_out, src), edge_weight * (dst_risk >= high_threshold).astype(np.float64))
+    np.add.at(channel_low_weight, (channel_idx_out, src), edge_weight * (dst_risk <= low_threshold).astype(np.float64))
+    np.maximum.at(channel_max_risk, (channel_idx_out, src), dst_risk)
+
+    total_weight = channel_weight.sum(axis=0)
+    total_count = channel_count.sum(axis=0)
+    total_sum = channel_sum.sum(axis=0)
+    total_sq_sum = channel_sq_sum.sum(axis=0)
+
+    base_prior = risk.astype(np.float64)[None, :]
+    channel_mean = np.repeat(base_prior, channel_sum.shape[0], axis=0)
+    weighted_mask = channel_weight > 0
+    channel_mean[weighted_mask] = channel_sum[weighted_mask] / channel_weight[weighted_mask]
+    shrink = channel_count / (channel_count + float(shrinkage_tau))
+    channel_mean = shrink * channel_mean + (1.0 - shrink) * base_prior
+
+    channel_var = np.zeros_like(channel_sum, dtype=np.float64)
+    channel_var[weighted_mask] = np.clip(
+        channel_sq_sum[weighted_mask] / channel_weight[weighted_mask] - (channel_sum[weighted_mask] / channel_weight[weighted_mask]) ** 2,
+        0.0,
+        None,
+    )
+    channel_std = np.sqrt(channel_var)
+    channel_high_mass = np.zeros_like(channel_sum, dtype=np.float64)
+    channel_low_mass = np.zeros_like(channel_sum, dtype=np.float64)
+    channel_high_mass[weighted_mask] = channel_high_weight[weighted_mask] / channel_weight[weighted_mask]
+    channel_low_mass[weighted_mask] = channel_low_weight[weighted_mask] / channel_weight[weighted_mask]
+
+    mean_in_rel0 = channel_mean[0].astype(np.float32)
+    mean_in_rel1 = channel_mean[1].astype(np.float32)
+    mean_out_rel0 = channel_mean[2].astype(np.float32)
+    mean_out_rel1 = channel_mean[3].astype(np.float32)
+
+    mean_in = (0.5 * (channel_mean[0] + channel_mean[1])).astype(np.float32)
+    mean_out = (0.5 * (channel_mean[2] + channel_mean[3])).astype(np.float32)
+    neighbor_mean = np.zeros(num_nodes, dtype=np.float64)
+    valid_neighbors = total_weight > 0
+    neighbor_mean[valid_neighbors] = total_sum[valid_neighbors] / total_weight[valid_neighbors]
+    neighbor_var = np.zeros(num_nodes, dtype=np.float64)
+    neighbor_var[valid_neighbors] = np.clip(
+        total_sq_sum[valid_neighbors] / total_weight[valid_neighbors] - neighbor_mean[valid_neighbors] ** 2,
+        0.0,
+        None,
+    )
+    neighbor_std = np.sqrt(neighbor_var).astype(np.float32)
+    risk_gap = np.abs(mean_in - mean_out).astype(np.float32)
+    relation_gap_in = np.abs(channel_mean[0] - channel_mean[1]).astype(np.float32)
+    relation_gap_out = np.abs(channel_mean[2] - channel_mean[3]).astype(np.float32)
+    channel_peak_risk = np.max(channel_mean, axis=0).astype(np.float32)
+    channel_peak_std = np.max(channel_std, axis=0).astype(np.float32)
+    high_risk_mass_peak = np.max(channel_high_mass, axis=0).astype(np.float32)
+    low_risk_mass_peak = np.max(channel_low_mass, axis=0).astype(np.float32)
+    channel_conflict_peak = np.max(np.minimum(channel_high_mass, channel_low_mass), axis=0).astype(np.float32)
+    similarity_weight_mean = np.zeros(num_nodes, dtype=np.float32)
+    similarity_weight_mean[valid_neighbors] = (total_weight[valid_neighbors] / np.clip(total_count[valid_neighbors], 1.0, None)).astype(np.float32)
+    effective_neighbor_count = total_count.astype(np.float32)
+    neighbor_risk_max = np.max(channel_max_risk, axis=0).astype(np.float32)
+
+    return {
+        "mean_in_rel0_risk": mean_in_rel0,
+        "mean_in_rel1_risk": mean_in_rel1,
+        "mean_out_rel0_risk": mean_out_rel0,
+        "mean_out_rel1_risk": mean_out_rel1,
+        "mean_in_risk": mean_in,
+        "mean_out_risk": mean_out,
+        "neighbor_risk_std": neighbor_std,
+        "neighbor_risk_max": neighbor_risk_max,
+        "risk_gap_in_out": risk_gap,
+        "relation_gap_in": relation_gap_in,
+        "relation_gap_out": relation_gap_out,
+        "channel_peak_risk": channel_peak_risk,
+        "channel_peak_std": channel_peak_std,
+        "high_risk_mass_peak": high_risk_mass_peak,
+        "low_risk_mass_peak": low_risk_mass_peak,
+        "channel_conflict_peak": channel_conflict_peak,
+        "similarity_weight_mean": similarity_weight_mean,
+        "effective_neighbor_count": effective_neighbor_count,
+    }
+
+
+class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
+    metadata = {
+        "claim_role": "stage2_calibrated_local_risk_router",
+        "stage2_role": "posthoc_calibrated_local_graph_ranker",
+        "canonical_stage2": False,
+        "scientific_gate": "posterior_calibration_then_local_risk_aggregation",
+        "paper_identity": "Calibrated Local-Risk Conformal Router v2",
+        "paper_identity_risk": "low_if_router_only_no_classifier_claim",
+        "promotion_rule": "conformal_family_ablation_only",
+        "prediction_set_estimator": True,
+        "diagnosis_or_action": False,
+        "input_boundary": "frozen_gnn_posterior_plus_local_scalar_graph_risk",
+    }
+
+    SCORE_FAMILIES = {
+        "base_only": lambda r0, f: r0,
+        "local_dispersion_legacy": lambda r0, f: 0.70 * r0 + 0.20 * 0.5 * (f["mean_in_risk"] + f["mean_out_risk"]) + 0.10 * f["neighbor_risk_std"],
+        "direction_gap_legacy": lambda r0, f: 0.65 * r0 + 0.20 * 0.5 * (f["mean_in_risk"] + f["mean_out_risk"]) + 0.15 * f["risk_gap_in_out"],
+        "localized_peak_dispersion": lambda r0, f: (
+            0.58 * r0
+            + 0.17 * f["channel_peak_risk"]
+            + 0.10 * f["channel_peak_std"]
+            + 0.10 * f["high_risk_mass_peak"]
+            + 0.05 * f["risk_gap_in_out"]
+        ),
+        "directional_relation_conflict": lambda r0, f: (
+            0.55 * r0
+            + 0.15 * f["channel_peak_risk"]
+            + 0.10 * f["high_risk_mass_peak"]
+            + 0.10 * f["channel_conflict_peak"]
+            + 0.05 * f["risk_gap_in_out"]
+            + 0.025 * f["relation_gap_in"]
+            + 0.025 * f["relation_gap_out"]
+        ),
+        "peak_minus_safe_support": lambda r0, f: (
+            0.62 * r0
+            + 0.20 * f["channel_peak_risk"]
+            + 0.12 * f["high_risk_mass_peak"]
+            + 0.08 * f["channel_peak_std"]
+            - 0.12 * f["low_risk_mass_peak"]
+        ),
+        "asymmetric_localized_peak": lambda r0, f: (
+            0.56 * r0
+            + 0.14 * f["channel_peak_risk"]
+            + 0.10 * f["neighbor_risk_max"]
+            + 0.08 * f["high_risk_mass_peak"]
+            + 0.07 * f["risk_gap_in_out"]
+            + 0.025 * f["relation_gap_in"]
+            + 0.025 * f["relation_gap_out"]
+        ),
+    }
+
+    def __init__(self, alpha=0.20, budgets=RESIDUAL_RISK_PAPER_BUDGETS):
+        super().__init__(alpha=alpha, budgets=budgets)
+        self.selected_score_family = "base_only"
+        self.selected_score_family_metrics = {}
+        self.local_risk_features_ = {}
+        self.candidate_score_family_metrics = {}
+        self.split_selection_metadata = {}
+
+    def _base_scalar_risk(self, logits, probs):
+        posterior = self._posterior(logits=logits, probs=probs)
+        return self._prediction_set_payload(posterior)["abstain_risk"].astype(np.float32)
+
+    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        self.budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
+        labels_np = _labels_to_numpy(labels).astype(np.int64)
+        labeled_count = int(labels_np.shape[0])
+        tune_idx = kwargs.get("tune_idx")
+        cal_idx = kwargs.get("cal_idx")
+        tune_idx_np = _valid_index_array(tune_idx if tune_idx is not None else val_idx, labeled_count)
+        cal_idx_np = _valid_index_array(cal_idx if cal_idx is not None else val_idx, labeled_count)
+
+        super().fit(
+            logits=logits,
+            probs=probs,
+            labels=labels,
+            train_idx=train_idx,
+            val_idx=cal_idx_np,
+            edge_index=None,
+            edge_type=None,
+            node_repr=None,
+            **kwargs,
+        )
+        posterior = self._posterior(logits=logits, probs=probs)
+        preds = posterior.argmax(axis=1)
+        wrong = (preds[:labeled_count] != labels_np).astype(np.int32)
+        r0 = self._base_scalar_risk(logits, probs)
+        local_features = _relation_aware_scalar_risk_features(
+            r0,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+        )
+        self.local_risk_features_ = {name: values.astype(np.float32) for name, values in local_features.items()}
+        best_key = None
+        best_metrics = None
+        best_score = None
+        candidate_metrics = {}
+        for family_name, scorer in self.SCORE_FAMILIES.items():
+            score = np.clip(np.asarray(scorer(r0, self.local_risk_features_), dtype=np.float32), 0.0, 1.0)
+            metrics = residual_risk_metrics(wrong[tune_idx_np], score[tune_idx_np], budgets=(0.15,)) if tune_idx_np.size else {}
+            candidate_metrics[family_name] = metrics
+            family_score = (
+                float(metrics.get("utility_at_15", 0.0)),
+                float(metrics.get("auprc_error", float("-inf"))) if math.isfinite(float(metrics.get("auprc_error", float("nan")))) else float("-inf"),
+                float(metrics.get("auroc_error", float("-inf"))) if math.isfinite(float(metrics.get("auroc_error", float("nan")))) else float("-inf"),
+            )
+            if best_score is None or family_score > best_score:
+                best_score = family_score
+                best_key = family_name
+                best_metrics = metrics
+        self.selected_score_family = str(best_key or "base_only")
+        self.selected_score_family_metrics = dict(best_metrics or {})
+        self.candidate_score_family_metrics = dict(candidate_metrics)
+        self.split_selection_metadata = {
+            "tune_idx_count": int(tune_idx_np.size),
+            "cal_idx_count": int(cal_idx_np.size),
+            "family_selection_split": "tune_idx" if tune_idx is not None else "val_idx",
+            "conformal_threshold_split": "cal_idx" if cal_idx is not None else "val_idx",
+            "tune_cal_split_metadata": dict(kwargs.get("tune_cal_split_metadata", {})),
+        }
+        self.fit_summary = {
+            **dict(self.fit_summary),
+            "source": "calibrated_local_risk_router",
+            "fit_scope": "validation_split_labels_only_posterior_then_local_risk_v2",
+            "base_risk_source": "posthoc_calibrated_ranker",
+            "local_risk_contract": "relation_aware_scalar_risk_aggregation_v2",
+            "selected_score_family": self.selected_score_family,
+            "selected_score_family_metrics": dict(self.selected_score_family_metrics),
+            "candidate_score_family_metrics": dict(self.candidate_score_family_metrics),
+            "local_risk_features": list(self.local_risk_features_.keys()),
+            "posterior_smoothed": False,
+            "risk_object_smoothed": True,
+            "graph_context_used": edge_index is not None,
+            "edge_type_used": edge_type is not None,
+            "relation_channel_used": edge_type is not None,
+            "direction_channel_used": edge_index is not None,
+            "embedding_context_used": node_repr is not None,
+            "node_repr_used": node_repr is not None,
+            "localized_similarity_used": node_repr is not None,
+            "local_hop_contract": "one_hop_only",
+            "local_graph_scope": "relation_aware_directional_channels",
+            "literature_basis": [
+                "Localized Conformal Prediction",
+                "SNAPS",
+                "RR-GNN",
+                "CoRel",
+                "Post-hoc Calibrated Ranker",
+            ],
+            "literature_boundary": (
+                "Keeps posterior calibration scalar-only, then adjusts the risk object with localized 1-hop relation/direction-aware aggregation; "
+                "does not smooth posterior, does not introduce a learned router head, and uses tune/cal split discipline for family selection vs conformal calibration."
+            ),
+            **self.split_selection_metadata,
+        }
+        self.calibration_metadata = dict(self.fit_summary)
+        return self
+
+    def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        r0 = self._base_scalar_risk(logits, probs)
+        features = _relation_aware_scalar_risk_features(
+            r0,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+        )
+        scorer = self.SCORE_FAMILIES[self.selected_score_family]
+        return np.clip(np.asarray(scorer(r0, features), dtype=np.float32), 0.0, 1.0)
+
+    def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        posterior = self._posterior(logits=logits, probs=probs)
+        base_risk = self._prediction_set_payload(posterior)["abstain_risk"].astype(np.float32)
+        local_features = _relation_aware_scalar_risk_features(
+            base_risk,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+        )
+        scorer = self.SCORE_FAMILIES[self.selected_score_family]
+        risk_score = np.clip(np.asarray(scorer(base_risk, local_features), dtype=np.float32), 0.0, 1.0)
+        labels_np = _labels_to_numpy(labels).astype(np.int64)
+        labeled_count = int(labels_np.shape[0])
+        preds = posterior.argmax(axis=1)
+        preds_labeled = preds[:labeled_count]
+        pred_label_score = posterior[np.arange(posterior.shape[0]), preds]
+        wrong = (preds_labeled != labels_np).astype(np.int32)
+        val_idx_np = _valid_index_array(val_idx, labeled_count)
+        test_idx_np = _valid_index_array(test_idx, labeled_count)
+        budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
+        if self.val_threshold is None:
+            budget = budgets[0] if budgets else RESIDUAL_RISK_PAPER_BUDGETS[0]
+            k = max(int(len(val_idx_np) * float(budget)), 1) if val_idx_np.size else 0
+            self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
+        metadata = {
+            **dict(self.calibration_metadata),
+            "source": "calibrated_local_risk_router",
+            "threshold_source": "validation_calibrated_local_risk",
+            "base_risk_source": "posthoc_calibrated_ranker",
+            "local_risk_contract": "relation_aware_scalar_risk_aggregation_v2",
+            "selected_score_family": self.selected_score_family,
+            "selected_score_family_metrics": dict(self.selected_score_family_metrics),
+            "candidate_score_family": dict(self.candidate_score_family_metrics),
+            "local_risk_features": list(local_features.keys()),
+            "posterior_smoothed": False,
+            "risk_object_smoothed": True,
+            "embedding_context_used": node_repr is not None,
+            "node_repr_used": node_repr is not None,
+        }
+        return {
+            "risk_score": risk_score,
+            "router_score": risk_score,
+            "abstain_risk": base_risk,
+            "pred_label_score": pred_label_score.astype(np.float32),
+            "local_risk_features": {name: values.astype(np.float32).tolist() for name, values in local_features.items()},
+            "selected_score_family": self.selected_score_family,
+            "selected_score_family_metrics": dict(self.selected_score_family_metrics),
+            "candidate_score_family": dict(self.candidate_score_family_metrics),
+            "base_risk_source": "posthoc_calibrated_ranker",
+            "thresholds": {
+                "validation_risk_threshold": float(self.val_threshold),
+                "conformal_nonconformity_threshold": float(self.threshold if self.threshold is not None else 1.0),
+            },
+            "calibration_metadata": metadata,
+            "hcw_mask": ((1.0 - posterior[:labeled_count].max(axis=1)) < 0.1) & (wrong == 1),
+            "validation_metrics": _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=budgets) if val_idx_np.size else {},
+            "test_metrics": _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=budgets) if test_idx_np.size else {},
+        }
+
+    def state_dict_payload(self):
+        return {
+            "alpha": float(self.alpha),
+            "graph_smoothing": 0.0,
+            "threshold": float(self.threshold if self.threshold is not None else 1.0),
+            "num_classes": self.num_classes,
+            "fit_summary": self.fit_summary,
+            "selected_score_family": self.selected_score_family,
         }
 
 
@@ -2303,8 +2724,10 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
         payload = self._prediction_set_payload_from_scores(scores)
         risk_score = payload["router_score"].astype(np.float32)
         labels_np = _labels_to_numpy(labels)
+        labeled_count = int(labels_np.shape[0])
         preds = posterior.argmax(axis=1)
-        wrong = (preds != labels_np).astype(np.int32)
+        preds_labeled = preds[:labeled_count]
+        wrong = (preds_labeled != labels_np).astype(np.int32)
         val_idx_np = _valid_index_array(val_idx, wrong.shape[0])
         test_idx_np = _valid_index_array(test_idx, wrong.shape[0])
         if self.val_threshold is None:
@@ -2335,7 +2758,7 @@ class GNN2HopConformalEstimator(GraphConformalSetEstimator):
                 "conformal_nonconformity_threshold": float(self.threshold if self.threshold is not None else 1.0),
             },
             "calibration_metadata": metadata,
-            "hcw_mask": ((1.0 - posterior.max(axis=1)) < 0.1) & (wrong == 1),
+            "hcw_mask": ((1.0 - posterior[:labeled_count].max(axis=1)) < 0.1) & (wrong == 1),
             "validation_metrics": _safe_router_metrics(wrong[val_idx_np], risk_score[val_idx_np], budgets=self.budgets) if val_idx_np.size else {},
             "test_metrics": _safe_router_metrics(wrong[test_idx_np], risk_score[test_idx_np], budgets=self.budgets) if test_idx_np.size else {},
         }
@@ -2873,6 +3296,8 @@ def build_estimator(mode):
         return MSPTemperatureEstimator()
     if mode == "posthoc_calibrated_ranker":
         return PostHocCalibratedRanker()
+    if mode == "calibrated_local_risk_router":
+        return CalibratedLocalRiskRouter()
     if mode == "login_uncertainty_router":
         return LOGINUncertaintyRouter()
     if mode == "graph_conformal_set_estimator":

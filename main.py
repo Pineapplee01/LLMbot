@@ -591,11 +591,11 @@ def _validate_graph_data_variant(args, execution_stage):
     variant = str(getattr(args, "graph_data_variant", "labeled")).lower()
     if variant == "labeled":
         return
-    supported = {"graph_detector_prepare", "joint_router_refinement"}
+    supported = {"graph_detector_prepare", "joint_router_refinement", "estimator_ablation"}
     if execution_stage not in supported:
         raise ValueError(
             "graph_data_variant=full_graph_support is currently supported only for "
-            "graph_detector_prepare and joint_router_refinement."
+            "graph_detector_prepare, estimator_ablation, and joint_router_refinement."
         )
 
 
