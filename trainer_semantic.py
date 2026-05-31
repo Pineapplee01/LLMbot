@@ -4,10 +4,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score
+from torch_geometric.nn.models import MLP
 
 from model_building import _labels_to_index, build_LM_model
 from runtime_env import _max_cuda_memory_allocated, _reset_cuda_peak_memory_stats, _resolve_device
-from utils import build_preparation_dir, capture_code_metadata, write_json, write_text, write_torch
+from utils import build_preparation_dir, capture_code_metadata, safe_torch_load, write_json, write_text, write_torch
 
 
 def _as_long_cpu_tensor(idx):
@@ -103,6 +104,228 @@ def _classification_metrics_from_logits(logits, labels, idx):
     return scores
 
 
+def _resolve_embedding_classifier_command(args):
+    keys = [
+        "experiment_task",
+        "dataset",
+        "reset_split",
+        "seeds",
+        "embedding_path",
+        "semantic_encoder",
+        "LM_classifier_n_layers",
+        "LM_classifier_hidden_dim",
+        "dropout",
+        "lm_learning_rate",
+        "lm_weight_decay",
+        "semantic_train_limit",
+        "experiment_name",
+        "artifact_root",
+        "device",
+        "disable_wandb",
+    ]
+    parts = ["python", "main.py"]
+    for key in keys:
+        if not hasattr(args, key):
+            continue
+        value = getattr(args, key)
+        if isinstance(value, bool):
+            if value:
+                parts.append(f"--{key}")
+            continue
+        if value is not None:
+            parts.extend([f"--{key}", str(value)])
+    return " ".join(parts)
+
+
+def _resolve_cached_semantic_embeddings(args, data, seed):
+    requested = getattr(args, "embedding_path", None)
+    if requested:
+        path = Path(requested)
+        source = "embedding_path"
+    else:
+        from model_building import resolve_seed_aware_roberta_embedding_path
+
+        path = resolve_seed_aware_roberta_embedding_path(data, seed=seed)
+        source = "semantic_encoder_roberta_seed_aware_iter_-1"
+    if not path.exists():
+        raise FileNotFoundError(f"semantic_embedding_classifier could not find embeddings at {path}")
+    payload = safe_torch_load(path, map_location="cpu")
+    if isinstance(payload, dict):
+        if "embeddings" in payload and torch.is_tensor(payload["embeddings"]):
+            payload = payload["embeddings"]
+        else:
+            raise ValueError("semantic_embedding_classifier expects a tensor or a payload with 'embeddings'.")
+    if not torch.is_tensor(payload) or payload.dim() != 2:
+        raise ValueError("semantic_embedding_classifier expects a 2-D embedding tensor.")
+    return payload.detach().cpu().float(), path, source
+
+
+def run_semantic_embedding_classifier_seed(args, seed, data, experiment_root, run):
+    stage_dir = build_preparation_dir(experiment_root, "semantic_embedding_classifier")
+    code_provenance = capture_code_metadata(Path(__file__).resolve().parents[1])
+    manifest = {
+        "contract": "semantic_embedding_classifier_v1",
+        "status": "started",
+        "seed": int(seed),
+        "canonical_task_name": "semantic_embedding_classifier",
+        "dataset": getattr(args, "dataset", "unknown"),
+        "dataset_path": str(data.get("dataset_path", "")),
+        "training_scope": "train_idx_supervised_cached_embedding_classifier",
+        "notes": "Direct classification over cached semantic embeddings under the frozen SimTeG/LMBot contract.",
+        "command": _resolve_embedding_classifier_command(args),
+        "code_commit": code_provenance["commit"],
+        "code_provenance": code_provenance,
+        "deprecated_cli_flags": list(getattr(args, "deprecated_cli_flags", [])),
+        "stage_visibility": "public",
+        "artifact_namespace": "preparation/semantic_embedding_classifier",
+        "invocation": {
+            "requested_task": getattr(args, "requested_experiment_task", getattr(args, "experiment_task", None)),
+            "resolved_task": "semantic_embedding_classifier",
+        },
+    }
+    write_json(stage_dir / "manifest.json", manifest)
+    write_text(stage_dir / "command.txt", manifest["command"] + "\n")
+
+    try:
+        device = _resolve_device(getattr(args, "device", -1))
+        if device.type == "cuda":
+            _reset_cuda_peak_memory_stats(device)
+        labels = _labels_to_index(data["labels"]).cpu()
+        embeddings, embedding_path, embedding_source = _resolve_cached_semantic_embeddings(args, data, seed)
+        if int(embeddings.shape[0]) != int(labels.numel()):
+            raise ValueError(
+                f"semantic_embedding_classifier row mismatch: embeddings={int(embeddings.shape[0])}, labels={int(labels.numel())}"
+            )
+        train_idx = _select_semantic_train_idx(
+            data["train_idx"],
+            getattr(args, "semantic_train_limit", 0),
+            seed,
+        )
+        valid_idx = _as_long_cpu_tensor(data["valid_idx"])
+        test_idx = _as_long_cpu_tensor(data["test_idx"])
+        if train_idx.numel() == 0:
+            raise ValueError("semantic_embedding_classifier requires a non-empty train_idx.")
+
+        model = MLP(
+            in_channels=int(embeddings.shape[1]),
+            hidden_channels=int(getattr(args, "LM_classifier_hidden_dim", 128)),
+            out_channels=2,
+            num_layers=int(getattr(args, "LM_classifier_n_layers", 2)),
+            dropout=float(getattr(args, "dropout", 0.4)),
+            act=str(getattr(args, "activation", "leakyrelu")),
+            norm="batch_norm",
+        ).to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(getattr(args, "lr_LM", getattr(args, "lm_learning_rate", 1e-5))),
+            weight_decay=float(getattr(args, "weight_decay_LM", getattr(args, "lm_weight_decay", 0.01))),
+        )
+        max_epochs = max(int(getattr(args, "LM_pretrain_epochs", 5)), 1)
+        losses = []
+        best_state = None
+        best_valid = (-float("inf"), -float("inf"))
+        best_epoch = -1
+        x_all = embeddings.to(device)
+        y_all = labels.to(device)
+        train_x = x_all[train_idx.to(device)]
+        train_y = y_all[train_idx.to(device)]
+        valid_idx_device = valid_idx.to(device)
+
+        for epoch in range(max_epochs):
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            logits_train = model(train_x)
+            loss = F.cross_entropy(logits_train, train_y)
+            loss.backward()
+            optimizer.step()
+            loss_value = float(loss.detach().cpu().item())
+            losses.append(loss_value)
+            run.log({"semantic_embedding_classifier_loss": loss_value, "semantic_embedding_classifier_epoch": epoch + 1})
+
+            model.eval()
+            with torch.no_grad():
+                logits_all = model(x_all).cpu()
+            valid_scores = _classification_metrics_from_logits(logits_all, labels, valid_idx)
+            score_tuple = (float(valid_scores["macro_f1"]), float(valid_scores["accuracy"]))
+            if score_tuple > best_valid:
+                best_valid = score_tuple
+                best_epoch = int(epoch)
+                best_state = {
+                    "model": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
+                    "valid_scores": dict(valid_scores),
+                }
+
+        if best_state is None:
+            raise RuntimeError("semantic_embedding_classifier failed to record a best checkpoint.")
+
+        model.load_state_dict(best_state["model"])
+        model.eval()
+        with torch.no_grad():
+            logits = model(x_all).cpu()
+        prob = torch.softmax(logits, dim=1)
+        pred = prob.argmax(dim=1)
+        outputs = {"logits": logits, "prob": prob, "pred": pred, "labels": labels}
+
+        write_torch(stage_dir / "outputs.pt", outputs)
+        write_torch(
+            stage_dir / "classifier.pt",
+            {
+                "model": best_state["model"],
+                "model_params": {
+                    "in_channels": int(embeddings.shape[1]),
+                    "hidden_channels": int(getattr(args, "LM_classifier_hidden_dim", 128)),
+                    "out_channels": 2,
+                    "num_layers": int(getattr(args, "LM_classifier_n_layers", 2)),
+                    "dropout": float(getattr(args, "dropout", 0.4)),
+                    "act": str(getattr(args, "activation", "leakyrelu")),
+                    "norm": "batch_norm",
+                },
+            },
+        )
+        write_torch(stage_dir / "embeddings_ref.pt", embeddings)
+
+        metrics = {
+            "losses": losses,
+            "final_loss": losses[-1] if losses else None,
+            "best_epoch": int(best_epoch),
+            "train": _classification_metrics_from_logits(logits, labels, train_idx),
+            "validation": _classification_metrics_from_logits(logits, labels, valid_idx),
+            "test": _classification_metrics_from_logits(logits, labels, test_idx),
+            "trainable_classifier_params": int(sum(param.numel() for param in model.parameters() if param.requires_grad)),
+            "cuda_max_memory_allocated": _max_cuda_memory_allocated(device),
+        }
+        write_json(stage_dir / "metrics.json", metrics)
+        manifest.update(
+            {
+                "status": "completed",
+                "embedding_path": str(embedding_path),
+                "embedding_source": str(embedding_source),
+                "embedding_dim": int(embeddings.shape[1]),
+                "embedding_row_count": int(embeddings.shape[0]),
+                "train_limit": int(train_idx.numel()),
+                "epochs": int(max_epochs),
+                "classifier_path": str(stage_dir / "classifier.pt"),
+                "outputs_path": str(stage_dir / "outputs.pt"),
+                "metrics_path": str(stage_dir / "metrics.json"),
+                "architecture": {
+                    "type": "cached_embedding_mlp",
+                    "hidden_dim": int(getattr(args, "LM_classifier_hidden_dim", 128)),
+                    "num_layers": int(getattr(args, "LM_classifier_n_layers", 2)),
+                    "dropout": float(getattr(args, "dropout", 0.4)),
+                    "activation": str(getattr(args, "activation", "leakyrelu")),
+                },
+            }
+        )
+        write_json(stage_dir / "manifest.json", manifest)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return {"stage": "semantic_embedding_classifier", "stage_dir": str(stage_dir), "metrics": metrics}
+    except Exception as exc:
+        manifest.update({"status": "failed", "error_type": type(exc).__name__, "error": str(exc)})
+        write_json(stage_dir / "manifest.json", manifest)
+        raise
+
+
 def _select_semantic_train_idx(train_idx, limit, seed):
     train_idx = _as_long_cpu_tensor(train_idx)
     if int(limit or 0) <= 0 or int(limit) >= int(train_idx.numel()):
@@ -115,7 +338,7 @@ def _select_semantic_train_idx(train_idx, limit, seed):
 
 def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
     stage_dir = build_preparation_dir(experiment_root, "semantic_encoder")
-    code_provenance = capture_code_metadata(Path(__file__).resolve().parents[2])
+    code_provenance = capture_code_metadata(Path(__file__).resolve().parents[1])
     manifest = {
         "contract": "semantic_finetune_v1",
         "status": "started",

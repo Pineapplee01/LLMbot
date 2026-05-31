@@ -1346,7 +1346,7 @@ def _deterministic_ego_explain_fallback(record):
             f"The account uses the display name {record['display_name'] or 'unknown'} and the handle @{record['screen_name'] or 'unknown'}.",
             f"It is verified={_format_bool(record['verified'])}, protected={_format_bool(record['protected'])}, and has followers={record['followers_count']} and following={record['following_count']}.",
             f"The account age bucket is {record['account_age_bucket']} and the posting density bucket is {record['posting_density_bucket']}.",
-            f"The bio is {_truncate_chars(record['bio'], 160) or 'missing'}, which is a useful cue for downstream bot detection.",
+            f"The bio is {_truncate_chars(record['bio'], 160) or 'missing'}, which provides additional profile context.",
         ]
     )
 
@@ -1357,7 +1357,7 @@ def _deterministic_tweet_explain_fallback(record, tweet_stats):
             f"The account shows a posting density bucket of {record['posting_density_bucket']} and a tweet count of {tweet_stats['tweet_count']}.",
             f"Its retweet ratio is {tweet_stats['rt_ratio']:.2f}, url ratio is {tweet_stats['url_ratio']:.2f}, and hashtag ratio is {tweet_stats['hashtag_ratio']:.2f}.",
             f"The average tweet length bucket is {tweet_stats['avg_tweet_len_bucket']} with duplicate ratio {tweet_stats['duplicate_ratio']:.2f}.",
-            f"These cues summarize how the account posts content for downstream bot detection.",
+            "These cues summarize the account's observable posting style and content behavior.",
         ]
     )
 
@@ -1375,7 +1375,7 @@ def _deterministic_graph_explain_fallback(direction_name, total_count, reciproca
             f"The account {label} {int(total_count)} directed neighbors in this view.",
             f"The selected reciprocal ratio is {float(reciprocal_ratio_selected):.2f}.",
             neighbor_text,
-            "This summary provides social-role evidence for downstream bot detection.",
+            "This summary captures the directed neighborhood evidence in this view.",
         ]
     )
 
@@ -1388,11 +1388,27 @@ def _deterministic_conflict_explain_fallback(row):
         hint_text = "The profile, posting behavior, and social neighborhood do not expose a strong explicit mismatch cue."
     return " ".join(
         [
-            "Cross-view evidence should be judged by consistency between profile cues, posting behavior, and directed neighborhood role.",
+            "Cross-view evidence can be summarized by comparing profile cues, posting behavior, and directed neighborhood role.",
             hint_text,
-            "This summary preserves cross-view conflict evidence for downstream bot detection.",
+            "This summary preserves the main agreements, tensions, and missing evidence across views.",
         ]
     )
+
+
+def _summary_generation_system():
+    return (
+        "You summarize social-media account evidence. "
+        "Be concise, balanced, and faithful to the provided evidence."
+    )
+
+
+def _summary_prompt_rules():
+    return [
+        "Write 3-4 short evidence-grounded sentences.",
+        "Summarize both organic-looking and automation-looking cues when they are visible.",
+        "If the evidence is weak, mixed, or missing, say so explicitly.",
+        "Do not output a final human/bot label, confidence score, or recommendation.",
+    ]
 
 
 def _expert_embedding_prompt(component_name, explanation_text):
@@ -1406,18 +1422,18 @@ def _expert_embedding_prompt(component_name, explanation_text):
     explanation_text = _compact_whitespace(explanation_text)
     component_label = label_map.get(component_name, component_name.replace("_", " "))
     return (
-        f"Instruct: Encode the {component_label} bot-detection explanation for downstream classification.\n"
-        f"Query: [EXPLANATION] {explanation_text} </END>"
+        f"Instruct: Encode the {component_label} evidence summary for downstream reasoning.\n"
+        f"Query: [SUMMARY] {explanation_text} </END>"
     )
 
 
 def _tweet_explain_generation_prompt(record, tweet_stats):
-    system = "You analyze Twitter accounts for bot detection."
+    system = _summary_generation_system()
     user = "\n".join(
         [
-            "Explain how this account posts content for social bot detection.",
-            "Focus on repetition, promotion intensity, conversationality, topical consistency, and automation cues.",
-            "Write 4-6 evidence-grounded sentences and do not output only a label.",
+            "Summarize this account's posting behavior from the provided tweet evidence.",
+            "Focus on recurring content patterns, interaction style, topical consistency, and any clear anomalies in the sampled tweets.",
+            *_summary_prompt_rules(),
             "PROFILE_CUE:",
             _profile_cue_summary(record, include_identity=True),
             "TWEET_BEHAVIOR_SUMMARY:",
@@ -1555,15 +1571,21 @@ def _attach_raw_tweet_records(records, raw_tweet_bundle, args):
 
 def _graph_explain_generation_prompt(direction_name, ego_record, neighbor_records, summary):
     if direction_name == "following":
-        task_line = "Explain who this account chooses to follow and what that implies about social role, affiliation, coordination, fandom, promotion, or organic behavior."
+        task_line = (
+            "Summarize who this account chooses to follow in this directed view. "
+            "Describe the dominant neighbor themes, notable support/contrast examples, and whether the view looks coherent, mixed, or sparse."
+        )
         heading = "FOLLOWING_NEIGHBORS:"
     else:
-        task_line = "Explain who follows this account and what that implies about audience, amplification, credibility, or suspicious coordination."
+        task_line = (
+            "Summarize who follows this account in this directed view. "
+            "Describe the dominant audience themes, notable support/contrast examples, and whether the view looks coherent, mixed, or sparse."
+        )
         heading = "FOLLOWER_NEIGHBORS:"
     user = "\n".join(
         [
             task_line,
-            "Write 4-6 evidence-grounded sentences and do not output only a label.",
+            *_summary_prompt_rules(),
             "EGO_PROFILE_CUE:",
             _profile_cue_summary(ego_record, include_identity=True),
             "DIRECTIONAL_SUMMARY:",
@@ -1576,7 +1598,7 @@ def _graph_explain_generation_prompt(direction_name, ego_record, neighbor_record
         ]
     )
     return {
-        "system": "You analyze Twitter accounts for bot detection.",
+        "system": _summary_generation_system(),
         "user": user,
         "fallback_explanation": _deterministic_graph_explain_fallback(
             direction_name,
@@ -1592,9 +1614,9 @@ def _conflict_explain_generation_prompt(row):
     mismatch_hints = list(row.get("conflict_mismatch_hints", []) or [])
     user = "\n".join(
         [
-            "Explain the cross-view consistency and contradiction cues for social bot detection.",
-            "Identify the main consistencies, the main conflicts, and which evidence stream should be trusted more.",
-            "Write 4-6 evidence-grounded sentences and do not output only a label.",
+            "Summarize the main consistencies, tensions, and unresolved gaps across the profile, tweet, following, and follower views.",
+            "When one view is weak because evidence is sparse or noisy, state that limitation instead of resolving the label.",
+            *_summary_prompt_rules(),
             "PROFILE_CUE_SUMMARY:",
             row.get("profile_cue_summary", ""),
             "TWEET_EXPERT_SUMMARY:",
@@ -1608,7 +1630,7 @@ def _conflict_explain_generation_prompt(row):
         ]
     )
     return {
-        "system": "You analyze Twitter accounts for bot detection.",
+        "system": _summary_generation_system(),
         "user": user,
         "fallback_explanation": _deterministic_conflict_explain_fallback(row),
         "prompt_role": "conflict_explainer",
@@ -1852,11 +1874,11 @@ def _fallback_explanation_text(row):
     if profile_card:
         return " ".join(
             [
-                "The profile provides limited generated explanation output.",
+                "The profile provides limited generated summary output.",
                 _compact_whitespace(profile_card)[:320],
             ]
         ).strip()
-    return "The profile provides limited generated explanation output."
+    return "The profile provides limited generated summary output."
 
 
 def _deterministic_explanations(generation_rows):
@@ -2457,11 +2479,11 @@ def _conflict_prompt_partitioned(
 
 
 def _ego_explain_generation_prompt(record):
-    system = "You analyze Twitter accounts for bot detection."
+    system = _summary_generation_system()
     user = "\n".join(
         [
-            "Given the profile card below, write a short explanation covering identity consistency, social reach, activity pattern, suspicious cues, and an overall judgment tendency.",
-            "Do not output a label only; output 4-6 evidence-grounded sentences.",
+            "Summarize the profile card using identity presentation, reach/activity cues, and any missing or unusual profile fields.",
+            *_summary_prompt_rules(),
             "PROFILE_CARD:",
             _profile_card(record, brief=False),
         ]

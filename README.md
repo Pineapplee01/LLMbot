@@ -352,6 +352,7 @@ The parser currently exposes these canonical public tasks:
 
 - `distillation_pipeline`
 - `semantic_encoder_finetune`
+- `semantic_embedding_classifier`
 - `graph_detector_prepare`
 - `graph_calibration_prepare`
 - `local_conformal_diagnostic`
@@ -485,6 +486,15 @@ python main.py \
   --experiment_task semantic_encoder_finetune \
   --dataset TwiBot-20 \
   --semantic_encoder roberta_finetuned \
+  --seeds 1 \
+  --disable_wandb
+
+# Cached finetuned-RoBERTa embedding -> direct classifier
+# Trains a lightweight MLP on the existing embedding tensor only.
+python main.py \
+  --experiment_task semantic_embedding_classifier \
+  --dataset TwiBot-20 \
+  --embedding_path datasets/TwiBot-20/embeddings_iter_-1_seed_1.pt \
   --seeds 1 \
   --disable_wandb
 
@@ -727,8 +737,13 @@ Prompt-expert bundle v2 note:
   - `graph_follower`
   - `conflict`
 - All four components follow `explanation -> embedding`:
-  - a local instruct model writes an evidence-grounded explanation
-  - the current finetuned RoBERTa encoder embeds that explanation
+  - a local instruct model writes a compact evidence-centered summary
+  - the current finetuned RoBERTa encoder embeds that summary
+- v2 prompt semantics are summary-first instead of label-first:
+  - keep target-node cues relatively detailed
+  - keep directed neighborhood evidence compressed
+  - summarize consistencies, tensions, and missing evidence without asking the
+    LLM to decide `human` or `bot` inside the cache text
 - v2 explanation generation now reuses one loaded explain model for the whole
   precompute run instead of reloading it once per component.
 - `graph_following` and `graph_follower` remain separate because the two
@@ -786,6 +801,7 @@ Root-level modules are the default implementation surface:
 New writes use canonical namespaces:
 
 - `seed_<n>/preparation/semantic_encoder`
+- `seed_<n>/preparation/semantic_embedding_classifier`
 - `seed_<n>/preparation/graph_detector`
 - `seed_<n>/preparation/graph_calibrator`
 - `seed_<n>/stages/<canonical_task_name>`

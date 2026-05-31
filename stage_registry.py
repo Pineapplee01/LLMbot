@@ -68,6 +68,18 @@ STAGE_REGISTRY: Dict[str, StageSpec] = {
         graph_data_mode="none",
         artifact_namespace="preparation/semantic_encoder",
     ),
+    "semantic_embedding_classifier": _spec(
+        "semantic_embedding_classifier",
+        legacy_names=("lm_embedding_classifier",),
+        visibility="public",
+        family="preparation",
+        runner_kind="semantic_embedding_classifier",
+        claim_grade_allowed=False,
+        requires_canonical_split=True,
+        forces_use_gnn=False,
+        graph_data_mode="none",
+        artifact_namespace="preparation/semantic_embedding_classifier",
+    ),
     "graph_detector_prepare": _spec(
         "graph_detector_prepare",
         legacy_names=("frozen_g0",),

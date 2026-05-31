@@ -575,24 +575,24 @@ def _normalize_semantic_payload(payload):
 
 
 def _refiner_feature_lookup(refiner_features, batch_idx, semantic_view_mode, device):
-    batch_idx = batch_idx.to(device=device)
+    batch_idx_cpu = batch_idx.detach().cpu()
     if isinstance(refiner_features, dict) and _is_prompt_expert_feature_kind(refiner_features.get("feature_kind")):
         return {
             "feature_kind": str(refiner_features.get("feature_kind", "prompt_expert_bundle")),
             "semantic_view_mode": str(refiner_features.get("semantic_view_mode", semantic_view_mode)),
-            "z_gnn": refiner_features["z_gnn"][batch_idx].to(device),
+            "z_gnn": refiner_features["z_gnn"][batch_idx_cpu].to(device),
             "semantic_views": {
-                key: value[batch_idx].to(device)
+                key: value[batch_idx_cpu].to(device)
                 for key, value in refiner_features["semantic_views"].items()
                 if torch.is_tensor(value) and value.dim() == 2
             },
-            "structural_features": refiner_features["structural_features"][batch_idx].to(device),
-            "graph_gate_features": refiner_features["graph_gate_features"][batch_idx].to(device),
-            "mpe_gate_features": refiner_features["mpe_gate_features"][batch_idx].to(device)
+            "structural_features": refiner_features["structural_features"][batch_idx_cpu].to(device),
+            "graph_gate_features": refiner_features["graph_gate_features"][batch_idx_cpu].to(device),
+            "mpe_gate_features": refiner_features["mpe_gate_features"][batch_idx_cpu].to(device)
             if "mpe_gate_features" in refiner_features
             else None,
         }
-    return refiner_features[batch_idx].to(device)
+    return refiner_features[batch_idx_cpu].to(device)
 
 
 class GlanceStageMixin:
@@ -3895,7 +3895,8 @@ class GlanceStageMixin:
                 router_prob_all[batch_idx] = batch_prob
                 k = min(max(int(top_k), 1), int(batch_idx.numel()))
                 routed_rel = torch.topk(batch_score, k=k, largest=True, sorted=False).indices
-                routed_idx = batch_idx[routed_rel]
+                routed_rel_cpu = routed_rel.detach().cpu()
+                routed_idx = batch_idx[routed_rel_cpu]
                 routed_mask[routed_idx] = True
                 routed_forward = self._glance_refiner_forward(
                     refiner_model,
@@ -4266,9 +4267,10 @@ class GlanceStageMixin:
                     batch_route_score, batch_route_prob = router_model(batch_router)
                 k = min(max(int(train_k), 1), int(batch_idx.numel()))
                 routed_rel = torch.topk(batch_route_score, k=k, largest=True, sorted=False).indices
+                routed_rel_cpu = routed_rel.detach().cpu()
                 routed_mask = torch.zeros(batch_idx.numel(), dtype=torch.bool, device=self.device)
                 routed_mask[routed_rel] = True
-                routed_idx = batch_idx[routed_rel]
+                routed_idx = batch_idx[routed_rel_cpu]
                 routed_labels = labels_t[routed_idx].to(self.device)
                 routed_forward = self._glance_refiner_forward(
                     refiner_model,
