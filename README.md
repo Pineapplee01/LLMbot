@@ -221,6 +221,7 @@ python precompute.py \
   --explain_batch_size 0 \
   --explain_max_new_tokens 128 \
   --explain_log_every 50 \
+  --explain_quality_gate true \
   --project_name llmbot-precompute \
   --experiment_name prompt_expert_v2 \
   --output_path datasets/TwiBot-20/glance_prompt_expert_concat_v2_roberta_finetuned_embed.pt
@@ -229,6 +230,11 @@ python precompute.py \
 Use `--model_path roberta_finetuned` or `--model_path /path/to/local/finetuned-roberta`
 when you want to make the encoder choice explicit. Passing `--model_path
 roberta-base` remains a valid ablation, but it is no longer the v2 default.
+`--explain_quality_gate true` is the default for explanation-first expert runs:
+it refuses to reuse empty, punctuation-only, or prompt-echo explanation sidecars
+and regenerates those rows instead. For routed-node reruns after a bad cache,
+prefer a new output stem or a clean `--explain_component_cache_dir` so the
+quality gate cannot be bypassed by stale artifacts.
 
 Example raw tweet smoke:
 
@@ -692,6 +698,10 @@ Prompt-cache experiment note:
   - graph-wide
   - or a labeled-prefix prompt-expert bundle aligned to the routed labeled
     nodes
+- If a graph-wide prompt-expert payload is paired with a labeled-only frozen
+  backbone through `--external_frozen_g0_root`, `joint_router_refinement` slices
+  the prompt-expert components and `target_node_mask` to the labeled prefix
+  before training the refiner.
 - When a high-performing backbone artifact already exists, the same ablation
   can be run read-only through `--external_frozen_g0_root` together with
   `--joint_refiner_embedding_path`, so the prompt cache changes only the
@@ -721,6 +731,9 @@ Prompt-expert bundle v1 note:
   `count_following/count_follower/has_following/has_follower`, and
   center-induced bundles append candidate-count, selected-count, mean-similarity,
   and reciprocal-ratio statistics.
+  Prompt-expert refiner diagnostics now also record whether a node was actually
+  eligible for prompt-based refinement, so routed-set ablations can separate
+  "not selected" from "not eligible".
 - When `--joint_refiner_explicit_gate --joint_refiner_target_mode keep_change`
   is used with `prompt_expert_bundle_v1`, the prompt-expert refiner also emits
   an abstain gate. `--joint_refiner_gate_target utility_positive` trains that
@@ -752,21 +765,48 @@ Prompt-expert bundle v2 note:
 - v2 keeps prompt-side metadata compressed into natural-language-friendly cues
   (`account_age_bucket`, `follow_ratio_bucket`, `posting_density_bucket`,
   `verified/protected`, `bio_present`) while exact counts and rates stay in the
-  refiner side channel.
+  refiner side channel. It also writes `metadata_structured`, a non-prompt
+  structured metadata expert built from profile logs, ratios, missingness
+  indicators, and bucket one-hots.
 - The strict refiner still uses the same routed projector architecture, but it
   now accepts `prompt_expert_bundle_v2`, keeps the graph-fusion gate on
   directional count/presence features only, and appends the full scalar
   side-channel after the projected expert embeddings.
 - Prompt-expert runs can choose the expert fusion head with
-  `--joint_prompt_expert_fusion {projector_concat,mpe_gated}`. The default
-  `projector_concat` preserves the existing projected-concat refiner;
-  `mpe_gated` is a GAugLLM-style refiner-only ablation that learns a
-  node-conditioned softmax over `graph_following`, `graph_follower`, `tweet`,
-  and `conflict` experts before classification. It does not change router
-  features, graph propagation, or prompt-cache construction.
+  `--joint_prompt_expert_fusion {projector_concat,mpe_gated,gaugllm_selector,raw_concat_single_graph_following,raw_concat_single_graph_follower,raw_concat_single_tweet,raw_concat_single_conflict,raw_concat_following_triplet,raw_concat_follower_triplet,raw_concat_metadata_anchor,raw_concat_metadata_only}`. The
+  default `projector_concat` preserves the existing projected-concat refiner;
+  `mpe_gated` keeps the existing refiner-only node-conditioned softmax over
+  `graph_following`, `graph_follower`, `tweet`, `conflict`, and
+  `metadata_structured`. `gaugllm_selector` is the strict runtime-reuse
+  selector transplant: it reuses the routed prompt cache recorded by
+  `--joint_refiner_embedding_path`, reads the adjacent
+  `<cache_stem>_manifest.json`, loads the four explanation sidecars
+  (`graph_following`, `graph_follower`, `tweet`, `conflict`) with duplicate
+  `node_id` rows resolved by last-row-wins, encodes one selector-context text
+  per routed node and expert with the same finetuned SimTeG RoBERTa line, and
+  applies a dual-branch context-aware softmax over those four experts only.
+  `metadata_structured` is not selectable in `gaugllm_selector`; it stays as a
+  structured side-channel and as node context for selector-text construction.
+  Both selector modes write per-node weights plus the selected expert into the
+  stage outputs. `raw_concat_single_*` modes remove
+  all expert projectors and `graph_fused`, then feed
+  `[z_gnn || one_raw_expert || structural_side_channel]` directly into the
+  routed-node MLP for expert-specialty diagnostics. `raw_concat_following_triplet`
+  removes all expert projectors and `graph_fused`, then feeds
+  `[z_gnn || graph_following || tweet || conflict || structural_side_channel]`
+  directly into the routed-node MLP. `raw_concat_follower_triplet` does the
+  same with `graph_follower` instead of `graph_following`, giving a clean
+  direction-comparison baseline without the duplicated fused graph slot.
+  `raw_concat_metadata_anchor` adds `metadata_structured` to the current
+  follower-triplet anchor, while `raw_concat_metadata_only` isolates the
+  structured metadata expert.
 - When `--routed_nodes_path` is used, the prompt cache records the explicit
   target source in the manifest, but still writes a full-graph tensor layout so
   the strict refiner can consume the cache without a separate scatter step.
+  These routed-targeted caches now also persist `target_node_ids` and a
+  full-graph `target_node_mask`, and `joint_router_refinement` uses that mask to
+  keep prompt-expert routing/application on the original routed set rather than
+  inferring scope from zero-filled rows.
 
 Frozen-router reuse note:
 
@@ -782,6 +822,22 @@ Frozen-router reuse note:
 - this path is the claim-grade comparison mode for refiner-only evidence
   upgrades because it keeps the routed set fixed while changing only the
   routed-node evidence/refiner branch
+- the standalone routed-node diagnostic script
+  `scripts/routed_explain_qwen3_embedding_mlp.py` now supports two diagnostic
+  modes:
+  - `--diagnostic_mode routed_classifier`:
+    - on-the-fly Qwen3 embedding generation through `--embedding_model_path`
+    - or an existing prompt-expert cache through
+      `--cached_embedding_path <cache.pt> --cached_embedding_key <tensor_key>`
+  - `--diagnostic_mode frozen_gnn_feature_swap`:
+    - explanation documents built from the routed-node expert sidecars
+    - encoded with a RoBERTa-family text encoder through `--roberta_model_path`
+    - then scattered back onto the routed node rows and replayed through the
+      original frozen GNN weights with no retraining
+- this keeps clean routed-node explain studies available in both forms:
+  - routed-node local classifier evidence
+  - frozen-backbone feature-replacement diagnostics bound to the same
+    high-base SimTeG root
 
 ## Mainline Layout
 

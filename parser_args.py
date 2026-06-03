@@ -517,11 +517,29 @@ def parser_args(argv=None):
         "--joint_prompt_expert_fusion",
         type=str,
         default="projector_concat",
-        choices=["projector_concat", "mpe_gated"],
+        choices=[
+            "projector_concat",
+            "mpe_gated",
+            "gaugllm_selector",
+            "raw_concat_single_graph_following",
+            "raw_concat_single_graph_follower",
+            "raw_concat_single_tweet",
+            "raw_concat_single_conflict",
+            "raw_concat_following_triplet",
+            "raw_concat_follower_triplet",
+            "raw_concat_metadata_anchor",
+            "raw_concat_metadata_only",
+        ],
         help=(
             "Fusion head for prompt-expert joint refiners. "
             "'projector_concat' preserves the existing projected concat path; "
-            "'mpe_gated' uses a GAugLLM-style node-conditioned softmax over graph_following, graph_follower, tweet, and conflict experts."
+            "'mpe_gated' uses the existing node-conditioned softmax over graph_following, graph_follower, tweet, conflict, and metadata_structured experts; "
+            "'gaugllm_selector' reuses routed explanation sidecars at runtime, encodes selector-context texts with the finetuned SimTeG RoBERTa line, and applies a strict 4-expert context-aware selector over graph_following, graph_follower, tweet, and conflict; "
+            "'raw_concat_single_*' concatenates z_gnn + one raw expert + structural side features without projectors; "
+            "'raw_concat_following_triplet' concatenates z_gnn + graph_following + tweet + conflict + structural side features without projectors; "
+            "'raw_concat_follower_triplet' concatenates z_gnn + graph_follower + tweet + conflict + structural side features without projectors; "
+            "'raw_concat_metadata_anchor' adds the structured metadata expert to the follower_triplet anchor; "
+            "'raw_concat_metadata_only' isolates z_gnn + metadata_structured + structural side features."
         ),
     )
     parser.add_argument(
@@ -545,7 +563,7 @@ def parser_args(argv=None):
             "Optional refiner-only semantic override for joint_router_refinement. "
             "Keeps graph_detector_prepare backbone features unchanged and only replaces the joint refiner semantic source. "
             "Accepts either a plain [num_nodes, d] tensor, a prompt-cache payload with ego/hop1/hop2 tensors, "
-            "or a prompt-expert bundle payload with ego/graph_following/graph_follower/tweet/conflict components."
+            "or a prompt-expert bundle payload with ego/graph_following/graph_follower/tweet/conflict/metadata_structured components."
         ),
     )
     parser.add_argument(

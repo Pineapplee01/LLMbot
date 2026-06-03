@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -59,7 +60,10 @@ PROMPT_FAMILY_VERSION_CHOICES = ("v1", "v2")
 NEIGHBOR_SAMPLING_CHOICES = ("auto", "uniform_random", "directional_heuristic", "center_induced_relation_aware")
 CENTER_NODE_SCOPE_CHOICES = ("labeled", "all_graph_nodes")
 EXPERT_COMPONENT_NAMES = ("ego", "graph_following", "graph_follower", "tweet", "conflict")
+EXPERT_STRUCTURED_COMPONENT_NAMES = ("metadata_structured",)
+EXPERT_COMPONENT_NAMES_WITH_STRUCTURED = EXPERT_COMPONENT_NAMES + EXPERT_STRUCTURED_COMPONENT_NAMES
 EXPERT_COMPONENT_NAMES_V2 = ("graph_following", "graph_follower", "tweet", "conflict")
+EXPERT_COMPONENT_NAMES_V2_WITH_STRUCTURED = EXPERT_COMPONENT_NAMES_V2 + EXPERT_STRUCTURED_COMPONENT_NAMES
 EXPERT_SCALAR_KEYS = (
     "count_following",
     "count_follower",
@@ -668,6 +672,34 @@ def _string_sha256(text):
     return digest.hexdigest()
 
 
+def _explanation_quality_issue(text):
+    text = str(text or "").strip()
+    if not text:
+        return "empty"
+    compact = "".join(text.split())
+    if compact and compact.count("!") > max(30, int(len(compact) * 0.2)):
+        return "many_exclamation_marks"
+    lowered = text.lower()
+    hard_echo_markers = (
+        "write 4-6 evidence-grounded sentences",
+        "do not output only a label",
+        "system\nyou analyze twitter accounts",
+    )
+    if any(marker in lowered for marker in hard_echo_markers):
+        return "prompt_echo"
+    if re.search(r"(?im)^\s*(system|user|assistant)\s*:?\s*$", text):
+        return "prompt_echo"
+    if re.search(r"(?im)^\s*(system|user|assistant)\s*:\s+", text):
+        return "prompt_echo"
+    if len(text) < 24:
+        return "too_short"
+    return ""
+
+
+def _is_explanation_quality_ok(text):
+    return not _explanation_quality_issue(text)
+
+
 def _coerce_node_id_sequence(value):
     if value is None:
         return []
@@ -722,10 +754,11 @@ def _load_explicit_target_node_ids(path: Path):
     return ordered
 
 
-def _load_resume_explanations(path: Path, component_name: str):
+def _load_resume_explanations(path: Path, component_name: str, quality_gate: bool = False):
     if not path or not Path(path).exists():
-        return {}
+        return {}, {}
     by_key = {}
+    rejected = defaultdict(int)
     for row in _read_jsonl(Path(path)):
         if str(row.get("component_name", component_name)) != str(component_name):
             continue
@@ -733,9 +766,16 @@ def _load_resume_explanations(path: Path, component_name: str):
             continue
         key = (int(row["node_id"]), str(row["prompt_hash"]))
         explanation = str(row.get("explanation", "") or "").strip()
-        if explanation:
-            by_key[key] = explanation
-    return by_key
+        if not explanation:
+            rejected["empty"] += 1
+            continue
+        if quality_gate:
+            issue = _explanation_quality_issue(explanation)
+            if issue:
+                rejected[issue] += 1
+                continue
+        by_key[key] = explanation
+    return by_key, dict(rejected)
 
 
 def _resolve_target_node_ids(args, labeled_node_count: int, full_node_count: int):
@@ -942,6 +982,128 @@ def _tweet_length_bucket(avg_length):
     if avg_length < 40.0:
         return "medium"
     return "long"
+
+
+_ACCOUNT_AGE_BUCKETS = ("unknown", "very_new", "new", "established", "old")
+_FOLLOW_RATIO_BUCKETS = ("very_low", "low", "balanced", "high", "very_high")
+_POSTING_DENSITY_BUCKETS = ("unknown", "very_low", "low", "moderate", "high", "very_high")
+
+
+def _one_hot_bucket(value, buckets):
+    token = str(value or "").strip().lower()
+    return [1.0 if token == item else 0.0 for item in buckets]
+
+
+def _safe_log_ratio(numerator, denominator):
+    return float(math.log1p(max(float(numerator), 0.0)) - math.log1p(max(float(denominator), 0.0)))
+
+
+def _metadata_structured_feature_names():
+    names = [
+        "protected",
+        "verified",
+        "bio_present",
+        "location_present",
+        "display_name_present",
+        "screen_name_present",
+        "created_at_known",
+        "account_days_log1p",
+        "followers_log1p",
+        "following_log1p",
+        "listed_log1p",
+        "statuses_log1p",
+        "followers_following_log_ratio",
+        "listed_followers_log_ratio",
+        "statuses_account_days_log_ratio",
+        "bio_char_len_log1p",
+        "display_name_char_len_log1p",
+        "screen_name_char_len_log1p",
+        "screen_name_digit_ratio",
+        "screen_name_underscore_ratio",
+        "display_screen_name_similarity",
+        "missing_profile_score",
+    ]
+    names.extend(f"account_age_bucket={bucket}" for bucket in _ACCOUNT_AGE_BUCKETS)
+    names.extend(f"follow_ratio_bucket={bucket}" for bucket in _FOLLOW_RATIO_BUCKETS)
+    names.extend(f"posting_density_bucket={bucket}" for bucket in _POSTING_DENSITY_BUCKETS)
+    return names
+
+
+METADATA_STRUCTURED_FEATURE_NAMES = tuple(_metadata_structured_feature_names())
+
+
+def _char_ratio(text, predicate):
+    text = str(text or "")
+    if not text:
+        return 0.0
+    return float(sum(1 for ch in text if predicate(ch))) / float(len(text))
+
+
+def _token_similarity(a, b):
+    def _tokens(value):
+        return {item for item in re.split(r"[^a-z0-9]+", str(value or "").lower()) if item}
+
+    left = _tokens(a)
+    right = _tokens(b)
+    if not left or not right:
+        return 0.0
+    return float(len(left.intersection(right))) / float(len(left.union(right)))
+
+
+def _metadata_structured_features(record):
+    account_days = record.get("account_days")
+    account_days_f = float(account_days) if account_days is not None else 0.0
+    followers_count = float(record.get("followers_count", 0) or 0)
+    following_count = float(record.get("following_count", 0) or 0)
+    listed_count = float(record.get("listed_count", 0) or 0)
+    statuses_count = float(record.get("statuses_count", 0) or 0)
+    bio = str(record.get("bio", "") or "")
+    display_name = str(record.get("display_name", "") or "")
+    screen_name = str(record.get("screen_name", "") or "")
+    location = str(record.get("location", "") or "")
+    missing_items = [
+        0 if bio else 1,
+        0 if display_name else 1,
+        0 if screen_name else 1,
+        0 if location else 1,
+        0 if account_days is not None else 1,
+    ]
+    numeric = [
+        float(bool(record.get("protected", False))),
+        float(bool(record.get("verified", False))),
+        float(bool(record.get("bio_present", 0))),
+        float(bool(location)),
+        float(bool(display_name)),
+        float(bool(screen_name)),
+        float(account_days is not None),
+        float(math.log1p(max(account_days_f, 0.0))),
+        float(math.log1p(max(followers_count, 0.0))),
+        float(math.log1p(max(following_count, 0.0))),
+        float(math.log1p(max(listed_count, 0.0))),
+        float(math.log1p(max(statuses_count, 0.0))),
+        _safe_log_ratio(followers_count, following_count),
+        _safe_log_ratio(listed_count, followers_count),
+        _safe_log_ratio(statuses_count, account_days_f),
+        float(math.log1p(len(bio))),
+        float(math.log1p(len(display_name))),
+        float(math.log1p(len(screen_name))),
+        _char_ratio(screen_name, str.isdigit),
+        _char_ratio(screen_name, lambda ch: ch == "_"),
+        _token_similarity(display_name, screen_name),
+        float(sum(missing_items)) / float(len(missing_items)),
+    ]
+    features = (
+        numeric
+        + _one_hot_bucket(record.get("account_age_bucket"), _ACCOUNT_AGE_BUCKETS)
+        + _one_hot_bucket(record.get("follow_ratio_bucket"), _FOLLOW_RATIO_BUCKETS)
+        + _one_hot_bucket(record.get("posting_density_bucket"), _POSTING_DENSITY_BUCKETS)
+    )
+    if len(features) != len(METADATA_STRUCTURED_FEATURE_NAMES):
+        raise RuntimeError(
+            "metadata_structured feature schema mismatch: "
+            f"{len(features)} values for {len(METADATA_STRUCTURED_FEATURE_NAMES)} names."
+        )
+    return features
 
 
 def _parse_norm_user_record(raw_text, node_id):
@@ -2511,7 +2673,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         "expert_graph_follower": ["graph_follower"],
         "expert_tweet": ["tweet"],
         "expert_conflict": ["conflict"],
-        "expert_concat_v1": list(EXPERT_COMPONENT_NAMES),
+        "expert_concat_v1": list(EXPERT_COMPONENT_NAMES_WITH_STRUCTURED),
     }
     selected_component_map_v2 = {
         "expert_ego": ["ego"],
@@ -2519,7 +2681,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         "expert_graph_follower": ["graph_follower"],
         "expert_tweet": ["tweet"],
         "expert_conflict": ["conflict"],
-        "expert_concat_v1": list(EXPERT_COMPONENT_NAMES_V2),
+        "expert_concat_v1": list(EXPERT_COMPONENT_NAMES_V2_WITH_STRUCTURED),
     }
     selected_components = (
         selected_component_map_v2 if prompt_family_version == "v2" else selected_component_map_v1
@@ -2535,6 +2697,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         "graph_follower": "follower_audience_explainer",
         "tweet": "posting_behavior_explainer",
         "conflict": "cross_view_conflict_explainer",
+        "metadata_structured": "structured_profile_metadata_encoder",
     }
     counts = {
         "ego_nodes": [],
@@ -2544,6 +2707,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         "conflict_nodes": [],
     }
     scalar_features = {key: [] for key in EXPERT_SCALAR_KEYS}
+    structured_components = {"metadata_structured": []}
     prompt_rows = []
     generation_rows_by_component = {}
     if prompt_family_version == "v2":
@@ -2607,6 +2771,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         tweet_stats = _get_tweet_stats(record, sample_size=int(getattr(args, "tweet_sample_size", 6)))
         count_following = len(set(context["following"][node_id]))
         count_follower = len(set(context["follower"][node_id]))
+        structured_components["metadata_structured"].append(_metadata_structured_features(record))
         scalar_features["count_following"].append(float(len(set(context["following"][node_id]))))
         scalar_features["count_follower"].append(float(len(set(context["follower"][node_id]))))
         scalar_features["has_following"].append(float(1 if context["following"][node_id] else 0))
@@ -2862,6 +3027,10 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         "prompt_style": prompt_style,
         "prompt_family_version": prompt_family_version,
         "prompt_components": prompt_components,
+        "structured_components": structured_components,
+        "structured_component_schema": {
+            "metadata_structured": list(METADATA_STRUCTURED_FEATURE_NAMES),
+        },
         "generation_rows_by_component": generation_rows_by_component,
         "component_max_length_group": {
             "ego": "ego",
@@ -2884,7 +3053,11 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
             "expert_graph_follower": ["graph_follower"],
             "expert_tweet": ["tweet"],
             "expert_conflict": ["conflict"],
-            "expert_concat_v1": list(EXPERT_COMPONENT_NAMES_V2) if prompt_family_version == "v2" else list(EXPERT_COMPONENT_NAMES),
+            "expert_concat_v1": (
+                list(EXPERT_COMPONENT_NAMES_V2_WITH_STRUCTURED)
+                if prompt_family_version == "v2"
+                else list(EXPERT_COMPONENT_NAMES_WITH_STRUCTURED)
+            ),
         }.items()},
         "selected_components": list(selected_components),
         "scalar_features": scalar_features,
@@ -3116,6 +3289,7 @@ def _generate_component_explanations(
     wandb_step_base=0,
 ):
     component_name = str(component_name or (generation_rows[0].get("component_name", "unknown") if generation_rows else "unknown"))
+    quality_gate = bool(getattr(args, "explain_quality_gate", True))
     if not generation_rows:
         return [], {
             "generated_count": 0,
@@ -3130,6 +3304,11 @@ def _generate_component_explanations(
             "explain_max_new_tokens": int(args.explain_max_new_tokens),
             "explain_model_load_mode": "skipped_empty",
             "explanation_sidecar_path": str(sidecar_path or ""),
+            "explain_quality_gate": bool(quality_gate),
+            "resume_rejected_count": 0,
+            "resume_rejected_reasons": {},
+            "quality_rejected_count": 0,
+            "quality_rejected_reasons": {},
         }
     prompts = [
         _format_chat_prompt(generation_runtime.get("tokenizer"), row["system"], row["user"])
@@ -3141,7 +3320,15 @@ def _generate_component_explanations(
         _string_sha256(prompt if prompt is not None else f"{row.get('system', '')}\n{row.get('user', '')}")
         for prompt, row in zip(prompts, generation_rows)
     ]
-    resumed_by_key = _load_resume_explanations(sidecar_path, component_name) if sidecar_path else {}
+    if sidecar_path:
+        resumed_by_key, resume_rejected_reasons = _load_resume_explanations(
+            sidecar_path,
+            component_name,
+            quality_gate=quality_gate,
+        )
+    else:
+        resumed_by_key, resume_rejected_reasons = {}, {}
+    resume_rejected_count = int(sum(int(value) for value in resume_rejected_reasons.values()))
     explanations = [None for _ in generation_rows]
     resumed_count = 0
     pending_rows = []
@@ -3162,6 +3349,19 @@ def _generate_component_explanations(
                 "status": "resume_explanations",
                 "component": component_name,
                 "resumed_count": int(resumed_count),
+                "pending_count": int(len(pending_rows)),
+                "resume_rejected_count": int(resume_rejected_count),
+                "resume_rejected_reasons": dict(resume_rejected_reasons),
+                "sidecar_path": str(sidecar_path or ""),
+            }
+        )
+    elif resume_rejected_count:
+        print(
+            {
+                "status": "resume_explanations_quality_rejected",
+                "component": component_name,
+                "resume_rejected_count": int(resume_rejected_count),
+                "resume_rejected_reasons": dict(resume_rejected_reasons),
                 "pending_count": int(len(pending_rows)),
                 "sidecar_path": str(sidecar_path or ""),
             }
@@ -3203,6 +3403,11 @@ def _generate_component_explanations(
             "explain_max_new_tokens": int(args.explain_max_new_tokens),
             "explain_model_load_mode": "not_requested",
             "explanation_sidecar_path": str(sidecar_path or ""),
+            "explain_quality_gate": bool(quality_gate),
+            "resume_rejected_count": int(resume_rejected_count),
+            "resume_rejected_reasons": dict(resume_rejected_reasons),
+            "quality_rejected_count": 0,
+            "quality_rejected_reasons": {},
         }
     tokenizer = None
     model = None
@@ -3241,6 +3446,11 @@ def _generate_component_explanations(
                 "explain_max_new_tokens": int(args.explain_max_new_tokens),
                 "explain_model_load_mode": "load_failed_once",
                 "explanation_sidecar_path": str(sidecar_path or ""),
+                "explain_quality_gate": bool(quality_gate),
+                "resume_rejected_count": int(resume_rejected_count),
+                "resume_rejected_reasons": dict(resume_rejected_reasons),
+                "quality_rejected_count": 0,
+                "quality_rejected_reasons": {},
             }
         tokenizer = generation_runtime.get("tokenizer")
         model = generation_runtime.get("model")
@@ -3286,11 +3496,24 @@ def _generate_component_explanations(
                 "explain_max_new_tokens": int(args.explain_max_new_tokens),
                 "explain_model_load_mode": "load_failed",
                 "explanation_sidecar_path": str(sidecar_path or ""),
+                "explain_quality_gate": bool(quality_gate),
+                "resume_rejected_count": int(resume_rejected_count),
+                "resume_rejected_reasons": dict(resume_rejected_reasons),
+                "quality_rejected_count": 0,
+                "quality_rejected_reasons": {},
             }
     if any(item is None for item in prompts):
         prompts = [_format_chat_prompt(tokenizer, row["system"], row["user"]) for row in generation_rows]
         prompt_hashes = [_string_sha256(prompt) for prompt in prompts]
-        resumed_by_key = _load_resume_explanations(sidecar_path, component_name) if sidecar_path else {}
+        if sidecar_path:
+            resumed_by_key, resume_rejected_reasons = _load_resume_explanations(
+                sidecar_path,
+                component_name,
+                quality_gate=quality_gate,
+            )
+        else:
+            resumed_by_key, resume_rejected_reasons = {}, {}
+        resume_rejected_count = int(sum(int(value) for value in resume_rejected_reasons.values()))
         explanations = [None for _ in generation_rows]
         resumed_count = 0
         pending_rows = []
@@ -3308,6 +3531,7 @@ def _generate_component_explanations(
     pending_prompts = [prompts[position] for position in pending_positions]
     fallback_count = 0
     generated_count = 0
+    quality_rejected = defaultdict(int)
     start_time = time.time()
     log_every = max(int(getattr(args, "explain_log_every", 50) or 0), 0)
     effective_batch_size = max(int(_effective_explain_batch_size(args, device)), 1)
@@ -3327,6 +3551,11 @@ def _generate_component_explanations(
             "explain_max_new_tokens": int(args.explain_max_new_tokens),
             "explain_model_load_mode": explain_model_load_mode,
             "explanation_sidecar_path": str(sidecar_path or ""),
+            "explain_quality_gate": bool(quality_gate),
+            "resume_rejected_count": int(resume_rejected_count),
+            "resume_rejected_reasons": dict(resume_rejected_reasons),
+            "quality_rejected_count": 0,
+            "quality_rejected_reasons": {},
         }
     try:
         with torch.no_grad():
@@ -3355,6 +3584,17 @@ def _generate_component_explanations(
                     continuation = decoder_generation_continuation(generated_ids, batch["input_ids"][row_idx])
                     text = tokenizer.decode(continuation, skip_special_tokens=True).strip()
                     if not text:
+                        fallback_count += 1
+                        text = _fallback_explanation_text(batch_rows[row_idx])
+                    issue = _explanation_quality_issue(text) if quality_gate else ""
+                    if issue:
+                        quality_rejected[issue] += 1
+                        if bool(getattr(args, "explain_required", False)):
+                            preview = " ".join(str(text or "").split())[:240]
+                            raise RuntimeError(
+                                f"Generated explanation failed quality gate for component={component_name}, "
+                                f"node_id={int(batch_rows[row_idx]['node_id'])}, reason={issue}, preview={preview!r}"
+                            )
                         fallback_count += 1
                         text = _fallback_explanation_text(batch_rows[row_idx])
                     explanations[batch_positions[row_idx]] = text
@@ -3442,8 +3682,13 @@ def _generate_component_explanations(
             "explain_max_input_length": int(args.explain_max_input_length),
             "explain_max_new_tokens": int(args.explain_max_new_tokens),
             "explain_model_load_mode": explain_model_load_mode,
-            "explanation_sidecar_path": str(sidecar_path or ""),
-        }
+                "explanation_sidecar_path": str(sidecar_path or ""),
+                "explain_quality_gate": bool(quality_gate),
+                "resume_rejected_count": int(resume_rejected_count),
+                "resume_rejected_reasons": dict(resume_rejected_reasons),
+                "quality_rejected_count": int(sum(int(value) for value in quality_rejected.values())),
+                "quality_rejected_reasons": dict(quality_rejected),
+            }
     finally:
         if generation_runtime is None and "model" in locals():
             del model
@@ -3465,6 +3710,11 @@ def _generate_component_explanations(
         "explain_max_new_tokens": int(args.explain_max_new_tokens),
         "explain_model_load_mode": explain_model_load_mode,
         "explanation_sidecar_path": str(sidecar_path or ""),
+        "explain_quality_gate": bool(quality_gate),
+        "resume_rejected_count": int(resume_rejected_count),
+        "resume_rejected_reasons": dict(resume_rejected_reasons),
+        "quality_rejected_count": int(sum(int(value) for value in quality_rejected.values())),
+        "quality_rejected_reasons": dict(quality_rejected),
     }
     return explanations, summary
 
@@ -3598,6 +3848,15 @@ def build_parser():
         type=int,
         default=50,
         help="Log and wandb-report explanation generation progress every N newly generated rows per component.",
+    )
+    parser.add_argument(
+        "--explain_quality_gate",
+        type=_parse_bool,
+        default=True,
+        help=(
+            "Validate explanation sidecars and fresh LLM outputs before reuse. "
+            "When enabled, empty, punctuation-only, or prompt-echo explanations are rejected and regenerated."
+        ),
     )
     parser.add_argument(
         "--explain_component_cache_dir",
@@ -3877,6 +4136,21 @@ def run(args):
             },
             step=100 + len(encoded),
         )
+    for component_name, values in prompt_bundle.get("structured_components", {}).items():
+        if not values:
+            continue
+        encoded[component_name] = torch.tensor(values, dtype=torch.float32)
+        _wandb_log(
+            wandb_run,
+            {
+                "precompute/structured_component_done": 1,
+                f"precompute/structured/{component_name}/rows": int(encoded[component_name].shape[0]),
+                f"precompute/structured/{component_name}/dim": int(encoded[component_name].shape[1])
+                if encoded[component_name].dim() == 2
+                else 0,
+            },
+            step=150 + len(encoded),
+        )
     del model
     gc.collect()
     if torch.cuda.is_available():
@@ -3894,6 +4168,9 @@ def run(args):
 
     save_dtype = torch.float16 if args.save_dtype == "float16" else torch.float32
     target_index_tensor = torch.tensor(target_node_ids, dtype=torch.long)
+    target_mask_tensor = torch.zeros((int(full_node_count),), dtype=torch.bool)
+    if int(target_index_tensor.numel()) > 0:
+        target_mask_tensor[target_index_tensor] = True
     full_graph_selected_embeddings = _scatter_selected_tensor_to_full_graph(
         selected_embeddings.to(save_dtype).contiguous(),
         target_index_tensor,
@@ -3910,12 +4187,15 @@ def run(args):
         "target_node_count": int(len(target_node_ids)),
         "full_graph_node_count": int(full_node_count),
         "labeled_node_count": int(labeled_node_count),
+        "target_node_ids": target_index_tensor.clone(),
+        "target_node_mask": target_mask_tensor.clone(),
         "target_node_scope": str(target_node_scope),
         "target_node_source": str(target_node_source),
         "center_node_scope_requested": str(center_node_scope_requested),
         "routed_nodes_path": str(routed_nodes_path),
         "prompt_family_version": prompt_family_version,
         "component_prompt_roles": dict(prompt_bundle.get("component_prompt_roles", {})),
+        "structured_component_schema": dict(prompt_bundle.get("structured_component_schema", {})),
         "embedding_encoder_tag": embedding_encoder_tag,
         "tweet_source_mode_requested": tweet_source_mode_requested,
         "tweet_source_mode_effective": tweet_source_mode_effective,
@@ -3949,7 +4229,7 @@ def run(args):
             component_payload = {
                 key: value
                 for key, value in payload.items()
-                if key not in set(EXPERT_COMPONENT_NAMES)
+                if key not in set(EXPERT_COMPONENT_NAMES_WITH_STRUCTURED)
             }
             component_payload["embeddings"] = payload[component_name]
             component_payload[component_name] = payload[component_name]
@@ -3964,6 +4244,8 @@ def run(args):
             component_cache_paths[component_name] = str(component_path)
 
     tensor_hashes = {"embeddings": tensor_sha256(payload["embeddings"])}
+    tensor_hashes["target_node_ids"] = tensor_sha256(payload["target_node_ids"])
+    tensor_hashes["target_node_mask"] = tensor_sha256(payload["target_node_mask"])
     for component_name in encoded:
         tensor_hashes[component_name] = tensor_sha256(payload[component_name])
     for scalar_key in prompt_bundle.get("scalar_features", {}):
@@ -4098,6 +4380,7 @@ def run(args):
         "full_graph_node_count": int(full_node_count),
         "labeled_node_count": int(labeled_node_count),
         "target_node_preview": [int(item) for item in target_node_ids[:32]],
+        "target_node_membership_encoding": "payload_target_node_ids_and_bool_mask",
         "payload_row_layout": "full_graph_zero_fill_for_unselected_nodes" if len(target_node_ids) < int(full_node_count) else "full_graph_dense",
         "semantic_mode": str(args.prompt_mode),
         "semantic_view_mode": prompt_bundle.get("semantic_view_mode", str(args.prompt_mode)),
@@ -4130,6 +4413,7 @@ def run(args):
             "payload_scalar_keys": list(prompt_bundle.get("scalar_features", {}).keys()),
             "semantic_view_mode": prompt_bundle.get("semantic_view_mode", str(args.prompt_mode)),
             "target_node_scope": str(target_node_scope),
+            "target_node_membership_encoding": "payload_target_node_ids_and_bool_mask",
             "payload_row_layout": "full_graph_zero_fill_for_unselected_nodes" if len(target_node_ids) < int(full_node_count) else "full_graph_dense",
             "support_fill_policy": "labeled_prefix_only" if target_node_scope == "labeled" and graph_data_variant == "full_graph_support" else "none",
             "same_root_requirement": (
