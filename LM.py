@@ -3,23 +3,30 @@ import torch.nn as nn
 from torch_geometric.nn.models import MLP
 import torch
 
+
+def _load_local_encoder(model_config, fallback_source):
+    model_source = model_config.get('pretrained_model_source') or fallback_source
+    kwargs = {"local_files_only": True} if model_config.get('pretrained_model_source') else {}
+    return AutoModel.from_pretrained(model_source, **kwargs)
+
+
 class LM_Model(nn.Module):
     def __init__(self, model_config):
         super().__init__()
         self.LM_model_name = model_config['lm_model']
         self.detach_embeddings = bool(model_config.get('detach_embeddings', False))
         if self.LM_model_name == 'deberta':
-            self.LM = AutoModel.from_pretrained('microsoft/deberta-v3-base')
+            self.LM = _load_local_encoder(model_config, 'microsoft/deberta-v3-base')
         elif self.LM_model_name == 'roberta':
-            self.LM = AutoModel.from_pretrained('roberta-base')
+            self.LM = _load_local_encoder(model_config, 'roberta-base')
         elif self.LM_model_name in {'roberta-f', 'roberta_finetuned'}:
-            self.LM = AutoModel.from_pretrained('yzxjb/roberta-finetuned-20')
+            self.LM = _load_local_encoder(model_config, 'yzxjb/roberta-finetuned-20')
         elif self.LM_model_name == 'bert':
-            self.LM = AutoModel.from_pretrained('bert-base-uncased')
+            self.LM = _load_local_encoder(model_config, 'bert-base-uncased')
         elif self.LM_model_name == 'twhin-bert':
-            self.LM = AutoModel.from_pretrained('Twitter/twhin-bert-base')
+            self.LM = _load_local_encoder(model_config, 'Twitter/twhin-bert-base')
         elif self.LM_model_name == 'xlm-roberta':
-            self.LM = AutoModel.from_pretrained('xlm-roberta-base')
+            self.LM = _load_local_encoder(model_config, 'xlm-roberta-base')
         elif self.LM_model_name in {'qwen_peft', 'qwen3_peft'}:
             from transformers import AutoModelForCausalLM
             from peft import LoraConfig, get_peft_model, TaskType
@@ -28,11 +35,11 @@ class LM_Model(nn.Module):
                 '/root/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-8B/snapshots/1d8ad4ca9b3dd8059ad90a75d4983776a23d44af',
             )
             device = model_config.get('device', torch.device('cpu'))
-            use_half = isinstance(device, torch.device) and device.type == 'cuda'
+            use_auto_dtype = isinstance(device, torch.device) and device.type == 'cuda'
             base = AutoModelForCausalLM.from_pretrained(
                 _qwen_path,
                 trust_remote_code=bool(model_config.get('qwen_trust_remote_code', False)),
-                torch_dtype=torch.float16 if use_half else torch.float32,
+                torch_dtype="auto" if use_auto_dtype else torch.float32,
                 low_cpu_mem_usage=True,
             )
             base.config.use_cache = False

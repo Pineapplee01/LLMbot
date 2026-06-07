@@ -7,7 +7,8 @@ import torch
 import torch.nn.functional as F
 
 from artifact_contracts import MissingFrozenArtifactError
-from model_building import resolve_g0_feature_bundle
+from estimators import fit_temperature_scaling
+from model_building import _idx_tensor, _score_logits, resolve_g0_feature_bundle
 from trainer_preparation import _resolve_optional_graph_override_paths, build_or_load_frozen_g0
 from utils import ensure_dir, safe_torch_load, save_stage_artifacts, tensor_sha256, write_json, write_text, write_torch
 
@@ -23,6 +24,37 @@ def _js_divergence_from_probs(p, q, eps=1e-8):
     kl_pm = torch.sum(p_t * (torch.log(p_t) - torch.log(m_t.clamp_min(eps))), dim=-1)
     kl_qm = torch.sum(q_t * (torch.log(q_t) - torch.log(m_t.clamp_min(eps))), dim=-1)
     return 0.5 * (kl_pm + kl_qm)
+
+
+def _score_all(labels, pred):
+    from sklearn.metrics import accuracy_score, f1_score
+
+    labels_np = np.asarray(labels)
+    pred_np = np.asarray(pred)
+    return {
+        "accuracy": float(accuracy_score(labels_np, pred_np)),
+        "macro_f1": float(f1_score(labels_np, pred_np, average="macro", zero_division=0)),
+        "bot_f1": float(f1_score(labels_np, pred_np, average="binary", zero_division=0)),
+        "count": int(labels_np.shape[0]),
+    }
+
+
+def _classification_consistency_proxy(probabilities, reference_labels):
+    prob_np = probabilities.detach().cpu().numpy() if torch.is_tensor(probabilities) else np.asarray(probabilities)
+    label_np = np.asarray(reference_labels, dtype=np.int64)
+    if prob_np.ndim != 2 or prob_np.shape[1] < 2:
+        return np.zeros(prob_np.shape[0] if prob_np.ndim >= 1 else 0, dtype=np.float32)
+    if label_np.ndim == 0:
+        label_np = np.full(prob_np.shape[0], int(label_np), dtype=np.int64)
+    if label_np.shape[0] < prob_np.shape[0]:
+        if label_np.shape[0] == 0:
+            return np.zeros(prob_np.shape[0], dtype=np.float32)
+        pad_value = int(label_np[-1])
+        label_np = np.pad(label_np, (0, prob_np.shape[0] - label_np.shape[0]), constant_values=pad_value)
+    label_np = np.clip(label_np[: prob_np.shape[0]], a_min=0, a_max=prob_np.shape[1] - 1)
+    row_idx = np.arange(prob_np.shape[0], dtype=np.int64)
+    clipped = np.clip(prob_np[row_idx, label_np], a_min=1e-8, a_max=1.0)
+    return clipped.astype(np.float32)
 
 
 class GraphStageMixin:
@@ -74,7 +106,7 @@ class GraphStageMixin:
         if edge_type.numel() != edge_index.size(1):
             raise MissingFrozenArtifactError("Resolved graph edge_type must align with edge_index.")
         relation_cardinality = int(torch.unique(edge_type).numel()) if edge_type.numel() else 0
-        num_nodes = int(len(self.labels))
+        num_nodes = int(self.graph_node_count)
         num_edges = int(edge_index.size(1))
         return {
             "edge_index": edge_index.contiguous(),
@@ -91,7 +123,7 @@ class GraphStageMixin:
                 "source": source,
                 "source_root": source_root,
                 "source_stage": source_stage,
-                "dataset_node_count_match": bool(num_nodes == int(len(self.labels))),
+                "dataset_node_count_match": bool(num_nodes == int(self.graph_node_count)),
             },
         }
 
@@ -119,6 +151,500 @@ class GraphStageMixin:
         rerun_data["edge_index"] = edge_index.detach().cpu().long()
         rerun_data["edge_type"] = edge_type.detach().cpu().long()
         return build_or_load_frozen_g0(rerun_args, self.seed, rerun_data, rerun_root)
+
+    def _build_or_load_lm_only_head(self):
+        graph_variant = str(getattr(self, "graph_data_variant", "labeled")).lower()
+        if graph_variant != "full_graph_support":
+            return super()._build_or_load_lm_only_head()
+
+        existing = self._load_lm_only_head()
+        if existing is not None:
+            existing_outputs = existing.get("outputs", {})
+            existing_prob = existing_outputs.get("prob_cal", existing_outputs.get("prob"))
+            existing_rows = int(existing_prob.shape[0]) if torch.is_tensor(existing_prob) else 0
+            manifest = existing.get("manifest", {})
+            manifest_variant = str(
+                manifest.get("graph_data_variant", manifest.get("feature_manifest", {}).get("graph_data_variant", "labeled"))
+            ).lower()
+            if existing_rows == int(self.graph_node_count) and manifest_variant == "full_graph_support":
+                return existing
+
+        if bool(getattr(self.args, "claim_grade", False)):
+            raise MissingFrozenArtifactError(
+                "claim_grade full-graph local conflict diagnostics require a full-graph lm_only_head artifact; "
+                "implicit recompute is disallowed."
+            )
+
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+
+        context = self.ensure_backbone_context()
+        feature_manifest = context["frozen_g0"]["manifest"].get("feature_manifest", {})
+        feature_path = feature_manifest.get("labeled_embedding_path") or feature_manifest.get("path")
+        if not feature_path or not Path(feature_path).exists():
+            raise MissingFrozenArtifactError(
+                "Full-graph local conflict diagnostics require a readable labeled semantic embedding tensor "
+                "from the frozen G0 feature manifest."
+            )
+
+        feature_args = SimpleNamespace(**vars(self.args))
+        feature_args.emb_path = str(feature_path)
+        feature_args.g0_feature_path = str(feature_path)
+        if feature_manifest.get("projected_dim") is not None:
+            feature_args.phase_a_project_dim = int(feature_manifest["projected_dim"])
+        if feature_manifest.get("projector") is not None:
+            feature_args.phase_a_projector = str(feature_manifest["projector"])
+        feature_args.peft = False
+        feature_bundle = resolve_g0_feature_bundle(feature_args, self.data)
+        features = feature_bundle["features"].detach().cpu().float().numpy()
+        labels = np.asarray(self.labels, dtype=np.int64)
+        train_idx = self.data["train_idx"].detach().cpu().long().numpy() if torch.is_tensor(self.data["train_idx"]) else np.asarray(self.data["train_idx"], dtype=np.int64)
+        valid_idx = self.data["valid_idx"].detach().cpu().long().numpy() if torch.is_tensor(self.data["valid_idx"]) else np.asarray(self.data["valid_idx"], dtype=np.int64)
+        test_idx = self.data["test_idx"].detach().cpu().long().numpy() if torch.is_tensor(self.data["test_idx"]) else np.asarray(self.data["test_idx"], dtype=np.int64)
+        if features.shape[0] < labels.shape[0]:
+            raise MissingFrozenArtifactError(
+                f"Full-graph lm_only_head features ({int(features.shape[0])} rows) must cover labeled nodes ({int(labels.shape[0])})."
+            )
+
+        scaler = StandardScaler()
+        x_train = scaler.fit_transform(features[train_idx])
+        x_all = scaler.transform(features)
+        classes = np.unique(labels[train_idx])
+        output_rows = int(features.shape[0])
+        if classes.size < 2:
+            prob = np.zeros((output_rows, 2), dtype=np.float32)
+            prob[:, int(classes[0])] = 1.0
+            classifier_payload = {"type": "constant", "class": int(classes[0])}
+        else:
+            clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+            clf.fit(x_train, labels[train_idx])
+            prob = clf.predict_proba(x_all).astype(np.float32)
+            if prob.shape[1] == 1:
+                fixed = np.zeros((output_rows, 2), dtype=np.float32)
+                fixed[:, int(clf.classes_[0])] = prob[:, 0]
+                prob = fixed
+            elif list(clf.classes_) != [0, 1]:
+                fixed = np.zeros((output_rows, 2), dtype=np.float32)
+                for col, cls in enumerate(clf.classes_):
+                    fixed[:, int(cls)] = prob[:, col]
+                prob = fixed
+            classifier_payload = {
+                "type": "logistic_regression",
+                "classes": [int(item) for item in getattr(clf, "classes_", [0, 1])],
+                "coef": getattr(clf, "coef_", np.zeros((1, features.shape[1]))).tolist(),
+                "intercept": getattr(clf, "intercept_", np.zeros(1)).tolist(),
+            }
+
+        logits = torch.log(torch.tensor(prob, dtype=torch.float32).clamp_min(1e-8))
+        temperature = 1.0
+        if valid_idx.size > 0 and len(np.unique(labels[valid_idx])) > 1:
+            temperature = fit_temperature_scaling(logits[valid_idx], labels[valid_idx])
+        prob_cal = torch.softmax(logits / float(temperature), dim=1)
+        outputs = {
+            "logits": logits,
+            "prob": torch.tensor(prob, dtype=torch.float32),
+            "prob_cal": prob_cal.detach().cpu(),
+            "pred": prob_cal.argmax(dim=1).detach().cpu(),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+        out_dir = self._lm_only_head_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(outputs, out_dir / "outputs.pt")
+        torch.save(
+            {
+                "scaler_mean": scaler.mean_.tolist(),
+                "scaler_scale": scaler.scale_.tolist(),
+                "classifier": classifier_payload,
+                "temperature": float(temperature),
+            },
+            out_dir / "checkpoint.pt",
+        )
+        manifest = {
+            "contract": "lm_only_head_v1",
+            "graph_data_variant": "full_graph_support",
+            "training_scope": "train_idx_supervised_lightweight_head_labeled_prefix",
+            "calibration_scope": "valid_idx_temperature_scaling_labeled_prefix",
+            "input_source": "cached_semantic_embedding_from_frozen_g0_manifest",
+            "feature_manifest": feature_bundle["feature_manifest"],
+            "temperature": float(temperature),
+            "output_rows": int(output_rows),
+            "graph_node_count": int(self.graph_node_count),
+            "labeled_node_count": int(self.labeled_node_count),
+            "support_node_count": int(self.support_node_count),
+            "split_counts": {
+                "train": int(train_idx.size),
+                "valid": int(valid_idx.size),
+                "test": int(test_idx.size),
+            },
+        }
+        write_json(out_dir / "manifest.json", manifest)
+        return {"manifest": manifest, "outputs": outputs, "dir": out_dir, "source": "derived_from_frozen_g0_feature_manifest"}
+
+    def _fit_local_conflict_structural_view(self, edge_index, edge_type, labels_t):
+        graph_variant = str(getattr(self, "graph_data_variant", "labeled")).lower()
+        if graph_variant != "full_graph_support":
+            return super()._fit_local_conflict_structural_view(edge_index, edge_type, labels_t)
+
+        import trainer_legacy_impl as _legacy_impl
+
+        train_idx = _idx_tensor(self.data["train_idx"])
+        valid_idx = _idx_tensor(self.data["valid_idx"])
+        test_idx = _idx_tensor(self.data["test_idx"])
+        if train_idx.numel() == 0 or valid_idx.numel() == 0:
+            raise MissingFrozenArtifactError(
+                "local_conflict_prune_diag requires non-empty train_idx and valid_idx for structural-view training."
+            )
+
+        labeled_count = int(labels_t.numel())
+        num_nodes = int(self.graph_node_count)
+        model = _legacy_impl.StructuralConflictRGCN(
+            num_nodes=num_nodes,
+            node_emb_dim=64,
+            hidden_dim=64,
+            n_relations=int(getattr(self.args, "n_relations", 2)),
+            n_layers=2,
+            dropout=0.1,
+        ).to(self.device)
+        edge_index_dev = edge_index.to(self.device)
+        edge_type_dev = edge_type.to(self.device)
+        labels_dev = labels_t.to(self.device)
+        train_idx_dev = train_idx.to(self.device)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+        patience = 10
+        max_epochs = 100
+        best_state = None
+        best_metrics = None
+        history = []
+        wait = 0
+
+        for epoch in range(max_epochs):
+            model.train()
+            optimizer.zero_grad()
+            train_outputs = model.forward_outputs(edge_index_dev, edge_type_dev)
+            loss = F.cross_entropy(train_outputs["logits"][train_idx_dev], labels_dev[train_idx_dev])
+            loss.backward()
+            optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                eval_outputs = model.forward_outputs(edge_index_dev, edge_type_dev)
+            labeled_logits = eval_outputs["logits"][:labeled_count].detach().cpu()
+            valid_metrics = _score_logits(labeled_logits, labels_t.detach().cpu(), valid_idx.cpu())
+            valid_metrics["epoch"] = int(epoch)
+            history.append(
+                {
+                    "epoch": int(epoch),
+                    "train_loss": float(loss.detach().cpu().item()),
+                    "valid_accuracy": float(valid_metrics["accuracy"]),
+                    "valid_macro_f1": float(valid_metrics["macro_f1"]),
+                    "valid_loss": float(valid_metrics["loss"]),
+                }
+            )
+            if _legacy_impl._is_better(valid_metrics, best_metrics):
+                best_metrics = valid_metrics
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+        if best_state is None:
+            raise MissingFrozenArtifactError("local_conflict_prune_diag failed to train a structural-only auxiliary view.")
+
+        model.load_state_dict(best_state)
+        model.eval()
+        with torch.no_grad():
+            final_outputs = model.forward_outputs(edge_index_dev, edge_type_dev)
+        labeled_logits = final_outputs["logits"][:labeled_count].detach().cpu()
+        return {
+            "model": model,
+            "outputs": {key: value.detach().cpu() for key, value in final_outputs.items()},
+            "checkpoint": {key: value.detach().cpu().clone() for key, value in best_state.items()},
+            "fit_summary": {
+                "max_epochs": int(max_epochs),
+                "patience": int(patience),
+                "best_epoch": int(best_metrics.get("epoch", -1) if best_metrics else -1),
+                "history": history,
+                "supervision_scope": "labeled_prefix_only",
+                "graph_node_count": int(self.graph_node_count),
+                "labeled_node_count": int(self.labeled_node_count),
+            },
+            "metrics": {
+                "train": _score_logits(labeled_logits, labels_t.detach().cpu(), train_idx.cpu()),
+                "valid": _score_logits(labeled_logits, labels_t.detach().cpu(), valid_idx.cpu()),
+                "test": _score_logits(labeled_logits, labels_t.detach().cpu(), test_idx.cpu()),
+            },
+            "model_config": {
+                "type": "structural_conflict_rgcn",
+                "node_emb_dim": 64,
+                "hidden_dim": 64,
+                "n_layers": 2,
+                "n_relations": int(getattr(self.args, "n_relations", 2)),
+                "dropout": 0.1,
+                "optimizer": "adamw",
+                "learning_rate": 1e-3,
+                "weight_decay": 1e-5,
+                "training_scope": "labeled_prefix_only_on_full_graph_structure",
+                "graph_node_count": int(self.graph_node_count),
+                "labeled_node_count": int(self.labeled_node_count),
+                "checkpoint_selection": {
+                    "primary": "validation_macro_f1",
+                    "tie_breaker": "validation_loss",
+                },
+            },
+        }
+
+    @staticmethod
+    def _split_metrics_from_outputs(outputs, labels_np, valid_mask, test_mask):
+        pred = outputs.get("pred")
+        if pred is None:
+            raise MissingFrozenArtifactError("Expected outputs.pt to include 'pred' for graph diagnostics.")
+        pred_np = pred.detach().cpu().numpy().astype(np.int64) if torch.is_tensor(pred) else np.asarray(pred, dtype=np.int64)
+        labels_np = np.asarray(labels_np, dtype=np.int64)
+        labeled_count = int(labels_np.shape[0])
+        if pred_np.shape[0] < labeled_count:
+            raise MissingFrozenArtifactError(
+                f"Graph diagnostic predictions ({int(pred_np.shape[0])}) must cover labeled nodes ({labeled_count})."
+            )
+        pred_eval_np = pred_np[:labeled_count]
+        return {
+            "valid": _score_all(labels_np[valid_mask], pred_eval_np[valid_mask]) if valid_mask.any() else {"accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0},
+            "test": _score_all(labels_np[test_mask], pred_eval_np[test_mask]) if test_mask.any() else {"accuracy": 0.0, "macro_f1": 0.0, "bot_f1": 0.0, "count": 0},
+            "pred": pred_eval_np,
+            "pred_full": pred_np,
+        }
+
+    @staticmethod
+    def _degree_arrays(edge_index, num_nodes):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        src = edge_index_cpu[0]
+        dst = edge_index_cpu[1]
+        out_degree = torch.bincount(src, minlength=int(num_nodes)).cpu().numpy().astype(np.int64)
+        in_degree = torch.bincount(dst, minlength=int(num_nodes)).cpu().numpy().astype(np.int64)
+        return in_degree, out_degree
+
+    @staticmethod
+    def _remove_edge_at_position(edge_index, edge_type, edge_pos):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type_cpu = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        keep_mask = torch.ones(edge_index_cpu.size(1), dtype=torch.bool)
+        keep_mask[int(edge_pos)] = False
+        return edge_index_cpu[:, keep_mask].contiguous(), edge_type_cpu[keep_mask].contiguous()
+
+    @staticmethod
+    def _pruned_graph_from_removed_positions(edge_index, edge_type, removed_positions):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type_cpu = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        if not removed_positions:
+            return edge_index_cpu.contiguous(), edge_type_cpu.contiguous()
+        keep_mask = torch.ones(edge_index_cpu.size(1), dtype=torch.bool)
+        keep_mask[torch.tensor(sorted(int(pos) for pos in removed_positions), dtype=torch.long)] = False
+        return edge_index_cpu[:, keep_mask].contiguous(), edge_type_cpu[keep_mask].contiguous()
+
+    def _full_graph_labeled_prefix_edge_tensors(self):
+        edge_index, edge_type = self._active_graph_tensors()
+        graph_variant = str(getattr(self, "graph_data_variant", "labeled")).lower()
+        if graph_variant != "full_graph_support":
+            return edge_index.detach().cpu().long(), edge_type.detach().cpu().long()
+        labeled_limit = int(self.labeled_node_count)
+        edge_index_cpu = edge_index.detach().cpu().long()
+        edge_type_cpu = edge_type.detach().cpu().long()
+        keep_mask = (edge_index_cpu[0] < labeled_limit) & (edge_index_cpu[1] < labeled_limit)
+        return edge_index_cpu[:, keep_mask].contiguous(), edge_type_cpu[keep_mask].contiguous()
+
+    @staticmethod
+    def _relation_direction_name(relation_id, target_role):
+        relation_name = "following" if int(relation_id) == 1 else "follower"
+        return f"{relation_name}_{str(target_role)}"
+
+    @staticmethod
+    def _reciprocity_per_node(edge_index, num_nodes):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        adjacency = [set() for _ in range(int(num_nodes))]
+        src = edge_index_cpu[0].tolist()
+        dst = edge_index_cpu[1].tolist()
+        for u, v in zip(src, dst):
+            u_i = int(u)
+            v_i = int(v)
+            if 0 <= u_i < int(num_nodes) and 0 <= v_i < int(num_nodes) and u_i != v_i:
+                adjacency[u_i].add(v_i)
+        reciprocity = np.zeros(int(num_nodes), dtype=np.float32)
+        for node_id in range(int(num_nodes)):
+            neighbors = adjacency[node_id]
+            if not neighbors:
+                continue
+            reciprocal = sum(1 for neigh in neighbors if node_id in adjacency[neigh])
+            reciprocity[node_id] = float(reciprocal / max(len(neighbors), 1))
+        return reciprocity
+
+    @staticmethod
+    def _support_exposure(edge_index, edge_type, labeled_node_count):
+        edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type_cpu = edge_type.detach().cpu().long() if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long)
+        labeled_count = int(labeled_node_count)
+        src = edge_index_cpu[0].tolist()
+        dst = edge_index_cpu[1].tolist()
+        rel = edge_type_cpu.tolist()
+        exposure = {}
+        for node_id in range(labeled_count):
+            support_neighbors = set()
+            support_only_1hop = set()
+            support_only_2hop = set()
+            support_direction_counts = {
+                "following_incoming": 0,
+                "following_outgoing": 0,
+                "follower_incoming": 0,
+                "follower_outgoing": 0,
+            }
+            for edge_pos, (u, v, r) in enumerate(zip(src, dst, rel)):
+                u_i = int(u)
+                v_i = int(v)
+                relation_id = int(r)
+                if u_i == node_id and v_i >= labeled_count:
+                    support_neighbors.add(v_i)
+                    support_only_1hop.add(v_i)
+                    support_direction_counts[GraphStageMixin._relation_direction_name(relation_id, "outgoing")] += 1
+                elif v_i == node_id and u_i >= labeled_count:
+                    support_neighbors.add(u_i)
+                    support_only_1hop.add(u_i)
+                    support_direction_counts[GraphStageMixin._relation_direction_name(relation_id, "incoming")] += 1
+            if support_neighbors:
+                first_hop = set(support_neighbors)
+                for edge_pos, (u, v) in enumerate(zip(src, dst)):
+                    u_i = int(u)
+                    v_i = int(v)
+                    if u_i in first_hop and v_i >= labeled_count and v_i != node_id:
+                        support_only_2hop.add(v_i)
+                    elif v_i in first_hop and u_i >= labeled_count and u_i != node_id:
+                        support_only_2hop.add(u_i)
+                support_only_2hop -= support_only_1hop
+            exposure[node_id] = {
+                "support_neighbor_ids": sorted(int(item) for item in support_neighbors),
+                "support_neighbor_count_delta": int(len(support_neighbors)),
+                "support_neighbors_by_relation_direction": support_direction_counts,
+                "support_only_1hop_count": int(len(support_only_1hop)),
+                "support_only_2hop_count": int(len(support_only_2hop)),
+            }
+        return exposure
+
+    def _support_consistency(self, semantic_raw, semantic_prob, base_pred_np):
+        graph_variant = str(getattr(self, "graph_data_variant", "labeled")).lower()
+        labeled_count = int(self.labeled_node_count)
+        if graph_variant != "full_graph_support" or semantic_raw.shape[0] <= labeled_count:
+            return {
+                node_id: {
+                    "support_semantic_similarity_mean": 0.0,
+                    "support_prediction_consistency_proxy_mean": 0.0,
+                }
+                for node_id in range(labeled_count)
+            }
+        semantic_norm = F.normalize(semantic_raw.detach().cpu().float(), p=2, dim=1, eps=1e-12)
+        semantic_prob_np = semantic_prob.detach().cpu().numpy() if torch.is_tensor(semantic_prob) else np.asarray(semantic_prob)
+        base_pred_full = np.asarray(base_pred_np, dtype=np.int64)
+        if base_pred_full.shape[0] < semantic_prob_np.shape[0]:
+            fallback_pred = semantic_prob_np.argmax(axis=1).astype(np.int64)
+            if base_pred_full.shape[0] > 0:
+                fallback_pred[: base_pred_full.shape[0]] = base_pred_full
+            base_pred_full = fallback_pred
+        exposure = self._support_exposure(*self._active_graph_tensors(), labeled_count)
+        summary = {}
+        for node_id in range(labeled_count):
+            support_ids = exposure[node_id]["support_neighbor_ids"]
+            if not support_ids:
+                summary[node_id] = {
+                    "support_semantic_similarity_mean": 0.0,
+                    "support_prediction_consistency_proxy_mean": 0.0,
+                }
+                continue
+            sims = []
+            proxies = []
+            node_vec = semantic_norm[node_id]
+            target_pred = int(base_pred_full[node_id]) if base_pred_full.shape[0] > node_id else int(semantic_prob_np[node_id].argmax())
+            for support_id in support_ids:
+                if support_id >= semantic_norm.shape[0]:
+                    continue
+                sims.append(float((node_vec * semantic_norm[int(support_id)]).sum().item()))
+                proxies.append(float(_classification_consistency_proxy(semantic_prob_np[[int(support_id)]], np.asarray([target_pred], dtype=np.int64))[0]))
+            summary[node_id] = {
+                "support_semantic_similarity_mean": float(np.mean(sims)) if sims else 0.0,
+                "support_prediction_consistency_proxy_mean": float(np.mean(proxies)) if proxies else 0.0,
+            }
+        return summary
+
+    def _structural_shock(self, full_edge_index, labeled_edge_index):
+        labeled_count = int(self.labeled_node_count)
+        full_in, full_out = self._degree_arrays(full_edge_index, int(self.graph_node_count))
+        labeled_in, labeled_out = self._degree_arrays(labeled_edge_index, labeled_count)
+        full_recip = self._reciprocity_per_node(full_edge_index, int(self.graph_node_count))[:labeled_count]
+        labeled_recip = self._reciprocity_per_node(labeled_edge_index, labeled_count)
+        shock = {}
+        for node_id in range(labeled_count):
+            full_total = int(full_in[node_id] + full_out[node_id])
+            labeled_total = int(labeled_in[node_id] + labeled_out[node_id])
+            full_disagreement = abs(int(full_in[node_id]) - int(full_out[node_id]))
+            labeled_disagreement = abs(int(labeled_in[node_id]) - int(labeled_out[node_id]))
+            shock[node_id] = {
+                "full_in_degree": int(full_in[node_id]),
+                "full_out_degree": int(full_out[node_id]),
+                "labeled_in_degree": int(labeled_in[node_id]),
+                "labeled_out_degree": int(labeled_out[node_id]),
+                "delta_in_degree": int(full_in[node_id] - labeled_in[node_id]),
+                "delta_out_degree": int(full_out[node_id] - labeled_out[node_id]),
+                "delta_total_degree": int(full_total - labeled_total),
+                "full_reciprocity": float(full_recip[node_id]),
+                "labeled_reciprocity": float(labeled_recip[node_id]),
+                "delta_reciprocity": float(full_recip[node_id] - labeled_recip[node_id]),
+                "full_disagreement": int(full_disagreement),
+                "labeled_disagreement": int(labeled_disagreement),
+                "delta_disagreement": int(full_disagreement - labeled_disagreement),
+            }
+        return shock
+
+    @staticmethod
+    def _density_bucket(total_degree):
+        degree = int(total_degree)
+        if degree <= 1:
+            return "sparse"
+        if degree <= 5:
+            return "low_density"
+        return "high_density"
+
+    @staticmethod
+    def _failure_mechanism(row):
+        if bool(row.get("support_induced_wrong", False)):
+            return "support_induced_fragile"
+        if int(row.get("has_following", 0)) == 0 and int(row.get("has_follower", 0)) == 0:
+            return "sparse_isolated"
+        if bool(row.get("was_wrong_base", False)) and int(row.get("has_follower", 0)) == 1 and int(row.get("has_following", 0)) == 1:
+            return "dense_directional_recoverable"
+        return "conflict_dominant"
+
+    @staticmethod
+    def _regime_label(row, prefix):
+        directional = "both_present" if int(row.get(f"{prefix}_has_following", row.get("has_following", 0))) == 1 and int(row.get(f"{prefix}_has_follower", row.get("has_follower", 0))) == 1 else "no_directional"
+        density = GraphStageMixin._density_bucket(row.get(f"{prefix}_total_degree", 0))
+        correctness = "wrong" if bool(row.get(f"{prefix}_is_wrong", False)) else "correct"
+        if prefix == "full" and bool(row.get("support_induced_wrong", False)):
+            return "support-induced wrong"
+        return f"{directional} -> {density} -> {correctness}"
+
+    def _error_regime_shift(self, rows):
+        regime_counts = {}
+        total = max(len(rows), 1)
+        for row in rows:
+            labeled_regime = self._regime_label(row, "labeled")
+            full_regime = self._regime_label(row, "full")
+            key = f"{labeled_regime} => {full_regime}"
+            regime_counts[key] = int(regime_counts.get(key, 0) + 1)
+        return {
+            key: {
+                "count": int(value),
+                "share": float(value / total),
+            }
+            for key, value in sorted(regime_counts.items(), key=lambda item: (-item[1], item[0]))
+        }
 
     def _run_local_conformal_prune_diag(self, stage_dir, base_bundle):
         context = self.ensure_backbone_context()
@@ -588,12 +1114,22 @@ class GraphStageMixin:
         labels_np = labels_t.numpy()
         semantic_bundle = resolve_g0_feature_bundle(self.args, self.data)
         semantic_raw = semantic_bundle["raw_features"].detach().cpu().float()
-        semantic_norm = F.normalize(semantic_raw, p=2, dim=1, eps=1e-12)
         degree_guard_enabled = not bool(getattr(self.args, "conflict_disable_degree_guard", False))
         topk_per_bucket = max(int(getattr(self.args, "conflict_topk_per_bucket", 1) or 1), 1)
+        labeled_count = int(self.labeled_node_count)
+        graph_variant = str(getattr(self, "graph_data_variant", "labeled")).lower()
+        if semantic_raw.shape[0] < labeled_count:
+            raise MissingFrozenArtifactError(
+                f"local_conflict_prune_diag semantic rows ({int(semantic_raw.shape[0])}) must cover labeled nodes ({labeled_count})."
+            )
+        semantic_norm = F.normalize(semantic_raw, p=2, dim=1, eps=1e-12)
 
         lm_head = self._build_or_load_lm_only_head()
         semantic_prob = lm_head["outputs"].get("prob_cal", lm_head["outputs"]["prob"]).detach().cpu().float()
+        if int(semantic_prob.shape[0]) < labeled_count:
+            raise MissingFrozenArtifactError(
+                f"local_conflict_prune_diag semantic probabilities ({int(semantic_prob.shape[0])}) must cover labeled nodes ({labeled_count})."
+            )
         structural_bundle = self._fit_local_conflict_structural_view(edge_index, edge_type, labels_t)
         structural_outputs = structural_bundle["outputs"]
         structural_prob = structural_outputs["prob"].detach().cpu().float()
@@ -610,10 +1146,15 @@ class GraphStageMixin:
         src_np = edge_index_cpu[0].numpy().astype(np.int64)
         dst_np = edge_index_cpu[1].numpy().astype(np.int64)
         rel_np = edge_type_cpu.numpy().astype(np.int64)
-        num_nodes = int(labels_t.numel())
+        num_nodes = int(self.graph_node_count)
         base_in_degree, base_out_degree = self._degree_arrays(edge_index_cpu, num_nodes)
+        labeled_edge_index_cpu, labeled_edge_type_cpu = self._full_graph_labeled_prefix_edge_tensors()
+        labeled_in_degree, labeled_out_degree = self._degree_arrays(labeled_edge_index_cpu, labeled_count)
+        support_exposure = self._support_exposure(edge_index_cpu, edge_type_cpu, labeled_count)
+        support_consistency = self._support_consistency(semantic_raw, semantic_prob, base_pred.detach().cpu().numpy().astype(np.int64))
+        structural_shock = self._structural_shock(edge_index_cpu, labeled_edge_index_cpu)
 
-        routed_node_ids = np.flatnonzero(routed_mask)
+        routed_node_ids = np.flatnonzero(routed_mask[:labeled_count])
         routed_node_ids = np.asarray(
             sorted(routed_node_ids.tolist(), key=lambda node_id: (-float(conflict_score[int(node_id)]), int(node_id))),
             dtype=np.int64,
@@ -787,10 +1328,32 @@ class GraphStageMixin:
             selected_by_relation_role[relation_role_key] = int(selected_by_relation_role.get(relation_role_key, 0) + count)
             selected_by_bucket[f"{bucket_key[0]}::{bucket_key[1]}::{bucket_key[2]}"] = int(count)
 
+        base_pred_np = base_pred.detach().cpu().numpy().astype(np.int64)
+        full_base_wrong = base_pred_np[:labeled_count] != labels_np[:labeled_count]
+        local_conf_pred_np = conflict_metrics["pred"]
+        local_rand_pred_np = rand_metrics["pred"]
+        full_is_wrong = local_conf_pred_np[:labeled_count] != labels_np[:labeled_count]
+        full_rand_is_wrong = local_rand_pred_np[:labeled_count] != labels_np[:labeled_count]
+        support_induced_wrong_mask = (~full_base_wrong) & full_is_wrong
+        labeled_directional = {}
+        for node_id in range(labeled_count):
+            labeled_directional[node_id] = {
+                "has_following": int(labeled_out_degree[node_id] > 0),
+                "has_follower": int(labeled_in_degree[node_id] > 0),
+                "total_degree": int(labeled_in_degree[node_id] + labeled_out_degree[node_id]),
+            }
+        full_directional = {}
+        for node_id in range(labeled_count):
+            support_dirs = support_exposure[node_id]["support_neighbors_by_relation_direction"]
+            full_directional[node_id] = {
+                "has_following": int((base_out_degree[node_id] > 0) or support_dirs["following_outgoing"] > 0 or support_dirs["following_incoming"] > 0),
+                "has_follower": int((base_in_degree[node_id] > 0) or support_dirs["follower_outgoing"] > 0 or support_dirs["follower_incoming"] > 0),
+                "total_degree": int(base_in_degree[node_id] + base_out_degree[node_id]),
+            }
+
         routed_rows = []
         p_sem_np = semantic_prob.detach().cpu().numpy()
         p_struct_np = structural_prob.detach().cpu().numpy()
-        base_pred_np = base_pred.detach().cpu().numpy().astype(np.int64)
         for split_name, idx_mask in (("train", self.train_mask), ("valid", self.val_mask), ("test", self.test_mask)):
             for node_id in np.flatnonzero(idx_mask).tolist():
                 routed_rows.append(
@@ -835,11 +1398,92 @@ class GraphStageMixin:
             if bool(row["selected"])
         ]
 
+        error_migration = {
+            "labeled_wrong_to_full_graph_correct": int((full_base_wrong & (~full_is_wrong)).sum()),
+            "labeled_correct_to_full_graph_wrong": int(((~full_base_wrong) & full_is_wrong).sum()),
+            "labeled_wrong_stays_wrong": int((full_base_wrong & full_is_wrong).sum()),
+            "labeled_correct_stays_correct": int(((~full_base_wrong) & (~full_is_wrong)).sum()),
+            "labeled_correct_to_local_rand_wrong": int(((~full_base_wrong) & full_rand_is_wrong).sum()),
+        }
+
+        per_node_rows = []
+        for node_id in np.flatnonzero(self.test_mask).tolist():
+            support_stats = support_exposure[int(node_id)]
+            support_consistency_row = support_consistency[int(node_id)]
+            shock_row = structural_shock[int(node_id)]
+            row = {
+                "node_id": int(node_id),
+                "label": int(labels_np[int(node_id)]),
+                "split": "test",
+                "routed": bool(routed_mask[int(node_id)]),
+                "base_pred": int(base_pred_np[int(node_id)]),
+                "local_conf_pred": int(local_conf_pred_np[int(node_id)]),
+                "local_rand_pred": int(local_rand_pred_np[int(node_id)]),
+                "was_wrong_base": bool(full_base_wrong[int(node_id)]),
+                "is_wrong_full_graph": bool(full_is_wrong[int(node_id)]),
+                "is_wrong_local_rand": bool(full_rand_is_wrong[int(node_id)]),
+                "labeled_is_wrong": bool(full_base_wrong[int(node_id)]),
+                "full_is_wrong": bool(full_is_wrong[int(node_id)]),
+                "support_induced_wrong": bool(support_induced_wrong_mask[int(node_id)]),
+                "labeled_has_following": int(labeled_directional[int(node_id)]["has_following"]),
+                "labeled_has_follower": int(labeled_directional[int(node_id)]["has_follower"]),
+                "full_has_following": int(full_directional[int(node_id)]["has_following"]),
+                "full_has_follower": int(full_directional[int(node_id)]["has_follower"]),
+                "has_following": int(full_directional[int(node_id)]["has_following"]),
+                "has_follower": int(full_directional[int(node_id)]["has_follower"]),
+                "labeled_total_degree": int(labeled_directional[int(node_id)]["total_degree"]),
+                "full_total_degree": int(full_directional[int(node_id)]["total_degree"]),
+                "support_neighbor_count_delta": int(support_stats["support_neighbor_count_delta"]),
+                "support_neighbors_by_relation_direction": dict(support_stats["support_neighbors_by_relation_direction"]),
+                "support_only_1hop_count": int(support_stats["support_only_1hop_count"]),
+                "support_only_2hop_count": int(support_stats["support_only_2hop_count"]),
+                "support_semantic_similarity_mean": float(support_consistency_row["support_semantic_similarity_mean"]),
+                "support_prediction_consistency_proxy_mean": float(support_consistency_row["support_prediction_consistency_proxy_mean"]),
+                "delta_in_degree": int(shock_row["delta_in_degree"]),
+                "delta_out_degree": int(shock_row["delta_out_degree"]),
+                "delta_total_degree": int(shock_row["delta_total_degree"]),
+                "delta_reciprocity": float(shock_row["delta_reciprocity"]),
+                "delta_disagreement": int(shock_row["delta_disagreement"]),
+                "conflict_score": float(conflict_score[int(node_id)]),
+            }
+            row["failure_mechanism"] = self._failure_mechanism(row)
+            row["labeled_regime"] = self._regime_label(row, "labeled")
+            row["full_regime"] = self._regime_label(row, "full")
+            per_node_rows.append(row)
+
+        failure_mechanism_summary = {}
+        for mechanism in ("sparse_isolated", "dense_directional_recoverable", "conflict_dominant", "support_induced_fragile"):
+            subset = [row for row in per_node_rows if row["failure_mechanism"] == mechanism]
+            if not subset:
+                continue
+            failure_mechanism_summary[mechanism] = {
+                "count": int(len(subset)),
+                "share": float(len(subset) / max(len(per_node_rows), 1)),
+                "base_wrong_rate": float(sum(1 for row in subset if row["was_wrong_base"]) / len(subset)),
+                "full_graph_wrong_rate": float(sum(1 for row in subset if row["is_wrong_full_graph"]) / len(subset)),
+                "mean_support_neighbor_count_delta": float(np.mean([row["support_neighbor_count_delta"] for row in subset])),
+                "mean_delta_total_degree": float(np.mean([row["delta_total_degree"] for row in subset])),
+            }
+
+        support_exposure_summary = {
+            "mean_support_neighbor_count_delta": float(np.mean([row["support_neighbor_count_delta"] for row in per_node_rows])) if per_node_rows else 0.0,
+            "mean_support_only_1hop_count": float(np.mean([row["support_only_1hop_count"] for row in per_node_rows])) if per_node_rows else 0.0,
+            "mean_support_only_2hop_count": float(np.mean([row["support_only_2hop_count"] for row in per_node_rows])) if per_node_rows else 0.0,
+        }
+        structural_shock_summary = {
+            "mean_delta_in_degree": float(np.mean([row["delta_in_degree"] for row in per_node_rows])) if per_node_rows else 0.0,
+            "mean_delta_out_degree": float(np.mean([row["delta_out_degree"] for row in per_node_rows])) if per_node_rows else 0.0,
+            "mean_delta_total_degree": float(np.mean([row["delta_total_degree"] for row in per_node_rows])) if per_node_rows else 0.0,
+            "mean_delta_reciprocity": float(np.mean([row["delta_reciprocity"] for row in per_node_rows])) if per_node_rows else 0.0,
+            "mean_delta_disagreement": float(np.mean([row["delta_disagreement"] for row in per_node_rows])) if per_node_rows else 0.0,
+        }
+
         metrics_payload = {
             "contract": "local_conflict_prune_diag_metrics_v1",
             "routing_mode": "dignn_style_topology_semantic_conflict",
             "paper_faithful_dignn_style": True,
             "official_code_verified": False,
+            "graph_data_variant": graph_variant,
             "routed_budget": routed_budget,
             "topk_per_bucket": int(topk_per_bucket),
             "base": {
@@ -901,12 +1545,22 @@ class GraphStageMixin:
                 "conflict_after_mean_selected_targets": float(np.mean([row["conflict_after"] for row in selected_rows_sorted if bool(row["selected"])])) if evidence_rows else 0.0,
                 "selected_semantic_cosine_mean": float(np.mean([row["semantic_cosine"] for row in selected_rows_sorted if bool(row["selected"])])) if evidence_rows else 0.0,
             },
+            "error_migration": error_migration,
+            "support_exposure": support_exposure_summary,
+            "support_consistency": {
+                "mean_support_semantic_similarity": float(np.mean([row["support_semantic_similarity_mean"] for row in per_node_rows])) if per_node_rows else 0.0,
+                "mean_support_prediction_consistency_proxy": float(np.mean([row["support_prediction_consistency_proxy_mean"] for row in per_node_rows])) if per_node_rows else 0.0,
+            },
+            "structural_shock": structural_shock_summary,
+            "error_regime_shift": self._error_regime_shift(per_node_rows),
+            "failure_mechanisms": failure_mechanism_summary,
         }
 
         manifest = {
             "contract": "local_conflict_prune_diag_v1",
             "status": "completed",
             "stage": "local_conflict_prune_diag",
+            "graph_data_variant": graph_variant,
             "routing_mode": "dignn_style_topology_semantic_conflict",
             "paper_faithful_dignn_style": True,
             "paper_faithful_dig_in_gnn_style_local_selection": True,
@@ -929,6 +1583,7 @@ class GraphStageMixin:
             "test_labels_used_for_training": False,
             "test_labels_used_for_threshold": False,
             "oracle_labels_used": False,
+            "supports_full_graph_diagnostic_comparison": bool(graph_variant == "full_graph_support"),
             "frozen_g0_dir": str(context["frozen_g0"]["dir"]),
             "frozen_g0_manifest": context["frozen_g0"]["manifest"],
             "graph_source": context["graph_bundle"]["source"],
@@ -940,13 +1595,14 @@ class GraphStageMixin:
             "local_rand_edge_index_path": str(stage_dir / "local_rand_edge_index.pt"),
             "local_rand_edge_type_path": str(stage_dir / "local_rand_edge_type.pt"),
             "conflict_evidence_edges_path": str(stage_dir / "conflict_evidence_edges.jsonl"),
+            "per_node_test_path": str(stage_dir / "per_node_test.jsonl"),
         }
         self._write_stage_manifest(
             stage_dir,
             manifest,
-            artifact_namespace="stages/glance_oracle_refinement_internal",
-            visibility="internal",
-            resolved_task="glance_oracle_refinement_internal",
+            artifact_namespace="stages/local_conflict_prune_diag",
+            visibility="public",
+            resolved_task="local_conflict_prune_diag",
         )
         write_json(stage_dir / "metrics.json", metrics_payload)
         write_text(
@@ -984,6 +1640,11 @@ class GraphStageMixin:
             "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in evidence_rows)
             + ("\n" if evidence_rows else ""),
         )
+        write_text(
+            stage_dir / "per_node_test.jsonl",
+            "\n".join(json.dumps(row, ensure_ascii=True, sort_keys=True) for row in per_node_rows)
+            + ("\n" if per_node_rows else ""),
+        )
         write_torch(stage_dir / "local_conflict_edge_index.pt", conflict_edge_index)
         write_torch(stage_dir / "local_conflict_edge_type.pt", conflict_edge_type)
         write_torch(stage_dir / "local_rand_edge_index.pt", rand_edge_index)
@@ -999,6 +1660,9 @@ class GraphStageMixin:
                     "routed_mask": torch.tensor(routed_mask, dtype=torch.bool),
                     "routing_threshold": torch.tensor([routing_threshold], dtype=torch.float32),
                     "structural_node_repr": structural_outputs["node_repr"],
+                    "base_pred": torch.tensor(base_pred_np, dtype=torch.long),
+                    "local_conf_pred": torch.tensor(local_conf_pred_np, dtype=torch.long),
+                    "local_rand_pred": torch.tensor(local_rand_pred_np, dtype=torch.long),
                 },
                 **base_bundle,
             },
@@ -1014,6 +1678,7 @@ class GraphStageMixin:
                     "Candidate edges are target-centered 1-hop incident edges, bucketed by (relation, target_role).",
                     "Propagation validation is performed by retraining frozen_g0 on the edited graph only.",
                     "Removed conflict edges are preserved as evidence-ready provenance for later local evidence graph consumption.",
+                    "When graph_data_variant=full_graph_support, the stage also compares labeled-prefix failure regimes against the support-augmented full graph and writes support-exposure, structural-shock, and error-migration diagnostics.",
                 ]
             )
             + "\n",

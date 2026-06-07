@@ -67,6 +67,92 @@ class GlanceReliabilityRouterMLP(nn.Module):
         return logits, prob
 
 
+class SelectiveNetResidualRouter(nn.Module):
+    """SelectiveNet-style residual-error router.
+
+    The model keeps a shared feature trunk and exposes:
+    - prediction head: predicts P(base_wrong | x)
+    - selection head: predicts whether the node should remain in-coverage
+    - auxiliary head: stabilizes representation learning on all samples
+    """
+
+    def __init__(self, input_dim, hidden_dim=128, bottleneck_dim=64, dropout=0.1):
+        super().__init__()
+        input_dim = int(input_dim)
+        hidden_dim = int(hidden_dim)
+        bottleneck_dim = int(bottleneck_dim)
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+        self.prediction_head = nn.Linear(bottleneck_dim, 1)
+        self.selection_head = nn.Linear(bottleneck_dim, 1)
+        self.auxiliary_head = nn.Linear(bottleneck_dim, 1)
+
+    def forward(self, x):
+        normalized = self.input_norm(x)
+        hidden = self.trunk(normalized)
+        prediction_logits = self.prediction_head(hidden).squeeze(-1)
+        selection_logits = self.selection_head(hidden).squeeze(-1)
+        auxiliary_logits = self.auxiliary_head(hidden).squeeze(-1)
+        prediction_prob = torch.sigmoid(prediction_logits)
+        selection_prob = torch.sigmoid(selection_logits)
+        auxiliary_prob = torch.sigmoid(auxiliary_logits)
+        combined_score = selection_prob * prediction_prob
+        return {
+            "prediction_logits": prediction_logits,
+            "prediction_prob": prediction_prob,
+            "selection_logits": selection_logits,
+            "selection_prob": selection_prob,
+            "auxiliary_logits": auxiliary_logits,
+            "auxiliary_prob": auxiliary_prob,
+            "combined_score": combined_score,
+        }
+
+
+def selectivenet_selective_loss(
+    prediction_prob,
+    selection_prob,
+    targets,
+    *,
+    coverage_target,
+    lambda_coverage=32.0,
+    eps=1e-6,
+):
+    prediction_prob = prediction_prob.float().reshape(-1)
+    selection_prob = selection_prob.float().reshape(-1)
+    targets = targets.float().reshape(-1)
+    if prediction_prob.numel() == 0:
+        zero = prediction_prob.sum() * 0.0
+        return {
+            "loss": zero,
+            "empirical_coverage": zero.detach(),
+            "selective_risk": zero.detach(),
+            "coverage_penalty": zero.detach(),
+        }
+    bce = F.binary_cross_entropy(
+        prediction_prob.clamp(min=eps, max=1.0 - eps),
+        targets,
+        reduction="none",
+    )
+    empirical_coverage = selection_prob.mean()
+    selective_risk = (bce * selection_prob).sum() / selection_prob.sum().clamp_min(eps)
+    coverage_gap = torch.clamp(float(coverage_target) - empirical_coverage, min=0.0)
+    coverage_penalty = coverage_gap.pow(2)
+    total_loss = selective_risk + float(lambda_coverage) * coverage_penalty
+    return {
+        "loss": total_loss,
+        "empirical_coverage": empirical_coverage.detach(),
+        "selective_risk": selective_risk.detach(),
+        "coverage_penalty": coverage_penalty.detach(),
+    }
+
+
 def _safe_mean(values):
     if values.size == 0:
         return 0.0

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from time import perf_counter
 
@@ -42,6 +43,74 @@ _GNN_BUILDERS = {
     "hgt": HGT,
     "gatv2": GATv2Bot,
 }
+
+
+def _hf_cache_root():
+    explicit = os.environ.get("HF_HUB_CACHE") or os.environ.get("TRANSFORMERS_CACHE")
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _looks_like_pretrained_dir(path):
+    path = Path(path)
+    if not path.is_dir():
+        return False
+    marker_files = (
+        "config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.json",
+        "merges.txt",
+        "model.safetensors",
+        "pytorch_model.bin",
+    )
+    return any((path / marker).exists() for marker in marker_files)
+
+
+def _ordered_snapshot_dirs(cache_dir):
+    snapshots_dir = Path(cache_dir) / "snapshots"
+    if not snapshots_dir.is_dir():
+        return []
+    ordered = []
+    main_ref = Path(cache_dir) / "refs" / "main"
+    if main_ref.is_file():
+        ref_name = main_ref.read_text(encoding="utf-8").strip()
+        if ref_name:
+            ordered.append(snapshots_dir / ref_name)
+    ordered.extend(sorted(snapshots_dir.iterdir(), key=lambda item: item.name, reverse=True))
+    result = []
+    seen = set()
+    for snapshot_dir in ordered:
+        snapshot_dir = Path(snapshot_dir)
+        key = str(snapshot_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _looks_like_pretrained_dir(snapshot_dir):
+            result.append(snapshot_dir)
+    return result
+
+
+def _resolve_local_pretrained_source(model_source):
+    text = str(model_source or "").strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    if candidate.exists():
+        if _looks_like_pretrained_dir(candidate):
+            return str(candidate)
+        for snapshot_dir in _ordered_snapshot_dirs(candidate):
+            return str(snapshot_dir)
+        return None
+    normalized = text.replace("\\", "/").strip("/")
+    if "/" not in normalized:
+        cache_dir = _hf_cache_root() / f"models--{normalized}"
+    else:
+        cache_dir = _hf_cache_root() / f"models--{normalized.replace('/', '--')}"
+    for snapshot_dir in _ordered_snapshot_dirs(cache_dir):
+        return str(snapshot_dir)
+    return None
 
 
 class PhaseAInputAdapter(nn.Module):
@@ -273,7 +342,9 @@ def _build_tokenizer(model_name, model_config):
     tokenizer_source = _TOKENIZER_SOURCES.get(model_name)
     if tokenizer_source is None:
         raise ValueError(f"Unsupported LM model: {model_config['lm_model']}")
-    return AutoTokenizer.from_pretrained(tokenizer_source)
+    resolved_source = model_config.get("pretrained_model_source") or tokenizer_source
+    kwargs = {"local_files_only": True} if model_config.get("pretrained_model_source") else {}
+    return AutoTokenizer.from_pretrained(resolved_source, **kwargs)
 
 
 def _resize_tokenizer_if_needed(model_name, tokenizer, lm_model):
@@ -574,8 +645,15 @@ def resolve_g0_node_features(args, data):
 
 
 def build_LM_model(model_config):
-    lm_model = LM_Model(model_config).to(model_config["device"])
     model_name = model_config["lm_model"].lower()
+    if model_name not in _QWEN_MODEL_NAMES:
+        tokenizer_source = _TOKENIZER_SOURCES.get(model_name)
+        if tokenizer_source:
+            resolved_source = _resolve_local_pretrained_source(tokenizer_source)
+            if resolved_source:
+                model_config = dict(model_config)
+                model_config["pretrained_model_source"] = resolved_source
+    lm_model = LM_Model(model_config).to(model_config["device"])
     tokenizer = _build_tokenizer(model_name, model_config)
     _resize_tokenizer_if_needed(model_name, tokenizer, lm_model)
     _print_model_info("LM", lm_model)

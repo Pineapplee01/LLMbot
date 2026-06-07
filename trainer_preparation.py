@@ -123,6 +123,30 @@ def train_frozen_g0(args, seed, data, experiment_root):
     y = labels.to(device)
     edge_index = data["edge_index"]
     edge_type = data["edge_type"]
+    graph_override = _resolve_optional_graph_override_paths(args)
+    graph_override_manifest = None
+    if graph_override is not None:
+        edge_index = safe_torch_load(graph_override["edge_index_path"], map_location="cpu")
+        edge_type = safe_torch_load(graph_override["edge_type_path"], map_location="cpu")
+        edge_index = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
+        edge_type = edge_type.detach().cpu().long().view(-1) if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long).view(-1)
+        if edge_index.dim() != 2 or int(edge_index.shape[0]) != 2:
+            raise ValueError(
+                f"--external_graph_edge_index_path must contain a [2, num_edges] tensor, got {tuple(edge_index.shape)}."
+            )
+        if int(edge_type.numel()) != int(edge_index.shape[1]):
+            raise ValueError(
+                "--external_graph_edge_type_path must align with --external_graph_edge_index_path: "
+                f"{int(edge_type.numel())} types for {int(edge_index.shape[1])} edges."
+            )
+        graph_override_manifest = {
+            "mode": "external_graph_override",
+            "edge_index_path": str(graph_override["edge_index_path"]),
+            "edge_type_path": str(graph_override["edge_type_path"]),
+            "edge_count": int(edge_index.shape[1]),
+            "edge_index_sha256": tensor_sha256(edge_index),
+            "edge_type_sha256": tensor_sha256(edge_type),
+        }
     graph_refine_stats = None
     if refine_request["mode"] != "none":
         edge_index, edge_type, graph_refine_stats = _directional_relation_aware_prune(
@@ -142,9 +166,14 @@ def train_frozen_g0(args, seed, data, experiment_root):
             out_dir / "pruned_edge_index.pt",
             out_dir / "pruned_edge_type.pt",
             out_dir / "graph_refine_stats.json",
+            out_dir / "external_edge_index.pt",
+            out_dir / "external_edge_type.pt",
         ):
             if stale_path.exists():
                 stale_path.unlink()
+    if graph_override_manifest is not None:
+        write_torch(out_dir / "external_edge_index.pt", edge_index)
+        write_torch(out_dir / "external_edge_type.pt", edge_type)
     edge_index = edge_index.to(device)
     edge_type = edge_type.to(device)
     train_idx = _idx_tensor(data["train_idx"]).to(device)
@@ -291,6 +320,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 "labels_sha256": tensor_sha256(data["labels"]),
             },
             "graph_data_variant": graph_data_variant,
+            "graph_override": graph_override_manifest if graph_override_manifest is not None else {"mode": "none"},
             **(
                 {
                     "graph_refine": {
@@ -558,11 +588,34 @@ def _resolve_optional_graph_override_paths(args):
     }
 
 
+def _graph_override_manifest_request(args):
+    graph_override = _resolve_optional_graph_override_paths(args)
+    if graph_override is None:
+        return None
+    return {
+        "edge_index_path": str(graph_override["edge_index_path"]),
+        "edge_type_path": str(graph_override["edge_type_path"]),
+    }
+
+
 def _existing_g0_matches_request(args, manifest):
     if manifest.get("contract") != FROZEN_G0_CONTRACT:
         return False
     if manifest.get("backbone", "").lower() != str(getattr(args, "GNN_model", "rgcn")).lower():
         return False
+
+    requested_graph_override = _graph_override_manifest_request(args)
+    existing_graph_override = manifest.get("graph_override")
+    if requested_graph_override is None:
+        if existing_graph_override not in (None, {}, {"mode": "none"}):
+            return False
+    else:
+        if not isinstance(existing_graph_override, dict):
+            return False
+        if str(existing_graph_override.get("edge_index_path", "")) != requested_graph_override["edge_index_path"]:
+            return False
+        if str(existing_graph_override.get("edge_type_path", "")) != requested_graph_override["edge_type_path"]:
+            return False
 
     requested_path = _requested_feature_path(args)
     feature_manifest = manifest.get("feature_manifest", {})

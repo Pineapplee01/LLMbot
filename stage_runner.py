@@ -256,6 +256,12 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
         if self.execution_stage == "joint_router_refinement":
             return self._run_glance_joint_router_refine(stage_dir, base_bundle)
 
+        if self.execution_stage == "router_only_ablation":
+            return self._run_router_only_ablation(stage_dir, base_bundle)
+
+        if self.execution_stage == "prompt_expert_quality_audit":
+            return self._run_prompt_expert_quality_audit(stage_dir, base_bundle)
+
         if self.execution_stage == "minimal_pipeline":
             return self._run_vertical_minimal(stage_dir, base_bundle)
 

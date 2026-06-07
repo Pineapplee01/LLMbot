@@ -203,6 +203,32 @@ def parser_args(argv=None):
     parser.add_argument("--raw_data_filepath", type=str, default="./data/raw/")
     parser.add_argument("--is_processed", type=_parse_bool, default=True, help=argparse.SUPPRESS)
     parser.add_argument("--reset_split", type=str, default="-1")
+    parser.add_argument(
+        "--routed_nodes_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional routed-nodes json used by semantic stages and routed-node experiments. "
+            "When set for semantic_encoder_finetune or semantic_embedding_classifier, train/validation/test "
+            "indices are replaced by the routed train/valid/test subsets stored in that file."
+        ),
+    )
+    parser.add_argument(
+        "--semantic_text_source_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional prompt/text sidecar for semantic_encoder_finetune and semantic_embedding_classifier. "
+            "When set, rows must contain node_id and a text field such as prompt/user/text; those texts replace "
+            "norm_user_text for the listed node ids while preserving full-graph row alignment."
+        ),
+    )
+    parser.add_argument(
+        "--semantic_text_field",
+        type=str,
+        default="prompt",
+        help="Field to read from --semantic_text_source_path rows; falls back to prompt/user/text when missing.",
+    )
 
     parser.add_argument(
         "--graph_backbone",
@@ -263,6 +289,31 @@ def parser_args(argv=None):
         choices=["none", "qwen_frozen", "qwen_peft", "ib_edl", "glance_boundary", "cs"],
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--joint_router_family",
+        type=str,
+        default="reliability_mlp",
+        choices=["reliability_mlp", "selectivenet"],
+        help="Router family for joint_router_refinement: current reliability MLP or a SelectiveNet-style selective predictor.",
+    )
+    parser.add_argument(
+        "--joint_selectivenet_coverages",
+        type=str,
+        default="0.10,0.20,0.30,0.40",
+        help="Comma-separated coverage targets for SelectiveNet-style router experiments.",
+    )
+    parser.add_argument(
+        "--joint_selectivenet_alpha",
+        type=float,
+        default=0.5,
+        help="SelectiveNet-style loss mixture weight on the selective branch; (1-alpha) weights the auxiliary prediction head.",
+    )
+    parser.add_argument(
+        "--joint_selectivenet_lambda",
+        type=float,
+        default=32.0,
+        help="SelectiveNet-style coverage penalty weight.",
+    )
 
     parser.add_argument("--text_encoder", dest="text_encoder", type=str, default="roberta")
     parser.add_argument("--LM_model", dest="text_encoder", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -287,6 +338,15 @@ def parser_args(argv=None):
         type=str,
         default="/root/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-8B/snapshots/1d8ad4ca9b3dd8059ad90a75d4983776a23d44af",
         help="Local path or HF id for Qwen3-Embedding-8B when --semantic_encoder qwen3_peft.",
+    )
+    parser.add_argument(
+        "--finetuned_roberta_checkpoint_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional SimTeG LM checkpoint (.pkl) used to initialize --semantic_encoder roberta_finetuned. "
+            "If omitted, semantic stages search for TwiBot-20_seed_<seed>/checkpoints/LM_pretrain/best.pkl."
+        ),
     )
     parser.add_argument(
         "--qwen_trust_remote_code",
@@ -514,6 +574,38 @@ def parser_args(argv=None):
         help="Loss weight for explicit keep/change gate supervision when joint_refiner_explicit_gate is enabled.",
     )
     parser.add_argument(
+        "--joint_utility_advantage_experiment",
+        type=str,
+        default="off",
+        choices=[
+            "off",
+            "utility_gate_only",
+            "botmoe_selector_only",
+            "utility_gate_botmoe_selector",
+        ],
+        help=(
+            "Public GLANCE utility-advantage experiment preset for joint_router_refinement. "
+            "'off' preserves the existing default behavior; utility-gate presets use the explicit keep/change gate, "
+            "and BotMoE selector presets keep expert selection separate from the keep/change decision."
+        ),
+    )
+    parser.add_argument(
+        "--joint_refiner_gate_policy",
+        type=str,
+        default="soft_mix",
+        choices=["soft_mix", "hard_keep_change"],
+        help=(
+            "Policy for applying the explicit keep/change gate in utility-advantage joint refiners. "
+            "'soft_mix' preserves the existing interpolation behavior; 'hard_keep_change' applies thresholded keep/change decisions at inference/evaluation time."
+        ),
+    )
+    parser.add_argument(
+        "--joint_refiner_gate_threshold",
+        type=float,
+        default=0.5,
+        help="Threshold for hard_keep_change explicit-gate application; default 0.5 preserves standard binary gate semantics.",
+    )
+    parser.add_argument(
         "--joint_prompt_expert_fusion",
         type=str,
         default="projector_concat",
@@ -521,12 +613,19 @@ def parser_args(argv=None):
             "projector_concat",
             "mpe_gated",
             "gaugllm_selector",
+            "gaugllm_mope",
+            "botmoe_selector",
+            "utility_correction_moe",
+            "metades_selector",
+            "conflict_aware_correction_moe",
             "raw_concat_single_graph_following",
             "raw_concat_single_graph_follower",
             "raw_concat_single_tweet",
             "raw_concat_single_conflict",
+            "raw_concat_follower_tweet",
             "raw_concat_following_triplet",
             "raw_concat_follower_triplet",
+            "ultratag_propagated_follower_triplet",
             "raw_concat_metadata_anchor",
             "raw_concat_metadata_only",
         ],
@@ -535,12 +634,211 @@ def parser_args(argv=None):
             "'projector_concat' preserves the existing projected concat path; "
             "'mpe_gated' uses the existing node-conditioned softmax over graph_following, graph_follower, tweet, conflict, and metadata_structured experts; "
             "'gaugllm_selector' reuses routed explanation sidecars at runtime, encodes selector-context texts with the finetuned SimTeG RoBERTa line, and applies a strict 4-expert context-aware selector over graph_following, graph_follower, tweet, and conflict; "
+            "'gaugllm_mope' reuses the same runtime sidecars but applies the official GAugLLM SimilarityAttentionMLP-style content-plus-context similarity MoPE head; "
+            "'botmoe_selector' applies sparse BotMoE-style noisy top-k selection over graph_following, graph_follower, tweet, and conflict only; "
+            "'utility_correction_moe' trains expert-specific correction heads over graph_follower, tweet, conflict, and metadata_structured, then uses per-expert utility probabilities as the abstain-aware selector; "
+            "'metades_selector' is a META-DES-style competence selector over graph_follower, tweet, conflict, and a runtime follower_triplet action, using base/expert confidence and disagreement meta-features for per-action utility; "
+            "'conflict_aware_correction_moe' selects only first-order prompt experts graph_following, graph_follower, and tweet, while using conflict plus runtime explanation-context embeddings as safety/context features for correction utility; "
             "'raw_concat_single_*' concatenates z_gnn + one raw expert + structural side features without projectors; "
+            "'raw_concat_follower_tweet' concatenates z_gnn + graph_follower + tweet + structural side features without projectors; "
             "'raw_concat_following_triplet' concatenates z_gnn + graph_following + tweet + conflict + structural side features without projectors; "
             "'raw_concat_follower_triplet' concatenates z_gnn + graph_follower + tweet + conflict + structural side features without projectors; "
+            "'ultratag_propagated_follower_triplet' is a legacy mean-propagation routed-node ablation, not an UltraTAG-S reproduction: it mean-propagates existing prompt-expert embeddings over one graph hop at runtime, then concatenates z_gnn + propagated graph_follower/tweet/conflict + structural side features; "
             "'raw_concat_metadata_anchor' adds the structured metadata expert to the follower_triplet anchor; "
             "'raw_concat_metadata_only' isolates z_gnn + metadata_structured + structural side features."
         ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_mope_attention",
+        type=str,
+        default="similarity",
+        choices=["similarity"],
+        help=(
+            "Attention family for --joint_prompt_expert_fusion gaugllm_mope. "
+            "Only 'similarity' is currently implemented, matching the official GAugLLM default SimilarityAttentionMLP."
+        ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_mope_temperature",
+        type=float,
+        default=0.2,
+        help=(
+            "Softmax temperature for --joint_prompt_expert_fusion gaugllm_mope. "
+            "The default 0.2 preserves the official GAugLLM SimilarityAttentionMLP setting."
+        ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_mope_logit_norm",
+        type=str,
+        default="none",
+        choices=["none", "branch_zscore", "combined_zscore"],
+        help=(
+            "Optional diagnostic calibration for gaugllm_mope selector logits. "
+            "'none' preserves the official formula; 'branch_zscore' normalizes content and similarity logits separately "
+            "across experts per node before summing; 'combined_zscore' normalizes the summed logits before temperature."
+        ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_mope_entropy_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Lightweight selector-entropy regularization weight for gaugllm_mope. "
+            "Adds weight * (log(E) - mean_entropy(selector_weights)) to the routed-node refiner loss "
+            "so diagnostics can test whether a softer selector reduces single-expert collapse."
+        ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_mope_load_balance_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Lightweight load-balance regularization weight for gaugllm_mope. "
+            "Adds weight * ||mean(selector_weights) - availability_prior||^2 over routed training nodes, "
+            "where availability_prior is derived from expert_presence_mask in the current batch."
+        ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_botmoe_top_k",
+        type=int,
+        default=1,
+        help=(
+            "Sparse top-k expert count for --joint_prompt_expert_fusion botmoe_selector. "
+            "Defaults to 1, matching the sparse single-expert BotMoE setting used in the local BotMoE reference."
+        ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_botmoe_noisy_gating",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable train-time noisy top-k gating for botmoe_selector. "
+            "Use --no-joint_prompt_expert_botmoe_noisy_gating for deterministic sparse gating diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--joint_prompt_expert_botmoe_aux_weight",
+        type=float,
+        default=1e-2,
+        help=(
+            "Auxiliary BotMoE load-balancing coefficient for botmoe_selector. "
+            "Scales cv_squared(importance) + cv_squared(load) on routed training batches."
+        ),
+    )
+    parser.add_argument(
+        "--joint_correction_moe_expert_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Auxiliary expert-head classification loss weight for correction-selector fusion modes "
+            "(utility_correction_moe and metades_selector). "
+            "The loss is applied only on routed nodes and available correction experts."
+        ),
+    )
+    parser.add_argument(
+        "--joint_correction_moe_utility_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Auxiliary per-expert utility BCE loss weight for correction-selector fusion modes "
+            "(utility_correction_moe and metades_selector). "
+            "Target semantics are controlled by --joint_correction_moe_utility_target."
+        ),
+    )
+    parser.add_argument(
+        "--joint_correction_moe_utility_target",
+        type=str,
+        default="loss_advantage",
+        choices=["loss_advantage", "decision_gain", "hybrid", "net_gain"],
+        help=(
+            "Per-expert utility target for correction-selector fusion modes "
+            "(utility_correction_moe and metades_selector). "
+            "'loss_advantage' preserves base_loss - expert_loss - beta > 0; "
+            "'decision_gain' uses base_wrong and expert_pred_correct; "
+            "'hybrid' treats either condition as utility-positive; "
+            "'net_gain' uses the decision-gain positive target while treating break actions "
+            "as explicit negative-utility examples through --joint_correction_moe_break_weight."
+        ),
+    )
+    parser.add_argument(
+        "--joint_correction_moe_break_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Break-action penalty for correction-selector fusion modes. "
+            "A base-correct/expert-wrong action receives utility reward -break_weight "
+            "for pairwise ranking and receives this multiplier in the utility BCE negative weight. "
+            "Default 1.0 preserves old negative weighting unless the flag is raised."
+        ),
+    )
+    parser.add_argument(
+        "--joint_correction_moe_ranking_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Within-node per-action utility ranking loss weight for correction-selector fusion modes. "
+            "When positive, utility logits are trained to rank fix actions above no-gain actions "
+            "and no-gain actions above break actions using the correction utility reward matrix."
+        ),
+    )
+    parser.add_argument(
+        "--joint_correction_moe_ranking_margin",
+        type=float,
+        default=0.0,
+        help="Softplus margin for --joint_correction_moe_ranking_weight.",
+    )
+    parser.add_argument(
+        "--joint_correction_moe_gate_calibration",
+        type=str,
+        default="off",
+        choices=["off", "global_threshold", "per_action_threshold"],
+        help=(
+            "Validation-locked gate calibration for correction-selector fusion modes. "
+            "'global_threshold' selects one utility gate threshold on valid and locks it to test; "
+            "'per_action_threshold' selects one threshold per selected correction action on valid. "
+            "The default 'off' keeps the existing --joint_refiner_gate_threshold path."
+        ),
+    )
+    parser.add_argument(
+        "--prompt_expert_quality_cache_path",
+        type=str,
+        default=None,
+        help=(
+            "Prompt-expert quality audit input cache. Expected to be a prompt_expert_bundle_v2 "
+            ".pt payload with graph_following, graph_follower, tweet, conflict, and adjacent "
+            "manifest/explanation sidecars."
+        ),
+    )
+    parser.add_argument(
+        "--prompt_expert_quality_reference_stage",
+        type=str,
+        default=None,
+        help=(
+            "Reference joint_router_refinement stage directory used by prompt_expert_quality_audit "
+            "to load routed masks, labels, base predictions, and correction utility tensors. "
+            "If omitted, --joint_router_reuse_root is used."
+        ),
+    )
+    parser.add_argument(
+        "--prompt_expert_quality_components",
+        type=str,
+        default="graph_following,graph_follower,tweet,conflict",
+        help=(
+            "Comma-separated prompt expert components audited by prompt_expert_quality_audit. "
+            "Defaults to the four v2 explanation-first experts."
+        ),
+    )
+    parser.add_argument(
+        "--prompt_expert_quality_probe_C",
+        type=float,
+        default=0.1,
+        help="Logistic-regression C used by prompt_expert_quality_audit separability probes.",
+    )
+    parser.add_argument(
+        "--prompt_expert_quality_threshold_grid",
+        type=int,
+        default=501,
+        help="Number of validation threshold candidates for prompt_expert_quality_audit utility probes.",
     )
     parser.add_argument(
         "--embedding_path",

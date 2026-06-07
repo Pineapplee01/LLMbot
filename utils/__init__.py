@@ -110,6 +110,11 @@ def write_text(path, text):
 def write_csv_rows(path, fieldnames, rows):
     path = Path(path)
     ensure_dir(path.parent)
+    fieldnames = list(fieldnames)
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
     with open(path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
