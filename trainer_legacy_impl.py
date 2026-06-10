@@ -6633,6 +6633,15 @@ class StageRunner:
             "conformal_knn_target_top_n": int(getattr(self.args, "conformal_knn_target_top_n", 200)),
             "conformal_knn_shrinkage_tau": float(getattr(self.args, "conformal_knn_shrinkage_tau", 3.0)),
             "conformal_knn_ncp_lambda": float(getattr(self.args, "conformal_knn_ncp_lambda", 1.0)),
+            "conformal_knn_neighbor_mode": str(getattr(self.args, "conformal_knn_neighbor_mode", "standard") or "standard"),
+            "conformal_knn_similarity_threshold": float(
+                getattr(self.args, "conformal_knn_similarity_threshold", -1.0)
+            ),
+            "conformal_knn_min_support": int(getattr(self.args, "conformal_knn_min_support", 1)),
+            "conformal_knn_adaptive_max_k": int(getattr(self.args, "conformal_knn_adaptive_max_k", 0)),
+            "conformal_knn_hubness_correction": str(
+                getattr(self.args, "conformal_knn_hubness_correction", "none") or "none"
+            ),
             "conformal_knn_learning_mode": str(getattr(self.args, "conformal_knn_learning_mode", "fixed") or "fixed"),
             "conformal_knn_score_family_override": str(
                 getattr(self.args, "conformal_knn_score_family_override", "auto") or "auto"
@@ -6681,6 +6690,25 @@ class StageRunner:
             )
         if config["conformal_knn_repr_source"] not in {"node_repr", "x_low", "x_new"}:
             raise ValueError("--conformal_knn_repr_source must resolve to one of {node_repr, x_low, x_new}.")
+        if config["conformal_knn_learning_mode"] not in {"fixed", "ncp_local"}:
+            raise ValueError("--conformal_knn_learning_mode must resolve to one of {fixed, ncp_local}.")
+        if config["conformal_knn_neighbor_mode"] not in {
+            "standard",
+            "mutual",
+            "threshold",
+            "adaptive",
+            "mutual_adaptive",
+        }:
+            raise ValueError(
+                "--conformal_knn_neighbor_mode must resolve to one of "
+                "{standard, mutual, threshold, adaptive, mutual_adaptive}."
+            )
+        if config["conformal_knn_hubness_correction"] not in {"none", "degree"}:
+            raise ValueError("--conformal_knn_hubness_correction must resolve to one of {none, degree}.")
+        if config["conformal_knn_min_support"] < 0:
+            raise ValueError("--conformal_knn_min_support must be non-negative.")
+        if config["conformal_knn_adaptive_max_k"] < 0:
+            raise ValueError("--conformal_knn_adaptive_max_k must be non-negative.")
         return config, metadata
 
     def _conformal_knn_router_repr(self, gnn_outputs, estimator_mode, repr_source=None):
@@ -6807,6 +6835,11 @@ class StageRunner:
                 "anchor_top_n": int(conformal_knn_config["conformal_knn_target_top_n"]),
                 "shrinkage_tau": float(conformal_knn_config["conformal_knn_shrinkage_tau"]),
                 "ncp_lambda": float(conformal_knn_config["conformal_knn_ncp_lambda"]),
+                "neighbor_mode": str(conformal_knn_config["conformal_knn_neighbor_mode"]),
+                "similarity_threshold": float(conformal_knn_config["conformal_knn_similarity_threshold"]),
+                "min_support": int(conformal_knn_config["conformal_knn_min_support"]),
+                "adaptive_max_k": int(conformal_knn_config["conformal_knn_adaptive_max_k"]),
+                "hubness_correction": str(conformal_knn_config["conformal_knn_hubness_correction"]),
                 "learning_mode": str(conformal_knn_config["conformal_knn_learning_mode"]),
                 "score_family_override": str(conformal_knn_config["conformal_knn_score_family_override"]),
                 "repr_source": str(conformal_knn_config["conformal_knn_repr_source"]),

@@ -1450,6 +1450,56 @@ def parser_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--conformal_knn_neighbor_mode",
+        type=str,
+        default="standard",
+        choices=["standard", "mutual", "threshold", "adaptive", "mutual_adaptive"],
+        help=(
+            "Non-model KNN support filter for conformal_knn_risk_router. `standard` preserves "
+            "the previous top-k behavior; `mutual` keeps only reciprocal feature neighbors; "
+            "`threshold` keeps neighbors above --conformal_knn_similarity_threshold; "
+            "`adaptive` may use --conformal_knn_adaptive_max_k before thresholding; "
+            "`mutual_adaptive` combines reciprocal and threshold/adaptive filtering."
+        ),
+    )
+    parser.add_argument(
+        "--conformal_knn_similarity_threshold",
+        type=float,
+        default=-1.0,
+        help=(
+            "Cosine-similarity floor used by threshold/adaptive conformal KNN neighbor modes. "
+            "Values <= -1 disable threshold filtering."
+        ),
+    )
+    parser.add_argument(
+        "--conformal_knn_min_support",
+        type=int,
+        default=1,
+        help=(
+            "Minimum filtered KNN support size required before using local KNN evidence. "
+            "Centers below this count fall back to target-only/global local-calibration features."
+        ),
+    )
+    parser.add_argument(
+        "--conformal_knn_adaptive_max_k",
+        type=int,
+        default=0,
+        help=(
+            "Optional maximum candidate count fetched before adaptive/threshold KNN filtering. "
+            "A value of 0 keeps --conformal_knn_k as the fetch size."
+        ),
+    )
+    parser.add_argument(
+        "--conformal_knn_hubness_correction",
+        type=str,
+        default="none",
+        choices=["none", "degree"],
+        help=(
+            "Optional non-model hubness correction for NCP KNN weights. `degree` downweights "
+            "neighbors that appear in many centers' raw top-k support lists."
+        ),
+    )
+    parser.add_argument(
         "--conformal_knn_repr_source",
         type=str,
         default="node_repr",
@@ -1464,12 +1514,13 @@ def parser_args(argv=None):
         "--conformal_knn_learning_mode",
         type=str,
         default="fixed",
-        choices=["fixed", "logistic"],
+        choices=["fixed", "ncp_local"],
         help=(
             "Risk-fusion mode for conformal_knn_risk_router. `fixed` preserves the "
-            "validation-selected fixed score families; `logistic` learns a target-node "
-            "residual-error risk model on the validation tune split from NCP-style KNN "
-            "support features, then keeps conformal calibration on the held-out cal split."
+            "validation-selected fixed score families; `ncp_local` uses KNN neighborhood "
+            "calibration samples with exp(-distance/lambda_L) weights to compute local "
+            "conformal features, then selects among nonparametric NCP-local score families "
+            "on the tune split by AUPRC-error first, without fitting a logistic head."
         ),
     )
     parser.add_argument(

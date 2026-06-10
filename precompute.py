@@ -63,6 +63,14 @@ DEFAULT_FINETUNED_ROBERTA_MODEL_PATH = "yzxjb/roberta-finetuned-20"
 DEFAULT_FINETUNED_ROBERTA_MODEL_ALIAS = "roberta_finetuned"
 DEFAULT_OUTPUT_NAME = "glance_qwen3_prompt_cache.pt"
 DEFAULT_ACCOUNT_REFERENCE_DATE = datetime(2020, 9, 1)
+EMBEDDING_MODEL_CLASS_CHOICES = ("auto", "auto_model", "causal_lm")
+EMBEDDING_POOLING_MODE_CHOICES = (
+    "auto",
+    "last_token",
+    "masked_mean",
+    "simteg_mean",
+    "causal_last_hidden_last_token",
+)
 LEGACY_PROMPT_MODES = (
     "glance_ego",
     "glance_hop1",
@@ -2248,9 +2256,36 @@ def _infer_embedding_encoder_tag(model_source):
         if "qwen3" in token:
             return "qwen3"
         return "qwen"
+    if "llama-3" in token or "llama3" in token:
+        return "llama3"
+    if "llama" in token:
+        return "llama"
+    if "mistral" in token:
+        return "mistral"
     if "bert" in token:
         return "bert"
     return "encoder"
+
+
+def _embedding_output_encoder_tag(model_source, args=None, pooling_mode=None, embedding_model_class=None):
+    base = _infer_embedding_encoder_tag(model_source)
+    requested_pooling = str(
+        pooling_mode
+        if pooling_mode is not None
+        else getattr(args, "embedding_pooling_mode", "auto")
+        if args is not None
+        else "auto"
+    ).strip().lower()
+    requested_model_class = str(
+        embedding_model_class
+        if embedding_model_class is not None
+        else getattr(args, "embedding_model_class", "auto")
+        if args is not None
+        else "auto"
+    ).strip().lower()
+    if requested_model_class == "causal_lm" or requested_pooling == "causal_last_hidden_last_token":
+        return f"{base}_causal_last_hidden"
+    return base
 
 
 def _resolve_finetuned_roberta_checkpoint(args):
@@ -2297,7 +2332,14 @@ def _load_simteg_lm_checkpoint_into_encoder(model, checkpoint_path):
     }
 
 
-def _resolve_pooling_mode(model_source, model):
+def _resolve_pooling_mode(model_source, model, requested_pooling_mode="auto", embedding_model_class="auto"):
+    requested = str(requested_pooling_mode or "auto").strip().lower()
+    if requested != "auto":
+        if requested not in EMBEDDING_POOLING_MODE_CHOICES:
+            raise ValueError(f"Unsupported embedding pooling mode: {requested}")
+        return requested
+    if str(embedding_model_class or "auto").strip().lower() == "causal_lm":
+        return "causal_last_hidden_last_token"
     token = str(model_source or "").replace("\\", "/").lower()
     config = getattr(model, "config", None)
     if "qwen" in token or bool(getattr(config, "is_decoder", False)):
@@ -2305,6 +2347,30 @@ def _resolve_pooling_mode(model_source, model):
     if _infer_embedding_encoder_tag(model_source) == "roberta_finetuned":
         return "simteg_mean"
     return "masked_mean"
+
+
+def _embedding_encoder_contract(pooling_mode, simteg_checkpoint_summary=None):
+    if pooling_mode == "causal_last_hidden_last_token":
+        return "causal_lm_last_hidden_state_last_token_embedding"
+    if simteg_checkpoint_summary:
+        return "frozen_simteg_finetuned_roberta_lm_checkpoint"
+    if pooling_mode == "simteg_mean":
+        return "simteg_finetuned_roberta_text_encoder"
+    return "generic_huggingface_embedding_encoder"
+
+
+def _embedding_tokenization_contract(pooling_mode):
+    if pooling_mode == "causal_last_hidden_last_token":
+        return (
+            "Causal-LM hidden-state embedding: padding=True, left padding, truncation=True, "
+            "add_special_tokens=True, output_hidden_states=True, pool outputs.hidden_states[-1] at last valid token"
+        )
+    if pooling_mode == "simteg_mean":
+        return (
+            "SimTeG-compatible: padding=True, truncation=True, max_length<=512, "
+            "add_special_tokens=False, final hidden-state plain mean"
+        )
+    return "padding=True, truncation=True, encoder-aligned pooling"
 
 
 def _is_prompt_expert_explanation_first(args):
@@ -4670,12 +4736,15 @@ def _effective_explain_batch_size(args, device):
 
 
 def _load_embedding_model(args, device):
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
     requested_encoder_tag = _infer_embedding_encoder_tag(args.model_path)
     checkpoint_path = _resolve_finetuned_roberta_checkpoint(args) if requested_encoder_tag == "roberta_finetuned" else None
     model_source = _require_local_pretrained_source(args.model_path, model_role="Embedding model")
     encoder_tag = requested_encoder_tag if requested_encoder_tag == "roberta_finetuned" else _infer_embedding_encoder_tag(model_source)
+    embedding_model_class = str(getattr(args, "embedding_model_class", "auto") or "auto").strip().lower()
+    if embedding_model_class not in EMBEDDING_MODEL_CLASS_CHOICES:
+        raise ValueError(f"Unsupported --embedding_model_class: {embedding_model_class}")
     tokenizer = AutoTokenizer.from_pretrained(
         model_source,
         trust_remote_code=bool(args.trust_remote_code),
@@ -4689,7 +4758,8 @@ def _load_embedding_model(args, device):
         if encoder_tag == "roberta_finetuned"
         else ("auto" if use_qwen_embedding_model else (torch.float16 if device.type == "cuda" else torch.float32))
     )
-    model = AutoModel.from_pretrained(
+    model_cls = AutoModelForCausalLM if embedding_model_class == "causal_lm" else AutoModel
+    model = model_cls.from_pretrained(
         model_source,
         trust_remote_code=bool(args.trust_remote_code),
         local_files_only=True,
@@ -4704,10 +4774,17 @@ def _load_embedding_model(args, device):
         checkpoint_load_summary["checkpoint_path"] = str(checkpoint_path)
         model.to(device)
     model.eval()
-    pooling_mode = _resolve_pooling_mode(model_source, model)
-    # Qwen embedding cards use left padding plus last-token pooling; mean-pool encoders stay right-padded.
-    tokenizer.padding_side = "left" if pooling_mode == "last_token" else "right"
-    return tokenizer, model, model_source, pooling_mode, checkpoint_load_summary
+    pooling_mode = _resolve_pooling_mode(
+        model_source,
+        model,
+        requested_pooling_mode=getattr(args, "embedding_pooling_mode", "auto"),
+        embedding_model_class=embedding_model_class,
+    )
+    # Decoder/causal-LM hidden-state embeddings use left padding so the last
+    # valid token is stable under batch padding; mean-pool encoders stay right-padded.
+    tokenizer.padding_side = "left" if pooling_mode in {"last_token", "causal_last_hidden_last_token"} else "right"
+    resolved_model_class = "causal_lm" if embedding_model_class == "causal_lm" else "auto_model"
+    return tokenizer, model, model_source, pooling_mode, checkpoint_load_summary, resolved_model_class
 
 
 def _encode_texts(model, tokenizer, texts, device, batch_size, max_length, normalize, pooling_mode):
@@ -4727,9 +4804,17 @@ def _encode_texts(model, tokenizer, texts, device, batch_size, max_length, norma
                 return_tensors="pt",
             )
             batch = {key: value.to(device) for key, value in batch.items()}
-            outputs = model(**batch, output_hidden_states=(pooling_mode == "simteg_mean"))
+            needs_hidden_states = pooling_mode in {"simteg_mean", "causal_last_hidden_last_token"}
+            outputs = model(**batch, output_hidden_states=needs_hidden_states)
             if pooling_mode == "last_token":
                 pooled = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
+            elif pooling_mode == "causal_last_hidden_last_token":
+                if not getattr(outputs, "hidden_states", None):
+                    raise ValueError(
+                        "causal_last_hidden_last_token pooling requires model outputs with hidden_states. "
+                        "Use --embedding_model_class causal_lm with a HuggingFace causal-LM model."
+                    )
+                pooled = last_token_pool(outputs.hidden_states[-1], batch["attention_mask"])
             elif pooling_mode == "masked_mean":
                 pooled = masked_mean_pool(outputs.last_hidden_state, batch["attention_mask"])
             elif pooling_mode == "simteg_mean":
@@ -5796,7 +5881,14 @@ def _run_ultratag_s_subgraph_precompute(
             ]
         )
 
-    tokenizer, model, resolved_embedding_model_source, embedding_pooling_mode, simteg_checkpoint_summary = _load_embedding_model(args, device)
+    (
+        tokenizer,
+        model,
+        resolved_embedding_model_source,
+        embedding_pooling_mode,
+        simteg_checkpoint_summary,
+        embedding_model_class,
+    ) = _load_embedding_model(args, device)
     encoded_target = _encode_texts(
         model,
         tokenizer,
@@ -5961,7 +6053,13 @@ def _run_ultratag_s_subgraph_precompute(
         "output_node_count": int(output_node_count),
         "context_graph_node_count": int(context_node_count),
         "labeled_node_count": int(labeled_node_count),
-        "embedding_encoder_tag": _infer_embedding_encoder_tag(resolved_embedding_model_source),
+        "embedding_encoder_tag": _embedding_output_encoder_tag(
+            resolved_embedding_model_source,
+            pooling_mode=embedding_pooling_mode,
+            embedding_model_class=embedding_model_class,
+        ),
+        "embedding_model_class": embedding_model_class,
+        "embedding_pooling_mode": embedding_pooling_mode,
         "base_embedding_path": str(getattr(args, "ultratag_base_embedding_path", "")),
     }
     payload["target_node_mask"][target_index_tensor] = True
@@ -6018,7 +6116,11 @@ def _run_ultratag_s_subgraph_precompute(
         "output_path": str(output_path),
         "base_embedding_path": str(getattr(args, "ultratag_base_embedding_path", "")),
         "embedding_model_path": str(resolved_embedding_model_source),
-        "embedding_encoder_tag": _infer_embedding_encoder_tag(resolved_embedding_model_source),
+        "embedding_encoder_tag": _embedding_output_encoder_tag(
+            resolved_embedding_model_source,
+            pooling_mode=embedding_pooling_mode,
+            embedding_model_class=embedding_model_class,
+        ),
         "embedding_pooling_mode": embedding_pooling_mode,
         "finetuned_roberta_checkpoint_path": str((simteg_checkpoint_summary or {}).get("checkpoint_path", "")),
         "finetuned_roberta_checkpoint_load": dict(simteg_checkpoint_summary or {}),
@@ -6150,6 +6252,24 @@ def build_parser():
         ),
     )
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument(
+        "--embedding_model_class",
+        choices=EMBEDDING_MODEL_CLASS_CHOICES,
+        default="auto",
+        help=(
+            "HuggingFace class used for prompt embedding. Use causal_lm for LLaMA/Qwen/Mistral-style "
+            "LLM last-hidden semantic embeddings; auto_model preserves the legacy AutoModel path."
+        ),
+    )
+    parser.add_argument(
+        "--embedding_pooling_mode",
+        choices=EMBEDDING_POOLING_MODE_CHOICES,
+        default="auto",
+        help=(
+            "Pooling contract for prompt embeddings. causal_last_hidden_last_token extracts "
+            "outputs.hidden_states[-1] at the last valid token and is the MH-LGC-style causal-LLM path."
+        ),
+    )
     parser.add_argument(
         "--finetuned_roberta_checkpoint_path",
         type=Path,
@@ -6400,7 +6520,7 @@ def run(args):
         context_edge_index = torch.load(context_variant_paths["edge_index_path"], map_location="cpu")
         context_edge_type = torch.load(context_variant_paths["edge_type_path"], map_location="cpu")
         embedding_model_source = _require_local_pretrained_source(args.model_path, model_role="Embedding model")
-        embedding_encoder_tag = _infer_embedding_encoder_tag(embedding_model_source)
+        embedding_encoder_tag = _embedding_output_encoder_tag(embedding_model_source, args=args)
         output_path = (
             Path(args.output_path)
             if args.output_path
@@ -6503,7 +6623,7 @@ def run(args):
         tweet_source_mode_effective = "raw_post_edges"
 
     embedding_model_source = _require_local_pretrained_source(args.model_path, model_role="Embedding model")
-    embedding_encoder_tag = _infer_embedding_encoder_tag(embedding_model_source)
+    embedding_encoder_tag = _embedding_output_encoder_tag(embedding_model_source, args=args)
     output_path = (
         Path(args.output_path)
         if args.output_path
@@ -6698,8 +6818,19 @@ def run(args):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    tokenizer, model, resolved_embedding_model_source, embedding_pooling_mode, simteg_checkpoint_summary = _load_embedding_model(args, device)
-    embedding_encoder_tag = _infer_embedding_encoder_tag(resolved_embedding_model_source)
+    (
+        tokenizer,
+        model,
+        resolved_embedding_model_source,
+        embedding_pooling_mode,
+        simteg_checkpoint_summary,
+        embedding_model_class,
+    ) = _load_embedding_model(args, device)
+    embedding_encoder_tag = _embedding_output_encoder_tag(
+        resolved_embedding_model_source,
+        pooling_mode=embedding_pooling_mode,
+        embedding_model_class=embedding_model_class,
+    )
     encoded = {}
     component_effective_budget = {}
     for component_name, component_prompts in prompt_bundle["prompt_components"].items():
@@ -6805,6 +6936,8 @@ def run(args):
         "component_prompt_roles": dict(prompt_bundle.get("component_prompt_roles", {})),
         "structured_component_schema": dict(prompt_bundle.get("structured_component_schema", {})),
         "embedding_encoder_tag": embedding_encoder_tag,
+        "embedding_model_class": embedding_model_class,
+        "embedding_pooling_mode": embedding_pooling_mode,
         "tweet_source_mode_requested": tweet_source_mode_requested,
         "tweet_source_mode_effective": tweet_source_mode_effective,
         "dgp_neighbor_summary_k": prompt_bundle.get("dgp_neighbor_summary_k", {}),
@@ -6944,23 +7077,17 @@ def run(args):
         "evidence_card_fields": list(prompt_bundle.get("evidence_card_fields", [])),
         "embedding_model_path": str(resolved_embedding_model_source),
         "embedding_encoder_tag": embedding_encoder_tag,
+        "embedding_model_class": embedding_model_class,
         "embedding_pooling_mode": embedding_pooling_mode,
-        "embedding_encoder_contract": (
-            "frozen_simteg_finetuned_roberta_lm_checkpoint"
-            if simteg_checkpoint_summary
-            else "simteg_finetuned_roberta_text_encoder"
-            if embedding_pooling_mode == "simteg_mean"
-            else "generic_huggingface_embedding_encoder"
+        "embedding_encoder_contract": _embedding_encoder_contract(
+            embedding_pooling_mode,
+            simteg_checkpoint_summary=simteg_checkpoint_summary,
         ),
         "finetuned_roberta_checkpoint_path": str(
             (simteg_checkpoint_summary or {}).get("checkpoint_path", getattr(args, "finetuned_roberta_checkpoint_path", "") or "")
         ),
         "finetuned_roberta_checkpoint_load": dict(simteg_checkpoint_summary or {}),
-        "embedding_tokenization_contract": (
-            "SimTeG-compatible: padding=True, truncation=True, max_length<=512, add_special_tokens=False, final hidden-state plain mean"
-            if embedding_pooling_mode == "simteg_mean"
-            else "padding=True, truncation=True, encoder-aligned pooling"
-        ),
+        "embedding_tokenization_contract": _embedding_tokenization_contract(embedding_pooling_mode),
         "generation_mode": generation_mode,
         "explain_model_load_mode": explain_model_load_mode_manifest,
         "explain_model_path": explain_model_path_manifest,

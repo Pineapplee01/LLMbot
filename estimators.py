@@ -2090,6 +2090,42 @@ def _weighted_quantile(values, weights, quantile):
     return float(sorted_values[index])
 
 
+def _conformal_quantile(scores, alpha):
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if scores.size == 0:
+        return 1.0
+    q = float(np.ceil((scores.size + 1) * (1.0 - float(alpha))) / scores.size)
+    q = min(max(q, 0.0), 1.0)
+    return float(np.quantile(scores, q, method="higher"))
+
+
+def _prediction_set_risk_from_thresholds(posterior, thresholds, num_classes=None):
+    posterior_np = np.asarray(posterior, dtype=np.float64)
+    if posterior_np.ndim != 2 or posterior_np.shape[0] == 0:
+        size = int(posterior_np.shape[0]) if posterior_np.ndim else 0
+        zero = np.zeros(size, dtype=np.float32)
+        return zero.copy(), zero.astype(np.int64), zero.copy(), zero.copy()
+    threshold_np = np.asarray(thresholds, dtype=np.float64).reshape(-1)
+    if threshold_np.shape[0] != posterior_np.shape[0]:
+        threshold_np = np.full(posterior_np.shape[0], 1.0, dtype=np.float64)
+    threshold_np = np.clip(threshold_np, 1e-8, 1.0)
+    conformity = 1.0 - posterior_np
+    in_set = conformity <= threshold_np[:, None] + 1e-12
+    set_size = in_set.sum(axis=1).astype(np.int64)
+    set_size = np.maximum(set_size, 1)
+    best_margin = threshold_np - conformity.min(axis=1)
+    max_extra = max(float(num_classes or posterior_np.shape[1]) - 1.0, 1.0)
+    size_risk = (set_size.astype(np.float64) - 1.0) / max_extra
+    margin_risk = 1.0 - np.clip(best_margin / threshold_np, 0.0, 1.0)
+    abstain_risk = np.clip(0.70 * size_risk + 0.30 * margin_risk, 0.0, 1.0)
+    return (
+        abstain_risk.astype(np.float32),
+        set_size.astype(np.int64),
+        best_margin.astype(np.float32),
+        margin_risk.astype(np.float32),
+    )
+
+
 def _conformal_knn_scalar_risk_features(
     base_risk,
     edge_index=None,
@@ -2102,6 +2138,15 @@ def _conformal_knn_scalar_risk_features(
     candidate_scope="labeled_full",
     shrinkage_tau=3.0,
     ncp_lambda=1.0,
+    neighbor_mode="standard",
+    similarity_threshold=-1.0,
+    min_support=1,
+    adaptive_max_k=0,
+    hubness_correction="none",
+    local_calibration_labels=None,
+    local_calibration_idx=None,
+    local_calibration_alpha=0.20,
+    global_conformal_threshold=None,
 ):
     del edge_type
     risk = np.asarray(base_risk, dtype=np.float32).reshape(-1)
@@ -2131,6 +2176,15 @@ def _conformal_knn_scalar_risk_features(
             "ncp_effective_sample_size": zero.copy(),
             "ncp_weight_sum": zero.copy(),
             "ncp_weight_max": zero.copy(),
+            "ncp_local_abstain_risk": risk.copy(),
+            "ncp_local_threshold": zero.copy(),
+            "ncp_local_threshold_delta": zero.copy(),
+            "ncp_local_set_size": zero.copy(),
+            "ncp_local_coverage_margin": zero.copy(),
+            "ncp_local_margin_risk": risk.copy(),
+            "ncp_local_calibration_neighbor_count": zero.copy(),
+            "ncp_local_effective_calibration_sample_size": zero.copy(),
+            "ncp_local_fallback_to_global": np.ones(num_nodes, dtype=np.float32),
             "knn_has_candidates": zero.copy(),
         }
 
@@ -2149,6 +2203,27 @@ def _conformal_knn_scalar_risk_features(
     center_limit = labeled_limit if labeled_count is not None else num_nodes
     center_limit = max(0, min(num_nodes, int(center_limit)))
     k = max(int(knn_k), 1)
+    adaptive_k = int(adaptive_max_k or 0)
+    support_k = max(k, adaptive_k) if adaptive_k > 0 else k
+    min_support_count = max(int(min_support or 0), 0)
+    sim_threshold = float(similarity_threshold)
+    if not math.isfinite(sim_threshold):
+        sim_threshold = -1.0
+    neighbor_mode_value = str(neighbor_mode or "standard").strip().lower()
+    if neighbor_mode_value not in {"standard", "mutual", "threshold", "adaptive", "mutual_adaptive"}:
+        raise ValueError(
+            "--conformal_knn_neighbor_mode must be one of "
+            "{standard, mutual, threshold, adaptive, mutual_adaptive}."
+        )
+    hubness_correction_value = str(hubness_correction or "none").strip().lower()
+    if hubness_correction_value not in {"none", "degree"}:
+        raise ValueError("--conformal_knn_hubness_correction must be one of {none, degree}.")
+    mutual_required = neighbor_mode_value in {"mutual", "mutual_adaptive"}
+    threshold_active = bool(sim_threshold > -1.0) and neighbor_mode_value in {
+        "threshold",
+        "adaptive",
+        "mutual_adaptive",
+    }
     scope = str(candidate_scope or "labeled_full").strip().lower()
     posterior_np = np.asarray(posterior, dtype=np.float32) if posterior is not None else None
     preds = posterior_np.argmax(axis=1).astype(np.int64) if posterior_np is not None and posterior_np.ndim == 2 else None
@@ -2174,21 +2249,63 @@ def _conformal_knn_scalar_risk_features(
     ncp_effective_sample_size = np.zeros(num_nodes, dtype=np.float64)
     ncp_weight_sum = np.zeros(num_nodes, dtype=np.float64)
     ncp_weight_max = np.zeros(num_nodes, dtype=np.float64)
+    knn_hubness_mean = np.zeros(num_nodes, dtype=np.float64)
+    knn_hubness_max = np.zeros(num_nodes, dtype=np.float64)
+    knn_filter_fallback = np.zeros(num_nodes, dtype=np.float64)
+    hubness_counts = np.zeros(num_nodes, dtype=np.float64)
+    ncp_local_threshold = np.ones(num_nodes, dtype=np.float64)
+    ncp_local_threshold_delta = np.zeros(num_nodes, dtype=np.float64)
+    ncp_local_calibration_neighbor_count = np.zeros(num_nodes, dtype=np.float64)
+    ncp_local_effective_calibration_sample_size = np.zeros(num_nodes, dtype=np.float64)
+    ncp_local_fallback_to_global = np.ones(num_nodes, dtype=np.float64)
 
     high_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.80)) if labeled_limit else 1.0
     low_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.35)) if labeled_limit else 0.0
     ncp_lambda_value = max(float(ncp_lambda), 1e-6)
+    labels_np = None
+    calibration_idx_np = np.empty(0, dtype=np.int64)
+    calibration_nonconformity = np.empty(0, dtype=np.float64)
+    calibration_lookup = np.zeros(num_nodes, dtype=bool)
+    if (
+        posterior_np is not None
+        and posterior_np.ndim == 2
+        and local_calibration_labels is not None
+        and labeled_limit > 0
+    ):
+        labels_np = _labels_to_numpy(local_calibration_labels).astype(np.int64).reshape(-1)
+        labels_limit = min(int(labels_np.shape[0]), int(posterior_np.shape[0]), int(labeled_limit))
+        labels_np = labels_np[:labels_limit]
+        raw_idx = local_calibration_idx if local_calibration_idx is not None else np.arange(labels_limit)
+        calibration_idx_np = _valid_index_array(raw_idx, labels_limit)
+        if calibration_idx_np.size:
+            calibration_idx_np = np.unique(np.sort(calibration_idx_np.astype(np.int64, copy=False)))
+            valid_label = (labels_np[calibration_idx_np] >= 0) & (labels_np[calibration_idx_np] < int(posterior_np.shape[1]))
+            calibration_idx_np = calibration_idx_np[valid_label]
+        if calibration_idx_np.size:
+            calibration_nonconformity = (
+                1.0 - posterior_np[calibration_idx_np, labels_np[calibration_idx_np]]
+            ).astype(np.float64)
+            calibration_lookup[calibration_idx_np] = True
+    if global_conformal_threshold is None:
+        global_threshold = _conformal_quantile(calibration_nonconformity, local_calibration_alpha)
+    else:
+        global_threshold = float(global_conformal_threshold)
+    if not math.isfinite(global_threshold):
+        global_threshold = 1.0
+    global_threshold = float(np.clip(global_threshold, 1e-8, 1.0))
+    ncp_local_threshold.fill(global_threshold)
+    local_calibration_active = bool(calibration_idx_np.size > 0 and posterior_np is not None and posterior_np.ndim == 2)
 
-    def _torch_exact_feature_topk(query_repr, candidate_repr, query_k):
+    def _torch_exact_feature_topk(query_repr, candidate_repr, query_k, backend_label="feature_pool"):
         if query_repr.shape[0] == 0 or candidate_repr.shape[0] == 0 or query_k <= 0:
             return (
                 np.empty((int(query_repr.shape[0]), 0), dtype=np.int64),
                 np.empty((int(query_repr.shape[0]), 0), dtype=np.float32),
-                "torch_exact_empty_hyperscan_full",
+                f"torch_exact_empty_{backend_label}",
             )
         use_cuda = bool(torch.cuda.is_available())
         device = torch.device("cuda" if use_cuda else "cpu")
-        batch_size = 512 if use_cuda else 64
+        batch_size = 512 if use_cuda else 256
         candidate_t = torch.from_numpy(candidate_repr.astype(np.float32, copy=False)).to(device=device)
         neighbor_chunks = []
         similarity_chunks = []
@@ -2206,7 +2323,7 @@ def _conformal_knn_scalar_risk_features(
         return (
             np.concatenate(neighbor_chunks, axis=0),
             np.concatenate(similarity_chunks, axis=0),
-            "torch_exact_cuda_hyperscan_full" if use_cuda else "torch_exact_cpu_hyperscan_full",
+            f"torch_exact_cuda_{backend_label}" if use_cuda else f"torch_exact_cpu_{backend_label}",
         )
 
     if scope in {"labeled_full", "hyperscan_full"}:
@@ -2218,12 +2335,13 @@ def _conformal_knn_scalar_risk_features(
             similarities = np.empty((num_nodes, 0), dtype=np.float32)
         else:
             query_repr = repr_np[:center_limit]
-            query_k = min(k, candidate_limit) if scope == "hyperscan_full" else min(k + 1, candidate_limit)
-            if scope == "hyperscan_full":
+            query_k = min(support_k, candidate_limit) if scope == "hyperscan_full" else min(support_k + 1, candidate_limit)
+            if scope == "hyperscan_full" or bool(torch.cuda.is_available()) or int(repr_np.shape[1]) > 128:
                 neighbors, similarities, backend = _torch_exact_feature_topk(
                     query_repr,
                     repr_np[:candidate_limit],
                     query_k,
+                    backend_label=scope,
                 )
             else:
                 try:
@@ -2256,12 +2374,54 @@ def _conformal_knn_scalar_risk_features(
         neighbors = None
         similarities = None
 
+    mutual_neighbor_sets = None
+    if scope in {"labeled_full", "hyperscan_full"} and neighbors is not None and int(neighbors.size) > 0:
+        for center in range(min(center_limit, int(neighbors.shape[0]))):
+            row = neighbors[center]
+            valid = (row >= 0) & (row < num_nodes) & (row != int(center))
+            if np.any(valid):
+                hubness_counts[row[valid].astype(np.int64)] += 1.0
+        if mutual_required:
+            mutual_neighbor_sets = []
+            for center in range(min(center_limit, int(neighbors.shape[0]))):
+                row = neighbors[center]
+                valid = (row >= 0) & (row < num_nodes) & (row != int(center))
+                mutual_neighbor_sets.append(set(int(item) for item in row[valid].tolist()))
+
+    def _filter_support(center, selected, sims):
+        raw_count = int(selected.size)
+        if selected.size == 0:
+            return selected.astype(np.int64), sims.astype(np.float32)
+        keep = np.ones(int(selected.size), dtype=bool)
+        if threshold_active:
+            keep &= sims.astype(np.float64) >= sim_threshold
+        if mutual_required and mutual_neighbor_sets is not None:
+            mutual_keep = np.zeros(int(selected.size), dtype=bool)
+            for pos, neighbor in enumerate(selected.astype(np.int64, copy=False).tolist()):
+                if 0 <= int(neighbor) < len(mutual_neighbor_sets):
+                    mutual_keep[pos] = int(center) in mutual_neighbor_sets[int(neighbor)]
+            keep &= mutual_keep
+        selected = selected[keep].astype(np.int64, copy=False)
+        sims = sims[keep].astype(np.float32, copy=False)
+        if selected.size > support_k:
+            selected = selected[:support_k]
+            sims = sims[:support_k]
+        if int(selected.size) < min_support_count:
+            if raw_count > 0:
+                knn_filter_fallback[center] = 1.0
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+        return selected, sims
+
     def _apply_selected(center, selected, sims, member_count=None):
         support_count = float(selected.size)
         support_neighbor_count[center] = support_count
         hyperedge_member_count[center] = float(member_count) if member_count is not None else support_count
         if selected.size == 0:
             return
+        selected_hubness = hubness_counts[selected] if hubness_counts.size else np.zeros(selected.size, dtype=np.float64)
+        if selected_hubness.size:
+            knn_hubness_mean[center] = float(selected_hubness.mean())
+            knn_hubness_max[center] = float(selected_hubness.max())
         values = risk[selected].astype(np.float64)
         count = support_count
         shrink = count / (count + float(shrinkage_tau))
@@ -2282,6 +2442,8 @@ def _conformal_knn_scalar_risk_features(
         else:
             weights = np.ones_like(values, dtype=np.float64)
         weights = np.clip(weights.astype(np.float64), 0.0, None)
+        if hubness_correction_value == "degree" and selected_hubness.size:
+            weights = weights / np.sqrt(1.0 + selected_hubness)
         weight_sum = float(weights.sum())
         if weight_sum > 0.0:
             normalized_weights = weights / weight_sum
@@ -2301,6 +2463,52 @@ def _conformal_knn_scalar_risk_features(
                 mismatch = (preds[selected] != preds[center]).astype(np.float64)
                 ncp_weighted_prediction_disagreement[center] = float(np.sum((weights / weight_sum) * mismatch))
 
+    def _apply_local_calibration(center, selected, sims):
+        if not local_calibration_active or selected.size == 0:
+            return
+        selected = selected.astype(np.int64, copy=False)
+        keep = (selected >= 0) & (selected < num_nodes) & calibration_lookup[selected] & (selected != int(center))
+        selected = selected[keep]
+        sims = sims[keep] if sims.size == keep.size else np.asarray([], dtype=np.float32)
+        if selected.size == 0:
+            return
+        cal_positions = np.searchsorted(calibration_idx_np, selected)
+        valid_positions = (
+            (cal_positions >= 0)
+            & (cal_positions < calibration_idx_np.size)
+            & (calibration_idx_np[cal_positions] == selected)
+        )
+        if not np.all(valid_positions):
+            selected = selected[valid_positions]
+            sims = sims[valid_positions] if sims.size == valid_positions.size else np.asarray([], dtype=np.float32)
+            cal_positions = cal_positions[valid_positions]
+        if selected.size == 0:
+            return
+        scores = calibration_nonconformity[cal_positions].astype(np.float64)
+        if sims.size:
+            clipped_sims = np.clip(sims.astype(np.float64), -1.0, 1.0)
+            distances = np.sqrt(np.clip(2.0 - 2.0 * clipped_sims, 0.0, None))
+            weights = np.exp(-distances / ncp_lambda_value)
+        else:
+            weights = np.ones_like(scores, dtype=np.float64)
+        weights = np.clip(weights.astype(np.float64), 0.0, None)
+        if hubness_correction_value == "degree" and hubness_counts.size:
+            weights = weights / np.sqrt(1.0 + hubness_counts[selected])
+        weight_sum = float(weights.sum())
+        if weight_sum <= 0.0:
+            return
+        normalized_weights = weights / weight_sum
+        local_q = float(np.ceil((selected.size + 1) * (1.0 - float(local_calibration_alpha))) / selected.size)
+        local_q = min(max(local_q, 0.0), 1.0)
+        local_threshold = _weighted_quantile(scores, normalized_weights, local_q)
+        ncp_local_threshold[center] = float(np.clip(local_threshold, 1e-8, 1.0))
+        ncp_local_threshold_delta[center] = float(ncp_local_threshold[center] - global_threshold)
+        ncp_local_calibration_neighbor_count[center] = float(selected.size)
+        ncp_local_effective_calibration_sample_size[center] = float(
+            (weight_sum ** 2) / max(float(np.sum(weights ** 2)), 1e-12)
+        )
+        ncp_local_fallback_to_global[center] = 0.0
+
     if scope in {"labeled_full", "hyperscan_full"}:
         candidate_limit = num_nodes if scope == "hyperscan_full" else labeled_limit
         for center in range(center_limit):
@@ -2315,17 +2523,65 @@ def _conformal_knn_scalar_risk_features(
                 # the returned top-k row, reserve one slot for the center rather
                 # than growing the hyperedge to k + 1.
                 has_center = bool(np.any(row_valid == int(center)))
-                support_budget = max(int(k) - 1, 0) if not has_center else int(row_valid.size)
+                support_budget = max(int(support_k) - 1, 0) if not has_center else int(row_valid.size)
                 keep = row_valid != int(center)
                 selected = row_valid[keep][:support_budget]
                 sims = sim_valid[keep][:support_budget]
-                member_count = min(int(k), int(selected.size) + 1)
+                selected, sims = _filter_support(center, selected.astype(np.int64), sims.astype(np.float32))
+                member_count = min(int(support_k), int(selected.size) + 1)
                 _apply_selected(center, selected.astype(np.int64), sims.astype(np.float32), member_count=member_count)
             else:
                 keep = (row_valid != int(center))
-                selected = row_valid[keep][:k]
-                sims = sim_valid[keep][:k]
+                selected = row_valid[keep][:support_k]
+                sims = sim_valid[keep][:support_k]
+                selected, sims = _filter_support(center, selected.astype(np.int64), sims.astype(np.float32))
                 _apply_selected(center, selected.astype(np.int64), sims.astype(np.float32))
+        if local_calibration_active:
+            calibration_candidate_count = int(calibration_idx_np.size)
+            query_k = min(support_k + 1, calibration_candidate_count)
+            if query_k > 0:
+                cal_repr = repr_np[calibration_idx_np]
+                if bool(torch.cuda.is_available()) or int(repr_np.shape[1]) > 128:
+                    cal_neighbor_pos, cal_sims, cal_backend = _torch_exact_feature_topk(
+                        repr_np[:center_limit],
+                        cal_repr,
+                        query_k,
+                        backend_label="calibration_local",
+                    )
+                else:
+                    try:
+                        from scipy.spatial import cKDTree
+
+                        tree = cKDTree(cal_repr)
+                        cal_distances, cal_neighbor_pos = tree.query(repr_np[:center_limit], k=query_k)
+                        cal_backend = "scipy_ckdtree_calibration_local"
+                    except Exception:
+                        distance = torch.cdist(torch.from_numpy(repr_np[:center_limit]), torch.from_numpy(cal_repr), p=2)
+                        topk = torch.topk(distance, k=query_k, largest=False, dim=1)
+                        cal_distances = topk.values.numpy()
+                        cal_neighbor_pos = topk.indices.numpy()
+                        cal_backend = "torch_cdist_calibration_local"
+                    cal_neighbor_pos = np.asarray(cal_neighbor_pos, dtype=np.int64)
+                    cal_distances = np.asarray(cal_distances, dtype=np.float32)
+                    if cal_neighbor_pos.ndim == 1:
+                        cal_neighbor_pos = cal_neighbor_pos.reshape(-1, 1)
+                        cal_distances = cal_distances.reshape(-1, 1)
+                    cal_sims = np.clip(1.0 - 0.5 * (cal_distances.astype(np.float64) ** 2), -1.0, 1.0).astype(np.float32)
+                for center in range(center_limit):
+                    row = calibration_idx_np[cal_neighbor_pos[center]]
+                    sim_row = cal_sims[center]
+                    keep = row != int(center)
+                    selected, selected_sims = _filter_support(
+                        center,
+                        row[keep][:support_k].astype(np.int64),
+                        sim_row[keep][:support_k].astype(np.float32),
+                    )
+                    _apply_local_calibration(
+                        center,
+                        selected.astype(np.int64),
+                        selected_sims.astype(np.float32),
+                    )
+                backend = f"{backend}+{cal_backend}"
     else:
         for center, row in enumerate(candidate_rows[:center_limit]):
             if not row:
@@ -2334,16 +2590,54 @@ def _conformal_knn_scalar_risk_features(
             if candidate_arr.size == 0:
                 continue
             sims = repr_np[candidate_arr] @ repr_np[int(center)]
-            topk = min(k, int(candidate_arr.size))
+            topk = min(support_k, int(candidate_arr.size))
             if topk == int(candidate_arr.size):
                 order = np.argsort(-sims, kind="stable")
             else:
                 partial = np.argpartition(-sims, topk - 1)[:topk]
                 order = partial[np.argsort(-sims[partial], kind="stable")]
-            _apply_selected(center, candidate_arr[order], sims[order].astype(np.float32))
+            selected, selected_sims = _filter_support(
+                center,
+                candidate_arr[order].astype(np.int64),
+                sims[order].astype(np.float32),
+            )
+            _apply_selected(center, selected.astype(np.int64), selected_sims.astype(np.float32))
+            if local_calibration_active:
+                cal_mask = calibration_lookup[candidate_arr]
+                cal_candidates = candidate_arr[cal_mask]
+                if cal_candidates.size:
+                    cal_sims_all = repr_np[cal_candidates] @ repr_np[int(center)]
+                    cal_topk = min(support_k, int(cal_candidates.size))
+                    if cal_topk == int(cal_candidates.size):
+                        cal_order = np.argsort(-cal_sims_all, kind="stable")
+                    else:
+                        partial = np.argpartition(-cal_sims_all, cal_topk - 1)[:cal_topk]
+                        cal_order = partial[np.argsort(-cal_sims_all[partial], kind="stable")]
+                    selected, selected_sims = _filter_support(
+                        center,
+                        cal_candidates[cal_order].astype(np.int64),
+                        cal_sims_all[cal_order].astype(np.float32),
+                    )
+                    _apply_local_calibration(center, selected.astype(np.int64), selected_sims.astype(np.float32))
 
     has_candidates = (neighbor_count > 0).astype(np.float32)
     similarity_gap = (1.0 - np.clip(similarity_mean, -1.0, 1.0)).astype(np.float32)
+    if posterior_np is not None and posterior_np.ndim == 2:
+        (
+            ncp_local_abstain_risk,
+            ncp_local_set_size,
+            ncp_local_coverage_margin,
+            ncp_local_margin_risk,
+        ) = _prediction_set_risk_from_thresholds(
+            posterior_np,
+            ncp_local_threshold,
+            num_classes=int(posterior_np.shape[1]),
+        )
+    else:
+        ncp_local_abstain_risk = risk.copy().astype(np.float32)
+        ncp_local_set_size = np.zeros(num_nodes, dtype=np.int64)
+        ncp_local_coverage_margin = np.zeros(num_nodes, dtype=np.float32)
+        ncp_local_margin_risk = risk.copy().astype(np.float32)
     features = {
         "knn_mean_risk": np.clip(mean_risk, 0.0, 1.0).astype(np.float32),
         "knn_max_risk": np.clip(max_risk, 0.0, 1.0).astype(np.float32),
@@ -2367,11 +2661,30 @@ def _conformal_knn_scalar_risk_features(
         "ncp_effective_sample_size": ncp_effective_sample_size.astype(np.float32),
         "ncp_weight_sum": ncp_weight_sum.astype(np.float32),
         "ncp_weight_max": ncp_weight_max.astype(np.float32),
+        "knn_hubness_mean": knn_hubness_mean.astype(np.float32),
+        "knn_hubness_max": knn_hubness_max.astype(np.float32),
+        "knn_filter_fallback": knn_filter_fallback.astype(np.float32),
+        "ncp_local_abstain_risk": np.clip(ncp_local_abstain_risk, 0.0, 1.0).astype(np.float32),
+        "ncp_local_threshold": np.clip(ncp_local_threshold, 0.0, 1.0).astype(np.float32),
+        "ncp_local_threshold_delta": ncp_local_threshold_delta.astype(np.float32),
+        "ncp_local_set_size": ncp_local_set_size.astype(np.float32),
+        "ncp_local_coverage_margin": ncp_local_coverage_margin.astype(np.float32),
+        "ncp_local_margin_risk": np.clip(ncp_local_margin_risk, 0.0, 1.0).astype(np.float32),
+        "ncp_local_calibration_neighbor_count": ncp_local_calibration_neighbor_count.astype(np.float32),
+        "ncp_local_effective_calibration_sample_size": ncp_local_effective_calibration_sample_size.astype(np.float32),
+        "ncp_local_fallback_to_global": ncp_local_fallback_to_global.astype(np.float32),
         "knn_has_candidates": has_candidates,
     }
     features["_metadata"] = {
         "knn_k": int(k),
+        "knn_support_k": int(support_k),
         "candidate_scope": scope,
+        "neighbor_mode": str(neighbor_mode_value),
+        "similarity_threshold": float(sim_threshold),
+        "similarity_threshold_active": bool(threshold_active),
+        "min_support": int(min_support_count),
+        "adaptive_max_k": int(adaptive_k),
+        "hubness_correction": str(hubness_correction_value),
         "center_scope": "labeled_graph_only" if labeled_count is not None else "all_nodes",
         "target_risk_contract": "target_node_to_knn_support_group_risk_v1",
         "backend": backend,
@@ -2381,12 +2694,25 @@ def _conformal_knn_scalar_risk_features(
         "knn_center_count": int(center_limit),
         "mean_effective_neighbor_count": float(neighbor_count.mean()) if neighbor_count.size else 0.0,
         "mean_effective_neighbor_count_on_centers": float(neighbor_count[:center_limit].mean()) if center_limit else 0.0,
+        "mean_knn_filter_fallback_on_centers": float(knn_filter_fallback[:center_limit].mean()) if center_limit else 0.0,
+        "mean_knn_hubness_on_centers": float(knn_hubness_mean[:center_limit].mean()) if center_limit else 0.0,
         "nodes_with_knn_candidates": int(has_candidates.sum()),
         "support_centers_skipped": int(max(num_nodes - center_limit, 0)),
         "ncp_weighting_function": "exp(-euclidean_distance/lambda_L)",
         "ncp_lambda": float(ncp_lambda_value),
         "ncp_official_code_reference": "1995subhankar1995/NCP CP/Classification.py HypertuningBothLamdas/TestProcedure",
         "mean_ncp_effective_sample_size_on_centers": float(ncp_effective_sample_size[:center_limit].mean()) if center_limit else 0.0,
+        "ncp_local_calibration_active": bool(local_calibration_active),
+        "ncp_local_calibration_split": "cal_idx_labels_only",
+        "ncp_local_global_threshold": float(global_threshold),
+        "ncp_local_alpha": float(local_calibration_alpha),
+        "ncp_local_calibration_count": int(calibration_idx_np.size),
+        "ncp_local_centers_with_calibration_neighbors": int((ncp_local_calibration_neighbor_count[:center_limit] > 0).sum()),
+        "ncp_local_mean_calibration_neighbor_count_on_centers": float(ncp_local_calibration_neighbor_count[:center_limit].mean()) if center_limit else 0.0,
+        "ncp_local_mean_effective_calibration_sample_size_on_centers": float(ncp_local_effective_calibration_sample_size[:center_limit].mean()) if center_limit else 0.0,
+        "ncp_local_fallback_count_on_centers": int((ncp_local_fallback_to_global[:center_limit] > 0).sum()) if center_limit else 0,
+        "ncp_local_score_semantics": "weighted_local_conformal_prediction_set_abstain_risk",
+        "ncp_local_quantile": "weighted_quantile_of_calibration_nonconformity_with_finite_sample_correction",
     }
     return features
 
@@ -2469,6 +2795,14 @@ def _top_target_rows(risk_score, split_idx, top_n, *, preds=None, pred_label_sco
             "ncp_weighted_prediction_disagreement",
             "ncp_weighted_high_risk_mass",
             "ncp_effective_sample_size",
+            "ncp_local_abstain_risk",
+            "ncp_local_threshold",
+            "ncp_local_threshold_delta",
+            "ncp_local_set_size",
+            "ncp_local_margin_risk",
+            "ncp_local_calibration_neighbor_count",
+            "ncp_local_effective_calibration_sample_size",
+            "ncp_local_fallback_to_global",
         ):
             values = local_features.get(name)
             if values is not None:
@@ -2737,6 +3071,7 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             "risk_object_smoothed": True,
             "embedding_context_used": node_repr is not None,
             "node_repr_used": node_repr is not None,
+            "local_calibration_router_metadata": dict(getattr(self, "local_calibration_router_metadata_", {}) or {}),
             "learned_router_metadata": dict(getattr(self, "learned_router_metadata_", {}) or {}),
         }
         target_top_n = int(
@@ -2766,6 +3101,7 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             "selected_score_family": self.selected_score_family,
             "selected_score_family_metrics": dict(self.selected_score_family_metrics),
             "candidate_score_family": dict(self.candidate_score_family_metrics),
+            "local_calibration_router_metadata": dict(getattr(self, "local_calibration_router_metadata_", {}) or {}),
             "learned_router_metadata": dict(getattr(self, "learned_router_metadata_", {}) or {}),
             "base_risk_source": "posthoc_calibrated_ranker",
             "selected_nodes": default_selected_nodes,
@@ -2853,7 +3189,7 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
         "Reuses the calibrated_local_risk_router conformal threshold and split discipline, "
         "but replaces relation-neighbor aggregation with target-node KNN support-group risk features, "
         "including NCP-style exp(-distance/lambda_L) weighted support evidence. "
-        "It ranks target nodes by fixed or tune-split learned KNN-informed risk for downstream LLM/refiner use and does not alter classifier logits."
+        "It ranks target nodes by fixed KNN-informed risk or NCP-style local calibration risk for downstream LLM/refiner use and does not alter classifier logits."
     )
     LITERATURE_BASIS = [
         "Localized Conformal Prediction",
@@ -2888,101 +3224,49 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             - 0.10 * f["knn_safe_support_mass"]
         ),
     }
-    LEARNED_FEATURE_NAMES = (
-        "base_abstain_risk",
-        "knn_mean_risk",
-        "knn_max_risk",
-        "knn_risk_std",
-        "knn_prediction_disagreement",
-        "knn_high_risk_mass",
-        "knn_safe_support_mass",
-        "knn_similarity_mean",
-        "knn_similarity_gap",
-        "knn_effective_neighbor_count",
-        "ncp_weighted_mean_risk",
-        "ncp_shrunk_weighted_mean_risk",
-        "ncp_weighted_risk_std",
-        "ncp_weighted_risk_q80",
-        "ncp_weighted_prediction_disagreement",
-        "ncp_weighted_high_risk_mass",
-        "ncp_weighted_safe_support_mass",
-        "ncp_effective_sample_size",
-        "ncp_weight_max",
-    )
-
+    NCP_LOCAL_SCORE_FAMILIES = {
+        "ncp_local_conformal": lambda r0, f: f["ncp_local_abstain_risk"],
+        "ncp_local_base_blend": lambda r0, f: 0.80 * r0 + 0.20 * f["ncp_local_abstain_risk"],
+        "ncp_local_margin_blend": lambda r0, f: 0.80 * r0 + 0.20 * f["ncp_local_margin_risk"],
+        "ncp_local_knn_conformal_blend": lambda r0, f: (
+            0.60 * r0
+            + 0.25 * f["ncp_shrunk_weighted_mean_risk"]
+            + 0.15 * f["ncp_local_abstain_risk"]
+        ),
+        "ncp_local_knn_margin_blend": lambda r0, f: (
+            0.60 * r0
+            + 0.25 * f["ncp_shrunk_weighted_mean_risk"]
+            + 0.15 * f["ncp_local_margin_risk"]
+        ),
+    }
     def __init__(self, alpha=0.20, budgets=RESIDUAL_RISK_PAPER_BUDGETS):
         super().__init__(alpha=alpha, budgets=budgets)
         self.learning_mode = "fixed"
-        self.learned_router_scaler = None
-        self.learned_router_model = None
-        self.learned_router_metadata_ = {}
+        self.local_calibration_router_metadata_ = {}
+        self.local_calibration_labels_ = None
+        self.local_calibration_idx_ = np.empty(0, dtype=np.int64)
 
-    def _learned_feature_matrix(self, r0, local_features):
-        r0_np = np.asarray(r0, dtype=np.float32).reshape(-1)
-        columns = []
-        for name in self.LEARNED_FEATURE_NAMES:
-            if name == "base_abstain_risk":
-                values = r0_np
-            else:
-                values = np.asarray(local_features.get(name, np.zeros_like(r0_np)), dtype=np.float32).reshape(-1)
-            if values.shape[0] != r0_np.shape[0]:
-                values = np.zeros_like(r0_np)
-            columns.append(np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0))
-        return np.stack(columns, axis=1).astype(np.float32)
-
-    def _fit_learned_router(self, r0, local_features, wrong, tune_idx_np):
-        self.learned_router_scaler = None
-        self.learned_router_model = None
-        self.learned_router_metadata_ = {
-            "learning_mode": self.learning_mode,
-            "learned_router_active": False,
-            "learned_router_fallback_reason": "",
-            "learned_feature_names": list(self.LEARNED_FEATURE_NAMES),
-            "official_ncp_alignment": "exp(-distance/lambda_L) KNN support weighting from 1995subhankar1995/NCP; logistic layer learns target residual-error risk on tune split.",
-        }
-        if self.learning_mode != "logistic":
-            self.learned_router_metadata_["learned_router_fallback_reason"] = "learning_mode_not_logistic"
-            return
-        fit_idx = _valid_index_array(tune_idx_np, int(np.asarray(r0).reshape(-1).shape[0]))
-        fit_idx = fit_idx[fit_idx < int(np.asarray(wrong).reshape(-1).shape[0])]
-        if fit_idx.size < 10:
-            self.learned_router_metadata_["learned_router_fallback_reason"] = "too_few_tune_samples"
-            return
-        y = np.asarray(wrong, dtype=np.int32).reshape(-1)[fit_idx]
-        if np.unique(y).size < 2:
-            self.learned_router_metadata_["learned_router_fallback_reason"] = "single_class_tune_labels"
-            return
-        x = self._learned_feature_matrix(r0, local_features)[fit_idx]
-        try:
-            scaler = StandardScaler()
-            x_scaled = scaler.fit_transform(x)
-            model = LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs")
-            model.fit(x_scaled, y)
-        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
-            self.learned_router_metadata_["learned_router_fallback_reason"] = f"logistic_fit_failed:{type(exc).__name__}"
-            return
-        self.learned_router_scaler = scaler
-        self.learned_router_model = model
-        train_score = model.predict_proba(x_scaled)[:, 1].astype(np.float32)
-        self.learned_router_metadata_.update(
-            {
-                "learned_router_active": True,
-                "learned_router_model": "StandardScaler+LogisticRegression(class_weight=balanced)",
-                "learned_router_train_count": int(fit_idx.size),
-                "learned_router_train_error_count": int(y.sum()),
-                "learned_router_train_metrics": residual_risk_metrics(y, train_score, budgets=(0.15,)),
-                "learned_router_coefficients": {
-                    name: float(value)
-                    for name, value in zip(self.LEARNED_FEATURE_NAMES, model.coef_[0].tolist())
-                },
-                "learned_router_intercept": float(model.intercept_[0]),
-            }
-        )
+    def _local_calibration_kwargs(self, kwargs):
+        payload = dict(kwargs)
+        if payload.get("conformal_knn_local_calibration_labels") is None:
+            payload["conformal_knn_local_calibration_labels"] = self.local_calibration_labels_
+        if payload.get("conformal_knn_local_calibration_idx") is None:
+            payload["conformal_knn_local_calibration_idx"] = self.local_calibration_idx_
+        payload["conformal_knn_global_threshold"] = float(self.threshold if self.threshold is not None else 1.0)
+        payload["conformal_knn_local_calibration_alpha"] = float(self.alpha)
+        return payload
 
     def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
         self.learning_mode = str(kwargs.get("conformal_knn_learning_mode", "fixed") or "fixed").strip().lower()
-        if self.learning_mode not in {"fixed", "logistic"}:
-            raise ValueError("--conformal_knn_learning_mode must be one of {fixed, logistic}.")
+        if self.learning_mode not in {"fixed", "ncp_local"}:
+            raise ValueError("--conformal_knn_learning_mode must be one of {fixed, ncp_local}.")
+        labels_np = _labels_to_numpy(labels).astype(np.int64)
+        self.local_calibration_labels_ = labels
+        self.local_calibration_idx_ = _valid_index_array(
+            kwargs.get("cal_idx", val_idx),
+            int(labels_np.shape[0]),
+        )
+        fit_kwargs = self._local_calibration_kwargs(kwargs)
         super().fit(
             logits=logits,
             probs=probs,
@@ -2992,22 +3276,78 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             edge_index=edge_index,
             edge_type=edge_type,
             node_repr=node_repr,
-            **kwargs,
+            **fit_kwargs,
         )
-        labels_np = _labels_to_numpy(labels).astype(np.int64)
         tune_idx_np = _valid_index_array(kwargs.get("tune_idx", val_idx), int(labels_np.shape[0]))
         posterior = self._posterior(logits=logits, probs=probs)
         wrong = (posterior.argmax(axis=1)[: int(labels_np.shape[0])] != labels_np).astype(np.int32)
         r0 = self._base_scalar_risk(logits, probs)
-        self._fit_learned_router(r0, self.local_risk_features_, wrong, tune_idx_np)
-        if self.learning_mode == "logistic" and self.learned_router_metadata_.get("learned_router_active"):
-            learned_score = self._score_from_local_risk_features(r0, self.local_risk_features_)
-            learned_metrics = residual_risk_metrics(wrong[tune_idx_np], learned_score[tune_idx_np], budgets=(0.15,)) if tune_idx_np.size else {}
-            self.selected_score_family = "learned_ncp_logistic"
-            self.selected_score_family_metrics = dict(learned_metrics)
+        local_metadata = dict(self.local_risk_feature_metadata_ or {})
+        self.local_calibration_router_metadata_ = {
+            "learning_mode": self.learning_mode,
+            "local_calibration_router_active": bool(self.learning_mode == "ncp_local"),
+            "router_model": "none",
+            "uses_logistic": False,
+            "calibration_split": "cal_idx",
+            "calibration_count": int(self.local_calibration_idx_.size),
+            "score_semantics": "validation_selected_nonparametric_ncp_local_risk_family"
+            if self.learning_mode == "ncp_local"
+            else "fixed_validation_selected_knn_risk_family",
+            "official_ncp_alignment": (
+                "Uses NCP-style KNN neighborhood samples, exp(-distance/lambda_L) localization weights, "
+                "and a local conformal quantile over calibration nonconformity scores; no learned logistic risk head."
+            ),
+            "local_risk_feature_metadata": {
+                key: local_metadata.get(key)
+                for key in (
+                    "ncp_local_calibration_active",
+                    "ncp_local_global_threshold",
+                    "ncp_local_alpha",
+                    "ncp_local_calibration_count",
+                    "ncp_local_centers_with_calibration_neighbors",
+                    "ncp_local_mean_calibration_neighbor_count_on_centers",
+                    "ncp_local_fallback_count_on_centers",
+                    "neighbor_mode",
+                    "similarity_threshold",
+                    "similarity_threshold_active",
+                    "min_support",
+                    "adaptive_max_k",
+                    "hubness_correction",
+                    "mean_knn_filter_fallback_on_centers",
+                    "mean_knn_hubness_on_centers",
+                )
+                if key in local_metadata
+            },
+        }
+        if self.learning_mode == "ncp_local":
+            local_candidate_metrics = {}
+            best_key = None
+            best_score = None
+            best_metrics = None
+            for family_name, scorer in self.NCP_LOCAL_SCORE_FAMILIES.items():
+                score = np.clip(np.asarray(scorer(r0, self.local_risk_features_), dtype=np.float32), 0.0, 1.0)
+                metrics = residual_risk_metrics(wrong[tune_idx_np], score[tune_idx_np], budgets=(0.15,)) if tune_idx_np.size else {}
+                local_candidate_metrics[family_name] = metrics
+                family_score = (
+                    float(metrics.get("auprc_error", float("-inf"))) if math.isfinite(float(metrics.get("auprc_error", float("nan")))) else float("-inf"),
+                    -float(metrics.get("aurc", float("inf"))) if math.isfinite(float(metrics.get("aurc", float("nan")))) else float("-inf"),
+                    float(metrics.get("utility_at_15", 0.0)),
+                    float(metrics.get("auroc_error", float("-inf"))) if math.isfinite(float(metrics.get("auroc_error", float("nan")))) else float("-inf"),
+                )
+                if best_score is None or family_score > best_score:
+                    best_score = family_score
+                    best_key = family_name
+                    best_metrics = metrics
+            self.selected_score_family = str(best_key or "ncp_local_conformal")
+            self.selected_score_family_metrics = dict(best_metrics or {})
+            self.local_calibration_router_metadata_["ncp_local_candidate_family_metrics"] = dict(local_candidate_metrics)
+            self.local_calibration_router_metadata_["selected_ncp_local_family"] = self.selected_score_family
+            self.local_calibration_router_metadata_["ncp_local_family_selection_rule"] = (
+                "valid_tune_auprc_error_then_lower_aurc_then_utility_at_15_then_auroc_error"
+            )
             self.candidate_score_family_metrics = {
                 **dict(self.candidate_score_family_metrics),
-                "learned_ncp_logistic": dict(learned_metrics),
+                **dict(local_candidate_metrics),
             }
             self.fit_summary = {
                 **dict(self.fit_summary),
@@ -3018,23 +3358,20 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
         self.fit_summary = {
             **dict(self.fit_summary),
             "learning_mode": self.learning_mode,
-            "learned_router_metadata": dict(self.learned_router_metadata_),
+            "local_calibration_router_metadata": dict(self.local_calibration_router_metadata_),
         }
         self.calibration_metadata = dict(self.fit_summary)
         return self
 
     def _score_from_local_risk_features(self, r0, local_features):
-        if (
-            self.learning_mode == "logistic"
-            and self.learned_router_scaler is not None
-            and self.learned_router_model is not None
-        ):
-            feature_matrix = self._learned_feature_matrix(r0, local_features)
-            scaled = self.learned_router_scaler.transform(feature_matrix)
-            return self.learned_router_model.predict_proba(scaled)[:, 1].astype(np.float32)
+        if self.learning_mode == "ncp_local" and self.selected_score_family in self.NCP_LOCAL_SCORE_FAMILIES:
+            scorer = self.NCP_LOCAL_SCORE_FAMILIES[self.selected_score_family]
+            values = np.asarray(scorer(r0, local_features), dtype=np.float32).reshape(-1)
+            return np.clip(values, 0.0, 1.0).astype(np.float32)
         return super()._score_from_local_risk_features(r0, local_features)
 
     def _compute_local_risk_features(self, base_risk, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        kwargs = self._local_calibration_kwargs(kwargs)
         return _conformal_knn_scalar_risk_features(
             base_risk,
             edge_index=edge_index,
@@ -3046,6 +3383,15 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             candidate_scope=kwargs.get("conformal_knn_candidate_scope", kwargs.get("candidate_scope", "labeled_full")),
             shrinkage_tau=kwargs.get("conformal_knn_shrinkage_tau", 3.0),
             ncp_lambda=kwargs.get("conformal_knn_ncp_lambda", 1.0),
+            neighbor_mode=kwargs.get("conformal_knn_neighbor_mode", "standard"),
+            similarity_threshold=kwargs.get("conformal_knn_similarity_threshold", -1.0),
+            min_support=kwargs.get("conformal_knn_min_support", 1),
+            adaptive_max_k=kwargs.get("conformal_knn_adaptive_max_k", 0),
+            hubness_correction=kwargs.get("conformal_knn_hubness_correction", "none"),
+            local_calibration_labels=kwargs.get("conformal_knn_local_calibration_labels"),
+            local_calibration_idx=kwargs.get("conformal_knn_local_calibration_idx"),
+            local_calibration_alpha=kwargs.get("conformal_knn_local_calibration_alpha", self.alpha),
+            global_conformal_threshold=kwargs.get("conformal_knn_global_threshold", self.threshold),
         )
 
     def state_dict_payload(self):
@@ -3053,7 +3399,7 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
         payload.update(
             {
                 "learning_mode": self.learning_mode,
-                "learned_router_metadata": dict(self.learned_router_metadata_),
+                "local_calibration_router_metadata": dict(self.local_calibration_router_metadata_),
             }
         )
         return payload

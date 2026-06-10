@@ -126,6 +126,12 @@ First-round full-graph support:
     `--neighbor_sampling_policy center_induced_relation_aware` and
     `--selection_embedding_path`, because the hypergraph view is derived from
     node-aligned semantic KNN rather than invented from text alone
+  - to mirror the MH-LGC paper's LLM semantic-view path more closely, pass a
+    local causal LM through `--model_path` and set
+    `--embedding_model_class causal_lm --embedding_pooling_mode
+    causal_last_hidden_last_token`; this extracts
+    `outputs.hidden_states[-1]` at the last valid token instead of using a
+    dedicated embedding model
   - the routed-node cache is still saved as a full-graph tensor with non-routed
     rows zero-filled, so downstream stages can keep graph-node alignment
   - `graph_detector_prepare --mhlgc_enable` consumes that embedding tensor via
@@ -280,6 +286,23 @@ python precompute.py \
   --following_quota 3 \
   --follower_quota 3 \
   --output_path datasets/TwiBot-20/mhlgc_llm_guide_qwen3_embed.pt \
+  --disable_wandb \
+  --overwrite
+
+# Paper-style causal-LLM semantic-view variant:
+python precompute.py \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --routed_nodes_path /path/to/routed_nodes.json \
+  --routed_nodes_split all \
+  --prompt_mode mhlgc_llm_guide \
+  --neighbor_sampling_policy center_induced_relation_aware \
+  --selection_embedding_path /path/to/selection_embeddings.pt \
+  --model_path /path/to/LLaMA3-8B-or-Qwen2.5-Instruct \
+  --embedding_model_class causal_lm \
+  --embedding_pooling_mode causal_last_hidden_last_token \
+  --max_length_hop 4096 \
+  --output_path datasets/TwiBot-20/mhlgc_llm_guide_llama3_causal_last_hidden_embed.pt \
   --disable_wandb \
   --overwrite
 
@@ -633,6 +656,12 @@ python precompute.py \
 Use `--model_path roberta_finetuned` or `--model_path /path/to/local/finetuned-roberta`
 when you want to make the encoder choice explicit. Passing `--model_path
 roberta-base` remains a valid ablation, but it is no longer the v2/v3 default.
+For LLaMA/Mistral/Qwen-Instruct hidden-state semantic views, use
+`--embedding_model_class causal_lm --embedding_pooling_mode
+causal_last_hidden_last_token`; the manifest records
+`embedding_encoder_contract=causal_lm_last_hidden_state_last_token_embedding`
+and the default output tag gains `_causal_last_hidden` when no
+`--output_path` is provided.
 `--explain_quality_gate true` is the default for explanation-first expert runs:
 it refuses to reuse empty, punctuation-only, special-token, repeated-placeholder,
 or prompt-echo explanation sidecars and regenerates those rows instead. Fresh
@@ -1350,11 +1379,17 @@ python main.py \
 # Use --conformal_knn_score_family_override base_only for the strict target-only
 # control; leave it as auto for the target + KNN support-group router.
 # The default --conformal_knn_learning_mode fixed preserves the historical
-# validation-selected score families. Set --conformal_knn_learning_mode logistic
-# to enable the NCP-style learned router: KNN support evidence is weighted as
-# exp(-distance/lambda_L), following the official 1995subhankar1995/NCP code,
-# and a tune-split logistic model learns target residual-error risk before
-# calibration/reporting stay on the held-out conformal split.
+# validation-selected score families. Set --conformal_knn_learning_mode ncp_local
+# to enable NCP-style local calibration: each target uses KNN calibration
+# neighbors weighted as exp(-distance/lambda_L), then derives a local conformal
+# threshold/features and selects among nonparametric NCP-local score families
+# on the tune split by AUPRC-error first, without fitting a logistic router head.
+# Non-model KNN support-quality controls are available for router-only ablation
+# sweeps: --conformal_knn_neighbor_mode {standard,mutual,threshold,adaptive,mutual_adaptive},
+# --conformal_knn_similarity_threshold, --conformal_knn_min_support,
+# --conformal_knn_adaptive_max_k, and --conformal_knn_hubness_correction
+# {none,degree}. These only filter or reweight KNN support evidence; they do
+# not train a new router head, consume LLM outputs, or alter classifier logits.
 # Treat this target-node Conformal-KNN router as the required router baseline:
 # any later learned or LLM-consuming router should report matched-split,
 # matched-budget AUROC-error, AUPRC-error, AURC, ErrRecall@K, Precision@K,

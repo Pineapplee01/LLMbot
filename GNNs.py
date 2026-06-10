@@ -265,9 +265,12 @@ def mhlgc_mask_edges(edge_index, edge_type, mask_probability=0.0):
     return masked_edge_index, edge_type.view(-1)[keep].contiguous()
 
 
-def mhlgc_select_borderline_anchors(labels, fraud_scores, positive_label=1, anchors_per_batch=1):
+def mhlgc_select_borderline_anchors(labels, fraud_scores, positive_label=1, anchors_per_batch=1, anchor_mask=None):
     labels = labels.detach().view(-1)
-    positive_idx = torch.nonzero(labels == int(positive_label), as_tuple=False).view(-1)
+    positive_mask = labels == int(positive_label)
+    if anchor_mask is not None:
+        positive_mask = positive_mask & anchor_mask.to(labels.device).bool().view(-1)
+    positive_idx = torch.nonzero(positive_mask, as_tuple=False).view(-1)
     if positive_idx.numel() == 0:
         return positive_idx
     anchors_per_batch = max(int(anchors_per_batch or 1), 1)
@@ -309,12 +312,28 @@ def mhlgc_llm_guided_contrastive_loss(
         raise ValueError("mhlgc temperature must be > 0.")
     gamma = min(max(float(gamma or 0.0), 0.0), 1.0)
     beta = float(beta or 0.0)
+    semantic_embeddings_clean = None
+    anchor_mask = None
+    if semantic_embeddings is not None and gamma > 0.0:
+        semantic_embeddings_clean = torch.nan_to_num(
+            semantic_embeddings.to(origin_embeddings.device).float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if (
+            semantic_embeddings_clean.dim() != 2
+            or int(semantic_embeddings_clean.size(0)) != int(origin_embeddings.size(0))
+        ):
+            raise ValueError("semantic_embeddings must be shaped [batch_nodes, semantic_dim].")
+        anchor_mask = semantic_embeddings_clean.norm(dim=1) > 0.0
 
     anchors = mhlgc_select_borderline_anchors(
         labels=labels,
         fraud_scores=fraud_scores,
         positive_label=positive_label,
         anchors_per_batch=anchors_per_batch,
+        anchor_mask=anchor_mask,
     )
     if negative_mask is None:
         negative_mask = labels != int(positive_label)
@@ -325,6 +344,7 @@ def mhlgc_llm_guided_contrastive_loss(
     if anchors.numel() == 0 or negative_idx.numel() == 0:
         return zero, {
             "mhlgc_anchor_count": int(anchors.numel()),
+            "mhlgc_anchor_candidate_count": int(anchor_mask.sum().item()) if anchor_mask is not None else int((labels == int(positive_label)).sum().item()),
             "mhlgc_negative_count": int(negative_idx.numel()),
             "mhlgc_active": False,
         }
@@ -339,17 +359,9 @@ def mhlgc_llm_guided_contrastive_loss(
         z_anchor.detach(),
         z_negative.detach().transpose(0, 1),
     ) / max(int(z_anchor.size(1)), 1)
-    if semantic_embeddings is not None and gamma > 0.0:
-        semantic_embeddings = torch.nan_to_num(
-            semantic_embeddings.to(origin_embeddings.device).float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        if semantic_embeddings.dim() != 2 or int(semantic_embeddings.size(0)) != int(origin_embeddings.size(0)):
-            raise ValueError("semantic_embeddings must be shaped [batch_nodes, semantic_dim].")
-        g_anchor = semantic_embeddings[anchors]
-        g_negative = semantic_embeddings[negative_idx]
+    if semantic_embeddings_clean is not None and gamma > 0.0:
+        g_anchor = semantic_embeddings_clean[anchors]
+        g_negative = semantic_embeddings_clean[negative_idx]
         semantic_sim = torch.matmul(
             g_anchor.detach(),
             g_negative.detach().transpose(0, 1),
@@ -364,6 +376,7 @@ def mhlgc_llm_guided_contrastive_loss(
     loss = F.softplus(log_neg - pos_logits).mean()
     return loss, {
         "mhlgc_anchor_count": int(anchors.numel()),
+        "mhlgc_anchor_candidate_count": int(anchor_mask.sum().item()) if anchor_mask is not None else int((labels == int(positive_label)).sum().item()),
         "mhlgc_negative_count": int(negative_idx.numel()),
         "mhlgc_active": True,
         "mhlgc_beta": float(beta),
