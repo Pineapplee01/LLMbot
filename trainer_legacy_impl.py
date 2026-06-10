@@ -29,7 +29,6 @@ import hashlib
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from transformers.optimization import get_cosine_schedule_with_warmup
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.nn.models import MLP
 from torch_geometric.nn import RGCNConv
@@ -87,6 +86,33 @@ from artifact_contracts import (
     split_provenance as _contract_split_provenance,
     frozen_g0_dir as _contract_frozen_g0_dir,
 )
+
+try:
+    from transformers.optimization import get_cosine_schedule_with_warmup
+except Exception:
+    from torch.optim.lr_scheduler import LambdaLR
+
+    def get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps,
+        num_training_steps,
+        num_cycles=0.5,
+        last_epoch=-1,
+    ):
+        """Compatibility fallback for environments where transformers schedulers fail to import."""
+
+        num_warmup_steps = max(int(num_warmup_steps), 0)
+        num_training_steps = max(int(num_training_steps), 1)
+        num_cycles = float(num_cycles)
+
+        def lr_lambda(current_step):
+            current_step = int(current_step)
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * 2.0 * num_cycles * progress)))
+
+        return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 from runtime_env import (
     _max_cuda_memory_allocated as _runtime_max_cuda_memory_allocated,
     _reset_cuda_peak_memory_stats as _runtime_reset_cuda_peak_memory_stats,
@@ -3256,7 +3282,7 @@ class StageRunner:
             raise MissingFrozenArtifactError("Resolved graph edge_index must have shape [2, num_edges].")
         if edge_type.numel() != edge_index.size(1):
             raise MissingFrozenArtifactError("Resolved graph edge_type must align with edge_index.")
-        relation_cardinality = int(torch.unique(edge_type).numel()) if edge_type.numel() else 0
+        relation_cardinality = int(edge_type.max().item()) + 1 if edge_type.numel() else 0
         num_nodes = int(getattr(self, "graph_node_count", len(self.labels)))
         num_edges = int(edge_index.size(1))
         return {
@@ -5759,6 +5785,7 @@ class StageRunner:
             "msp_ts",
             "posthoc_calibrated_ranker",
             "calibrated_local_risk_router",
+            "conformal_knn_risk_router",
             "graph_conformal_set_estimator",
             "gnn_2hop_conformal",
         }
@@ -6250,11 +6277,12 @@ class StageRunner:
             )
 
         num_nodes = int(labels_t.numel())
+        relation_cardinality = int(edge_type.max().item()) + 1 if edge_type.numel() else int(getattr(self.args, "n_relations", 2))
         model = StructuralConflictRGCN(
             num_nodes=num_nodes,
             node_emb_dim=64,
             hidden_dim=64,
-            n_relations=int(getattr(self.args, "n_relations", 2)),
+            n_relations=max(int(relation_cardinality), 1),
             n_layers=2,
             dropout=0.1,
         ).to(self.device)
@@ -6329,7 +6357,7 @@ class StageRunner:
                 "node_emb_dim": 64,
                 "hidden_dim": 64,
                 "n_layers": 2,
-                "n_relations": int(getattr(self.args, "n_relations", 2)),
+                "n_relations": max(int(relation_cardinality), 1),
                 "dropout": 0.1,
                 "optimizer": "adamw",
                 "learning_rate": 1e-3,
@@ -6526,6 +6554,189 @@ class StageRunner:
         }
         return bundle, login_artifacts, login_budget_rows
 
+    def _frozen_g0_second_view_config(self):
+        context = self.ensure_backbone_context()
+        manifest = context.get("frozen_g0", {}).get("manifest", {}) or {}
+        graph_refine = manifest.get("graph_refine", {}) if isinstance(manifest.get("graph_refine", {}), dict) else {}
+        second_view = manifest.get("second_view", {}) if isinstance(manifest.get("second_view", {}), dict) else {}
+        detector = manifest.get("detector", {}) if isinstance(manifest.get("detector", {}), dict) else {}
+        mode = str(graph_refine.get("mode", "") or "").strip().lower()
+        scope = str(
+            second_view.get("scope", graph_refine.get("second_view_scope", ""))
+            or ""
+        ).strip().lower()
+        candidate_scope = str(
+            second_view.get("candidate_scope", graph_refine.get("candidate_scope", ""))
+            or ""
+        ).strip().lower()
+        training_geometry = str(
+            second_view.get(
+                "training_geometry",
+                graph_refine.get("training_geometry", graph_refine.get("training_loader_mode", "")),
+            )
+            or ""
+        ).strip().lower()
+        active_modes = {
+            "hyperscan_knn_hypergraph_proxy_augment",
+            "relation_overlap_knn_proxy_augment",
+            "relation_overlap_knn_repr_prefit_augment",
+            "routed_dynamic_hyperscan_branch",
+            "hyperscan_neighborloader_batch_local_branch",
+        }
+        active_scopes = {"labeled_prefix", "routed_nodes", "neighborloader_batch"}
+        router_candidate_scope = None
+        candidate_alignment_note = ""
+        if candidate_scope in {"labeled_relation_1hop", "undirected_relation_1hop"}:
+            router_candidate_scope = candidate_scope
+            candidate_alignment_note = "router uses the same relation-local candidate scope as the Hyper KNN branch"
+        elif candidate_scope == "batch_local_subgraph_knn" or mode == "hyperscan_neighborloader_batch_local_branch":
+            router_candidate_scope = "labeled_full"
+            candidate_alignment_note = (
+                "training branch uses NeighborLoader batch-local KNN; post-hoc router cannot replay stochastic "
+                "sampled batches, so it inherits k/x_new and uses deterministic labeled_full support for the "
+                "same labeled graph"
+            )
+        elif mode == "hyperscan_knn_hypergraph_proxy_augment":
+            router_candidate_scope = "hyperscan_full"
+            candidate_alignment_note = "proxy hypergraph augmentation used full feature-pool KNN"
+        knn_k = graph_refine.get("knn_k", second_view.get("knn_k"))
+        return {
+            "active": bool(mode in active_modes or scope in active_scopes),
+            "mode": mode,
+            "scope": scope,
+            "candidate_scope": candidate_scope,
+            "router_candidate_scope": router_candidate_scope,
+            "candidate_alignment_note": candidate_alignment_note,
+            "training_geometry": training_geometry,
+            "knn_k": knn_k,
+            "hypergraph_backend": str(
+                second_view.get(
+                    "hypergraph_backend",
+                    detector.get("graph_second_view_hypergraph_backend", detector.get("hypergraph_backend", "")),
+                )
+                or ""
+            ),
+            "fusion": str(
+                second_view.get(
+                    "fusion",
+                    detector.get("graph_second_view_fusion", detector.get("hyperscan_detector_style", "")),
+                )
+                or ""
+            ),
+            "artifact_dir": str(context.get("frozen_g0", {}).get("dir", "")),
+        }
+
+    def _effective_conformal_knn_config(self, estimator_mode):
+        config = {
+            "conformal_knn_k": int(getattr(self.args, "conformal_knn_k", 8)),
+            "conformal_knn_candidate_scope": str(getattr(self.args, "conformal_knn_candidate_scope", "labeled_full")),
+            "conformal_knn_target_top_n": int(getattr(self.args, "conformal_knn_target_top_n", 200)),
+            "conformal_knn_shrinkage_tau": float(getattr(self.args, "conformal_knn_shrinkage_tau", 3.0)),
+            "conformal_knn_ncp_lambda": float(getattr(self.args, "conformal_knn_ncp_lambda", 1.0)),
+            "conformal_knn_learning_mode": str(getattr(self.args, "conformal_knn_learning_mode", "fixed") or "fixed"),
+            "conformal_knn_score_family_override": str(
+                getattr(self.args, "conformal_knn_score_family_override", "auto") or "auto"
+            ),
+            "conformal_knn_repr_source": str(getattr(self.args, "conformal_knn_repr_source", "node_repr") or "node_repr"),
+        }
+        metadata = {
+            "source": str(getattr(self.args, "conformal_knn_config_source", "explicit_cli_or_router_defaults")),
+            "parser_inherited_from_second_view": bool(
+                getattr(self.args, "conformal_knn_inherited_from_second_view", False)
+            ),
+            "explicit_cli_flags": list(getattr(self.args, "explicit_cli_flags", []) or []),
+            "inherited_fields": [],
+            "frozen_g0_second_view": None,
+        }
+        if estimator_mode != "conformal_knn_risk_router":
+            return config, metadata
+
+        explicit_flags = set(getattr(self.args, "explicit_cli_flags", []) or [])
+        second_view_config = self._frozen_g0_second_view_config()
+        metadata["frozen_g0_second_view"] = second_view_config
+        if second_view_config.get("active"):
+            inherited_fields = []
+            if "--conformal_knn_k" not in explicit_flags and second_view_config.get("knn_k") is not None:
+                config["conformal_knn_k"] = int(second_view_config["knn_k"])
+                inherited_fields.append("k")
+            if "--conformal_knn_candidate_scope" not in explicit_flags and second_view_config.get("router_candidate_scope"):
+                config["conformal_knn_candidate_scope"] = str(second_view_config["router_candidate_scope"])
+                inherited_fields.append("candidate_scope")
+            if "--conformal_knn_repr_source" not in explicit_flags and second_view_config.get("mode") in {
+                "routed_dynamic_hyperscan_branch",
+                "hyperscan_neighborloader_batch_local_branch",
+                "hyperscan_knn_hypergraph_proxy_augment",
+            }:
+                config["conformal_knn_repr_source"] = "x_new"
+                inherited_fields.append("repr_source")
+            if inherited_fields:
+                metadata["source"] = "frozen_g0_hyper_knn_second_view"
+                metadata["inherited_fields"] = inherited_fields
+
+        allowed_scopes = {"labeled_full", "hyperscan_full", "labeled_relation_1hop", "undirected_relation_1hop"}
+        if config["conformal_knn_candidate_scope"] not in allowed_scopes:
+            raise ValueError(
+                "--conformal_knn_candidate_scope must resolve to one of "
+                "{labeled_full, hyperscan_full, labeled_relation_1hop, undirected_relation_1hop}."
+            )
+        if config["conformal_knn_repr_source"] not in {"node_repr", "x_low", "x_new"}:
+            raise ValueError("--conformal_knn_repr_source must resolve to one of {node_repr, x_low, x_new}.")
+        return config, metadata
+
+    def _conformal_knn_router_repr(self, gnn_outputs, estimator_mode, repr_source=None):
+        node_repr = None if estimator_mode == "posthoc_calibrated_ranker" else gnn_outputs.get("node_repr")
+        if estimator_mode != "conformal_knn_risk_router":
+            return node_repr, None
+        repr_source = str(repr_source or getattr(self.args, "conformal_knn_repr_source", "node_repr") or "node_repr").strip().lower()
+        if repr_source not in {"node_repr", "x_low", "x_new"}:
+            raise ValueError("--conformal_knn_repr_source must be one of {node_repr, x_low, x_new}.")
+        if node_repr is None:
+            raise MissingFrozenArtifactError("conformal_knn_risk_router requires frozen G0 node_repr.")
+        x_low = node_repr.detach().cpu().float() if torch.is_tensor(node_repr) else torch.tensor(node_repr, dtype=torch.float32)
+        metadata = {
+            "requested_repr_source": repr_source,
+            "effective_repr_source": "node_repr" if repr_source in {"node_repr", "x_low"} else "x_new",
+            "x_low_source": "frozen_g0.node_repr",
+            "x_low_shape": [int(x_low.shape[0]), int(x_low.shape[1])] if x_low.dim() == 2 else list(x_low.shape),
+            "hyperscan_alignment_note": (
+                "For the current RGCN frozen G0, node_repr is the relation-view x_low-like embedding. "
+                "x_new follows HyperScan's KNN feature contract by concatenating x_low with the frozen G0 input features."
+            ),
+        }
+        if repr_source in {"node_repr", "x_low"}:
+            metadata["repr_shape"] = list(metadata["x_low_shape"])
+            return x_low, metadata
+
+        x_in = self._strict_glance_backbone_input_features()
+        x_in = x_in.detach().cpu().float() if torch.is_tensor(x_in) else torch.tensor(x_in, dtype=torch.float32)
+        if x_low.dim() != 2 or x_in.dim() != 2:
+            raise MissingFrozenArtifactError(
+                f"conformal_knn x_new expects 2-D x_low/x_in tensors, got {tuple(x_low.shape)} and {tuple(x_in.shape)}."
+            )
+        if int(x_low.shape[0]) != int(x_in.shape[0]):
+            raise MissingFrozenArtifactError(
+                "conformal_knn x_new requires frozen G0 input features and node_repr to have the same node count."
+            )
+        x_new = torch.cat([x_low, x_in], dim=1)
+        context = self.ensure_backbone_context()
+        feature_manifest = (
+            context.get("frozen_g0", {})
+            .get("manifest", {})
+            .get("feature_manifest", {})
+            or {}
+        )
+        metadata.update(
+            {
+                "x_in_source": "frozen_g0.input_pipeline.projected_features",
+                "x_in_shape": [int(x_in.shape[0]), int(x_in.shape[1])],
+                "repr_shape": [int(x_new.shape[0]), int(x_new.shape[1])],
+                "feature_manifest_path": str(feature_manifest.get("path", "") or ""),
+                "feature_manifest_projector": str(feature_manifest.get("projector", "") or ""),
+                "feature_manifest_projected_dim": feature_manifest.get("projected_dim"),
+            }
+        )
+        return x_new, metadata
+
     def _build_graph_conformal_estimator_bundle(self, estimator_mode):
         context = self.ensure_backbone_context()
         gnn_outputs = context["gnn_outputs"]
@@ -6538,7 +6749,12 @@ class StageRunner:
         scalar_only = estimator_mode == "posthoc_calibrated_ranker"
         edge_index = None if scalar_only else self.data["edge_index"]
         edge_type = None if scalar_only else self.data["edge_type"]
-        node_repr = None if scalar_only else gnn_outputs.get("node_repr")
+        conformal_knn_config, conformal_knn_config_metadata = self._effective_conformal_knn_config(estimator_mode)
+        node_repr, conformal_knn_repr_metadata = self._conformal_knn_router_repr(
+            gnn_outputs,
+            estimator_mode,
+            repr_source=conformal_knn_config.get("conformal_knn_repr_source"),
+        )
         estimator.fit(
             logits=gnn_outputs.get("logits"),
             probs=gnn_outputs.get("prob"),
@@ -6552,17 +6768,20 @@ class StageRunner:
             node_repr=node_repr,
             budgets=budgets,
             tune_cal_split_metadata=split_metadata,
+            **conformal_knn_config,
         )
         risk_manifest = estimator.build_manifest(
             logits=gnn_outputs.get("logits"),
             probs=gnn_outputs.get("prob"),
             labels=labels,
+            train_idx=self.data["train_idx"],
             val_idx=self.data["valid_idx"],
             test_idx=self.data["test_idx"],
             edge_index=edge_index,
             edge_type=edge_type,
             node_repr=node_repr,
             budgets=budgets,
+            **conformal_knn_config,
         )
         risk_manifest["calibration_metadata"] = {
             **risk_manifest.get("calibration_metadata", {}),
@@ -6581,6 +6800,40 @@ class StageRunner:
                 **dict(risk_manifest.get("calibration_metadata", {}).get("tune_cal_split_metadata", {})),
                 **split_metadata,
             },
+            "conformal_knn_config": {
+                "k": int(conformal_knn_config["conformal_knn_k"]),
+                "candidate_scope": str(conformal_knn_config["conformal_knn_candidate_scope"]),
+                "target_top_n": int(conformal_knn_config["conformal_knn_target_top_n"]),
+                "anchor_top_n": int(conformal_knn_config["conformal_knn_target_top_n"]),
+                "shrinkage_tau": float(conformal_knn_config["conformal_knn_shrinkage_tau"]),
+                "ncp_lambda": float(conformal_knn_config["conformal_knn_ncp_lambda"]),
+                "learning_mode": str(conformal_knn_config["conformal_knn_learning_mode"]),
+                "score_family_override": str(conformal_knn_config["conformal_knn_score_family_override"]),
+                "repr_source": str(conformal_knn_config["conformal_knn_repr_source"]),
+                "repr_metadata": dict(conformal_knn_repr_metadata or {}),
+                "config_source": dict(conformal_knn_config_metadata),
+                "hyper_knn_alignment": {
+                    "router_reuses_hyper_knn_config_by_default": bool(
+                        conformal_knn_config_metadata.get("inherited_fields")
+                    ),
+                    "explicit_router_flags_override_inheritance": True,
+                    "candidate_alignment_note": str(
+                        (conformal_knn_config_metadata.get("frozen_g0_second_view") or {}).get(
+                            "candidate_alignment_note",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "k_semantics": (
+                        "hyperscan_full uses k as hyperedge size including center; "
+                        "relation-local scopes use k as the maximum non-center support-neighbor count"
+                    ),
+                },
+                "target_selection_contract": "target_node_to_knn_support_group_risk_v1",
+                "support_group_role": "evidence_only_not_routed_outputs",
+            }
+            if estimator_mode == "conformal_knn_risk_router"
+            else None,
         }
         return self._bundle_from_risk_manifest(estimator_mode, risk_manifest)
 
@@ -10570,7 +10823,8 @@ class StageRunner:
         if str(getattr(self, "graph_data_variant", "labeled")).lower() == "full_graph_support" and not self._graph_conformal_estimator_requested():
             raise MissingFrozenArtifactError(
                 "graph_data_variant=full_graph_support currently supports only conformal-style estimator_ablation modes "
-                "(`graph_conformal_set_estimator`, `posthoc_calibrated_ranker`, `calibrated_local_risk_router`, `gnn_2hop_conformal`)."
+                "(`graph_conformal_set_estimator`, `posthoc_calibrated_ranker`, `calibrated_local_risk_router`, "
+                "`conformal_knn_risk_router`, `gnn_2hop_conformal`)."
             )
         if self._login_uncertainty_router_requested():
             return self._run_login_uncertainty_router_matrix(stage_dir, base_bundle)

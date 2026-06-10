@@ -4,7 +4,8 @@ This helper builds per-node prompt texts, optionally generates explanation-first
 expert summaries, encodes them with a local embedding model, applies
 encoder-aligned pooling plus optional l2 normalization, and stores a prompt
 cache under a stable ``embeddings`` key for downstream graph_detector_prepare
-and strict GLANCE runs.
+and strict GLANCE runs. HyperScan-style KNN and hypergraph helpers live in
+``hypergnn.py`` so this file stays prompt-cache focused.
 """
 
 from __future__ import annotations
@@ -28,10 +29,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from hypergnn import (
+    resolve_selection_feature_bundle,
+    select_center_induced_directional_neighbors,
+)
 from prompt import (
     _conflict_explain_generation_prompt as build_conflict_explain_generation_prompt,
     _conflict_prompt as build_conflict_prompt,
     _conflict_prompt_partitioned as build_conflict_prompt_partitioned,
+    _ego_botsay_tweet_metadata_prompt as build_ego_botsay_tweet_metadata_prompt,
     _ego_explain_generation_prompt as build_ego_explain_generation_prompt,
     _expert_embedding_prompt as build_expert_embedding_prompt,
     _evidence_card_generation_system as build_evidence_card_generation_system,
@@ -39,6 +45,8 @@ from prompt import (
     _graph_explain_generation_prompt as build_graph_explain_generation_prompt,
     _graph_prompt as build_graph_prompt,
     _graph_prompt_partitioned as build_graph_prompt_partitioned,
+    _mhlgc_llm_guide_prompt as build_mhlgc_llm_guide_prompt,
+    _mhlgc_semantic_embedding_prompt as build_mhlgc_semantic_embedding_prompt,
     _summary_generation_system as build_summary_generation_system,
     _summary_prompt_rules as build_summary_prompt_rules,
     _tweet_explain_generation_prompt as build_tweet_explain_generation_prompt,
@@ -81,12 +89,16 @@ DGP_PROMPT_MODES = (
     "dgp_predictor_v1",
     "dgp_predictor_v2",
 )
+MHLGC_PROMPT_MODES = (
+    "mhlgc_llm_guide",
+)
 PROMPT_MODE_CHOICES = (
     LEGACY_PROMPT_MODES
     + EXPERT_PROMPT_MODES
     + ULTRATAG_PROMPT_MODES
     + RESIDUAL_AUDIT_PROMPT_MODES
     + DGP_PROMPT_MODES
+    + MHLGC_PROMPT_MODES
 )
 PROMPT_FAMILY_VERSION_CHOICES = ("v1", "v2", "v3")
 EXPLAIN_PROMPT_STYLE_CHOICES = ("default", "botsay")
@@ -391,34 +403,6 @@ def _iter_json_array(path: Path, chunk_size: int = 1 << 20):
             if eof:
                 return
 
-
-def _load_feature_tensor(path: Path):
-    payload = torch.load(path, map_location="cpu")
-    if isinstance(payload, dict):
-        for key in ("embeddings", "features", "x"):
-            if key in payload:
-                payload = payload[key]
-                break
-    if not torch.is_tensor(payload):
-        payload = torch.as_tensor(payload)
-    payload = payload.detach().cpu().float()
-    if payload.dim() != 2:
-        raise ValueError(f"Expected a 2-D embedding tensor at {path}, got shape {tuple(payload.shape)}.")
-    return payload.contiguous()
-
-
-def _resolve_default_selection_embedding_path(dataset_path: Path, seed: int):
-    candidates = [
-        dataset_path / f"embeddings_iter_-1_seed_{int(seed)}.pt",
-        dataset_path / "embeddings_roberta.pt",
-        dataset_path / "finetuned_roberta_embeddings_iter_2_seed1.pt",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def _canonical_node_id(raw_id):
     text = str(raw_id).strip()
     if not text:
@@ -501,70 +485,6 @@ def _build_raw_node_indices(node_source_path: Path, target_user_ids=None, target
         "user_profile_by_id": user_profile_by_id,
         "tweet_text_by_id": tweet_text_by_id,
     }
-
-
-def _resolve_selection_feature_bundle(args, dataset_path: Path, graph_variant: str, graph_node_count: int, labeled_node_count: int):
-    explicit_labeled = getattr(args, "selection_embedding_path", None)
-    labeled_path = Path(explicit_labeled) if explicit_labeled else _resolve_default_selection_embedding_path(dataset_path, int(args.seed))
-    if labeled_path is None or not labeled_path.exists():
-        raise FileNotFoundError(
-            "center_induced_relation_aware requires --selection_embedding_path or a default labeled embedding tensor "
-            f"(for example embeddings_iter_-1_seed_{int(args.seed)}.pt) under {dataset_path}."
-        )
-    labeled_features = _load_feature_tensor(labeled_path)
-
-    if graph_variant == "full_graph_support":
-        if int(labeled_features.shape[0]) == int(graph_node_count):
-            return {
-                "features": F.normalize(labeled_features, p=2, dim=1, eps=1e-12),
-                "mode": "single_full_graph_tensor",
-                "labeled_path": str(labeled_path),
-                "support_path": "",
-            }
-        if int(labeled_features.shape[0]) != int(labeled_node_count):
-            raise ValueError(
-                "full_graph_support center-induced selection expects labeled selection embeddings to have either "
-                f"{labeled_node_count} rows or {graph_node_count} rows, got {int(labeled_features.shape[0])}."
-            )
-        explicit_support = getattr(args, "support_selection_embedding_path", None)
-        support_path = Path(explicit_support) if explicit_support else dataset_path / "support_roberta_embeddings_new.pt"
-        if not support_path.exists():
-            raise FileNotFoundError(
-                "full_graph_support center-induced selection requires --support_selection_embedding_path or the "
-                f"default support embedding tensor at {support_path}."
-            )
-        support_features = _load_feature_tensor(support_path)
-        expected_support = int(graph_node_count) - int(labeled_node_count)
-        if int(support_features.shape[0]) != expected_support:
-            raise ValueError(
-                "Support selection embeddings do not match the full-graph support suffix size: "
-                f"expected {expected_support}, got {int(support_features.shape[0])}."
-            )
-        if int(support_features.shape[1]) != int(labeled_features.shape[1]):
-            raise ValueError(
-                "Labeled and support selection embeddings must share the same feature dimension for "
-                "center_induced_relation_aware."
-            )
-        full_features = torch.cat([labeled_features, support_features], dim=0)
-        return {
-            "features": F.normalize(full_features, p=2, dim=1, eps=1e-12),
-            "mode": "runtime_labeled_plus_support_concat",
-            "labeled_path": str(labeled_path),
-            "support_path": str(support_path),
-        }
-
-    if int(labeled_features.shape[0]) != int(graph_node_count):
-        raise ValueError(
-            f"labeled graph variant expects selection embeddings with {graph_node_count} rows, "
-            f"got {int(labeled_features.shape[0])}."
-        )
-    return {
-        "features": F.normalize(labeled_features, p=2, dim=1, eps=1e-12),
-        "mode": "single_labeled_tensor",
-        "labeled_path": str(labeled_path),
-        "support_path": "",
-    }
-
 
 def _resolve_graph_variant_paths(dataset_path: Path, graph_data_variant: str, text_path: Path | None):
     variant = str(graph_data_variant or "labeled").lower()
@@ -1457,6 +1377,19 @@ def _profile_cue_summary(record, include_identity=True):
         ]
     )
     return "\n".join(lines)
+
+
+def _target_account_text_for_llm(record, tweet_stats, *, include_identity=True, brief=False):
+    lines = [
+        "PROFILE:",
+        _profile_cue_summary(record, include_identity=include_identity),
+        "TWEET_BEHAVIOR:",
+        _tweet_behavior_summary(record, tweet_stats),
+        _tweet_samples_block(tweet_stats),
+    ]
+    rendered = "\n".join(lines)
+    limit = 1400 if brief else 2200
+    return _truncate_chars(rendered, limit) or "No usable account text was available."
 
 
 def _neighbor_card_v2(record):
@@ -2536,149 +2469,6 @@ def _rank_directional_candidates(node_id, nodes, texts, context):
     return sorted(unique, key=lambda cand: _relation_heuristic_sort_key(node_id, cand, texts, context))
 
 
-def _center_induced_relation_stats(node_id, candidate, texts, context, selection_features):
-    following = context["following"]
-    follower = context["follower"]
-    undirected = context["undirected"]
-    text_len = len(texts[candidate]) if isinstance(texts[candidate], str) else 0
-    has_text = 1 if text_len > 0 else 0
-    ego_follows_candidate = (candidate in following[node_id]) or (node_id in follower[candidate])
-    candidate_follows_ego = (candidate in follower[node_id]) or (node_id in following[candidate])
-    mutual = 1 if (ego_follows_candidate and candidate_follows_ego) else 0
-    common_neighbors = len(undirected[node_id].intersection(undirected[candidate]))
-    candidate_degree = len(undirected[candidate])
-    center_vec = selection_features[int(node_id)]
-    candidate_vec = selection_features[int(candidate)]
-    similarity = float(torch.sum(center_vec * candidate_vec).item())
-    nontrivial_structure = 1 if (candidate_degree > 1 or common_neighbors > 0 or mutual > 0) else 0
-    return {
-        "candidate": int(candidate),
-        "similarity": similarity,
-        "mutual": int(mutual),
-        "common_neighbors": int(common_neighbors),
-        "candidate_degree": int(candidate_degree),
-        "text_length": int(text_len),
-        "has_text": int(has_text),
-        "nontrivial_structure": int(nontrivial_structure),
-        "reciprocal": int(mutual),
-    }
-
-
-def _center_support_sort_key(stats):
-    return (
-        -float(stats["similarity"]),
-        -int(stats["mutual"]),
-        -int(stats["common_neighbors"]),
-        -int(stats["candidate_degree"]),
-        -int(stats["text_length"]),
-        int(stats["candidate"]),
-    )
-
-
-def _center_contrast_sort_key(stats):
-    return (
-        float(stats["similarity"]),
-        -int(stats["has_text"]),
-        -int(stats["nontrivial_structure"]),
-        -int(stats["candidate_degree"]),
-        -int(stats["common_neighbors"]),
-        -int(stats["text_length"]),
-        int(stats["candidate"]),
-    )
-
-
-def _partition_center_induced_candidates(candidate_stats, quota):
-    quota = max(int(quota), 0)
-    support_quota = int(math.ceil(float(quota) / 2.0))
-    contrast_quota = int(math.floor(float(quota) / 2.0))
-    support_ranked = sorted(candidate_stats, key=_center_support_sort_key)
-    selected_support = support_ranked[:support_quota]
-    used = {int(item["candidate"]) for item in selected_support}
-    contrast_ranked = sorted(
-        [item for item in candidate_stats if int(item["candidate"]) not in used],
-        key=_center_contrast_sort_key,
-    )
-    selected_contrast = contrast_ranked[:contrast_quota]
-    used.update(int(item["candidate"]) for item in selected_contrast)
-    fallback_used = False
-    if len(selected_support) + len(selected_contrast) < quota:
-        fallback_used = True
-        support_overflow = [item for item in support_ranked if int(item["candidate"]) not in used]
-        contrast_overflow = [item for item in contrast_ranked if int(item["candidate"]) not in used]
-        overflow = support_overflow + contrast_overflow
-        for item in overflow:
-            if len(selected_support) + len(selected_contrast) >= quota:
-                break
-            if int(item["candidate"]) in used:
-                continue
-            if len(selected_support) < support_quota:
-                selected_support.append(item)
-            else:
-                selected_contrast.append(item)
-            used.add(int(item["candidate"]))
-    return selected_support, selected_contrast, fallback_used
-
-
-def _selected_similarity_mean(items):
-    if not items:
-        return 0.0
-    return float(np.mean([float(item["similarity"]) for item in items]))
-
-
-def _selected_reciprocal_ratio(items):
-    if not items:
-        return 0.0
-    return float(np.mean([float(item["reciprocal"]) for item in items]))
-
-
-def _select_center_induced_directional_neighbors(
-    node_id,
-    texts,
-    context,
-    selection_features,
-    following_quota,
-    follower_quota,
-):
-    following_candidates = [
-        _center_induced_relation_stats(node_id, cand, texts, context, selection_features)
-        for cand in sorted(set(int(n) for n in context["following"][node_id] if int(n) >= 0 and int(n) != int(node_id)))
-    ]
-    follower_candidates = [
-        _center_induced_relation_stats(node_id, cand, texts, context, selection_features)
-        for cand in sorted(set(int(n) for n in context["follower"][node_id] if int(n) >= 0 and int(n) != int(node_id)))
-    ]
-
-    following_support, following_contrast, following_fallback = _partition_center_induced_candidates(
-        following_candidates,
-        quota=int(following_quota),
-    )
-    follower_support, follower_contrast, follower_fallback = _partition_center_induced_candidates(
-        follower_candidates,
-        quota=int(follower_quota),
-    )
-
-    summary = {
-        "candidate_count_following": int(len(following_candidates)),
-        "candidate_count_follower": int(len(follower_candidates)),
-        "selected_count_following": int(len(following_support) + len(following_contrast)),
-        "selected_count_follower": int(len(follower_support) + len(follower_contrast)),
-        "mean_sim_following_support": _selected_similarity_mean(following_support),
-        "mean_sim_following_contrast": _selected_similarity_mean(following_contrast),
-        "mean_sim_follower_support": _selected_similarity_mean(follower_support),
-        "mean_sim_follower_contrast": _selected_similarity_mean(follower_contrast),
-        "reciprocal_ratio_following_selected": _selected_reciprocal_ratio(following_support + following_contrast),
-        "reciprocal_ratio_follower_selected": _selected_reciprocal_ratio(follower_support + follower_contrast),
-        "fallback_used": bool(following_fallback or follower_fallback),
-    }
-    return {
-        "following_support": following_support,
-        "following_contrast": following_contrast,
-        "follower_support": follower_support,
-        "follower_contrast": follower_contrast,
-        "summary": summary,
-    }
-
-
 def _sample_directional_neighbors(node_id, texts, context, following_quota, follower_quota):
     following_ranked = _rank_directional_candidates(node_id, context["following"][node_id], texts, context)
     follower_ranked = _rank_directional_candidates(node_id, context["follower"][node_id], texts, context)
@@ -2790,6 +2580,212 @@ def _build_relation_aware_prompt_bundle(texts, edge_index, edge_type, following_
             "relation_aware_ego": ["ego"],
             "relation_aware_1hop": ["directional_1hop"],
         },
+    }
+
+
+def _mhlgc_relation_tags(node_id, candidate_id, context):
+    node_id = int(node_id)
+    candidate_id = int(candidate_id)
+    tags = []
+    if candidate_id in context["following"][node_id]:
+        tags.append("target_follows_candidate")
+    if candidate_id in context["follower"][node_id]:
+        tags.append("candidate_follows_target")
+    if (
+        candidate_id in context["following"][node_id]
+        and candidate_id in context["follower"][node_id]
+    ):
+        tags.append("mutual")
+    if not tags and candidate_id in context["undirected"][node_id]:
+        tags.append("undirected_relation_1hop")
+    if not tags:
+        tags.append("semantic_knn_only")
+    return tags
+
+
+def _mhlgc_neighbor_card(node_id, candidate_id, texts, context, similarity=None, rank=None):
+    candidate_id = int(candidate_id)
+    card = {
+        "node_id": candidate_id,
+        "relation_to_target": _mhlgc_relation_tags(node_id, candidate_id, context),
+        "text": _node_text(texts[candidate_id]),
+    }
+    if rank is not None:
+        card["rank"] = int(rank)
+    if similarity is not None:
+        card["semantic_similarity"] = float(similarity)
+    return card
+
+
+def _mhlgc_original_view(node_id, texts, context, following_quota, follower_quota):
+    following_ranked = _rank_directional_candidates(
+        node_id,
+        context["following"][node_id],
+        texts,
+        context,
+    )
+    follower_ranked = _rank_directional_candidates(
+        node_id,
+        context["follower"][node_id],
+        texts,
+        context,
+    )
+    following_ids = following_ranked[: int(following_quota)]
+    follower_ids = follower_ranked[: int(follower_quota)]
+    mutual_count = len(set(context["following"][node_id]).intersection(set(context["follower"][node_id])))
+    return {
+        "view_type": "original_directed_relation_view",
+        "node_id": int(node_id),
+        "counts": {
+            "following": int(len(set(context["following"][node_id]))),
+            "follower": int(len(set(context["follower"][node_id]))),
+            "mutual": int(mutual_count),
+            "undirected_1hop": int(len(context["undirected"][node_id])),
+        },
+        "selected_following_neighbors": [
+            _mhlgc_neighbor_card(node_id, candidate, texts, context, rank=rank)
+            for rank, candidate in enumerate(following_ids, start=1)
+        ],
+        "selected_follower_neighbors": [
+            _mhlgc_neighbor_card(node_id, candidate, texts, context, rank=rank)
+            for rank, candidate in enumerate(follower_ids, start=1)
+        ],
+        "selection_policy": "directional_heuristic_fixed_quota",
+    }
+
+
+def _mhlgc_hypergraph_view(node_id, texts, context, selection_features, knn_k):
+    if selection_features is None:
+        raise ValueError("mhlgc_llm_guide requires selection_features from --selection_embedding_path.")
+    features = selection_features.detach().cpu().float()
+    if features.dim() != 2:
+        raise ValueError("mhlgc_llm_guide selection features must be a 2-D tensor.")
+    if not (0 <= int(node_id) < int(features.shape[0])):
+        raise ValueError(f"mhlgc_llm_guide node_id {int(node_id)} is outside selection feature rows.")
+    k = max(int(knn_k), 1)
+    center = F.normalize(features[int(node_id)].view(1, -1), p=2, dim=1, eps=1e-12)
+    all_features = F.normalize(features, p=2, dim=1, eps=1e-12)
+    scores = torch.matmul(all_features, center.t()).view(-1)
+    topk = min(int(k) + 1, int(scores.numel()))
+    values, indices = torch.topk(scores, k=topk, largest=True)
+    members = []
+    for rank, (candidate, similarity) in enumerate(zip(indices.tolist(), values.tolist()), start=1):
+        candidate = int(candidate)
+        if candidate == int(node_id):
+            continue
+        members.append(
+            _mhlgc_neighbor_card(
+                node_id,
+                candidate,
+                texts,
+                context,
+                similarity=float(similarity),
+                rank=len(members) + 1,
+            )
+        )
+        if len(members) >= k:
+            break
+    return {
+        "view_type": "hyperscan_style_knn_hypergraph_view",
+        "node_id": int(node_id),
+        "hyperedge_center": int(node_id),
+        "construction": "one center-induced semantic KNN hyperedge over selection embeddings",
+        "knn_k": int(k),
+        "members": members,
+        "member_count": int(len(members)),
+    }
+
+
+def _resolve_mhlgc_prompt_bundle(args, texts, edge_index, edge_type, target_node_ids=None, selection_features=None):
+    num_nodes = len(texts)
+    context = _build_graph_context(edge_index, edge_type, num_nodes)
+    prompts = {"mhlgc_llm_guide": []}
+    prompt_rows = []
+    counts = {
+        "original_following_nodes": [],
+        "original_follower_nodes": [],
+        "hypergraph_member_nodes": [],
+    }
+    target_ids = list(target_node_ids) if target_node_ids is not None else list(range(num_nodes))
+    for node_id in target_ids:
+        node_id = int(node_id)
+        original_view = _mhlgc_original_view(
+            node_id,
+            texts,
+            context,
+            following_quota=int(args.following_quota),
+            follower_quota=int(args.follower_quota),
+        )
+        hypergraph_view = _mhlgc_hypergraph_view(
+            node_id,
+            texts,
+            context,
+            selection_features,
+            knn_k=int(args.neighbor_cap),
+        )
+        target_text = _node_text(texts[node_id])
+        guide_prompt = build_mhlgc_llm_guide_prompt(
+            node_id=node_id,
+            original_view=original_view,
+            hypergraph_view=hypergraph_view,
+            target_text=target_text,
+            role="borderline_anchor",
+        )
+        embedding_prompt = build_mhlgc_semantic_embedding_prompt(
+            node_id=node_id,
+            original_view=original_view,
+            hypergraph_view=hypergraph_view,
+            target_text=target_text,
+            role="borderline_anchor",
+        )
+        prompts["mhlgc_llm_guide"].append(embedding_prompt)
+        prompt_rows.append(
+            {
+                "node_id": int(node_id),
+                "component_name": "mhlgc_llm_guide",
+                "prompt_role": guide_prompt["prompt_role"],
+                "prompt_family": guide_prompt["prompt_family"],
+                "system": guide_prompt["system"],
+                "user": guide_prompt["user"],
+                "prompt": embedding_prompt,
+                "target_text": target_text,
+                "original_view": original_view,
+                "hypergraph_view": hypergraph_view,
+            }
+        )
+        counts["original_following_nodes"].append(
+            int(len(original_view["selected_following_neighbors"]))
+        )
+        counts["original_follower_nodes"].append(
+            int(len(original_view["selected_follower_neighbors"]))
+        )
+        counts["hypergraph_member_nodes"].append(int(hypergraph_view["member_count"]))
+    return {
+        "prompt_family": "mhlgc_llm_guide_v1",
+        "prompt_style": "mhlgc_original_relation_plus_hyperscan_knn_hypergraph",
+        "prompt_family_version": "mhlgc_llm_guide_v1",
+        "evidence_schema": "llm_guided_multiview_semantic_embedding",
+        "evidence_card_fields": [],
+        "prompt_components": prompts,
+        "structured_components": {},
+        "structured_component_schema": {},
+        "generation_rows_by_component": {},
+        "component_max_length_group": {"mhlgc_llm_guide": "hop"},
+        "component_prompt_roles": {"mhlgc_llm_guide": "mhlgc_multiview_llm_guide"},
+        "counts": counts,
+        "neighbor_sample_policy": "mhlgc_original_relation_plus_selection_embedding_knn_hypergraph",
+        "directional_quota": {"following": int(args.following_quota), "follower": int(args.follower_quota)},
+        "support_contrast_quota": {},
+        "component_order": {"mhlgc_llm_guide": ["mhlgc_llm_guide"]},
+        "selected_components": ["mhlgc_llm_guide"],
+        "scalar_features": {},
+        "prompt_rows": prompt_rows,
+        "semantic_view_mode": "mhlgc_llm_guide_v1",
+        "selection_policy_note": (
+            "MH-LGC-style prompt cache serializes the original directed relation view and one "
+            "HyperScan-style semantic KNN hypergraph view. The prompt asks for LLM guide embeddings "
+            "for hard-negative contrastive learning and forbids final bot/human labels."
+        ),
     }
 
 
@@ -3250,14 +3246,7 @@ def _resolve_residual_audit_prompt_bundle(
 
 
 def _dgp_system_instruction():
-    return "\n".join(
-        [
-            "You are a Twitter social-bot detection classifier.",
-            "Use the target account evidence as the primary signal.",
-            "Use neighbor evidence only as coarse local graph context.",
-            "Do not infer from dataset labels, oracle outcomes, or unavailable information.",
-        ]
-    )
+    return "You are a social bot detection classifier."
 
 
 def _dgp_target_block(record, tweet_stats):
@@ -3265,17 +3254,12 @@ def _dgp_target_block(record, tweet_stats):
     tweet_lines = [f"- {tweet}" for tweet in tweets] if tweets else ["- None"]
     return "\n".join(
         [
-            "<target_account_fine_grained>",
-            "<profile>",
+            "EGO_PROFILE:",
             _profile_card(record, brief=False),
-            "</profile>",
-            "<tweet_behavior>",
+            "EGO_TWEET_BEHAVIOR:",
             _tweet_behavior_summary(record, tweet_stats),
-            "</tweet_behavior>",
-            "<representative_tweets>",
+            "EGO_TWEET_SAMPLES:",
             *tweet_lines,
-            "</representative_tweets>",
-            "</target_account_fine_grained>",
         ]
     )
 
@@ -3303,18 +3287,17 @@ def _dgp_neighbor_context(node_id, context, records, args, variant):
     follower = sorted(set(int(item) for item in context["follower"][int(node_id)] if int(item) != int(node_id)))
     reciprocal = sorted(set(following).intersection(set(follower)))
     lines = [
-        "<local_graph_coarse_context>",
-        f"- following_count: {len(following)}",
-        f"- follower_count: {len(follower)}",
-        f"- reciprocal_follow_count: {len(reciprocal)}",
-        f"- has_following: {_format_bool(bool(following))}",
-        f"- has_follower: {_format_bool(bool(follower))}",
+        "GRAPH_CONTEXT_STATS:",
+        f"- following_count={len(following)}",
+        f"- follower_count={len(follower)}",
+        f"- reciprocal_follow_count={len(reciprocal)}",
+        f"- has_following={_format_bool(bool(following))}",
+        f"- has_follower={_format_bool(bool(follower))}",
     ]
     if str(variant) == "target_only":
         lines.extend(
             [
-                "- neighbor_cards_policy: omitted_target_only_ablation",
-                "</local_graph_coarse_context>",
+                "- neighbor_cards_policy=omitted_target_only_ablation",
             ]
         )
         return "\n".join(lines), {"following_selected": 0, "follower_selected": 0}
@@ -3335,13 +3318,10 @@ def _dgp_neighbor_context(node_id, context, records, args, variant):
     )
     lines.extend(
         [
-            "<following_neighbor_cards>",
+            "FOLLOWING_NEIGHBORS:",
             *([_dgp_neighbor_card(records[int(item)]) for item in following_selected] or ["- None"]),
-            "</following_neighbor_cards>",
-            "<follower_neighbor_cards>",
+            "FOLLOWER_NEIGHBORS:",
             *([_dgp_neighbor_card(records[int(item)]) for item in follower_selected] or ["- None"]),
-            "</follower_neighbor_cards>",
-            "</local_graph_coarse_context>",
         ]
     )
     return "\n".join(lines), {
@@ -3351,25 +3331,15 @@ def _dgp_neighbor_context(node_id, context, records, args, variant):
 
 
 def _build_dgp_predictor_prompt_parts(record, tweet_stats, neighbor_context_text, class_names, variant):
-    label_space = "\n".join([f"- {label}" for label in class_names])
     system = _dgp_system_instruction()
+    label_space = ", ".join(str(label) for label in class_names)
     user = "\n\n".join(
         [
-            "<task>",
-            "Classify one Twitter account as human or bot.",
-            "This is a dual-granularity prompt: the target account is detailed, while neighbors are compressed.",
-            "Return the most likely label using only the supplied evidence.",
-            "</task>",
-            "<label_space>\n" + label_space + "\n</label_space>",
+            f"Instruct: Predict the node's category for social bot detection from the provided context. Possible categories: {label_space}.",
+            "Query:",
             _dgp_target_block(record, tweet_stats),
             neighbor_context_text,
-            "<decision_rules>",
-            "1. Prioritize specific target profile and tweet evidence over generic neighbor similarity.",
-            "2. Use neighbors as coarse context about social role, audience, and possible coordination.",
-            "3. Treat sparse or mixed evidence as uncertainty, but still choose the more supported label.",
-            "4. Do not output explanations, probabilities, or extra text.",
-            "</decision_rules>",
-            '<output_format>{"label":"human | bot"}</output_format>',
+            "Answer with exactly one token: Yes or No.",
         ]
     )
     full_prompt = "\n\n".join(
@@ -3378,7 +3348,7 @@ def _build_dgp_predictor_prompt_parts(record, tweet_stats, neighbor_context_text
             system,
             "USER_MESSAGE:",
             user,
-            "ASSISTANT_JSON:",
+            "ASSISTANT_ANSWER:",
         ]
     )
     return {"system": system, "user": user, "full": full_prompt}
@@ -3458,37 +3428,19 @@ def _dgp_v2_clean_generated_summary(text, limit=600):
 
 
 def _dgp_v2_summary_system():
-    return "\n".join(
-        [
-            "You summarize Twitter account text for downstream social bot detection.",
-            "Preserve evidence that could help a later classifier, but do not output final bot/human labels.",
-            "Use only supplied text and do not infer missing information.",
-            "Always write the summary in English. Do not copy raw non-English or noisy source spans.",
-        ]
-    )
+    return "You summarize account text."
 
 
 def _dgp_v2_neighbor_summary_prompt(direction, neighbor_text):
     direction = _dgp_v2_relation_label(direction)
     user = "\n\n".join(
         [
-            "<task>",
-            "Summarize this neighboring Twitter account for social bot detection context.",
-            "The summary will be used as coarse graph evidence for a target account.",
-            "</task>",
-            "<requirements>",
-            "1. Preserve profile, content, activity, and social-role cues.",
-            "2. Mention automation-like, promotional, broadcast, or coordination behavior only when directly supported.",
-            "3. Do not classify this neighbor as bot or human.",
-            "4. Do not predict the target account label.",
-            "5. Write in English only; if the source text is non-English or noisy, describe that as an evidence-quality cue instead of copying it.",
-            "6. Keep the summary within 2-3 evidence-grounded sentences.",
-            "</requirements>",
-            f"<relation_to_target>{direction}</relation_to_target>",
-            "<neighbor_account_text>",
+            "Instruct: Summarize the following account text within 10 tokens.",
+            "Query:",
+            f"RELATION_TO_TARGET: {direction}",
+            "ACCOUNT_TEXT:",
             _dgp_v2_clean_norm_text(neighbor_text, limit=2200),
-            "</neighbor_account_text>",
-            "ENGLISH_SUMMARY:",
+            "Summary:",
         ]
     )
     return {
@@ -3514,22 +3466,13 @@ def _dgp_v2_context_summary_prompt(direction, neighbor_summary_rows):
         summary_lines = ["None"]
     user = "\n\n".join(
         [
-            "<task>",
-            f"Summarize the target account's {direction} context for social bot detection.",
-            f"The {direction} context consists of {relation_description}.",
-            "</task>",
-            "<requirements>",
-            "1. Use only the neighbor summaries below.",
-            "2. Do not predict the final bot/human label.",
-            "3. Focus on common social-role, affiliation, promotion, audience, or coordination patterns.",
-            "4. Mention uncertainty when the neighbor evidence is sparse, mixed, or weakly informative.",
-            "5. Write in English only and do not copy raw non-English or noisy text spans.",
-            "6. Keep the summary within 3-5 evidence-grounded sentences.",
-            "</requirements>",
-            f"<{direction}_neighbor_summaries>",
+            "Instruct: Summarize the following account texts within 10 tokens.",
+            "Query:",
+            f"RELATION_CONTEXT: {direction}",
+            f"RELATION_DESCRIPTION: {relation_description}",
+            "ACCOUNT_SUMMARIES:",
             "\n".join(summary_lines),
-            f"</{direction}_neighbor_summaries>",
-            f"{direction.upper()}_ENGLISH_CONTEXT_SUMMARY:",
+            "Summary:",
         ]
     )
     return {
@@ -3553,14 +3496,7 @@ def _dgp_v2_empty_context_summary(direction):
 
 
 def _dgp_v2_predictor_system():
-    return "\n".join(
-        [
-            "You are a Twitter social bot detection classifier.",
-            "Use the target account text as the primary evidence.",
-            "Use summarized neighbor context only as coarse supporting graph evidence.",
-            "Do not use dataset priors, true labels, oracle outcomes, or unavailable information.",
-        ]
-    )
+    return "You are a social bot detection classifier."
 
 
 def _dgp_v2_predictor_prompt_parts(target_text, context_summaries, variant):
@@ -3569,35 +3505,21 @@ def _dgp_v2_predictor_prompt_parts(target_text, context_summaries, variant):
         summary = str(context_summaries.get(direction, "") or "").strip()
         if not summary:
             continue
-        tag = f"{direction.upper()}_CONTEXT_COARSE_SUMMARY"
-        context_sections.extend([f"<{tag}>", summary, f"</{tag}>"])
+        tag = f"{direction.upper()}_CONTEXT_SUMMARY"
+        context_sections.extend([f"{tag}:", summary])
     if not context_sections:
         context_sections = [
-            "<NEIGHBOR_CONTEXT_COARSE_SUMMARY>",
+            "NEIGHBOR_CONTEXT_SUMMARY:",
             "No neighbor context summary is used for this target-only ablation.",
-            "</NEIGHBOR_CONTEXT_COARSE_SUMMARY>",
         ]
     user = "\n\n".join(
         [
-            "<question>",
-            "Is the target account a social bot?",
-            "</question>",
-            "<label_definition>",
-            "Yes: the target account is likely a bot or automation-driven account.",
-            "No: the target account is likely a human-operated account.",
-            "</label_definition>",
-            "<target_account_fine_grained_text>",
+            "Instruct: Predict the node's category for social bot detection from the provided context. Possible categories: No, Yes.",
+            "Query:",
+            "TARGET_ACCOUNT_TEXT:",
             _dgp_v2_clean_norm_text(target_text, limit=3600),
-            "</target_account_fine_grained_text>",
             "\n".join(context_sections),
-            "<decision_rules>",
-            "1. Prioritize the target account's own profile, metadata, and tweet/content evidence.",
-            "2. Use neighbor context only to interpret social role, affiliation, promotion, audience, or coordination.",
-            "3. Do not let generic neighbor similarity override strong target evidence.",
-            "4. If evidence is mixed, choose the better-supported answer.",
-            "5. Output exactly one token: Yes or No.",
-            "</decision_rules>",
-            "ANSWER:",
+            "Answer with exactly one token: Yes or No.",
         ]
     )
     full_prompt = "\n\n".join(
@@ -3998,6 +3920,8 @@ def _default_output_path(
             dgp_prompt_variant=dgp_prompt_variant,
             embedding_encoder_tag=embedding_encoder_tag,
         )
+    if prompt_mode in MHLGC_PROMPT_MODES:
+        return dataset_path / f"{prompt_mode}_{embedding_encoder_tag}_embed.pt"
     return dataset_path / f"glance_qwen3_prompt_cache_{prompt_mode}.pt"
 
 
@@ -4008,9 +3932,10 @@ def _graph_prompt(
     total_count,
     reciprocal_count,
 ):
+    tweet_stats = _get_tweet_stats(ego_record, sample_size=5)
     return build_graph_prompt(
         direction_name,
-        _profile_card(ego_record, brief=True),
+        _target_account_text_for_llm(ego_record, tweet_stats, include_identity=True, brief=True),
         [_neighbor_card(record) for record in neighbor_records],
         total_count,
         reciprocal_count,
@@ -4050,6 +3975,21 @@ def _tweet_prompt(record, tweet_stats):
         _profile_card(record, brief=True),
         _tweet_behavior_summary(record, tweet_stats),
         _tweet_samples_block(tweet_stats),
+    )
+
+
+def _ego_prompt(record, tweet_stats):
+    prompt = build_ego_botsay_tweet_metadata_prompt(
+        _profile_card(record, brief=False),
+        _tweet_behavior_summary(record, tweet_stats),
+        _tweet_samples_block(tweet_stats),
+    )
+    return "\n".join(
+        [
+            f"SYSTEM_MESSAGE:\n{prompt['system']}",
+            f"USER_MESSAGE:\n{prompt['user']}",
+            "ASSISTANT_RESPONSE:",
+        ]
     )
 
 
@@ -4201,11 +4141,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
     selected_components = (
         selected_component_map_v2 if explanation_first else selected_component_map_v1
     )[mode]
-    prompt_components = {
-        name: []
-        for name in selected_components
-        if not (prompt_family_version == "v1" and name == "ego")
-    }
+    prompt_components = {name: [] for name in selected_components}
     component_prompt_roles = {
         "ego": "profile_explainer",
         "graph_following": "following_role_explainer",
@@ -4230,7 +4166,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         if "conflict" in selected_components:
             generation_components.update({"tweet", "graph_following", "graph_follower"})
         generation_rows_by_component = {name: [] for name in generation_components}
-    elif "ego" in selected_components:
+    elif False:
         generation_rows_by_component = {"ego": []}
 
     target_ids = list(target_node_ids) if target_node_ids is not None else list(range(num_nodes))
@@ -4239,7 +4175,7 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         if policy == "center_induced_relation_aware":
             if selection_features is None:
                 raise ValueError("center_induced_relation_aware expert prompts require selection_features.")
-            center_selection = _select_center_induced_directional_neighbors(
+            center_selection = select_center_induced_directional_neighbors(
                 node_id,
                 [item["raw_text"] for item in records],
                 context,
@@ -4351,25 +4287,6 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
             "conflict_mismatch_hints": conflict_mismatch_hints,
             "component_prompt_roles": component_prompt_roles,
         }
-
-        if "ego" in generation_rows_by_component:
-            generation_prompt = _ego_explain_generation_prompt(
-                record,
-                evidence_schema=evidence_schema,
-                prompt_style=explain_prompt_style,
-            )
-            generation_rows_by_component["ego"].append(
-                {
-                    "node_id": int(node_id),
-                    "component_name": "ego",
-                    "system": generation_prompt["system"],
-                    "user": generation_prompt["user"],
-                    "profile_card": _profile_card(record, brief=False),
-                    "fallback_explanation": generation_prompt["fallback_explanation"],
-                    "prompt_role": generation_prompt.get("prompt_role", component_prompt_roles["ego"]),
-                }
-            )
-            row["ego_generation_prompt"] = generation_prompt["user"]
 
         if explanation_first:
             following_summary = {
@@ -4498,6 +4415,10 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
                         )
                     )
                 row["graph_follower_prompt"] = prompt_components["graph_follower"][-1]
+
+            if "ego" in selected_components:
+                prompt_components["ego"].append(_ego_prompt(record, tweet_stats))
+                row["ego_prompt"] = prompt_components["ego"][-1]
 
             if "tweet" in selected_components:
                 prompt_components["tweet"].append(_tweet_prompt(record, tweet_stats))
@@ -4701,6 +4622,20 @@ def _resolve_prompt_bundle(
                 classes,
                 target_node_ids=target_node_ids,
             )
+    elif mode in MHLGC_PROMPT_MODES:
+        if policy not in {"center_induced_relation_aware"}:
+            raise ValueError(
+                f"{mode} requires --neighbor_sampling_policy center_induced_relation_aware "
+                "so the hypergraph view is backed by --selection_embedding_path."
+            )
+        bundle = _resolve_mhlgc_prompt_bundle(
+            args,
+            texts,
+            edge_index,
+            edge_type,
+            target_node_ids=target_node_ids,
+            selection_features=selection_features,
+        )
     else:
         raise ValueError(f"Unsupported prompt mode: {mode}")
     selected_components = bundle["component_order"].get(mode)
@@ -6174,7 +6109,7 @@ def _run_ultratag_s_subgraph_precompute(
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Precompute GLANCE-style, relation-aware, or expert prompt caches.")
+    parser = argparse.ArgumentParser(description="Precompute GLANCE-style, relation-aware, expert, DGP, or MH-LGC prompt caches.")
     parser.add_argument("--dataset", type=str, default="TwiBot-20")
     parser.add_argument("--graph_data_variant", choices=GRAPH_DATA_VARIANT_CHOICES, default="labeled")
     parser.add_argument("--context_graph_variant", choices=GRAPH_DATA_VARIANT_CHOICES, default=None)
@@ -6285,7 +6220,15 @@ def build_parser():
         ),
     )
     parser.add_argument("--neighbor_sampling_policy", choices=NEIGHBOR_SAMPLING_CHOICES, default="auto")
-    parser.add_argument("--selection_embedding_path", type=Path, default=None)
+    parser.add_argument(
+        "--selection_embedding_path",
+        type=Path,
+        default=None,
+        help=(
+            "Node-aligned semantic feature tensor used by center_induced_relation_aware prompt selection "
+            "and by mhlgc_llm_guide to construct the HyperScan-style KNN hypergraph view."
+        ),
+    )
     parser.add_argument("--support_selection_embedding_path", type=Path, default=None)
     parser.add_argument("--tweet_source_mode", choices=TWEET_SOURCE_MODE_CHOICES, default="norm_user_text")
     parser.add_argument("--node_source_path", type=Path, default=None)
@@ -6383,10 +6326,11 @@ def run(args):
         and str(getattr(args, "prompt_mode", "")) not in ULTRATAG_PROMPT_MODES
         and str(getattr(args, "prompt_mode", "")) not in RESIDUAL_AUDIT_PROMPT_MODES
         and str(getattr(args, "prompt_mode", "")) not in DGP_PROMPT_MODES
+        and str(getattr(args, "prompt_mode", "")) not in MHLGC_PROMPT_MODES
     ):
         raise ValueError(
             "--routed_nodes_path is only supported for expert_* prompt modes, ultratag_s_subgraph_v1, "
-            "residual_audit_v1, and dgp_predictor_v1."
+            "residual_audit_v1, dgp_predictor_v1, and mhlgc_llm_guide."
         )
     dataset_path = resolve_dataset_path(args.dataset)
     _wandb_log(
@@ -6498,7 +6442,7 @@ def run(args):
     edge_type = torch.load(variant_paths["edge_type_path"], map_location="cpu")
     selection_feature_bundle = None
     if str(args.neighbor_sampling_policy).lower() == "center_induced_relation_aware":
-        selection_feature_bundle = _resolve_selection_feature_bundle(
+        selection_feature_bundle = resolve_selection_feature_bundle(
             args,
             dataset_path,
             graph_variant=graph_data_variant,

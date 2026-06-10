@@ -80,6 +80,18 @@ STAGE_REGISTRY: Dict[str, StageSpec] = {
         graph_data_mode="none",
         artifact_namespace="preparation/semantic_embedding_classifier",
     ),
+    "semantic_correction_gate": _spec(
+        "semantic_correction_gate",
+        legacy_names=(),
+        visibility="public",
+        family="preparation",
+        runner_kind="semantic_correction_gate",
+        claim_grade_allowed=False,
+        requires_canonical_split=True,
+        forces_use_gnn=False,
+        graph_data_mode="none",
+        artifact_namespace="preparation/semantic_correction_gate",
+    ),
     "graph_detector_prepare": _spec(
         "graph_detector_prepare",
         legacy_names=("frozen_g0",),

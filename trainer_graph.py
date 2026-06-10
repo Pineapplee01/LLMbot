@@ -105,7 +105,7 @@ class GraphStageMixin:
             raise MissingFrozenArtifactError("Resolved graph edge_index must have shape [2, num_edges].")
         if edge_type.numel() != edge_index.size(1):
             raise MissingFrozenArtifactError("Resolved graph edge_type must align with edge_index.")
-        relation_cardinality = int(torch.unique(edge_type).numel()) if edge_type.numel() else 0
+        relation_cardinality = int(edge_type.max().item()) + 1 if edge_type.numel() else 0
         num_nodes = int(self.graph_node_count)
         num_edges = int(edge_index.size(1))
         return {
@@ -297,11 +297,12 @@ class GraphStageMixin:
 
         labeled_count = int(labels_t.numel())
         num_nodes = int(self.graph_node_count)
+        relation_cardinality = int(edge_type.max().item()) + 1 if edge_type.numel() else int(getattr(self.args, "n_relations", 2))
         model = _legacy_impl.StructuralConflictRGCN(
             num_nodes=num_nodes,
             node_emb_dim=64,
             hidden_dim=64,
-            n_relations=int(getattr(self.args, "n_relations", 2)),
+            n_relations=max(int(relation_cardinality), 1),
             n_layers=2,
             dropout=0.1,
         ).to(self.device)
@@ -381,7 +382,7 @@ class GraphStageMixin:
                 "node_emb_dim": 64,
                 "hidden_dim": 64,
                 "n_layers": 2,
-                "n_relations": int(getattr(self.args, "n_relations", 2)),
+                "n_relations": max(int(relation_cardinality), 1),
                 "dropout": 0.1,
                 "optimizer": "adamw",
                 "learning_rate": 1e-3,

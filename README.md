@@ -73,6 +73,70 @@ First-round full-graph support:
 - the semantic tensor is built at runtime by concatenating:
   - labeled RoBERTa embeddings from `--embedding_path`
   - support RoBERTa embeddings from `--support_embedding_path`
+- optional graph-only refine modes before `graph_detector_prepare`:
+  - `--graph_refine_mode hyperscan_knn_hypergraph_proxy_augment`
+    adds a full-graph feature-KNN proxy relation
+  - `--graph_refine_mode relation_overlap_knn_proxy_augment`
+    restricts similarity grouping to relation-supported 1-hop neighbors and is
+    the preferred routed-node follow-up when `--routed_nodes_path` is
+    available
+  - `--graph_refine_mode relation_overlap_knn_repr_prefit_augment`
+    is the closer HyperScan-style follow-up: it first fits a relation-view GNN
+    on the original graph, then builds routed-node local overlap KNN groups
+    from `node_repr + g0_input` instead of from the raw Phase-A input alone
+  - `--graph_second_view_scope routed_nodes` with
+    `--graph_backbone rgcn_hyperscan` is the canonical parser spelling for the
+    current closest active mainline proxy to HyperScan's real mechanism:
+    it keeps the original relation graph unchanged, then inside each forward
+    it builds routed-node local KNN hyperedges from `x_low + x_in` and runs a
+    separate HypergraphConv branch before fusion
+  - `--graph_second_view_scope labeled_prefix` runs the same dynamic second
+    view over the labeled-prefix centers when no routed-node file should be
+    consumed
+  - `--graph_second_view_scope neighborloader_batch` is the closer labeled-graph
+    training proxy to the released HyperScan TwiBot20 code:
+    it requires `--graph_data_variant labeled` and trains with
+    `NeighborLoader` subgraph batches, rebuilding a batch-local KNN hypergraph
+    from `x_low + x_in` inside each sampled subgraph
+  - `--graph_second_view_hypergraph_backend {pyg,dhg}` and
+    `--graph_second_view_fusion {residual,multiattn}` split second-view
+    realization into two parser axes. `dhg` now consumes the same dynamic
+    incidence specification as `pyg`; `multiattn` swaps the residual detector
+    for the HyperScan-style bidirectional MultiAttn concat detector.
+  - `--graph_node_input_family hyperscan_meta_tweet_proxy` rebuilds a
+    HyperScan-style node input from the labeled graph:
+    current tweet embedding stays as the tweet channel, while numeric and
+    categorical metadata proxies are parsed from `norm_user_text.json`
+  - `--graph_node_input_family hyperscan_meta_tweet_proxy` uses that
+    paper-inspired tweet/num/cat preprocessing before the current
+    HyperScan-style KNN branch
+  - `--graph_training_loader_mode neighbor_subgraph` can also be used without a
+    dynamic branch to build a `base labeled + NeighborLoader` control
+  - `--graph_training_max_steps` caps total optimizer updates so
+    NeighborLoader and full-batch runs can be matched on update budget
+  - `--graph_second_view_candidate_scope labeled_relation_1hop` restricts
+    relation-local KNN candidates to the labeled prefix instead of allowing
+    support nodes from the full graph
+- optional MH-LGC-style graph training:
+  - `precompute.py --prompt_mode mhlgc_llm_guide --routed_nodes_path ...`
+    builds graph-node-aligned LLM guide embeddings for routed hard nodes from
+    two serialized views: the original directed relation view and a
+    HyperScan-style KNN hypergraph view
+  - the prompt cache requires
+    `--neighbor_sampling_policy center_induced_relation_aware` and
+    `--selection_embedding_path`, because the hypergraph view is derived from
+    node-aligned semantic KNN rather than invented from text alone
+  - the routed-node cache is still saved as a full-graph tensor with non-routed
+    rows zero-filled, so downstream stages can keep graph-node alignment
+  - `graph_detector_prepare --mhlgc_enable` consumes that embedding tensor via
+    `--mhlgc_semantic_embedding_path` and adds an auxiliary LLM-guided
+    hard-negative contrastive loss in `GNNs.py`
+  - this is an MH-LGC-style task adaptation: the LLM guides training through
+    semantic hard-negative weights; it is not an LLM predictor and the LLM is
+    not used at graph-detector inference
+- `relation_overlap_knn_proxy_augment` reads centers from
+  `--routed_nodes_path` plus `--routed_nodes_split {all,train,valid,test}`
+  when provided; otherwise it defaults to the labeled-node prefix
 
 Example full-graph Phase A smoke:
 
@@ -84,6 +148,158 @@ python main.py \
   --graph_backbone rgcn \
   --support_embedding_path datasets/TwiBot-20/support_roberta_embeddings_new.pt \
   --graph_detector_epochs 1 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Example routed-node relation-overlap graph refine:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant full_graph_support \
+  --graph_backbone rgcn \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --support_embedding_path /root/workspace/LMbot/datasets/TwiBot-20/support_roberta_embeddings_new.pt \
+  --routed_nodes_path /root/workspace/LMbot/LLMbot/experiments/knn_routed_eval_reliability_router_20260608_remote_inputs/routed_nodes_reliability_budget010_seed1.json \
+  --routed_nodes_split all \
+  --graph_refine_mode relation_overlap_knn_proxy_augment \
+  --graph_refine_knn_k 8 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Example routed-node dynamic HyperScan-style branch:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant full_graph_support \
+  --graph_backbone rgcn_hyperscan \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --support_embedding_path /root/workspace/LMbot/datasets/TwiBot-20/support_roberta_embeddings_new.pt \
+  --routed_nodes_path /root/workspace/LMbot/LLMbot/experiments/knn_routed_eval_reliability_router_20260608_remote_inputs/routed_nodes_reliability_budget010_seed1.json \
+  --routed_nodes_split all \
+  --graph_second_view_scope labeled_prefix \
+  --graph_second_view_candidate_scope labeled_relation_1hop \
+  --graph_second_view_hypergraph_backend pyg \
+  --graph_second_view_fusion residual \
+  --graph_refine_knn_k 8 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Example labeled-graph NeighborLoader HyperScan-style branch:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --graph_backbone rgcn_hyperscan \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_second_view_hypergraph_backend pyg \
+  --graph_second_view_fusion residual \
+  --graph_neighbor_num_neighbors 64 \
+  --graph_refine_knn_k 8 \
+  --gnn_batch_size 1024 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Detector/fusion-head ablation on the same labeled-graph NeighborLoader branch:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --graph_backbone rgcn_hyperscan \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_second_view_hypergraph_backend pyg \
+  --graph_second_view_fusion multiattn \
+  --graph_neighbor_num_neighbors 64 \
+  --graph_refine_knn_k 8 \
+  --gnn_batch_size 1024 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Example labeled-graph NeighborLoader baseline control:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --graph_backbone rgcn_hyperscan \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_training_loader_mode neighbor_subgraph \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Example labeled-graph HyperScan node-input proxy with current KNN branch:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --graph_backbone rgcn_hyperscan \
+  --graph_node_input_family hyperscan_meta_tweet_proxy \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_second_view_scope routed_nodes \
+  --graph_second_view_candidate_scope labeled_relation_1hop \
+  --graph_second_view_hypergraph_backend pyg \
+  --graph_second_view_fusion residual \
+  --graph_refine_knn_k 8 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Example routed-node MH-LGC-style prompt cache plus graph-detector GCL:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --routed_nodes_path /root/workspace/LMbot/LLMbot/experiments/knn_routed_eval_reliability_router_20260608_remote_inputs/routed_nodes_reliability_budget010_seed1.json \
+  --routed_nodes_split all \
+  --prompt_mode mhlgc_llm_guide \
+  --neighbor_sampling_policy center_induced_relation_aware \
+  --selection_embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --neighbor_cap 8 \
+  --following_quota 3 \
+  --follower_quota 3 \
+  --output_path datasets/TwiBot-20/mhlgc_llm_guide_qwen3_embed.pt \
+  --disable_wandb \
+  --overwrite
+
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --graph_backbone rgcn_hyperscan \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_second_view_hypergraph_backend pyg \
+  --graph_second_view_fusion residual \
+  --graph_neighbor_num_neighbors 64 \
+  --graph_refine_knn_k 8 \
+  --mhlgc_enable \
+  --mhlgc_semantic_embedding_path datasets/TwiBot-20/mhlgc_llm_guide_qwen3_embed.pt \
+  --mhlgc_loss_weight 0.1 \
+  --mhlgc_beta 1.0 \
+  --mhlgc_gamma 0.5 \
+  --mhlgc_temperature 1.0 \
   --seeds 1 \
   --disable_wandb
 ```
@@ -136,6 +352,16 @@ Routed-node semantic specialization:
   text by `node_id`. This is the DGP/CALM bridge: the same DGP-style prompt
   sidecar can be used for Qwen PEFT predictor tuning and for query-embedding
   MLP classification.
+- `semantic_encoder_finetune` now also accepts
+  `--semantic_supervision_mode {classifier,answer_token}`:
+  - `classifier` preserves the old hidden-state classifier-head CE path
+  - `answer_token` upgrades the Qwen PEFT route to causal-LM supervision over
+    the final answer slot in the prompt, with routed-node evaluation scored by
+    the conditional completion likelihood of `No` (human) versus `Yes` (bot)
+  - when `answer_token` is used, the consumed text must be the full DGP prompt
+    that ends exactly at the final `ASSISTANT_ANSWER:` slot; the semantic stage
+    now validates that contract explicitly and tokenizes the prompt body without
+    injecting extra special tokens before appending the `Yes`/`No` suffix
 - for `semantic_encoder_finetune`, a routed-node run only encodes the routed
   train/valid/test union during evaluation, then scatters those rows back into
   full-graph `embeddings.pt` / `outputs.pt` with zero-filled non-evaluated
@@ -156,6 +382,61 @@ python main.py \
   --finetuned_roberta_checkpoint_path ../TwiBot-20_seed_1/checkpoints/LM_pretrain/best.pkl \
   --seeds 1 \
   --device 0 \
+  --disable_wandb
+```
+
+Routed-node semantic correction gate:
+
+- `semantic_correction_gate` trains a lightweight base-aware keep/change gate
+  over existing candidate semantic outputs, such as a Qwen PEFT predictor and
+  a DGP/CALM embedding-MLP classifier
+- the stage does not regenerate prompts, update candidate LLM/MLP weights, or
+  change the frozen SimTeG graph detector
+- the gate is trained on routed train nodes, locks its threshold on routed
+  validation nodes, and applies the locked accept/defer policy to routed test
+  nodes
+- action utility is correction-oriented:
+  - accept candidate when frozen SimTeG is wrong and the candidate is correct
+  - strongly penalize accepting a candidate that breaks a frozen-SimTeG-correct
+    node through `--semantic_gate_break_weight`
+- `--semantic_gate_feature_family probability` preserves the original
+  probability-only competence features; `node_attribute` additionally appends
+  target-account metadata/tweet cues parsed from `norm_user_text` plus labeled
+  graph attributes such as following/follower counts, reciprocal ratio, local
+  degree, and neighbor activity; `local_competence` keeps those features and
+  appends per-candidate nearest-neighbor competence estimates computed only
+  from routed train nodes
+- `--semantic_gate_local_k` controls the routed-train top-k neighborhood used
+  by `local_competence`. The stage records local fix rate, break rate,
+  weighted net estimate, and neighbor-similarity support in artifacts. This is
+  a META-DES / learning-to-defer inspired diagnostic, not a new prompt
+  generation path.
+- `--semantic_gate_selection_policy defer_softmax` switches from independent
+  candidate BCE gates to one action-level softmax over
+  `{keep_base, accept_candidate_i}`. `--semantic_gate_safety_policy break_first`
+  adds a candidate break-risk head and locks the break threshold on routed
+  validation nodes before routed-test replay.
+- artifacts are written under `preparation/semantic_correction_gate`:
+  `manifest.json`, `metrics.json`, `outputs.pt`, `checkpoint.pt`, and
+  `per_node_test.jsonl`
+
+Example semantic correction gate over two routed-node semantic candidates:
+
+```bash
+python main.py \
+  --experiment_task semantic_correction_gate \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --seeds 1 \
+  --routed_nodes_path ../datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --semantic_gate_base_outputs_path /path/to/base_outputs_for_routed_classifier.pt \
+  --semantic_gate_candidate_output_paths /path/to/qwen_peft/outputs.pt,/path/to/dgp_embed_mlp/outputs.pt \
+  --semantic_gate_candidate_names qwen25_peft,dgp_embed_mlp \
+  --semantic_gate_feature_family local_competence \
+  --semantic_gate_local_k 25 \
+  --semantic_gate_selection_policy defer_softmax \
+  --semantic_gate_safety_policy break_first \
+  --semantic_gate_break_weight 2.0 \
   --disable_wandb
 ```
 
@@ -185,6 +466,14 @@ Prompt-cache helper modes:
   - `expert_tweet`
   - `expert_conflict`
   - `expert_concat_v1`
+  - direct `expert_ego` is now a BotSay-aligned target-account prompt surface
+    over `tweet + metadata`: it verbalizes target metadata/profile plus target
+    tweet behavior and sampled tweets, then requests `Label: bot or human`
+    followed by `Explanation: ...`
+  - direct `expert_graph_following` / `expert_graph_follower` now use a narrow
+    GLANCE-style classifier shell for social bot detection:
+    `Instruct: Predict the node's category ... Query: EGO: ... HOP1: ... Category? </END>`
+    rather than the older heavier social-hint encoder prompt body
 
 Prompt-family versioning:
 
@@ -255,6 +544,9 @@ Relation-aware center-induced prompt-expert selection:
 
 - `precompute.py` now supports
   `--neighbor_sampling_policy center_induced_relation_aware`
+- HyperScan-style local KNN grouping and support/contrast partition helpers now
+  live in `LLMbot/hypergnn.py`, while `precompute.py` only orchestrates prompt
+  rows, explanation generation, and embedding-cache writing
 - it can build prompt-expert evidence from either:
   - `--context_graph_variant labeled`
   - `--context_graph_variant full_graph_support`
@@ -401,9 +693,10 @@ python precompute.py \
 routed-node LLM-as-predictor experiments. It keeps target account evidence
 fine-grained (profile, tweet behavior, representative tweets) and compresses
 following/follower evidence into ranked coarse neighbor cards and counts. The
-prompt asks for a strict `{"label":"human | bot"}` response, never inserts
-true labels or oracle fix/break information, and writes the same full-graph
-zero-fill cache layout as other routed prompt modes. The adjacent
+prompt now follows a stricter DGP-style classifier shell:
+`Instruct ... Possible categories: human, bot. Query: ... Answer with exactly one token: Yes or No.`
+It never inserts true labels or oracle fix/break information, and writes the
+same full-graph zero-fill cache layout as other routed prompt modes. The adjacent
 `*_prompts.jsonl` sidecar is intended for
 `semantic_encoder_finetune --semantic_encoder qwen3_peft
 --semantic_text_source_path ...` as the DGP-style Qwen LoRA predictor line.
@@ -429,8 +722,13 @@ record and renders it as LLM-friendly `PROFILE`, `TWEET_BEHAVIOR`, and
 delimiter string. If a routed node has no selected neighbor in the requested
 direction, v2 writes a deterministic sparse-context sentence rather than
 spending a Qwen call to summarize empty evidence. The neighbor and relation
-summary prompts require English output; non-English or noisy source text should
-be described as an evidence-quality cue rather than copied into the summary.
+summary prompts now use a minimal DGP-style summarization shell,
+`Instruct: Summarize ... within 10 tokens. Query: ... Summary:`,
+instead of the earlier requirement-heavy XML/task schema. This follows the DGP
+paper's evidence that task-aware summarization can hurt performance and keeps
+the summarization stage closer to task-agnostic compression. Non-English or
+noisy source text should still be described as an evidence-quality cue rather
+than copied into the summary.
 If an individual generated summary still fails the text-quality gate after
 bounded retries, the row is written as an English `quality_fallback` limited-
 evidence summary with the failure reason recorded in the sidecar, while model
@@ -438,9 +736,30 @@ load failures still abort when `--explain_required` is set.
 The mainline variant is `norm_text_following_summary` with
 `--dgp_neighbor_summary_k 5`; `norm_text_follower_summary`,
 `norm_text_following_follower_summary`, and `norm_text_target_only` are
-ablation variants. This remains DGP-style: it does not insert labels, oracle
-fix/break outcomes, or frozen SimTeG correctness into prompt text, and it does
-not by itself implement generative answer-token SFT.
+ablation variants. It does not insert labels, oracle fix/break outcomes, or
+frozen SimTeG correctness into prompt text. When consumed by
+`semantic_encoder_finetune --semantic_encoder qwen3_peft
+--semantic_supervision_mode answer_token`, the active mainline now supports a
+faithful answer-token finetune path over the final `ASSISTANT_ANSWER:` slot.
+`--semantic_supervision_mode classifier` remains the compatibility ablation
+that trains a hidden-state classifier head on the same prompt text.
+
+Example routed-node DGP v2 answer-token finetune:
+
+```bash
+python main.py \
+  --experiment_task semantic_encoder_finetune \
+  --dataset TwiBot-20 \
+  --semantic_encoder qwen3_peft \
+  --semantic_supervision_mode answer_token \
+  --qwen_model_path /path/to/Qwen2.5-7B-Instruct \
+  --semantic_text_source_path datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed_prompts.jsonl \
+  --semantic_text_field prompt \
+  --routed_nodes_path /path/to/routed_nodes.json \
+  --seeds 1 \
+  --device 0 \
+  --disable_wandb
+```
 
 ```bash
 python precompute.py \
@@ -819,6 +1138,19 @@ python main.py \
   --seeds 1 \
   --disable_wandb
 
+# HyperScan-style KNN hypergraph proxy graph augmentation before Phase-A GNN
+# This adds one new relation type by expanding each feature-KNN group into
+# bidirectional center-neighbor proxy edges.
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --graph_refine_mode hyperscan_knn_hypergraph_proxy_augment \
+  --graph_refine_knn_k 8 \
+  --seeds 1 \
+  --disable_wandb
+
 # Iter-2 compatibility regime: explicit cross-seed compat branch
 python main.py \
   --experiment_task graph_detector_prepare \
@@ -968,6 +1300,7 @@ python main.py \
 # Current full-graph estimator_ablation support is intentionally narrow:
 #   - posthoc_calibrated_ranker
 #   - calibrated_local_risk_router
+#   - conformal_knn_risk_router
 #   - graph_conformal_set_estimator
 #   - gnn_2hop_conformal
 python main.py \
@@ -995,6 +1328,56 @@ python main.py \
   --estimator_mode calibrated_local_risk_router \
   --external_frozen_g0_root tmp_iterm1_forward_fullgraph/seed_1 \
   --experiment_name fullgraph_conformal_localrisk_seed1 \
+  --seeds 1 \
+  --disable_wandb
+
+# Target-node Conformal-KNN risk selection on top of the same frozen SimTeG backbone.
+# This reuses the calibrated_local_risk_router split/threshold/reporting
+# contract, but replaces relation-neighbor aggregation with KNN similarity
+# support-group risk. Each target node is the KNN center; when
+# --conformal_knn_candidate_scope hyperscan_full is used, the support group is
+# drawn from the full feature pool to match HyperScan's feature-kNN hyperedge.
+# If the frozen G0 artifact was trained with a HyperScan-style second-view KNN
+# branch, omitted --conformal_knn_k / --conformal_knn_candidate_scope /
+# --conformal_knn_repr_source values inherit that artifact's Hyper KNN config.
+# Explicit --conformal_knn_* flags still override the inherited defaults, and
+# the effective source is written to risk_manifest.calibration_metadata.
+# Only labeled centers are risk-updated and routed; support nodes keep their
+# base conformal risk and are not routed. The stage writes selected high-risk
+# target users under
+# risk_manifest.selected_nodes for the default budget and
+# risk_manifest.selected_nodes_by_budget for the full budget sweep.
+# Use --conformal_knn_score_family_override base_only for the strict target-only
+# control; leave it as auto for the target + KNN support-group router.
+# The default --conformal_knn_learning_mode fixed preserves the historical
+# validation-selected score families. Set --conformal_knn_learning_mode logistic
+# to enable the NCP-style learned router: KNN support evidence is weighted as
+# exp(-distance/lambda_L), following the official 1995subhankar1995/NCP code,
+# and a tune-split logistic model learns target residual-error risk before
+# calibration/reporting stay on the held-out conformal split.
+# Treat this target-node Conformal-KNN router as the required router baseline:
+# any later learned or LLM-consuming router should report matched-split,
+# matched-budget AUROC-error, AUPRC-error, AURC, ErrRecall@K, Precision@K,
+# Lift@K, and selected-node overlap against this artifact before claiming
+# router-quality improvement. New router schemes should be framed as improving
+# target-node risk identification over this target->KNN support-group baseline.
+python main.py \
+  --experiment_task estimator_ablation \
+  --dataset TwiBot-20 \
+  --graph_data_variant full_graph_support \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --estimator_mode conformal_knn_risk_router \
+  --external_frozen_g0_root tmp_iterm1_forward_fullgraph/seed_1 \
+  --conformal_knn_k 8 \
+  --conformal_knn_candidate_scope hyperscan_full \
+  --conformal_knn_repr_source x_new \
+  --conformal_knn_target_top_n 200 \
+  --conformal_knn_ncp_lambda 1.0 \
+  --conformal_knn_learning_mode fixed \
+  --conformal_knn_score_family_override auto \
+  --risk_budgets 0.05,0.10,0.15,0.20 \
+  --experiment_name fullgraph_conformal_knn_risk_seed1 \
   --seeds 1 \
   --disable_wandb
 
@@ -1143,7 +1526,7 @@ Prompt-expert bundle v2 note:
   comparison in `utility_correction_moe`, but it does not claim faithful GNN
   explanations, representation repair, or LLM-as-predictor behavior by itself.
 - Prompt-expert runs can choose the expert fusion head with
-  `--joint_prompt_expert_fusion {projector_concat,mpe_gated,gaugllm_selector,gaugllm_mope,botmoe_selector,utility_correction_moe,metades_selector,conflict_aware_correction_moe,raw_concat_single_graph_following,raw_concat_single_graph_follower,raw_concat_single_tweet,raw_concat_single_conflict,raw_concat_follower_tweet,raw_concat_following_triplet,raw_concat_follower_triplet,ultratag_propagated_follower_triplet,raw_concat_metadata_anchor,raw_concat_metadata_only}`. The
+  `--joint_prompt_expert_fusion {projector_concat,mpe_gated,gaugllm_selector,gaugllm_mope,botmoe_selector,utility_correction_moe,metades_selector,conflict_aware_correction_moe,raw_concat_ego_following,raw_concat_ego_follower,raw_concat_ego_following_follower,raw_concat_single_graph_following,raw_concat_single_graph_follower,raw_concat_single_tweet,raw_concat_single_conflict,raw_concat_follower_tweet,raw_concat_following_triplet,raw_concat_follower_triplet,ultratag_propagated_follower_triplet,raw_concat_metadata_anchor,raw_concat_metadata_only}`. The
   default `projector_concat` preserves the existing projected-concat refiner;
   `mpe_gated` keeps the existing refiner-only node-conditioned softmax over
   `graph_following`, `graph_follower`, `tweet`, `conflict`, and
@@ -1154,6 +1537,10 @@ Prompt-expert bundle v2 note:
   (`graph_following`, `graph_follower`, `tweet`, `conflict`) with duplicate
   `node_id` rows resolved by last-row-wins, encodes one selector-context text
   per routed node and expert with the same finetuned SimTeG RoBERTa line, and
+  `raw_concat_ego_following`, `raw_concat_ego_follower`, and
+  `raw_concat_ego_following_follower` expose direct no-projector routed-node
+  checks over `ego` plus one or both directional graph experts before the
+  broader triplet/fusion variants.
   applies a dual-branch context-aware softmax over those four experts only.
   `gaugllm_mope` reuses the same runtime cache/sidecar/context path but replaces
   the custom query-dot selector with the official GAugLLM

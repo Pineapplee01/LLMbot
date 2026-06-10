@@ -6,6 +6,8 @@ assembly, fallback handling, sidecars, and encoder execution.
 
 from __future__ import annotations
 
+import json
+
 
 def _compact_whitespace(text):
     if not isinstance(text, str):
@@ -15,6 +17,10 @@ def _compact_whitespace(text):
 
 def _format_bool(value):
     return "yes" if bool(value) else "no"
+
+
+def _json_compact(payload):
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _normalize_prompt_style(prompt_style):
@@ -128,6 +134,76 @@ def _expert_embedding_prompt(component_name, explanation_text, evidence_schema="
         f"Instruct: Encode the {component_label} {schema_label} for downstream correction reasoning.\n"
         f"Query: [{query_tag}] {explanation_text} </END>"
     )
+
+
+def _mhlgc_llm_guide_prompt(
+    node_id,
+    original_view,
+    hypergraph_view,
+    target_text="",
+    role="borderline_anchor",
+):
+    """Build the MH-LGC-style LLM guide prompt for a routed hard node.
+
+    The prompt is intentionally an embedding/analysis prompt, not a classifier
+    prompt. It follows Ou et al.'s LLM-as-guide boundary: serialize the original
+    graph view and hypergraph view, let the LLM mine semantic patterns, and use
+    the resulting text/hidden embedding for contrastive hard-negative guidance.
+    """
+    role = str(role or "borderline_anchor").strip().lower()
+    if role not in {"borderline_anchor", "positive_augmented", "negative_candidate"}:
+        raise ValueError("role must be one of {borderline_anchor, positive_augmented, negative_candidate}.")
+    payload = {
+        "node_id": int(node_id),
+        "role": role,
+        "target_text": _compact_whitespace(target_text),
+        "original_relation_view": original_view if original_view is not None else {},
+        "hypergraph_view": hypergraph_view if hypergraph_view is not None else {},
+    }
+    system = "Instruction"
+    user = "\n".join(
+        [
+            "[Role Description]",
+            (
+                "You are a social bot detection risk analysis expert. You are used as an LLM guide "
+                "for contrastive graph representation learning, not as a final classifier."
+            ),
+            "",
+            "[Task Definition]",
+            (
+                "Your task is to analyze the social behavior patterns of the target account from "
+                "the original relation view and the HyperScan-style hypergraph view. Focus on "
+                "semantic similarity, camouflage, victimization, and hard-negative mining signals. "
+                "Do not output a final bot/human label, probability, confidence score, or recommendation."
+            ),
+            "",
+            "[Input Graph]",
+            _json_compact(payload),
+        ]
+    )
+    full = f"{system}\n\n{user}"
+    return {
+        "system": system,
+        "user": user,
+        "full": full,
+        "prompt_role": "mhlgc_llm_guide_multiview",
+        "prompt_family": "mhlgc_llm_guide_v1",
+    }
+
+
+def _mhlgc_semantic_embedding_prompt(node_id, original_view, hypergraph_view, target_text="", role="borderline_anchor"):
+    prompt = _mhlgc_llm_guide_prompt(
+        node_id=node_id,
+        original_view=original_view,
+        hypergraph_view=hypergraph_view,
+        target_text=target_text,
+        role=role,
+    )
+    return prompt["full"]
+
+
+def _glance_bot_detection_header():
+    return "Instruct: Predict the node's category for social bot detection from the provided context. Possible categories: human, bot."
 
 
 def _botsay_label_explanation_fields():
@@ -403,35 +479,19 @@ def _ego_explain_generation_prompt(profile_card, evidence_schema="summary", prom
 
 
 def _graph_prompt(direction_name, ego_profile_brief, neighbor_cards, total_count, reciprocal_count):
-    heading = "FOLLOWING_NEIGHBORS" if direction_name == "following" else "FOLLOWER_NEIGHBORS"
-    if direction_name == "following":
-        instruct = (
-            "Instruct: Encode who this account chooses to follow and what that implies about "
-            "social role, coordination, fandom, promotion, or organic behavior."
-        )
-    else:
-        instruct = (
-            "Instruct: Encode who follows this account and what that implies about audience type, "
-            "credibility, coordination, or suspicious amplification."
-        )
-    social_hints = [
-        f"count_{direction_name}: {int(total_count)}",
-        f"has_{direction_name}: {_format_bool(total_count > 0)}",
-        f"reciprocal_{direction_name}_count: {int(reciprocal_count)}",
-    ]
+    header = _glance_bot_detection_header()
+    hop_label = "HOP1_FOLLOWING" if direction_name == "following" else "HOP1_FOLLOWER"
     query = "\n".join(
         [
             "Query:",
-            "EGO_PROFILE_BRIEF:",
+            "EGO:",
             ego_profile_brief,
-            f"{heading}:",
+            f"{hop_label}:",
             *(neighbor_cards or ["- None"]),
-            "SOCIAL_HINTS:",
-            *social_hints,
-            "</END>",
+            "Category? </END>",
         ]
     )
-    return f"{instruct}\n{query}"
+    return f"{header}\n{query}"
 
 
 def _graph_prompt_partitioned(
@@ -500,6 +560,30 @@ def _tweet_prompt(profile_brief, tweet_behavior_summary, tweet_samples_block):
         ]
     )
     return f"{instruct}\n{query}"
+
+
+def _ego_botsay_tweet_metadata_prompt(profile_card, tweet_behavior_summary, tweet_samples_block):
+    user = "\n".join(
+        [
+            "The following task focuses on evaluating whether a Twitter user is a bot or human with the user's tweets and metadata.",
+            "You should output the label first and explanation after.",
+            "Use only the provided evidence.",
+            "Do not invent missing profile fields or tweet content.",
+            "Target user metadata:",
+            profile_card,
+            "Target user tweet behavior:",
+            tweet_behavior_summary,
+            tweet_samples_block.replace("TWEET_SAMPLES:", "Target user tweets:"),
+            "Output format:",
+            "Label: bot or human",
+            "Explanation: concise evidence-grounded explanation",
+        ]
+    )
+    return {
+        "system": _summary_generation_system(prompt_style="botsay"),
+        "user": user,
+        "prompt_role": "ego_predictor_botsay_tweet_metadata",
+    }
 
 
 def _conflict_prompt(profile_card, tweet_card_summary, tweet_samples_block, following_cards, follower_cards, mismatch_hints):

@@ -1,5 +1,7 @@
 from pathlib import Path
 import json
+import math
+import re
 
 import numpy as np
 import torch
@@ -10,6 +12,12 @@ from torch_geometric.nn.models import MLP
 from model_building import _labels_to_index, build_LM_model
 from runtime_env import _max_cuda_memory_allocated, _reset_cuda_peak_memory_stats, _resolve_device
 from utils import build_preparation_dir, capture_code_metadata, safe_torch_load, write_json, write_text, write_torch
+
+_SEMANTIC_ANSWER_TEXT_BY_CLASS = {
+    0: "No",
+    1: "Yes",
+}
+_SEMANTIC_ANSWER_SLOT = "ASSISTANT_ANSWER:"
 
 
 def _as_long_cpu_tensor(idx):
@@ -162,40 +170,56 @@ def _resolve_semantic_split_indices(args, data, seed):
 
 
 def _semantic_command(args):
-    keys = [
-        "experiment_task",
-        "dataset",
-        "reset_split",
-        "seeds",
-        "semantic_encoder",
-        "semantic_text_source_path",
-        "semantic_text_field",
-        "qwen_model_path",
-        "qwen_trust_remote_code",
-        "peft_rank",
-        "peft_alpha",
-        "lm_batch_size",
-        "max_length",
-        "semantic_train_limit",
-        "semantic_max_steps",
-        "routed_nodes_path",
-        "finetuned_roberta_checkpoint_path",
-        "experiment_name",
-        "artifact_root",
-        "device",
-        "disable_wandb",
+    flag_attr_pairs = [
+        ("experiment_task", "experiment_task"),
+        ("dataset", "dataset"),
+        ("reset_split", "reset_split"),
+        ("seeds", "seeds"),
+        ("semantic_encoder", "semantic_encoder"),
+        ("semantic_supervision_mode", "semantic_supervision_mode"),
+        ("semantic_text_source_path", "semantic_text_source_path"),
+        ("semantic_text_field", "semantic_text_field"),
+        ("qwen_model_path", "qwen_model_path"),
+        ("qwen_trust_remote_code", "qwen_trust_remote_code"),
+        ("peft_rank", "peft_rank"),
+        ("peft_alpha", "peft_alpha"),
+        ("lm_batch_size", "batch_size_LM"),
+        ("lm_learning_rate", "lr_LM"),
+        ("lm_weight_decay", "weight_decay_LM"),
+        ("dropout", "dropout"),
+        ("lm_dropout", "LM_dropout"),
+        ("lm_attention_dropout", "LM_att_dropout"),
+        ("max_length", "max_length"),
+        ("semantic_train_limit", "semantic_train_limit"),
+        ("semantic_max_steps", "semantic_max_steps"),
+        ("routed_nodes_path", "routed_nodes_path"),
+        ("semantic_gate_base_outputs_path", "semantic_gate_base_outputs_path"),
+        ("semantic_gate_candidate_output_paths", "semantic_gate_candidate_output_paths"),
+        ("semantic_gate_candidate_names", "semantic_gate_candidate_names"),
+        ("semantic_gate_epochs", "semantic_gate_epochs"),
+        ("semantic_gate_hidden_dim", "semantic_gate_hidden_dim"),
+        ("semantic_gate_learning_rate", "semantic_gate_learning_rate"),
+        ("semantic_gate_weight_decay", "semantic_gate_weight_decay"),
+        ("semantic_gate_break_weight", "semantic_gate_break_weight"),
+        ("semantic_gate_threshold_policy", "semantic_gate_threshold_policy"),
+        ("semantic_gate_feature_family", "semantic_gate_feature_family"),
+        ("finetuned_roberta_checkpoint_path", "finetuned_roberta_checkpoint_path"),
+        ("experiment_name", "experiment_name"),
+        ("artifact_root", "artifact_root"),
+        ("device", "device"),
+        ("disable_wandb", "disable_wandb"),
     ]
     parts = ["python", "main.py"]
-    for key in keys:
-        if not hasattr(args, key):
+    for flag_name, attr_name in flag_attr_pairs:
+        if not hasattr(args, attr_name):
             continue
-        value = getattr(args, key)
+        value = getattr(args, attr_name)
         if isinstance(value, bool):
             if value:
-                parts.append(f"--{key}")
+                parts.append(f"--{flag_name}")
             continue
         if value is not None:
-            parts.extend([f"--{key}", str(value)])
+            parts.extend([f"--{flag_name}", str(value)])
     return " ".join(parts)
 
 
@@ -208,6 +232,223 @@ def _semantic_tokenize(tokenizer, texts, max_length, device):
         padding=True,
     )
     return {key: value.to(device) for key, value in tokenized.items()}
+
+
+def _resolve_semantic_supervision_mode(args, lm_model):
+    mode = str(getattr(args, "semantic_supervision_mode", "classifier") or "classifier").lower()
+    if mode not in {"classifier", "answer_token"}:
+        raise ValueError(f"Unsupported --semantic_supervision_mode: {mode}")
+    if mode == "answer_token" and lm_model != "qwen3_peft":
+        raise ValueError(
+            "--semantic_supervision_mode answer_token currently requires "
+            "--semantic_encoder qwen3_peft so the stage can train a causal-LM answer-token objective."
+        )
+    return mode
+
+
+def _semantic_answer_text_from_label(label_idx):
+    label_idx = int(label_idx)
+    if label_idx not in _SEMANTIC_ANSWER_TEXT_BY_CLASS:
+        raise ValueError(f"Unsupported semantic class for answer-token supervision: {label_idx}")
+    return _SEMANTIC_ANSWER_TEXT_BY_CLASS[label_idx]
+
+
+def _semantic_answer_token_mapping_manifest():
+    return {
+        "class_0": "No",
+        "class_1": "Yes",
+        "human": "No",
+        "bot": "Yes",
+    }
+
+
+def _normalize_answer_slot_prompt(prompt):
+    text = str(prompt or "").strip()
+    if not text:
+        raise ValueError("answer-token supervision received an empty prompt.")
+    if _SEMANTIC_ANSWER_SLOT not in text:
+        raise ValueError(
+            "answer-token supervision expects each prompt to end with a final "
+            f"{_SEMANTIC_ANSWER_SLOT!r} slot. Use the DGP prompt sidecar 'prompt'/'full' field instead of raw user text."
+        )
+    prefix, _, suffix = text.rpartition(_SEMANTIC_ANSWER_SLOT)
+    if suffix.strip():
+        raise ValueError(
+            "answer-token supervision expects prompts to stop at the final "
+            f"{_SEMANTIC_ANSWER_SLOT!r} slot, but found a non-empty suffix after it."
+        )
+    prefix = prefix.rstrip()
+    if not prefix:
+        raise ValueError(
+            f"answer-token supervision requires non-empty prompt content before {_SEMANTIC_ANSWER_SLOT!r}."
+        )
+    return f"{prefix}\n\n{_SEMANTIC_ANSWER_SLOT}"
+
+
+def _normalize_answer_slot_prompts(prompts):
+    return [_normalize_answer_slot_prompt(prompt) for prompt in prompts]
+
+
+def _semantic_answer_token_sequences(tokenizer):
+    answer_token_ids = {}
+    for class_idx, answer_text in _SEMANTIC_ANSWER_TEXT_BY_CLASS.items():
+        token_ids = tokenizer(" " + answer_text, add_special_tokens=False)["input_ids"]
+        if not token_ids:
+            raise ValueError(f"Tokenizer produced an empty sequence for answer text {answer_text!r}.")
+        answer_token_ids[int(class_idx)] = list(token_ids)
+    return answer_token_ids
+
+
+def _pad_long_sequences(sequences, pad_value, device):
+    if not sequences:
+        raise ValueError("Expected at least one sequence to pad.")
+    max_len = max(int(seq.numel()) for seq in sequences)
+    padded = torch.full((len(sequences), max_len), int(pad_value), dtype=torch.long)
+    attention = torch.zeros((len(sequences), max_len), dtype=torch.long)
+    for row_idx, seq in enumerate(sequences):
+        seq = seq.long().reshape(-1)
+        padded[row_idx, : seq.numel()] = seq
+        attention[row_idx, : seq.numel()] = 1
+    return padded.to(device), attention.to(device)
+
+
+def _semantic_prompt_token_ids(tokenizer, prompts, *, max_length, reserved_answer_tokens):
+    if int(max_length) <= int(reserved_answer_tokens):
+        raise ValueError(
+            f"--max_length={max_length} is too small for answer-token supervision with "
+            f"reserved_answer_tokens={reserved_answer_tokens}."
+        )
+    prompts = _normalize_answer_slot_prompts(prompts)
+    prompt_max_length = int(max_length) - int(reserved_answer_tokens)
+    tokenized = tokenizer(
+        list(prompts),
+        add_special_tokens=False,
+        truncation=True,
+        max_length=prompt_max_length,
+        return_attention_mask=False,
+    )
+    return [torch.tensor(ids, dtype=torch.long) for ids in tokenized["input_ids"]]
+
+
+def _build_answer_token_train_batch(tokenizer, prompts, labels, *, max_length, device, answer_token_ids):
+    reserved_answer_tokens = max(len(ids) for ids in answer_token_ids.values())
+    prompt_token_ids = _semantic_prompt_token_ids(
+        tokenizer,
+        prompts,
+        max_length=max_length,
+        reserved_answer_tokens=reserved_answer_tokens,
+    )
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        raise ValueError("Tokenizer must expose pad_token_id for answer-token supervision.")
+    input_sequences = []
+    label_sequences = []
+    for prompt_ids, label in zip(prompt_token_ids, labels):
+        answer_ids = torch.tensor(answer_token_ids[int(label)], dtype=torch.long)
+        input_ids = torch.cat([prompt_ids, answer_ids], dim=0)
+        label_ids = torch.cat(
+            [
+                torch.full((prompt_ids.numel(),), -100, dtype=torch.long),
+                answer_ids.clone(),
+            ],
+            dim=0,
+        )
+        input_sequences.append(input_ids)
+        label_sequences.append(label_ids)
+    input_ids, attention_mask = _pad_long_sequences(input_sequences, pad_token_id, device)
+    labels_tensor, _ = _pad_long_sequences(label_sequences, -100, device)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels_tensor,
+    }
+
+
+def _build_decoder_prompt_batch(tokenizer, prompts, *, max_length, device, answer_token_ids):
+    reserved_answer_tokens = max(len(ids) for ids in answer_token_ids.values())
+    prompt_token_ids = _semantic_prompt_token_ids(
+        tokenizer,
+        prompts,
+        max_length=max_length,
+        reserved_answer_tokens=reserved_answer_tokens,
+    )
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        raise ValueError("Tokenizer must expose pad_token_id for decoder prompt batching.")
+    input_ids, attention_mask = _pad_long_sequences(prompt_token_ids, pad_token_id, device)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+
+
+def _decoder_last_token_embeddings(hidden_states, attention_mask):
+    last_idx = attention_mask.sum(dim=1).clamp_min(1) - 1
+    return hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), last_idx].float()
+
+
+def _score_answer_token_candidates(model, tokenizer, prompts, *, max_length, device, answer_token_ids):
+    prompt_batch = _build_decoder_prompt_batch(
+        tokenizer,
+        prompts,
+        max_length=max_length,
+        device=device,
+        answer_token_ids=answer_token_ids,
+    )
+    with torch.no_grad():
+        prompt_out = model.LM(**prompt_batch, output_hidden_states=True)
+    prompt_embeddings = _decoder_last_token_embeddings(prompt_out.hidden_states[-1], prompt_batch["attention_mask"]).detach().cpu()
+
+    flat_sequences = []
+    flat_labels = []
+    flat_prompt_row = []
+    flat_class_idx = []
+    class_order = [0, 1]
+    for prompt_row, prompt_ids in enumerate(prompt_batch["input_ids"].detach().cpu()):
+        prompt_len = int(prompt_batch["attention_mask"][prompt_row].sum().item())
+        prompt_ids = prompt_ids[:prompt_len]
+        for class_idx in class_order:
+            candidate_ids = torch.tensor(answer_token_ids[class_idx], dtype=torch.long)
+            full_ids = torch.cat([prompt_ids, candidate_ids], dim=0)
+            labels_ids = torch.cat(
+                [
+                    torch.full((prompt_ids.numel(),), -100, dtype=torch.long),
+                    candidate_ids.clone(),
+                ],
+                dim=0,
+            )
+            flat_sequences.append(full_ids)
+            flat_labels.append(labels_ids)
+            flat_prompt_row.append(int(prompt_row))
+            flat_class_idx.append(int(class_idx))
+
+    pad_token_id = tokenizer.pad_token_id
+    input_ids, attention_mask = _pad_long_sequences(flat_sequences, pad_token_id, device)
+    labels_tensor, _ = _pad_long_sequences(flat_labels, -100, device)
+    with torch.no_grad():
+        scored_out = model.LM(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+        token_logits = scored_out.logits[:, :-1, :].float()
+        target_tokens = input_ids[:, 1:]
+        target_mask = labels_tensor[:, 1:] != -100
+        token_log_prob = torch.log_softmax(token_logits, dim=-1)
+        gathered = token_log_prob.gather(dim=-1, index=target_tokens.unsqueeze(-1)).squeeze(-1)
+        gathered = gathered * target_mask.float()
+        token_count = target_mask.sum(dim=1).clamp_min(1)
+        candidate_scores = gathered.sum(dim=1) / token_count.float()
+
+    logits = torch.zeros((len(prompts), 2), dtype=torch.float32)
+    for score, prompt_row, class_idx in zip(
+        candidate_scores.detach().cpu(),
+        flat_prompt_row,
+        flat_class_idx,
+    ):
+        logits[int(prompt_row), int(class_idx)] = float(score.item())
+    return prompt_embeddings, logits
 
 
 def _classification_metrics_from_logits(logits, labels, idx):
@@ -352,6 +593,1272 @@ def _resolve_cached_semantic_embeddings(args, data, seed):
     if not torch.is_tensor(payload) or payload.dim() != 2:
         raise ValueError("semantic_embedding_classifier expects a 2-D embedding tensor.")
     return payload.detach().cpu().float(), path, source
+
+
+def _split_csv_arg(value):
+    if value is None:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _semantic_outputs_prob_pred(payload, *, pred_key="pred", prob_key="prob", logits_key="logits", prefix=""):
+    if not isinstance(payload, dict):
+        raise ValueError("semantic correction gate expects outputs payloads to be dictionaries.")
+    pred = payload.get(f"{prefix}{pred_key}") if prefix else payload.get(pred_key)
+    prob = payload.get(f"{prefix}{prob_key}") if prefix else payload.get(prob_key)
+    logits = payload.get(f"{prefix}{logits_key}") if prefix else payload.get(logits_key)
+    if pred is None and prefix:
+        pred = payload.get(pred_key)
+    if prob is None and prefix:
+        prob = payload.get(prob_key)
+    if logits is None and prefix:
+        logits = payload.get(logits_key)
+    if prob is None:
+        if logits is None:
+            raise ValueError("outputs payload must contain prob or logits.")
+        prob = torch.softmax(logits.detach().cpu().float(), dim=1)
+    else:
+        prob = prob.detach().cpu().float()
+    if pred is None:
+        pred = prob.argmax(dim=1)
+    else:
+        pred = pred.detach().cpu().long().reshape(-1)
+    if prob.dim() != 2 or prob.shape[1] != 2:
+        raise ValueError(f"semantic correction gate expects binary probabilities, got shape {tuple(prob.shape)}.")
+    if int(pred.numel()) != int(prob.shape[0]):
+        raise ValueError(f"pred/prob row mismatch: pred={int(pred.numel())}, prob={int(prob.shape[0])}.")
+    return prob, pred
+
+
+def _load_base_prob_pred(path):
+    payload = safe_torch_load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Base outputs at {path} must be a dictionary.")
+    prob, pred = _semantic_outputs_prob_pred(
+        payload,
+        pred_key="base_pred",
+        prob_key="base_prob",
+        logits_key="base_logits",
+    )
+    return prob, pred, payload
+
+
+def _load_candidate_prob_pred(path):
+    payload = safe_torch_load(path, map_location="cpu")
+    prob, pred = _semantic_outputs_prob_pred(payload)
+    return prob, pred, payload
+
+
+def _binary_prob_summary(prob, pred):
+    prob = prob.detach().cpu().float()
+    pred = pred.detach().cpu().long().reshape(-1)
+    conf = prob.max(dim=1).values
+    margin = (prob[:, 1] - prob[:, 0]).abs()
+    entropy = -(prob.clamp_min(1e-8) * prob.clamp_min(1e-8).log()).sum(dim=1)
+    return torch.stack(
+        [
+            prob[:, 0],
+            prob[:, 1],
+            conf,
+            margin,
+            entropy,
+            pred.float(),
+        ],
+        dim=1,
+    )
+
+
+def _none_like_text(value):
+    token = str(value or "").strip().lower()
+    return token in {"", "none", "null", "nan", "unknown"}
+
+
+def _parse_bool_feature(value):
+    token = str(value or "").strip().lower()
+    if token in {"true", "1", "yes", "y"}:
+        return 1.0
+    if token in {"false", "0", "no", "n", "none", ""}:
+        return 0.0
+    return 0.0
+
+
+def _safe_float_feature(value):
+    token = str(value or "").replace(",", " ")
+    match = re.search(r"-?\d+(?:\.\d+)?", token)
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return 0.0
+
+
+def _log1p_feature(value):
+    return float(math.log1p(max(float(value), 0.0)))
+
+
+def _char_ratio_feature(text, predicate):
+    text = str(text or "")
+    if not text:
+        return 0.0
+    return float(sum(1 for ch in text if predicate(ch))) / float(len(text))
+
+
+def _split_norm_user_text(text):
+    text = str(text or "")
+    upper = text.upper()
+    meta_anchor = "METADATA:"
+    desc_anchor = "DESCRIPTION:"
+    tweet_anchor = "TWEET:"
+    meta_idx = upper.find(meta_anchor)
+    desc_idx = upper.find(desc_anchor)
+    tweet_idx = upper.find(tweet_anchor)
+    metadata = ""
+    description = ""
+    tweets = ""
+    if meta_idx >= 0:
+        meta_start = meta_idx + len(meta_anchor)
+        meta_end = desc_idx if desc_idx >= 0 else (tweet_idx if tweet_idx >= 0 else len(text))
+        metadata = text[meta_start:meta_end].strip()
+    if desc_idx >= 0:
+        desc_start = desc_idx + len(desc_anchor)
+        desc_end = tweet_idx if tweet_idx >= 0 else len(text)
+        description = text[desc_start:desc_end].strip()
+    if tweet_idx >= 0:
+        tweets = text[tweet_idx + len(tweet_anchor) :].strip()
+    metadata_fields = [item.strip() for item in metadata.split("</s>")]
+    while len(metadata_fields) < 10:
+        metadata_fields.append("")
+    tweet_items = [item.strip() for item in tweets.split("</s>") if item.strip()]
+    return metadata_fields, description, tweets, tweet_items
+
+
+def _build_text_attribute_features(user_text, row_count):
+    names = [
+        "protected",
+        "verified",
+        "created_at_present",
+        "location_present",
+        "display_name_present",
+        "screen_name_present",
+        "bio_present",
+        "followers_log1p",
+        "following_log1p",
+        "listed_log1p",
+        "statuses_log1p",
+        "followers_following_log_ratio",
+        "listed_followers_log_ratio",
+        "statuses_followers_log_ratio",
+        "bio_char_len_log1p",
+        "display_name_char_len_log1p",
+        "screen_name_char_len_log1p",
+        "screen_name_digit_ratio",
+        "screen_name_underscore_ratio",
+        "tweet_count_log1p",
+        "tweet_char_len_log1p",
+        "rt_ratio",
+        "url_ratio",
+        "hashtag_ratio",
+        "mention_ratio",
+        "emoji_ratio",
+        "no_tweet_evidence",
+    ]
+    matrix = torch.zeros((int(row_count), len(names)), dtype=torch.float32)
+    usable = min(int(row_count), len(user_text or []))
+    for node_idx in range(usable):
+        fields, description, tweets, tweet_items = _split_norm_user_text(user_text[node_idx])
+        created_at, location, display_name, protected = fields[0], fields[1], fields[2], fields[3]
+        followers = _safe_float_feature(fields[4])
+        following = _safe_float_feature(fields[5])
+        listed = _safe_float_feature(fields[6])
+        statuses = _safe_float_feature(fields[7])
+        screen_name = fields[8]
+        verified = fields[9]
+        tweet_count = max(len(tweet_items), 0)
+        lower_tweets = [item.lower() for item in tweet_items]
+        denom = float(max(tweet_count, 1))
+        rt_count = sum(1 for item in lower_tweets if item.startswith("rt ") or " rt @user" in item or item.startswith("rt @user"))
+        url_count = sum(1 for item in lower_tweets if "httpurl" in item or "http://" in item or "https://" in item)
+        hashtag_count = sum(1 for item in lower_tweets if "#hashtag" in item or "#" in item)
+        mention_count = sum(1 for item in lower_tweets if "@user" in item or "@" in item)
+        emoji_count = sum(1 for item in lower_tweets if "emoji" in item)
+        row = [
+            _parse_bool_feature(protected),
+            _parse_bool_feature(verified),
+            0.0 if _none_like_text(created_at) else 1.0,
+            0.0 if _none_like_text(location) else 1.0,
+            0.0 if _none_like_text(display_name) else 1.0,
+            0.0 if _none_like_text(screen_name) else 1.0,
+            0.0 if _none_like_text(description) else 1.0,
+            _log1p_feature(followers),
+            _log1p_feature(following),
+            _log1p_feature(listed),
+            _log1p_feature(statuses),
+            _log1p_feature(followers) - _log1p_feature(following),
+            _log1p_feature(listed) - _log1p_feature(followers),
+            _log1p_feature(statuses) - _log1p_feature(max(followers, 1.0)),
+            _log1p_feature(len(str(description or ""))),
+            _log1p_feature(len(str(display_name or ""))),
+            _log1p_feature(len(str(screen_name or ""))),
+            _char_ratio_feature(screen_name, lambda ch: ch.isdigit()),
+            _char_ratio_feature(screen_name, lambda ch: ch == "_"),
+            _log1p_feature(tweet_count),
+            _log1p_feature(len(str(tweets or ""))),
+            float(rt_count) / denom,
+            float(url_count) / denom,
+            float(hashtag_count) / denom,
+            float(mention_count) / denom,
+            float(emoji_count) / denom,
+            1.0 if tweet_count == 0 else 0.0,
+        ]
+        matrix[node_idx] = torch.tensor(row, dtype=torch.float32)
+    return matrix, names
+
+
+def _resolve_gate_edge_tensors(data):
+    if "edge_index" in data and "edge_type" in data:
+        return data["edge_index"], data["edge_type"], "data"
+    dataset_path = Path(data.get("dataset_path", ""))
+    edge_index_path = dataset_path / "edge_index.pt"
+    edge_type_path = dataset_path / "edge_type.pt"
+    if edge_index_path.exists() and edge_type_path.exists():
+        return safe_torch_load(edge_index_path, map_location="cpu"), safe_torch_load(edge_type_path, map_location="cpu"), "dataset_labeled_graph"
+    return None, None, "missing"
+
+
+def _build_graph_attribute_features(data, row_count):
+    names = [
+        "graph_following_log1p",
+        "graph_follower_log1p",
+        "graph_has_following",
+        "graph_has_follower",
+        "graph_total_degree_log1p",
+        "graph_following_follower_log_ratio",
+        "graph_reciprocal_ratio",
+        "graph_neighbor_activity_log1p",
+        "graph_isolated",
+    ]
+    matrix = torch.zeros((int(row_count), len(names)), dtype=torch.float32)
+    edge_index, edge_type, source = _resolve_gate_edge_tensors(data)
+    if edge_index is None or edge_type is None:
+        return matrix, names, {"graph_attribute_source": source, "graph_attribute_available": False}
+    edge_index = edge_index.detach().cpu().long()
+    edge_type = edge_type.detach().cpu().long().reshape(-1)
+    if edge_index.dim() != 2 or edge_index.shape[0] != 2 or edge_type.numel() != edge_index.shape[1]:
+        return matrix, names, {"graph_attribute_source": source, "graph_attribute_available": False, "graph_attribute_error": "invalid_edge_shape"}
+    src = edge_index[0].clamp_min(0)
+    dst = edge_index[1].clamp_min(0)
+    valid = (src < int(row_count)) & (dst < int(row_count))
+    src = src[valid]
+    dst = dst[valid]
+    rel = edge_type[valid]
+    following_mask = rel == 1
+    follower_mask = rel == 0
+    following = torch.bincount(src[following_mask], minlength=int(row_count)).float()
+    follower = torch.bincount(dst[follower_mask], minlength=int(row_count)).float()
+    out_all = torch.bincount(src, minlength=int(row_count)).float()
+    in_all = torch.bincount(dst, minlength=int(row_count)).float()
+    total = out_all + in_all
+    neighbor_sum = torch.zeros(int(row_count), dtype=torch.float32)
+    if src.numel():
+        neighbor_total = total
+        neighbor_sum.index_add_(0, src, neighbor_total[dst])
+        neighbor_sum.index_add_(0, dst, neighbor_total[src])
+    neighbor_mean = neighbor_sum / total.clamp_min(1.0)
+    neighbor_sets = [set() for _ in range(int(row_count))]
+    for s, d in zip(src.tolist(), dst.tolist()):
+        neighbor_sets[int(s)].add(int(d))
+    reciprocal = torch.zeros(int(row_count), dtype=torch.float32)
+    for node_idx, neighbors in enumerate(neighbor_sets):
+        if not neighbors:
+            continue
+        reciprocal_count = sum(1 for nbr in neighbors if node_idx in neighbor_sets[nbr])
+        reciprocal[node_idx] = float(reciprocal_count) / float(len(neighbors))
+    matrix = torch.stack(
+        [
+            torch.log1p(following),
+            torch.log1p(follower),
+            (following > 0).float(),
+            (follower > 0).float(),
+            torch.log1p(total),
+            torch.log1p(following) - torch.log1p(follower),
+            reciprocal,
+            torch.log1p(neighbor_mean),
+            (total == 0).float(),
+        ],
+        dim=1,
+    ).float()
+    return matrix, names, {
+        "graph_attribute_source": source,
+        "graph_attribute_available": True,
+        "edge_count_used": int(src.numel()),
+    }
+
+
+def _standardize_attribute_features(features, train_idx):
+    train_idx = _as_long_cpu_tensor(train_idx)
+    reference = features[train_idx] if train_idx.numel() else features
+    mean = reference.mean(dim=0, keepdim=True)
+    std = reference.std(dim=0, keepdim=True, unbiased=False)
+    std = torch.where(std < 1e-6, torch.ones_like(std), std)
+    normalized = ((features - mean) / std).clamp(-10.0, 10.0)
+    return normalized.float(), {
+        "normalization": "train_zscore_clamped_10",
+        "mean": mean.reshape(-1).tolist(),
+        "std": std.reshape(-1).tolist(),
+    }
+
+
+def _build_semantic_gate_node_attribute_features(data, train_idx, row_count):
+    text_features, text_names = _build_text_attribute_features(data.get("user_text", []), row_count)
+    graph_features, graph_names, graph_meta = _build_graph_attribute_features(data, row_count)
+    raw = torch.cat([text_features, graph_features], dim=1).float()
+    features, norm_meta = _standardize_attribute_features(raw, train_idx)
+    names = list(text_names) + list(graph_names)
+    return features, names, {
+        "feature_source": "norm_user_text_plus_labeled_graph",
+        "raw_feature_dim": int(raw.shape[1]),
+        "feature_names": names,
+        **graph_meta,
+        **norm_meta,
+    }
+
+
+def _build_semantic_gate_features(
+    base_prob,
+    base_pred,
+    candidate_probs,
+    candidate_preds,
+    node_attribute_features=None,
+    action_local_features=None,
+):
+    base_summary = _binary_prob_summary(base_prob, base_pred)
+    features = []
+    for action_idx, (cand_prob, cand_pred) in enumerate(zip(candidate_probs, candidate_preds)):
+        cand_summary = _binary_prob_summary(cand_prob, cand_pred)
+        agreement = (cand_pred == base_pred).float().unsqueeze(1)
+        bot_delta = (cand_prob[:, 1] - base_prob[:, 1]).unsqueeze(1)
+        conf_delta = (cand_summary[:, 2] - base_summary[:, 2]).unsqueeze(1)
+        abs_bot_delta = bot_delta.abs()
+        action_feature = torch.cat(
+            [
+                base_summary,
+                cand_summary,
+                agreement,
+                bot_delta,
+                conf_delta,
+                abs_bot_delta,
+            ],
+            dim=1,
+        )
+        if node_attribute_features is not None:
+            action_feature = torch.cat([action_feature, node_attribute_features], dim=1)
+        if action_local_features is not None:
+            action_feature = torch.cat([action_feature, action_local_features[:, action_idx, :]], dim=1)
+        features.append(action_feature)
+    return torch.stack(features, dim=1).float()
+
+
+def _build_semantic_gate_local_competence_features(
+    action_descriptor_features,
+    train_idx,
+    labels,
+    base_pred,
+    candidate_preds,
+    rewards,
+    break_masks,
+    break_weight,
+    k=25,
+):
+    train_idx = _as_long_cpu_tensor(train_idx)
+    row_count = int(action_descriptor_features.shape[0])
+    action_count = int(action_descriptor_features.shape[1])
+    if train_idx.numel() == 0:
+        raise ValueError("local_competence semantic gate requires non-empty routed train nodes.")
+    k = max(int(k), 1)
+    labels = labels.detach().cpu().long().reshape(-1)
+    base_pred = base_pred.detach().cpu().long().reshape(-1)
+    base_wrong_train = (base_pred[train_idx] != labels[train_idx]).float()
+    train_node_ids = train_idx.reshape(1, -1)
+    node_ids = torch.arange(row_count, dtype=torch.long).reshape(-1, 1)
+    feature_names = [
+        "local_candidate_correct_rate",
+        "local_base_wrong_rate",
+        "local_fix_rate",
+        "local_break_rate",
+        "local_change_rate",
+        "local_net_estimate",
+        "weighted_local_fix_rate",
+        "weighted_local_break_rate",
+        "weighted_local_net_estimate",
+        "mean_neighbor_similarity",
+        "max_neighbor_similarity",
+        "support_fraction",
+    ]
+    per_action = []
+    support_min = None
+    support_max = 0
+    support_total = 0.0
+    support_rows = 0
+    chunk_size = 4096
+    for action_idx, cand_pred in enumerate(candidate_preds):
+        descriptor = action_descriptor_features[:, action_idx, :].detach().cpu().float()
+        train_descriptor = descriptor[train_idx]
+        mean = train_descriptor.mean(dim=0, keepdim=True)
+        std = train_descriptor.std(dim=0, keepdim=True, unbiased=False)
+        std = torch.where(std < 1e-6, torch.ones_like(std), std)
+        descriptor = torch.nan_to_num(((descriptor - mean) / std).clamp(-10.0, 10.0))
+        descriptor = F.normalize(descriptor, p=2, dim=1, eps=1e-6)
+        train_descriptor = descriptor[train_idx]
+        cand_pred = cand_pred.detach().cpu().long().reshape(-1)
+        cand_correct_train = (cand_pred[train_idx] == labels[train_idx]).float()
+        changed_train = (cand_pred[train_idx] != base_pred[train_idx]).float()
+        fix_train = (rewards[train_idx, action_idx] > 0).float()
+        break_train = break_masks[train_idx, action_idx].float()
+        local_rows = []
+        k_eff = min(k, int(train_idx.numel()))
+        for start in range(0, row_count, chunk_size):
+            end = min(start + chunk_size, row_count)
+            similarity = descriptor[start:end].matmul(train_descriptor.t())
+            same_node = node_ids[start:end] == train_node_ids
+            similarity = similarity.masked_fill(same_node, float("-inf"))
+            top_sim, top_pos = torch.topk(similarity, k=k_eff, dim=1)
+            valid_mask = torch.isfinite(top_sim)
+            top_sim_safe = top_sim.masked_fill(~valid_mask, 0.0)
+            support = valid_mask.float().sum(dim=1, keepdim=True)
+            support_clamped = support.clamp_min(1.0)
+            weight = (top_sim_safe.clamp_min(0.0) + 1e-6) * valid_mask.float()
+            weight_sum = weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+            def gather_mean(values):
+                gathered = values[top_pos] * valid_mask.float()
+                return gathered.sum(dim=1, keepdim=True) / support_clamped
+
+            def gather_weighted(values):
+                gathered = values[top_pos] * weight
+                return gathered.sum(dim=1, keepdim=True) / weight_sum
+
+            local_candidate_correct = gather_mean(cand_correct_train)
+            local_base_wrong = gather_mean(base_wrong_train)
+            local_fix = gather_mean(fix_train)
+            local_break = gather_mean(break_train)
+            local_change = gather_mean(changed_train)
+            local_net = local_fix - float(break_weight) * local_break
+            weighted_fix = gather_weighted(fix_train)
+            weighted_break = gather_weighted(break_train)
+            weighted_net = weighted_fix - float(break_weight) * weighted_break
+            mean_similarity = (top_sim_safe * valid_mask.float()).sum(dim=1, keepdim=True) / support_clamped
+            max_similarity = top_sim_safe.masked_fill(~valid_mask, -1.0).max(dim=1, keepdim=True).values.clamp_min(0.0)
+            support_fraction = support / float(k)
+            local_rows.append(
+                torch.cat(
+                    [
+                        local_candidate_correct,
+                        local_base_wrong,
+                        local_fix,
+                        local_break,
+                        local_change,
+                        local_net,
+                        weighted_fix,
+                        weighted_break,
+                        weighted_net,
+                        mean_similarity,
+                        max_similarity,
+                        support_fraction,
+                    ],
+                    dim=1,
+                )
+            )
+            support_values = support.reshape(-1)
+            finite_support = support_values[support_values > 0]
+            if finite_support.numel():
+                min_value = int(finite_support.min().item())
+                support_min = min_value if support_min is None else min(support_min, min_value)
+                support_max = max(support_max, int(finite_support.max().item()))
+                support_total += float(finite_support.sum().item())
+                support_rows += int(finite_support.numel())
+        per_action.append(torch.cat(local_rows, dim=0))
+    features = torch.stack(per_action, dim=1).float()
+    return features, {
+        "feature_source": "train_routed_local_action_competence",
+        "literature_alignment": [
+            "META-DES local region competence meta-features",
+            "learning-to-defer accept-or-defer decision framing",
+            "selective classification validation-locked risk-coverage behavior",
+        ],
+        "nearest_neighbor_policy": "cosine_topk_on_train_standardized_action_descriptors",
+        "uses_only_routed_train_for_competence": True,
+        "self_neighbor_policy": "excluded_for_train_queries",
+        "k": int(k),
+        "feature_dim": int(features.shape[-1]),
+        "feature_names": feature_names,
+        "support_min": int(support_min or 0),
+        "support_max": int(support_max),
+        "support_mean_nonzero": float(support_total / max(support_rows, 1)),
+    }
+
+
+def _semantic_gate_rewards(labels, base_pred, candidate_preds, break_weight):
+    labels = labels.detach().cpu().long().reshape(-1)
+    base_pred = base_pred.detach().cpu().long().reshape(-1)
+    base_correct = base_pred == labels
+    rewards = []
+    break_masks = []
+    for cand_pred in candidate_preds:
+        cand_pred = cand_pred.detach().cpu().long().reshape(-1)
+        cand_correct = cand_pred == labels
+        reward = torch.zeros_like(labels, dtype=torch.float32)
+        reward[(~base_correct) & cand_correct] = 1.0
+        reward[base_correct & (~cand_correct)] = -float(break_weight)
+        rewards.append(reward)
+        break_masks.append(base_correct & (~cand_correct))
+    return torch.stack(rewards, dim=1), torch.stack(break_masks, dim=1), base_correct
+
+
+def _scores_for_indices(labels, pred, idx):
+    idx = _as_long_cpu_tensor(idx)
+    return _score_all(labels[idx].numpy(), pred[idx].numpy()) if idx.numel() else {
+        "accuracy": 0.0,
+        "macro_f1": 0.0,
+        "bot_f1": 0.0,
+        "count": 0,
+    }
+
+
+def _semantic_gate_apply(base_pred, candidate_preds, gate_prob, idx, threshold):
+    idx = _as_long_cpu_tensor(idx)
+    final_pred = base_pred.clone()
+    selected_action = torch.full((int(base_pred.numel()),), -1, dtype=torch.long)
+    selected_score = torch.zeros((int(base_pred.numel()),), dtype=torch.float32)
+    if idx.numel() == 0:
+        return final_pred, selected_action, selected_score
+    scores_idx = gate_prob[idx]
+    max_scores, best_actions = scores_idx.max(dim=1)
+    take = max_scores >= float(threshold)
+    take_idx = idx[take]
+    if take_idx.numel():
+        best_take = best_actions[take]
+        for action_idx, cand_pred in enumerate(candidate_preds):
+            action_nodes = take_idx[best_take == action_idx]
+            if action_nodes.numel():
+                final_pred[action_nodes] = cand_pred[action_nodes]
+                selected_action[action_nodes] = int(action_idx)
+                selected_score[action_nodes] = max_scores[take][best_take == action_idx]
+    skipped_idx = idx[~take]
+    if skipped_idx.numel():
+        selected_score[skipped_idx] = max_scores[~take]
+    return final_pred, selected_action, selected_score
+
+
+def _semantic_gate_delta(labels, base_pred, final_pred, idx):
+    idx = _as_long_cpu_tensor(idx)
+    if idx.numel() == 0:
+        return {
+            "fix": 0,
+            "break": 0,
+            "net": 0,
+            "changed": 0,
+            "base_wrong": 0,
+            "base_correct": 0,
+            "conditional_fix_rate_on_base_wrong": 0.0,
+            "correct_node_break_rate": 0.0,
+        }
+    base_correct = base_pred[idx] == labels[idx]
+    final_correct = final_pred[idx] == labels[idx]
+    fix = int(((~base_correct) & final_correct).sum().item())
+    broke = int((base_correct & (~final_correct)).sum().item())
+    changed = int((base_pred[idx] != final_pred[idx]).sum().item())
+    base_wrong = int((~base_correct).sum().item())
+    base_correct_count = int(base_correct.sum().item())
+    return {
+        "fix": fix,
+        "break": broke,
+        "net": int(fix - broke),
+        "changed": changed,
+        "base_wrong": base_wrong,
+        "base_correct": base_correct_count,
+        "conditional_fix_rate_on_base_wrong": float(fix / max(base_wrong, 1)),
+        "correct_node_break_rate": float(broke / max(base_correct_count, 1)),
+    }
+
+
+class _SemanticCorrectionGate(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(int(in_channels), int(hidden_channels)),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(int(hidden_channels), 1),
+        )
+
+    def forward(self, features):
+        original_shape = features.shape[:-1]
+        flat = features.reshape(-1, features.shape[-1])
+        return self.net(flat).reshape(*original_shape)
+
+
+class _SemanticCorrectionDeferGate(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels):
+        super().__init__()
+        self.candidate_scorer = torch.nn.Sequential(
+            torch.nn.Linear(int(in_channels), int(hidden_channels)),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(int(hidden_channels), 1),
+        )
+        self.base_scorer = torch.nn.Sequential(
+            torch.nn.Linear(int(in_channels) * 2, int(hidden_channels)),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(int(hidden_channels), 1),
+        )
+
+    def forward(self, features):
+        candidate_logits = self.candidate_scorer(features).squeeze(-1)
+        pooled = torch.cat([features.mean(dim=1), features.max(dim=1).values], dim=1)
+        base_logit = self.base_scorer(pooled)
+        return torch.cat([base_logit, candidate_logits], dim=1)
+
+
+class _SemanticBreakRiskHead(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(int(in_channels), int(hidden_channels)),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(int(hidden_channels), 1),
+        )
+
+    def forward(self, features):
+        original_shape = features.shape[:-1]
+        flat = features.reshape(-1, features.shape[-1])
+        return self.net(flat).reshape(*original_shape)
+
+
+def _select_semantic_gate_threshold(labels, base_pred, candidate_preds, gate_prob, valid_idx):
+    valid_idx = _as_long_cpu_tensor(valid_idx)
+    if valid_idx.numel() == 0:
+        return {"threshold": 1.0, "selection": "empty_valid"}
+    candidates = torch.linspace(0.0, 1.0, steps=101).tolist()
+    valid_scores = torch.unique(gate_prob[valid_idx].reshape(-1).detach().cpu()).tolist()
+    candidates.extend(float(score) for score in valid_scores)
+    candidates = sorted(set(float(max(0.0, min(1.0, value))) for value in candidates))
+    best = None
+    for threshold in candidates:
+        final_pred, _, _ = _semantic_gate_apply(base_pred, candidate_preds, gate_prob, valid_idx, threshold)
+        delta = _semantic_gate_delta(labels, base_pred, final_pred, valid_idx)
+        scores = _scores_for_indices(labels, final_pred, valid_idx)
+        row = {
+            "threshold": float(threshold),
+            **delta,
+            "accuracy": float(scores["accuracy"]),
+            "macro_f1": float(scores["macro_f1"]),
+        }
+        key = (row["net"], row["macro_f1"], -row["break"], row["fix"], -row["changed"])
+        if best is None or key > best[0]:
+            best = (key, row)
+    return best[1]
+
+
+def _semantic_defer_targets(rewards):
+    row_best, best_candidate = rewards.max(dim=1)
+    targets = torch.zeros((int(rewards.shape[0]),), dtype=torch.long)
+    positive = row_best > 0
+    targets[positive] = best_candidate[positive].long() + 1
+    return targets
+
+
+def _semantic_defer_apply(
+    base_pred,
+    candidate_preds,
+    action_prob,
+    idx,
+    accept_threshold,
+    break_prob=None,
+    break_threshold=None,
+):
+    idx = _as_long_cpu_tensor(idx)
+    final_pred = base_pred.clone()
+    selected_action = torch.full((int(base_pred.numel()),), -1, dtype=torch.long)
+    selected_score = torch.zeros((int(base_pred.numel()),), dtype=torch.float32)
+    if idx.numel() == 0:
+        return final_pred, selected_action, selected_score
+    node_action_prob = action_prob[idx]
+    base_score = node_action_prob[:, 0]
+    candidate_score = node_action_prob[:, 1:].clone()
+    if break_prob is not None and break_threshold is not None:
+        safe_mask = break_prob[idx] <= float(break_threshold)
+        candidate_score = candidate_score.masked_fill(~safe_mask, -1.0)
+    best_scores, best_actions = candidate_score.max(dim=1)
+    take = (best_scores >= float(accept_threshold)) & (best_scores > base_score)
+    take_idx = idx[take]
+    if take_idx.numel():
+        best_take = best_actions[take]
+        for action_idx, cand_pred in enumerate(candidate_preds):
+            action_nodes = take_idx[best_take == action_idx]
+            if action_nodes.numel():
+                final_pred[action_nodes] = cand_pred[action_nodes]
+                selected_action[action_nodes] = int(action_idx)
+                selected_score[action_nodes] = best_scores[take][best_take == action_idx]
+    skipped_idx = idx[~take]
+    if skipped_idx.numel():
+        selected_score[skipped_idx] = best_scores[~take].clamp_min(0.0)
+    return final_pred, selected_action, selected_score
+
+
+def _select_semantic_defer_policy(
+    labels,
+    base_pred,
+    candidate_preds,
+    action_prob,
+    valid_idx,
+    break_prob=None,
+    break_budget=-1.0,
+):
+    valid_idx = _as_long_cpu_tensor(valid_idx)
+    if valid_idx.numel() == 0:
+        return {"accept_threshold": 1.0, "break_threshold": None, "selection": "empty_valid"}
+    accept_candidates = torch.linspace(0.0, 1.0, steps=51).tolist()
+    valid_scores = action_prob[valid_idx, 1:].reshape(-1).detach().cpu()
+    if valid_scores.numel():
+        quantiles = torch.linspace(0.0, 1.0, steps=21)
+        accept_candidates.extend(float(score) for score in torch.quantile(valid_scores, quantiles).tolist())
+    accept_candidates = sorted(set(float(max(0.0, min(1.0, value))) for value in accept_candidates))
+    if break_prob is None:
+        break_candidates = [None]
+    else:
+        break_candidates = torch.linspace(0.0, 1.0, steps=51).tolist()
+        valid_breaks = break_prob[valid_idx].reshape(-1).detach().cpu()
+        if valid_breaks.numel():
+            quantiles = torch.linspace(0.0, 1.0, steps=21)
+            break_candidates.extend(float(score) for score in torch.quantile(valid_breaks, quantiles).tolist())
+        break_candidates = sorted(set(float(max(0.0, min(1.0, value))) for value in break_candidates))
+    best = None
+    best_budgeted = None
+    for accept_threshold in accept_candidates:
+        for break_threshold in break_candidates:
+            final_pred, _, _ = _semantic_defer_apply(
+                base_pred,
+                candidate_preds,
+                action_prob,
+                valid_idx,
+                accept_threshold,
+                break_prob=break_prob,
+                break_threshold=break_threshold,
+            )
+            delta = _semantic_gate_delta(labels, base_pred, final_pred, valid_idx)
+            if float(break_budget) >= 0.0 and delta["correct_node_break_rate"] > float(break_budget):
+                budget_ok = False
+            else:
+                budget_ok = True
+            scores = _scores_for_indices(labels, final_pred, valid_idx)
+            row = {
+                "accept_threshold": float(accept_threshold),
+                "break_threshold": None if break_threshold is None else float(break_threshold),
+                **delta,
+                "accuracy": float(scores["accuracy"]),
+                "macro_f1": float(scores["macro_f1"]),
+                "break_budget": float(break_budget),
+                "break_budget_satisfied": bool(budget_ok),
+            }
+            key = (row["net"], row["macro_f1"], -row["break"], row["fix"], -row["changed"])
+            if best is None or key > best[0]:
+                best = (key, row)
+            if budget_ok and (best_budgeted is None or key > best_budgeted[0]):
+                best_budgeted = (key, row)
+    return (best_budgeted or best)[1]
+
+
+def run_semantic_correction_gate_seed(args, seed, data, experiment_root, run):
+    stage_dir = build_preparation_dir(experiment_root, "semantic_correction_gate")
+    code_provenance = capture_code_metadata(Path(__file__).resolve().parents[1])
+    base_path = Path(str(getattr(args, "semantic_gate_base_outputs_path", "") or ""))
+    candidate_paths = [Path(item) for item in _split_csv_arg(getattr(args, "semantic_gate_candidate_output_paths", None))]
+    candidate_names = _split_csv_arg(getattr(args, "semantic_gate_candidate_names", None))
+    if not candidate_names:
+        candidate_names = [path.parent.name or f"candidate_{idx}" for idx, path in enumerate(candidate_paths)]
+    manifest = {
+        "contract": "semantic_correction_gate_v1",
+        "status": "started",
+        "seed": int(seed),
+        "canonical_task_name": "semantic_correction_gate",
+        "dataset": getattr(args, "dataset", "unknown"),
+        "dataset_path": str(data.get("dataset_path", "")),
+        "training_scope": "routed_nodes_base_aware_correction_gate",
+        "notes": (
+            "Validation-locked base-aware keep/change gate over existing candidate semantic outputs. "
+            "This stage trains utility selection only; it does not regenerate prompts or update the candidate LLM/MLP."
+        ),
+        "command": _semantic_command(args),
+        "code_commit": code_provenance["commit"],
+        "code_provenance": code_provenance,
+        "deprecated_cli_flags": list(getattr(args, "deprecated_cli_flags", [])),
+        "stage_visibility": "public",
+        "artifact_namespace": "preparation/semantic_correction_gate",
+        "invocation": {
+            "requested_task": getattr(args, "requested_experiment_task", getattr(args, "experiment_task", None)),
+            "resolved_task": "semantic_correction_gate",
+        },
+        "base_outputs_path": str(base_path),
+        "candidate_output_paths": [str(path) for path in candidate_paths],
+        "candidate_names": list(candidate_names),
+        "break_weight": float(getattr(args, "semantic_gate_break_weight", 2.0)),
+        "threshold_policy": str(getattr(args, "semantic_gate_threshold_policy", "global")),
+        "feature_family": str(getattr(args, "semantic_gate_feature_family", "probability")),
+        "selection_policy": str(getattr(args, "semantic_gate_selection_policy", "threshold")),
+        "safety_policy": str(getattr(args, "semantic_gate_safety_policy", "none")),
+        "break_budget": float(getattr(args, "semantic_gate_break_budget", -1.0)),
+    }
+    write_json(stage_dir / "manifest.json", manifest)
+    write_text(stage_dir / "command.txt", manifest["command"] + "\n")
+
+    try:
+        if not base_path.exists():
+            raise FileNotFoundError(f"--semantic_gate_base_outputs_path does not exist: {base_path}")
+        if not candidate_paths:
+            raise ValueError("--semantic_gate_candidate_output_paths must list at least one candidate outputs.pt.")
+        if len(candidate_names) != len(candidate_paths):
+            raise ValueError("--semantic_gate_candidate_names length must match --semantic_gate_candidate_output_paths.")
+        for path in candidate_paths:
+            if not path.exists():
+                raise FileNotFoundError(f"candidate outputs path does not exist: {path}")
+
+        device = _resolve_device(getattr(args, "device", -1))
+        if device.type == "cuda":
+            _reset_cuda_peak_memory_stats(device)
+        labels = _labels_to_index(data["labels"]).cpu()
+        canonical_test_idx = _as_long_cpu_tensor(data["test_idx"])
+        train_idx, valid_idx, test_idx, routed_info, _ = _resolve_semantic_split_indices(args, data, seed)
+        if routed_info is None:
+            raise ValueError("semantic_correction_gate requires --routed_nodes_path.")
+        base_prob, base_pred, _ = _load_base_prob_pred(base_path)
+        candidate_probs = []
+        candidate_preds = []
+        for path in candidate_paths:
+            prob, pred, _ = _load_candidate_prob_pred(path)
+            candidate_probs.append(prob)
+            candidate_preds.append(pred)
+        row_count = int(labels.numel())
+        tensors_to_check = [base_prob, base_pred, *candidate_probs, *candidate_preds]
+        for tensor in tensors_to_check:
+            if int(tensor.shape[0]) != row_count:
+                raise ValueError(f"semantic_correction_gate row mismatch: expected {row_count}, got {int(tensor.shape[0])}.")
+
+        feature_family = str(getattr(args, "semantic_gate_feature_family", "probability") or "probability").lower()
+        node_attribute_features = None
+        node_attribute_metadata = None
+        if feature_family in {"node_attribute", "local_competence"}:
+            node_attribute_features, node_attribute_names, node_attribute_metadata = _build_semantic_gate_node_attribute_features(
+                data,
+                train_idx,
+                row_count,
+            )
+            node_attribute_metadata["feature_names"] = list(node_attribute_names)
+        elif feature_family == "probability":
+            pass
+        else:
+            raise ValueError(f"Unsupported semantic_gate_feature_family={feature_family!r}")
+        rewards, break_masks, base_correct = _semantic_gate_rewards(
+            labels,
+            base_pred,
+            candidate_preds,
+            float(getattr(args, "semantic_gate_break_weight", 2.0)),
+        )
+        local_competence_features = None
+        local_competence_metadata = None
+        descriptor_features = _build_semantic_gate_features(
+            base_prob,
+            base_pred,
+            candidate_probs,
+            candidate_preds,
+            node_attribute_features=node_attribute_features,
+        )
+        if feature_family == "local_competence":
+            local_competence_features, local_competence_metadata = _build_semantic_gate_local_competence_features(
+                descriptor_features,
+                train_idx,
+                labels,
+                base_pred,
+                candidate_preds,
+                rewards,
+                break_masks,
+                float(getattr(args, "semantic_gate_break_weight", 2.0)),
+                k=int(getattr(args, "semantic_gate_local_k", 25)),
+            )
+            local_competence_metadata["descriptor_feature_dim"] = int(descriptor_features.shape[-1])
+            local_competence_metadata["candidate_names"] = list(candidate_names)
+            local_competence_metadata["node_attribute_descriptor_enabled"] = node_attribute_features is not None
+        if feature_family == "local_competence" and node_attribute_metadata is not None:
+            node_attribute_metadata["usage"] = "descriptor_and_gate_input"
+        features = _build_semantic_gate_features(
+            base_prob,
+            base_pred,
+            candidate_probs,
+            candidate_preds,
+            node_attribute_features=node_attribute_features,
+            action_local_features=local_competence_features,
+        )
+        selection_policy = str(getattr(args, "semantic_gate_selection_policy", "threshold") or "threshold").lower()
+        safety_policy = str(getattr(args, "semantic_gate_safety_policy", "none") or "none").lower()
+        if selection_policy not in {"threshold", "defer_softmax"}:
+            raise ValueError(f"Unsupported semantic_gate_selection_policy={selection_policy!r}")
+        if safety_policy not in {"none", "break_first"}:
+            raise ValueError(f"Unsupported semantic_gate_safety_policy={safety_policy!r}")
+        if selection_policy != "defer_softmax" and safety_policy != "none":
+            raise ValueError("--semantic_gate_safety_policy break_first requires --semantic_gate_selection_policy defer_softmax.")
+        targets = (rewards > 0).float()
+        sample_weights = torch.ones_like(targets)
+        sample_weights[break_masks] = float(getattr(args, "semantic_gate_break_weight", 2.0))
+        train_features = features[train_idx].to(device)
+        epochs = max(int(getattr(args, "semantic_gate_epochs", 200)), 1)
+        losses = []
+        best_state = None
+        best_break_state = None
+        best_valid = None
+        action_logits = None
+        action_prob = None
+        break_logits = None
+        break_prob = None
+        break_model = None
+        break_threshold = None
+        defer_targets = None
+        if selection_policy == "threshold":
+            train_targets = targets[train_idx].to(device)
+            train_weights = sample_weights[train_idx].to(device)
+            model = _SemanticCorrectionGate(
+                in_channels=int(features.shape[-1]),
+                hidden_channels=int(getattr(args, "semantic_gate_hidden_dim", 64)),
+            ).to(device)
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=float(getattr(args, "semantic_gate_learning_rate", 1e-3)),
+                weight_decay=float(getattr(args, "semantic_gate_weight_decay", 1e-4)),
+            )
+            for epoch in range(epochs):
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+                logits_train = model(train_features)
+                loss_raw = F.binary_cross_entropy_with_logits(logits_train, train_targets, reduction="none")
+                loss = (loss_raw * train_weights).sum() / train_weights.sum().clamp_min(1.0)
+                loss.backward()
+                optimizer.step()
+                loss_value = float(loss.detach().cpu().item())
+                losses.append(loss_value)
+                run.log({"semantic_correction_gate_loss": loss_value, "semantic_correction_gate_epoch": epoch + 1})
+                if epoch == epochs - 1 or epoch % 10 == 0:
+                    model.eval()
+                    with torch.no_grad():
+                        gate_prob_epoch = torch.sigmoid(model(features.to(device))).cpu()
+                    threshold_row = _select_semantic_gate_threshold(labels, base_pred, candidate_preds, gate_prob_epoch, valid_idx)
+                    key = (int(threshold_row["net"]), float(threshold_row["macro_f1"]), -int(threshold_row["break"]))
+                    if best_valid is None or key > best_valid[0]:
+                        best_valid = (key, dict(threshold_row))
+                        best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+            if best_state is None:
+                raise RuntimeError("semantic_correction_gate failed to record a best state.")
+            model.load_state_dict(best_state)
+            model.eval()
+            with torch.no_grad():
+                gate_logits = model(features.to(device)).cpu()
+            gate_prob = torch.sigmoid(gate_logits)
+            threshold_row = _select_semantic_gate_threshold(labels, base_pred, candidate_preds, gate_prob, valid_idx)
+            threshold = float(threshold_row["threshold"])
+        else:
+            defer_targets = _semantic_defer_targets(rewards)
+            train_targets = defer_targets[train_idx].to(device)
+            train_weights = torch.ones_like(train_targets, dtype=torch.float32)
+            train_break_any = break_masks[train_idx].any(dim=1).to(device)
+            train_weights[train_break_any] = float(getattr(args, "semantic_gate_break_weight", 2.0))
+            model = _SemanticCorrectionDeferGate(
+                in_channels=int(features.shape[-1]),
+                hidden_channels=int(getattr(args, "semantic_gate_hidden_dim", 64)),
+            ).to(device)
+            if safety_policy == "break_first":
+                break_model = _SemanticBreakRiskHead(
+                    in_channels=int(features.shape[-1]),
+                    hidden_channels=int(getattr(args, "semantic_gate_hidden_dim", 64)),
+                ).to(device)
+                train_break_targets = break_masks[train_idx].float().to(device)
+                break_train_weights = torch.ones_like(train_break_targets)
+                break_train_weights[train_break_targets > 0] = float(getattr(args, "semantic_gate_break_weight", 2.0))
+                params = list(model.parameters()) + list(break_model.parameters())
+            else:
+                train_break_targets = None
+                break_train_weights = None
+                params = model.parameters()
+            optimizer = torch.optim.AdamW(
+                params,
+                lr=float(getattr(args, "semantic_gate_learning_rate", 1e-3)),
+                weight_decay=float(getattr(args, "semantic_gate_weight_decay", 1e-4)),
+            )
+            for epoch in range(epochs):
+                model.train()
+                if break_model is not None:
+                    break_model.train()
+                optimizer.zero_grad(set_to_none=True)
+                logits_train = model(train_features)
+                loss_raw = F.cross_entropy(logits_train, train_targets, reduction="none")
+                loss = (loss_raw * train_weights).sum() / train_weights.sum().clamp_min(1.0)
+                if break_model is not None:
+                    break_logits_train = break_model(train_features)
+                    break_loss_raw = F.binary_cross_entropy_with_logits(
+                        break_logits_train,
+                        train_break_targets,
+                        reduction="none",
+                    )
+                    break_loss = (break_loss_raw * break_train_weights).sum() / break_train_weights.sum().clamp_min(1.0)
+                    loss = loss + break_loss
+                loss.backward()
+                optimizer.step()
+                loss_value = float(loss.detach().cpu().item())
+                losses.append(loss_value)
+                run.log({"semantic_correction_gate_loss": loss_value, "semantic_correction_gate_epoch": epoch + 1})
+                if epoch == epochs - 1 or epoch % 10 == 0:
+                    model.eval()
+                    if break_model is not None:
+                        break_model.eval()
+                    with torch.no_grad():
+                        action_prob_epoch = F.softmax(model(features.to(device)), dim=1).cpu()
+                        break_prob_epoch = torch.sigmoid(break_model(features.to(device))).cpu() if break_model is not None else None
+                    threshold_row = _select_semantic_defer_policy(
+                        labels,
+                        base_pred,
+                        candidate_preds,
+                        action_prob_epoch,
+                        valid_idx,
+                        break_prob=break_prob_epoch,
+                        break_budget=float(getattr(args, "semantic_gate_break_budget", -1.0)),
+                    )
+                    key = (int(threshold_row["net"]), float(threshold_row["macro_f1"]), -int(threshold_row["break"]))
+                    if best_valid is None or key > best_valid[0]:
+                        best_valid = (key, dict(threshold_row))
+                        best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+                        if break_model is not None:
+                            best_break_state = {name: value.detach().cpu().clone() for name, value in break_model.state_dict().items()}
+            if best_state is None:
+                raise RuntimeError("semantic_correction_gate failed to record a best state.")
+            model.load_state_dict(best_state)
+            model.eval()
+            if break_model is not None:
+                break_model.load_state_dict(best_break_state)
+                break_model.eval()
+            with torch.no_grad():
+                action_logits = model(features.to(device)).cpu()
+                action_prob = F.softmax(action_logits, dim=1)
+                if break_model is not None:
+                    break_logits = break_model(features.to(device)).cpu()
+                    break_prob = torch.sigmoid(break_logits)
+            gate_logits = action_logits[:, 1:]
+            gate_prob = action_prob[:, 1:]
+            threshold_row = _select_semantic_defer_policy(
+                labels,
+                base_pred,
+                candidate_preds,
+                action_prob,
+                valid_idx,
+                break_prob=break_prob,
+                break_budget=float(getattr(args, "semantic_gate_break_budget", -1.0)),
+            )
+            threshold = float(threshold_row["accept_threshold"])
+            break_threshold = threshold_row.get("break_threshold")
+        final_pred = base_pred.clone()
+        selected_action = torch.full((row_count,), -1, dtype=torch.long)
+        selected_score = torch.zeros((row_count,), dtype=torch.float32)
+        for split_idx in (train_idx, valid_idx, test_idx):
+            if selection_policy == "threshold":
+                split_final, split_action, split_score = _semantic_gate_apply(
+                    base_pred,
+                    candidate_preds,
+                    gate_prob,
+                    split_idx,
+                    threshold,
+                )
+            else:
+                split_final, split_action, split_score = _semantic_defer_apply(
+                    base_pred,
+                    candidate_preds,
+                    action_prob,
+                    split_idx,
+                    threshold,
+                    break_prob=break_prob,
+                    break_threshold=break_threshold,
+                )
+            split_idx = _as_long_cpu_tensor(split_idx)
+            final_pred[split_idx] = split_final[split_idx]
+            selected_action[split_idx] = split_action[split_idx]
+            selected_score[split_idx] = split_score[split_idx]
+
+        metrics = {
+            "losses": losses,
+            "final_loss": losses[-1] if losses else None,
+            "validation_threshold": threshold_row,
+            "feature_family": feature_family,
+            "selection_policy": selection_policy,
+            "safety_policy": safety_policy,
+            "break_budget": float(getattr(args, "semantic_gate_break_budget", -1.0)),
+            "node_attribute_feature_dim": int(node_attribute_features.shape[1]) if node_attribute_features is not None else 0,
+            "local_competence_feature_dim": int(local_competence_features.shape[-1]) if local_competence_features is not None else 0,
+            "local_competence_metadata": local_competence_metadata,
+            "train": {
+                "base": _scores_for_indices(labels, base_pred, train_idx),
+                "gated": _scores_for_indices(labels, final_pred, train_idx),
+                "delta": _semantic_gate_delta(labels, base_pred, final_pred, train_idx),
+            },
+            "validation": {
+                "base": _scores_for_indices(labels, base_pred, valid_idx),
+                "gated": _scores_for_indices(labels, final_pred, valid_idx),
+                "delta": _semantic_gate_delta(labels, base_pred, final_pred, valid_idx),
+            },
+            "test": {
+                "base": _scores_for_indices(labels, base_pred, test_idx),
+                "gated": _scores_for_indices(labels, final_pred, test_idx),
+                "delta": _semantic_gate_delta(labels, base_pred, final_pred, test_idx),
+            },
+            "canonical_full_test": {
+                "base": _scores_for_indices(labels, base_pred, canonical_test_idx),
+                "gated": _scores_for_indices(labels, final_pred, canonical_test_idx),
+                "delta": _semantic_gate_delta(labels, base_pred, final_pred, canonical_test_idx),
+            },
+            "candidate_oracle": {},
+            "trainable_gate_params": int(
+                sum(param.numel() for param in model.parameters() if param.requires_grad)
+                + (sum(param.numel() for param in break_model.parameters() if param.requires_grad) if break_model is not None else 0)
+            ),
+            "cuda_max_memory_allocated": _max_cuda_memory_allocated(device),
+        }
+        for action_idx, name in enumerate(candidate_names):
+            cand_final = base_pred.clone()
+            cand_final[test_idx] = candidate_preds[action_idx][test_idx]
+            metrics["candidate_oracle"][name] = {
+                "test_candidate": _scores_for_indices(labels, candidate_preds[action_idx], test_idx),
+                "test_delta_if_always_take": _semantic_gate_delta(labels, base_pred, cand_final, test_idx),
+                "positive_utility_train": int((targets[train_idx, action_idx] > 0).sum().item()),
+                "positive_utility_valid": int((targets[valid_idx, action_idx] > 0).sum().item()),
+                "positive_utility_test": int((targets[test_idx, action_idx] > 0).sum().item()),
+            }
+        outputs = {
+            "gate_logits": gate_logits,
+            "gate_prob": gate_prob,
+            "action_logits": action_logits,
+            "action_prob": action_prob,
+            "break_logits": break_logits,
+            "break_prob": break_prob,
+            "final_pred": final_pred,
+            "base_pred": base_pred,
+            "labels": labels,
+            "selected_action": selected_action,
+            "selected_score": selected_score,
+            "candidate_names": list(candidate_names),
+            "candidate_preds": torch.stack(candidate_preds, dim=1),
+            "candidate_probs": torch.stack(candidate_probs, dim=1),
+            "targets": targets,
+            "defer_targets": defer_targets,
+            "rewards": rewards,
+            "node_attribute_features": node_attribute_features,
+            "local_competence_features": local_competence_features,
+        }
+        write_torch(stage_dir / "outputs.pt", outputs)
+        write_torch(
+            stage_dir / "checkpoint.pt",
+            {
+                "model": best_state,
+                "break_model": best_break_state,
+                "model_params": {
+                    "in_channels": int(features.shape[-1]),
+                    "hidden_channels": int(getattr(args, "semantic_gate_hidden_dim", 64)),
+                },
+                "threshold": threshold,
+                "break_threshold": break_threshold,
+                "candidate_names": list(candidate_names),
+                "feature_family": feature_family,
+                "selection_policy": selection_policy,
+                "safety_policy": safety_policy,
+                "node_attribute_metadata": node_attribute_metadata,
+                "local_competence_metadata": local_competence_metadata,
+            },
+        )
+        write_json(stage_dir / "metrics.json", metrics)
+        per_node_path = stage_dir / "per_node_test.jsonl"
+        with per_node_path.open("w", encoding="utf-8") as handle:
+            for node_idx in _as_long_cpu_tensor(test_idx).tolist():
+                action_idx = int(selected_action[node_idx].item())
+                row = {
+                    "node_id": int(node_idx),
+                    "label": int(labels[node_idx].item()),
+                    "base_pred": int(base_pred[node_idx].item()),
+                    "final_pred": int(final_pred[node_idx].item()),
+                    "selected_action": action_idx,
+                    "selected_action_name": "base" if action_idx < 0 else str(candidate_names[action_idx]),
+                    "selected_score": float(selected_score[node_idx].item()),
+                    "gate_probs": {
+                        str(candidate_names[i]): float(gate_prob[node_idx, i].item())
+                        for i in range(len(candidate_names))
+                    },
+                    "action_probs": (
+                        {
+                            "base": float(action_prob[node_idx, 0].item()),
+                            **{
+                                str(candidate_names[i]): float(action_prob[node_idx, i + 1].item())
+                                for i in range(len(candidate_names))
+                            },
+                        }
+                        if action_prob is not None
+                        else None
+                    ),
+                    "break_probs": (
+                        {
+                            str(candidate_names[i]): float(break_prob[node_idx, i].item())
+                            for i in range(len(candidate_names))
+                        }
+                        if break_prob is not None
+                        else None
+                    ),
+                    "base_correct": bool(base_pred[node_idx].item() == labels[node_idx].item()),
+                    "final_correct": bool(final_pred[node_idx].item() == labels[node_idx].item()),
+                    "changed": bool(base_pred[node_idx].item() != final_pred[node_idx].item()),
+                    "fix": bool(base_pred[node_idx].item() != labels[node_idx].item() and final_pred[node_idx].item() == labels[node_idx].item()),
+                    "break": bool(base_pred[node_idx].item() == labels[node_idx].item() and final_pred[node_idx].item() != labels[node_idx].item()),
+                }
+                if local_competence_features is not None and local_competence_metadata is not None:
+                    local_names = list(local_competence_metadata.get("feature_names", []))
+                    row["local_competence"] = {
+                        str(candidate_names[action_i]): {
+                            local_names[feature_i]: float(local_competence_features[node_idx, action_i, feature_i].item())
+                            for feature_i in range(len(local_names))
+                        }
+                        for action_i in range(len(candidate_names))
+                    }
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+        manifest.update(
+            {
+                "status": "completed",
+                "routed_nodes": routed_info,
+                "feature_dim": int(features.shape[-1]),
+                "candidate_count": int(len(candidate_names)),
+                "epochs": int(epochs),
+                "validation_threshold": threshold_row,
+                "feature_family": feature_family,
+                "selection_policy": selection_policy,
+                "safety_policy": safety_policy,
+                "break_budget": float(getattr(args, "semantic_gate_break_budget", -1.0)),
+                "node_attribute_metadata": node_attribute_metadata,
+                "local_competence_metadata": local_competence_metadata,
+                "outputs_path": str(stage_dir / "outputs.pt"),
+                "checkpoint_path": str(stage_dir / "checkpoint.pt"),
+                "metrics_path": str(stage_dir / "metrics.json"),
+                "per_node_test_path": str(per_node_path),
+            }
+        )
+        write_json(stage_dir / "manifest.json", manifest)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return {"stage": "semantic_correction_gate", "stage_dir": str(stage_dir), "metrics": metrics}
+    except Exception as exc:
+        manifest.update({"status": "failed", "error_type": type(exc).__name__, "error": str(exc)})
+        write_json(stage_dir / "manifest.json", manifest)
+        raise
 
 
 def run_semantic_embedding_classifier_seed(args, seed, data, experiment_root, run):
@@ -536,7 +2043,7 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
     stage_dir = build_preparation_dir(experiment_root, "semantic_encoder")
     code_provenance = capture_code_metadata(Path(__file__).resolve().parents[1])
     manifest = {
-        "contract": "semantic_finetune_v1",
+        "contract": "semantic_finetune_v2",
         "status": "started",
         "seed": int(seed),
         "canonical_task_name": "semantic_encoder_finetune",
@@ -574,6 +2081,7 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
             raise ValueError("semantic_finetune requires a non-empty train_idx.")
 
         lm_model = _semantic_backbone_to_lm_model(args)
+        supervision_mode = _resolve_semantic_supervision_mode(args, lm_model)
         model_config = {
             "lm_model": lm_model,
             "qwen_model_path": getattr(args, "qwen_model_path", None),
@@ -590,6 +2098,7 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
             "detach_embeddings": False,
         }
         model, tokenizer = build_LM_model(model_config)
+        answer_token_ids = None
         checkpoint_summary = None
         if lm_model == "roberta_finetuned":
             checkpoint_path = _resolve_finetuned_roberta_checkpoint(args, seed)
@@ -602,6 +2111,10 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
             checkpoint_summary["checkpoint_path"] = str(checkpoint_path)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        if supervision_mode == "answer_token":
+            answer_token_ids = _semantic_answer_token_sequences(tokenizer)
+            for param in model.classifier.parameters():
+                param.requires_grad = False
         model.to(device)
         model.train()
 
@@ -629,10 +2142,22 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
                 batch_idx = torch.cat([batch_idx, extra])
             texts = [user_text[int(idx)] for idx in batch_idx]
             y = labels[batch_idx].to(device)
-            tokenized = _semantic_tokenize(tokenizer, texts, max_length, device)
             optimizer.zero_grad(set_to_none=True)
-            _, logits = model(tokenized)
-            loss = F.cross_entropy(logits, y)
+            if supervision_mode == "answer_token":
+                train_batch = _build_answer_token_train_batch(
+                    tokenizer,
+                    texts,
+                    y.detach().cpu().tolist(),
+                    max_length=max_length,
+                    device=device,
+                    answer_token_ids=answer_token_ids,
+                )
+                out = model.LM(**train_batch, use_cache=False)
+                loss = out.loss
+            else:
+                tokenized = _semantic_tokenize(tokenizer, texts, max_length, device)
+                _, logits = model(tokenized)
+                loss = F.cross_entropy(logits, y)
             loss.backward()
             optimizer.step()
             loss_value = float(loss.detach().cpu().item())
@@ -647,8 +2172,18 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
             for start in range(0, int(eval_idx.numel()), batch_size):
                 batch_eval_idx = eval_idx[start : start + batch_size]
                 texts = [user_text[int(idx)] for idx in batch_eval_idx]
-                tokenized = _semantic_tokenize(tokenizer, texts, max_length, device)
-                batch_embeddings, batch_logits = model(tokenized)
+                if supervision_mode == "answer_token":
+                    batch_embeddings, batch_logits = _score_answer_token_candidates(
+                        model,
+                        tokenizer,
+                        texts,
+                        max_length=max_length,
+                        device=device,
+                        answer_token_ids=answer_token_ids,
+                    )
+                else:
+                    tokenized = _semantic_tokenize(tokenizer, texts, max_length, device)
+                    batch_embeddings, batch_logits = model(tokenized)
                 all_embeddings.append(batch_embeddings.cpu())
                 all_logits.append(batch_logits.cpu())
         eval_embeddings = torch.cat(all_embeddings, dim=0)
@@ -671,6 +2206,7 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
             "pred": pred,
             "labels": labels,
             "evaluated_node_ids": eval_idx,
+            "semantic_supervision_mode": supervision_mode,
         }
 
         write_torch(stage_dir / "embeddings.pt", embeddings)
@@ -692,6 +2228,7 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
             "test": _classification_metrics_from_logits(logits, labels, test_idx),
             "trainable_model_params": int(sum(param.numel() for param in model.LM.parameters() if param.requires_grad)),
             "trainable_classifier_params": int(sum(param.numel() for param in model.classifier.parameters() if param.requires_grad)),
+            "semantic_supervision_mode": supervision_mode,
             "cuda_max_memory_allocated": _max_cuda_memory_allocated(device),
         }
         write_json(stage_dir / "metrics.json", metrics)
@@ -699,6 +2236,12 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
             {
                 "status": "completed",
                 "lm_model": lm_model,
+                "semantic_supervision_mode": supervision_mode,
+                "prompt_answer_schema": "ASSISTANT_ANSWER: Yes|No",
+                "prompt_answer_slot": _SEMANTIC_ANSWER_SLOT,
+                "answer_prompt_contract": "prompt_must_end_at_final_assistant_answer_slot",
+                "answer_prompt_tokenization": "prompt_special_tokens_disabled_manual_yes_no_suffix",
+                "answer_token_mapping": _semantic_answer_token_mapping_manifest() if supervision_mode == "answer_token" else None,
                 "qwen_model_path": getattr(args, "qwen_model_path", None),
                 "qwen_trust_remote_code": bool(getattr(args, "qwen_trust_remote_code", False)),
                 "semantic_text_source": semantic_text_source,
@@ -711,6 +2254,7 @@ def run_semantic_finetune_seed(args, seed, data, experiment_root, run):
                 "embeddings_path": str(stage_dir / "embeddings.pt"),
                 "outputs_path": str(stage_dir / "outputs.pt"),
                 "classifier_path": str(stage_dir / "classifier.pt"),
+                "classifier_role": "trainable_head" if supervision_mode == "classifier" else "compatibility_artifact_unused_by_answer_token",
                 "metrics_path": str(stage_dir / "metrics.json"),
                 "finetuned_roberta_checkpoint_path": str((checkpoint_summary or {}).get("checkpoint_path", "")),
                 "finetuned_roberta_checkpoint_load": checkpoint_summary,

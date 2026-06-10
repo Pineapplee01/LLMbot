@@ -10,7 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 
 from LM import LM_Model
-from GNNs import BotRGCN, GATv2Bot, HGT, RGCN, RGT, SimpleHGN
+from GNNs import BotRGCN, GATv2Bot, HGT, RGCN, RGCNHyperScanDHGProxy, RGCNHyperScanNodeInputDHG, RGCNHyperScanNodeInputProxy, RGCNHyperScanProxy, RGT, SimpleHGN
 from estimators import build_estimator as _build_estimator
 from operators import build_repair_operator as _build_repair_operator
 from operators import build_semantic_operator as _build_semantic_operator
@@ -38,11 +38,173 @@ _EXTRA_TOKENS = ["@USER", "#HASHTAG", "HTTPURL", "EMOJI", "RT", "None"]
 _GNN_BUILDERS = {
     "botrgcn": BotRGCN,
     "rgcn": RGCN,
+    "rgcn_hyperscan": RGCNHyperScanProxy,
+    "rgcn_hyperscan_routed": RGCNHyperScanProxy,
+    "rgcn_hyperscan_dhg": RGCNHyperScanDHGProxy,
+    "rgcn_hyperscan_nodeinput": RGCNHyperScanNodeInputProxy,
+    "rgcn_hyperscan_dhg_nodeinput": RGCNHyperScanNodeInputDHG,
     "rgt": RGT,
     "simplehgn": SimpleHGN,
     "hgt": HGT,
     "gatv2": GATv2Bot,
 }
+
+_HYPERSCAN_BACKBONES = {
+    "rgcn_hyperscan",
+    "rgcn_hyperscan_routed",
+    "rgcn_hyperscan_dhg",
+    "rgcn_hyperscan_nodeinput",
+    "rgcn_hyperscan_dhg_nodeinput",
+}
+
+
+def _resolve_hyperscan_builder(model_name, model_config):
+    backend = str(model_config.get("graph_second_view_hypergraph_backend", "") or "").lower()
+    if not backend:
+        backend = "dhg" if model_name in {"rgcn_hyperscan_dhg", "rgcn_hyperscan_dhg_nodeinput"} else "pyg"
+    if backend not in {"pyg", "dhg"}:
+        raise ValueError("--graph_second_view_hypergraph_backend must be one of {pyg, dhg}.")
+
+    node_input_family = str(model_config.get("node_input_family", "") or "").lower()
+    if not node_input_family and model_name in {"rgcn_hyperscan_nodeinput", "rgcn_hyperscan_dhg_nodeinput"}:
+        node_input_family = "hyperscan_meta_tweet_proxy"
+
+    uses_node_input = node_input_family == "hyperscan_meta_tweet_proxy"
+    if backend == "dhg":
+        return RGCNHyperScanNodeInputDHG if uses_node_input else RGCNHyperScanDHGProxy
+    return RGCNHyperScanNodeInputProxy if uses_node_input else RGCNHyperScanProxy
+
+
+def _none_like_text(value):
+    text = str(value or "").strip().lower()
+    return text in {"", "none", "null", "nan", "n/a", "na", "unknown"}
+
+
+def _safe_float_feature(value):
+    text = str(value or "").strip()
+    if _none_like_text(text):
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def _parse_bool_feature(value):
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return 1.0
+    if text in {"0", "false", "f", "no", "n"}:
+        return 0.0
+    return 0.0
+
+
+def _split_norm_user_text(text):
+    text = str(text or "")
+    meta_anchor = "METADATA:"
+    desc_anchor = "DESCRIPTION:"
+    tweet_anchor = "TWEET:"
+    meta_idx = text.find(meta_anchor)
+    desc_idx = text.find(desc_anchor)
+    tweet_idx = text.find(tweet_anchor)
+    metadata = ""
+    description = ""
+    tweets = ""
+    if meta_idx >= 0:
+        meta_start = meta_idx + len(meta_anchor)
+        meta_end = desc_idx if desc_idx >= 0 else (tweet_idx if tweet_idx >= 0 else len(text))
+        metadata = text[meta_start:meta_end].strip()
+    if desc_idx >= 0:
+        desc_start = desc_idx + len(desc_anchor)
+        desc_end = tweet_idx if tweet_idx >= 0 else len(text)
+        description = text[desc_start:desc_end].strip()
+    if tweet_idx >= 0:
+        tweets = text[tweet_idx + len(tweet_anchor) :].strip()
+    metadata_fields = [item.strip() for item in metadata.split("</s>")]
+    while len(metadata_fields) < 10:
+        metadata_fields.append("")
+    tweet_items = [item.strip() for item in tweets.split("</s>") if item.strip()]
+    return metadata_fields, description, tweet_items
+
+
+def _build_hyperscan_meta_tweet_proxy_bundle(args, data, tweet_embedding_path):
+    graph_variant = str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower()
+    if graph_variant != "labeled":
+        raise ValueError(
+            "--graph_node_input_family hyperscan_meta_tweet_proxy currently requires "
+            "--graph_data_variant labeled."
+        )
+    if not data.get("user_text_loaded", False):
+        raise ValueError(
+            "--graph_node_input_family hyperscan_meta_tweet_proxy requires labeled user_text "
+            "to be loaded from norm_user_text.json."
+        )
+
+    tweet_tensor = _load_tensor_features(tweet_embedding_path)
+    user_text = list(data.get("user_text") or [])
+    row_count = int(tweet_tensor.shape[0])
+    if len(user_text) < row_count:
+        raise ValueError(
+            "hyperscan_meta_tweet_proxy requires user_text rows to cover the labeled graph: "
+            f"{len(user_text)} vs {row_count}."
+        )
+
+    num_prop = torch.zeros((row_count, 5), dtype=torch.float32)
+    cat_prop = torch.zeros((row_count, 3), dtype=torch.float32)
+    for node_idx in range(row_count):
+        fields, description, tweet_items = _split_norm_user_text(user_text[node_idx])
+        protected = _parse_bool_feature(fields[3])
+        followers = _safe_float_feature(fields[4])
+        following = _safe_float_feature(fields[5])
+        listed = _safe_float_feature(fields[6])
+        statuses = _safe_float_feature(fields[7])
+        verified = _parse_bool_feature(fields[9])
+        tweet_count = float(max(len(tweet_items), 0))
+        bio_present = 0.0 if _none_like_text(description) else 1.0
+        num_prop[node_idx] = torch.tensor(
+            [
+                float(np.log1p(max(followers, 0.0))),
+                float(np.log1p(max(following, 0.0))),
+                float(np.log1p(max(listed, 0.0))),
+                float(np.log1p(max(statuses, 0.0))),
+                float(np.log1p(max(tweet_count, 0.0))),
+            ],
+            dtype=torch.float32,
+        )
+        cat_prop[node_idx] = torch.tensor([protected, verified, bio_present], dtype=torch.float32)
+
+    raw_features = torch.cat([tweet_tensor, num_prop, cat_prop], dim=1).contiguous()
+    feature_manifest = {
+        "source": "hyperscan_meta_tweet_proxy",
+        "path": str(tweet_embedding_path),
+        "tweet_embedding_path": str(tweet_embedding_path),
+        "graph_data_variant": graph_variant,
+        "node_input_family": "hyperscan_meta_tweet_proxy",
+        "projection_applied": False,
+        "projector": "node_input_proxy",
+        "fit_scope": "labeled_nodes_only",
+        "raw_dim": int(raw_features.shape[1]),
+        "projected_dim": int(raw_features.shape[1]),
+        "raw_sha256": tensor_sha256(raw_features),
+        "projected_sha256": tensor_sha256(raw_features),
+        "sha256": tensor_sha256(raw_features),
+        "projection_time_seconds": 0.0,
+        "tweet_dim": int(tweet_tensor.shape[1]),
+        "num_prop_dim": int(num_prop.shape[1]),
+        "cat_prop_dim": int(cat_prop.shape[1]),
+        "peft": {
+            "enabled": bool(getattr(args, "peft", False)),
+            "rank": int(getattr(args, "peft_rank", 8)),
+            "alpha": float(getattr(args, "peft_alpha", 16.0)),
+            "trainable_parameter_count": 0,
+        },
+    }
+    return {
+        "features": raw_features,
+        "raw_features": raw_features,
+        "feature_manifest": feature_manifest,
+        "projector_state": {"projector": "node_input_proxy"},
+    }
 
 
 def _hf_cache_root():
@@ -176,6 +338,18 @@ _MODE_METADATA = {
         "lm_gnn_disagreement_used": False,
         "input_boundary": "gnn_posterior_optional_gnn_or_simteg_embedding_original_graph_only",
         "snaps_reference": "row-normalized k-hop aggregation; no LM-GNN disagreement in main path",
+    },
+    "conformal_knn_risk_router": {
+        "claim_role": "stage2_target_node_conformal_knn_risk_selector",
+        "stage2_role": "posthoc_calibrated_target_knn_ranker",
+        "canonical_stage2": False,
+        "scientific_gate": "posterior_calibration_then_target_node_ncp_weighted_knn_similarity_risk_aggregation",
+        "paper_identity": "Target-node NCP-style Conformal-KNN Risk Router",
+        "paper_identity_risk": "medium_combination_innovation_if_used_for_llm_anchor_selection",
+        "promotion_rule": "candidate_after_target_knn_risk_ablation",
+        "prediction_set_estimator": True,
+        "diagnosis_or_action": False,
+        "input_boundary": "frozen_gnn_posterior_plus_target_node_ncp_weighted_knn_support_risk",
     },
     "login_uncertainty_router": {
         "claim_role": "stage_b_login_official_uncertainty_router",
@@ -560,6 +734,7 @@ def _project_semantic_features(features, args):
 def resolve_g0_feature_bundle(args, data):
     feature_path = getattr(args, "emb_path", None) or getattr(args, "g0_feature_path", None)
     graph_data_variant = str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower()
+    node_input_family = str(getattr(args, "graph_node_input_family", "semantic_embedding") or "semantic_embedding").lower()
     if feature_path:
         feature_path = Path(feature_path)
     else:
@@ -578,6 +753,14 @@ def resolve_g0_feature_bundle(args, data):
         raise ValueError(
             "full_graph_support requires --embedding_path to point to the labeled RoBERTa embedding tensor."
         )
+
+    if node_input_family == "hyperscan_meta_tweet_proxy":
+        if feature_path is None:
+            raise ValueError(
+                "--graph_node_input_family hyperscan_meta_tweet_proxy requires --embedding_path "
+                "or a resolvable labeled tweet embedding tensor."
+            )
+        return _build_hyperscan_meta_tweet_proxy_bundle(args, data, feature_path)
 
     if feature_path is None:
         features, manifest = _fallback_structural_node_features(data)
@@ -662,7 +845,7 @@ def build_LM_model(model_config):
 
 def build_GNN_model(model_config):
     model_name = model_config["GNN_model"].lower()
-    builder = _GNN_BUILDERS.get(model_name)
+    builder = _resolve_hyperscan_builder(model_name, model_config) if model_name in _HYPERSCAN_BACKBONES else _GNN_BUILDERS.get(model_name)
     if builder is None:
         raise ValueError(f"Unknown GNN model '{model_name}'")
 

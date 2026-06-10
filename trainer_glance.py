@@ -954,6 +954,9 @@ class PromptExpertBundleRefinerMLP(nn.Module):
     CORRECTION_MOE_DIAGNOSTIC_TENSOR_NAMES = _CORRECTION_MOE_DIAGNOSTIC_TENSOR_NAMES
     DEFAULT_MPE_COMPONENT = "tweet"
     RAW_CONCAT_COMPONENTS = {
+        "raw_concat_ego_following": ("ego", "graph_following"),
+        "raw_concat_ego_follower": ("ego", "graph_follower"),
+        "raw_concat_ego_following_follower": ("ego", "graph_following", "graph_follower"),
         "raw_concat_single_graph_following": ("graph_following",),
         "raw_concat_single_graph_follower": ("graph_follower",),
         "raw_concat_single_tweet": ("tweet",),

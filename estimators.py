@@ -2038,6 +2038,447 @@ def _relation_aware_scalar_risk_features(
     }
 
 
+def _knn_candidate_rows(edge_index, num_nodes, labeled_count, candidate_scope):
+    scope = str(candidate_scope or "labeled_full").strip().lower()
+    labeled_limit = max(0, min(int(num_nodes), int(labeled_count)))
+    if scope == "labeled_full":
+        return None
+    if scope not in {"labeled_relation_1hop", "undirected_relation_1hop"}:
+        raise ValueError(
+            "--conformal_knn_candidate_scope must be one of "
+            "{labeled_full, hyperscan_full, labeled_relation_1hop, undirected_relation_1hop}."
+        )
+    if edge_index is None:
+        return [[] for _ in range(int(num_nodes))]
+    edge_np = _to_numpy(edge_index).astype(np.int64)
+    if edge_np.ndim != 2 or edge_np.shape[0] != 2:
+        raise ValueError("conformal_knn_risk_router expects edge_index shaped [2, num_edges].")
+    rows = [set() for _ in range(int(num_nodes))]
+    src, dst = edge_np
+    valid = (src >= 0) & (src < int(num_nodes)) & (dst >= 0) & (dst < int(num_nodes))
+    for u_raw, v_raw in zip(src[valid].tolist(), dst[valid].tolist()):
+        u = int(u_raw)
+        v = int(v_raw)
+        if u == v:
+            continue
+        if scope == "labeled_relation_1hop":
+            if v < labeled_limit:
+                rows[u].add(v)
+            if u < labeled_limit:
+                rows[v].add(u)
+        else:
+            rows[u].add(v)
+            rows[v].add(u)
+    return [sorted(item) for item in rows]
+
+
+def _weighted_quantile(values, weights, quantile):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if values.size == 0 or weights.size != values.size:
+        return 0.0
+    weights = np.clip(weights, 0.0, None)
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0.0:
+        return float(np.quantile(values, float(quantile)))
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    sorted_weights = weights[order]
+    cumulative = np.cumsum(sorted_weights) / weight_sum
+    index = int(np.searchsorted(cumulative, float(quantile), side="left"))
+    index = min(max(index, 0), int(sorted_values.size) - 1)
+    return float(sorted_values[index])
+
+
+def _conformal_knn_scalar_risk_features(
+    base_risk,
+    edge_index=None,
+    edge_type=None,
+    node_repr=None,
+    *,
+    posterior=None,
+    labeled_count=None,
+    knn_k=8,
+    candidate_scope="labeled_full",
+    shrinkage_tau=3.0,
+    ncp_lambda=1.0,
+):
+    del edge_type
+    risk = np.asarray(base_risk, dtype=np.float32).reshape(-1)
+    num_nodes = int(risk.shape[0])
+    zero = np.zeros(num_nodes, dtype=np.float32)
+    if node_repr is None or num_nodes == 0:
+        return {
+            "knn_mean_risk": risk.copy(),
+            "knn_max_risk": risk.copy(),
+            "knn_risk_std": zero.copy(),
+            "knn_prediction_disagreement": zero.copy(),
+            "knn_high_risk_mass": zero.copy(),
+            "knn_safe_support_mass": zero.copy(),
+            "knn_similarity_mean": zero.copy(),
+            "knn_similarity_min": zero.copy(),
+            "knn_similarity_gap": zero.copy(),
+            "knn_effective_neighbor_count": zero.copy(),
+            "knn_support_neighbor_count": zero.copy(),
+            "knn_hyperedge_member_count": zero.copy(),
+            "ncp_weighted_mean_risk": risk.copy(),
+            "ncp_shrunk_weighted_mean_risk": risk.copy(),
+            "ncp_weighted_risk_std": zero.copy(),
+            "ncp_weighted_risk_q80": risk.copy(),
+            "ncp_weighted_prediction_disagreement": zero.copy(),
+            "ncp_weighted_high_risk_mass": zero.copy(),
+            "ncp_weighted_safe_support_mass": zero.copy(),
+            "ncp_effective_sample_size": zero.copy(),
+            "ncp_weight_sum": zero.copy(),
+            "ncp_weight_max": zero.copy(),
+            "knn_has_candidates": zero.copy(),
+        }
+
+    repr_np = _to_numpy(node_repr).astype(np.float32)
+    if repr_np.ndim != 2 or repr_np.shape[0] != num_nodes:
+        raise ValueError(
+            "conformal_knn_risk_router expects node_repr shaped [num_nodes, hidden_dim] "
+            "and aligned with the graph-wide node count."
+        )
+    repr_np = np.nan_to_num(repr_np, nan=0.0, posinf=0.0, neginf=0.0)
+    norm = np.linalg.norm(repr_np, axis=1, keepdims=True)
+    repr_np = repr_np / np.clip(norm, 1e-12, None)
+
+    labeled_limit = int(labeled_count) if labeled_count is not None else num_nodes
+    labeled_limit = max(0, min(num_nodes, labeled_limit))
+    center_limit = labeled_limit if labeled_count is not None else num_nodes
+    center_limit = max(0, min(num_nodes, int(center_limit)))
+    k = max(int(knn_k), 1)
+    scope = str(candidate_scope or "labeled_full").strip().lower()
+    posterior_np = np.asarray(posterior, dtype=np.float32) if posterior is not None else None
+    preds = posterior_np.argmax(axis=1).astype(np.int64) if posterior_np is not None and posterior_np.ndim == 2 else None
+
+    mean_risk = risk.copy().astype(np.float64)
+    max_risk = risk.copy().astype(np.float64)
+    std_risk = np.zeros(num_nodes, dtype=np.float64)
+    pred_disagreement = np.zeros(num_nodes, dtype=np.float64)
+    high_risk_mass = np.zeros(num_nodes, dtype=np.float64)
+    safe_support_mass = np.zeros(num_nodes, dtype=np.float64)
+    similarity_mean = np.zeros(num_nodes, dtype=np.float64)
+    similarity_min = np.zeros(num_nodes, dtype=np.float64)
+    neighbor_count = np.zeros(num_nodes, dtype=np.float64)
+    support_neighbor_count = np.zeros(num_nodes, dtype=np.float64)
+    hyperedge_member_count = np.zeros(num_nodes, dtype=np.float64)
+    ncp_weighted_mean_risk = risk.copy().astype(np.float64)
+    ncp_shrunk_weighted_mean_risk = risk.copy().astype(np.float64)
+    ncp_weighted_risk_std = np.zeros(num_nodes, dtype=np.float64)
+    ncp_weighted_risk_q80 = risk.copy().astype(np.float64)
+    ncp_weighted_prediction_disagreement = np.zeros(num_nodes, dtype=np.float64)
+    ncp_weighted_high_risk_mass = np.zeros(num_nodes, dtype=np.float64)
+    ncp_weighted_safe_support_mass = np.zeros(num_nodes, dtype=np.float64)
+    ncp_effective_sample_size = np.zeros(num_nodes, dtype=np.float64)
+    ncp_weight_sum = np.zeros(num_nodes, dtype=np.float64)
+    ncp_weight_max = np.zeros(num_nodes, dtype=np.float64)
+
+    high_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.80)) if labeled_limit else 1.0
+    low_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.35)) if labeled_limit else 0.0
+    ncp_lambda_value = max(float(ncp_lambda), 1e-6)
+
+    def _torch_exact_feature_topk(query_repr, candidate_repr, query_k):
+        if query_repr.shape[0] == 0 or candidate_repr.shape[0] == 0 or query_k <= 0:
+            return (
+                np.empty((int(query_repr.shape[0]), 0), dtype=np.int64),
+                np.empty((int(query_repr.shape[0]), 0), dtype=np.float32),
+                "torch_exact_empty_hyperscan_full",
+            )
+        use_cuda = bool(torch.cuda.is_available())
+        device = torch.device("cuda" if use_cuda else "cpu")
+        batch_size = 512 if use_cuda else 64
+        candidate_t = torch.from_numpy(candidate_repr.astype(np.float32, copy=False)).to(device=device)
+        neighbor_chunks = []
+        similarity_chunks = []
+        with torch.no_grad():
+            for start in range(0, int(query_repr.shape[0]), batch_size):
+                end = min(start + batch_size, int(query_repr.shape[0]))
+                query_t = torch.from_numpy(query_repr[start:end].astype(np.float32, copy=False)).to(device=device)
+                scores = query_t @ candidate_t.t()
+                values, indices = torch.topk(scores, k=int(query_k), largest=True, dim=1)
+                neighbor_chunks.append(indices.cpu().numpy().astype(np.int64, copy=False))
+                similarity_chunks.append(values.clamp(-1.0, 1.0).cpu().numpy().astype(np.float32, copy=False))
+                del query_t, scores, values, indices
+        if use_cuda:
+            torch.cuda.empty_cache()
+        return (
+            np.concatenate(neighbor_chunks, axis=0),
+            np.concatenate(similarity_chunks, axis=0),
+            "torch_exact_cuda_hyperscan_full" if use_cuda else "torch_exact_cpu_hyperscan_full",
+        )
+
+    if scope in {"labeled_full", "hyperscan_full"}:
+        candidate_limit = num_nodes if scope == "hyperscan_full" else labeled_limit
+        if candidate_limit == 0:
+            backend = "empty_labeled_candidate_pool"
+            candidate_rows = []
+            neighbors = np.empty((num_nodes, 0), dtype=np.int64)
+            similarities = np.empty((num_nodes, 0), dtype=np.float32)
+        else:
+            query_repr = repr_np[:center_limit]
+            query_k = min(k, candidate_limit) if scope == "hyperscan_full" else min(k + 1, candidate_limit)
+            if scope == "hyperscan_full":
+                neighbors, similarities, backend = _torch_exact_feature_topk(
+                    query_repr,
+                    repr_np[:candidate_limit],
+                    query_k,
+                )
+            else:
+                try:
+                    from scipy.spatial import cKDTree
+
+                    tree = cKDTree(repr_np[:candidate_limit])
+                    distances, neighbors = tree.query(query_repr, k=query_k)
+                    backend = "scipy_ckdtree_labeled_full"
+                except Exception as exc:
+                    if candidate_limit > 4096 or num_nodes > 4096:
+                        raise RuntimeError(
+                            "conformal_knn_risk_router requires SciPy cKDTree for labeled_full KNN "
+                            "on graphs larger than 4096 nodes."
+                        ) from exc
+                    distance = torch.cdist(torch.from_numpy(query_repr), torch.from_numpy(repr_np[:candidate_limit]), p=2)
+                    topk = torch.topk(distance, k=query_k, largest=False, dim=1)
+                    distances = topk.values.numpy()
+                    neighbors = topk.indices.numpy()
+                    backend = "torch_cdist_labeled_full"
+                neighbors = np.asarray(neighbors, dtype=np.int64)
+                distances = np.asarray(distances, dtype=np.float32)
+                if neighbors.ndim == 1:
+                    neighbors = neighbors.reshape(-1, 1)
+                    distances = distances.reshape(-1, 1)
+                similarities = np.clip(1.0 - 0.5 * (distances.astype(np.float64) ** 2), -1.0, 1.0).astype(np.float32)
+            candidate_rows = None
+    else:
+        backend = "relation_local_cosine_topk"
+        candidate_rows = _knn_candidate_rows(edge_index, num_nodes, labeled_limit, scope)
+        neighbors = None
+        similarities = None
+
+    def _apply_selected(center, selected, sims, member_count=None):
+        support_count = float(selected.size)
+        support_neighbor_count[center] = support_count
+        hyperedge_member_count[center] = float(member_count) if member_count is not None else support_count
+        if selected.size == 0:
+            return
+        values = risk[selected].astype(np.float64)
+        count = support_count
+        shrink = count / (count + float(shrinkage_tau))
+        local_mean = float(values.mean())
+        mean_risk[center] = shrink * local_mean + (1.0 - shrink) * float(risk[center])
+        max_risk[center] = float(values.max())
+        std_risk[center] = float(values.std())
+        high_risk_mass[center] = float((values >= high_threshold).mean())
+        safe_support_mass[center] = float((values <= low_threshold).mean())
+        similarity_mean[center] = float(np.mean(sims)) if sims.size else 0.0
+        similarity_min[center] = float(np.min(sims)) if sims.size else 0.0
+        neighbor_count[center] = count
+        if sims.size:
+            # Official NCP uses exp(-distance / lambda_L) over the KNN support.
+            clipped_sims = np.clip(sims.astype(np.float64), -1.0, 1.0)
+            distances = np.sqrt(np.clip(2.0 - 2.0 * clipped_sims, 0.0, None))
+            weights = np.exp(-distances / ncp_lambda_value)
+        else:
+            weights = np.ones_like(values, dtype=np.float64)
+        weights = np.clip(weights.astype(np.float64), 0.0, None)
+        weight_sum = float(weights.sum())
+        if weight_sum > 0.0:
+            normalized_weights = weights / weight_sum
+            weighted_mean = float(np.sum(normalized_weights * values))
+            ncp_weighted_mean_risk[center] = weighted_mean
+            ncp_shrunk_weighted_mean_risk[center] = shrink * weighted_mean + (1.0 - shrink) * float(risk[center])
+            ncp_weighted_risk_std[center] = float(np.sqrt(np.sum(normalized_weights * ((values - weighted_mean) ** 2))))
+            ncp_weighted_risk_q80[center] = _weighted_quantile(values, normalized_weights, 0.80)
+            ncp_weighted_high_risk_mass[center] = float(np.sum(normalized_weights[values >= high_threshold]))
+            ncp_weighted_safe_support_mass[center] = float(np.sum(normalized_weights[values <= low_threshold]))
+            ncp_effective_sample_size[center] = float((weight_sum ** 2) / max(float(np.sum(weights ** 2)), 1e-12))
+            ncp_weight_sum[center] = weight_sum
+            ncp_weight_max[center] = float(weights.max()) if weights.size else 0.0
+        if preds is not None:
+            pred_disagreement[center] = float((preds[selected] != preds[center]).mean())
+            if selected.size and ncp_weight_sum[center] > 0.0:
+                mismatch = (preds[selected] != preds[center]).astype(np.float64)
+                ncp_weighted_prediction_disagreement[center] = float(np.sum((weights / weight_sum) * mismatch))
+
+    if scope in {"labeled_full", "hyperscan_full"}:
+        candidate_limit = num_nodes if scope == "hyperscan_full" else labeled_limit
+        for center in range(center_limit):
+            row = neighbors[center] if neighbors is not None else np.asarray([], dtype=np.int64)
+            sim_row = similarities[center] if similarities is not None else np.asarray([], dtype=np.float32)
+            valid = (row >= 0) & (row < candidate_limit)
+            row_valid = row[valid].astype(np.int64)
+            sim_valid = sim_row[valid].astype(np.float32)
+            if scope == "hyperscan_full":
+                # DHG from_feature_kNN builds a k-member group for each center.
+                # If duplicate features make the backend omit the center from
+                # the returned top-k row, reserve one slot for the center rather
+                # than growing the hyperedge to k + 1.
+                has_center = bool(np.any(row_valid == int(center)))
+                support_budget = max(int(k) - 1, 0) if not has_center else int(row_valid.size)
+                keep = row_valid != int(center)
+                selected = row_valid[keep][:support_budget]
+                sims = sim_valid[keep][:support_budget]
+                member_count = min(int(k), int(selected.size) + 1)
+                _apply_selected(center, selected.astype(np.int64), sims.astype(np.float32), member_count=member_count)
+            else:
+                keep = (row_valid != int(center))
+                selected = row_valid[keep][:k]
+                sims = sim_valid[keep][:k]
+                _apply_selected(center, selected.astype(np.int64), sims.astype(np.float32))
+    else:
+        for center, row in enumerate(candidate_rows[:center_limit]):
+            if not row:
+                continue
+            candidate_arr = np.asarray([int(item) for item in row if int(item) != int(center)], dtype=np.int64)
+            if candidate_arr.size == 0:
+                continue
+            sims = repr_np[candidate_arr] @ repr_np[int(center)]
+            topk = min(k, int(candidate_arr.size))
+            if topk == int(candidate_arr.size):
+                order = np.argsort(-sims, kind="stable")
+            else:
+                partial = np.argpartition(-sims, topk - 1)[:topk]
+                order = partial[np.argsort(-sims[partial], kind="stable")]
+            _apply_selected(center, candidate_arr[order], sims[order].astype(np.float32))
+
+    has_candidates = (neighbor_count > 0).astype(np.float32)
+    similarity_gap = (1.0 - np.clip(similarity_mean, -1.0, 1.0)).astype(np.float32)
+    features = {
+        "knn_mean_risk": np.clip(mean_risk, 0.0, 1.0).astype(np.float32),
+        "knn_max_risk": np.clip(max_risk, 0.0, 1.0).astype(np.float32),
+        "knn_risk_std": std_risk.astype(np.float32),
+        "knn_prediction_disagreement": pred_disagreement.astype(np.float32),
+        "knn_high_risk_mass": high_risk_mass.astype(np.float32),
+        "knn_safe_support_mass": safe_support_mass.astype(np.float32),
+        "knn_similarity_mean": similarity_mean.astype(np.float32),
+        "knn_similarity_min": similarity_min.astype(np.float32),
+        "knn_similarity_gap": similarity_gap,
+        "knn_effective_neighbor_count": neighbor_count.astype(np.float32),
+        "knn_support_neighbor_count": support_neighbor_count.astype(np.float32),
+        "knn_hyperedge_member_count": hyperedge_member_count.astype(np.float32),
+        "ncp_weighted_mean_risk": np.clip(ncp_weighted_mean_risk, 0.0, 1.0).astype(np.float32),
+        "ncp_shrunk_weighted_mean_risk": np.clip(ncp_shrunk_weighted_mean_risk, 0.0, 1.0).astype(np.float32),
+        "ncp_weighted_risk_std": ncp_weighted_risk_std.astype(np.float32),
+        "ncp_weighted_risk_q80": np.clip(ncp_weighted_risk_q80, 0.0, 1.0).astype(np.float32),
+        "ncp_weighted_prediction_disagreement": ncp_weighted_prediction_disagreement.astype(np.float32),
+        "ncp_weighted_high_risk_mass": ncp_weighted_high_risk_mass.astype(np.float32),
+        "ncp_weighted_safe_support_mass": ncp_weighted_safe_support_mass.astype(np.float32),
+        "ncp_effective_sample_size": ncp_effective_sample_size.astype(np.float32),
+        "ncp_weight_sum": ncp_weight_sum.astype(np.float32),
+        "ncp_weight_max": ncp_weight_max.astype(np.float32),
+        "knn_has_candidates": has_candidates,
+    }
+    features["_metadata"] = {
+        "knn_k": int(k),
+        "candidate_scope": scope,
+        "center_scope": "labeled_graph_only" if labeled_count is not None else "all_nodes",
+        "target_risk_contract": "target_node_to_knn_support_group_risk_v1",
+        "backend": backend,
+        "labeled_candidate_count": int(labeled_limit),
+        "hyperscan_candidate_count": int(num_nodes if scope == "hyperscan_full" else labeled_limit),
+        "hyperscan_k_includes_center": bool(scope == "hyperscan_full"),
+        "knn_center_count": int(center_limit),
+        "mean_effective_neighbor_count": float(neighbor_count.mean()) if neighbor_count.size else 0.0,
+        "mean_effective_neighbor_count_on_centers": float(neighbor_count[:center_limit].mean()) if center_limit else 0.0,
+        "nodes_with_knn_candidates": int(has_candidates.sum()),
+        "support_centers_skipped": int(max(num_nodes - center_limit, 0)),
+        "ncp_weighting_function": "exp(-euclidean_distance/lambda_L)",
+        "ncp_lambda": float(ncp_lambda_value),
+        "ncp_official_code_reference": "1995subhankar1995/NCP CP/Classification.py HypertuningBothLamdas/TestProcedure",
+        "mean_ncp_effective_sample_size_on_centers": float(ncp_effective_sample_size[:center_limit].mean()) if center_limit else 0.0,
+    }
+    return features
+
+
+def _split_selected_nodes_from_risk(risk_score, train_idx, val_idx, test_idx, budgets):
+    risk_score = np.asarray(risk_score, dtype=np.float32).reshape(-1)
+
+    def _top_for(idx, budget):
+        idx_np = _valid_index_array(idx, risk_score.shape[0])
+        if idx_np.size == 0:
+            return []
+        count = max(int(idx_np.size * float(budget)), 1)
+        order = idx_np[np.argsort(-risk_score[idx_np], kind="mergesort")]
+        return [int(item) for item in order[:count].tolist()]
+
+    payload = {}
+    for budget in parse_budget_list(budgets, default=RESIDUAL_RISK_PAPER_BUDGETS):
+        key = f"budget_{int(round(float(budget) * 1000)):03d}"
+        train_nodes = _top_for(train_idx, budget)
+        valid_nodes = _top_for(val_idx, budget)
+        test_nodes = _top_for(test_idx, budget)
+        seen = set()
+        all_nodes = []
+        for item in train_nodes + valid_nodes + test_nodes:
+            if int(item) in seen:
+                continue
+            seen.add(int(item))
+            all_nodes.append(int(item))
+        payload[key] = {
+            "budget": float(budget),
+            "train": train_nodes,
+            "valid": valid_nodes,
+            "test": test_nodes,
+            "all": all_nodes,
+            "split_counts": {
+                "train": int(len(train_nodes)),
+                "valid": int(len(valid_nodes)),
+                "test": int(len(test_nodes)),
+                "all": int(len(all_nodes)),
+            },
+        }
+    return payload
+
+
+def _top_target_rows(risk_score, split_idx, top_n, *, preds=None, pred_label_score=None, base_risk=None, local_features=None):
+    risk_score = np.asarray(risk_score, dtype=np.float32).reshape(-1)
+    idx_np = _valid_index_array(split_idx, risk_score.shape[0])
+    if idx_np.size == 0 or int(top_n) <= 0:
+        return []
+    order = idx_np[np.argsort(-risk_score[idx_np], kind="mergesort")][: int(top_n)]
+    preds_np = np.asarray(preds).reshape(-1) if preds is not None else None
+    pred_score_np = np.asarray(pred_label_score, dtype=np.float32).reshape(-1) if pred_label_score is not None else None
+    base_risk_np = np.asarray(base_risk, dtype=np.float32).reshape(-1) if base_risk is not None else None
+    local_features = dict(local_features or {})
+    rows = []
+    for rank, node_id in enumerate(order.tolist(), start=1):
+        row = {
+            "rank": int(rank),
+            "node_id": int(node_id),
+            "risk_score": float(risk_score[int(node_id)]),
+        }
+        if preds_np is not None and int(node_id) < preds_np.shape[0]:
+            row["prediction"] = int(preds_np[int(node_id)])
+        if pred_score_np is not None and int(node_id) < pred_score_np.shape[0]:
+            row["pred_label_score"] = float(pred_score_np[int(node_id)])
+        if base_risk_np is not None and int(node_id) < base_risk_np.shape[0]:
+            row["base_abstain_risk"] = float(base_risk_np[int(node_id)])
+        for name in (
+            "knn_mean_risk",
+            "knn_prediction_disagreement",
+            "knn_high_risk_mass",
+            "knn_safe_support_mass",
+            "knn_similarity_mean",
+            "knn_effective_neighbor_count",
+            "knn_support_neighbor_count",
+            "knn_hyperedge_member_count",
+            "ncp_weighted_mean_risk",
+            "ncp_shrunk_weighted_mean_risk",
+            "ncp_weighted_risk_q80",
+            "ncp_weighted_prediction_disagreement",
+            "ncp_weighted_high_risk_mass",
+            "ncp_effective_sample_size",
+        ):
+            values = local_features.get(name)
+            if values is not None:
+                arr = np.asarray(values).reshape(-1)
+                if int(node_id) < arr.shape[0]:
+                    row[name] = float(arr[int(node_id)])
+        rows.append(row)
+    return rows
+
+
 class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
     metadata = {
         "claim_role": "stage2_calibrated_local_risk_router",
@@ -2089,18 +2530,42 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             + 0.025 * f["relation_gap_out"]
         ),
     }
+    ESTIMATOR_SOURCE = "calibrated_local_risk_router"
+    ALLOW_SCORE_FAMILY_OVERRIDE = False
+    LOCAL_RISK_CONTRACT = "relation_aware_scalar_risk_aggregation_v2"
+    LOCAL_RISK_BOUNDARY = (
+        "Keeps posterior calibration scalar-only, then adjusts the risk object with localized 1-hop relation/direction-aware aggregation; "
+        "does not smooth posterior, does not introduce a learned router head, and uses tune/cal split discipline for family selection vs conformal calibration."
+    )
+    LITERATURE_BASIS = [
+        "Localized Conformal Prediction",
+        "SNAPS",
+        "RR-GNN",
+        "CoRel",
+        "Post-hoc Calibrated Ranker",
+    ]
 
     def __init__(self, alpha=0.20, budgets=RESIDUAL_RISK_PAPER_BUDGETS):
         super().__init__(alpha=alpha, budgets=budgets)
         self.selected_score_family = "base_only"
         self.selected_score_family_metrics = {}
         self.local_risk_features_ = {}
+        self.local_risk_feature_metadata_ = {}
         self.candidate_score_family_metrics = {}
         self.split_selection_metadata = {}
+        self.score_family_override = "auto"
 
     def _base_scalar_risk(self, logits, probs):
         posterior = self._posterior(logits=logits, probs=probs)
         return self._prediction_set_payload(posterior)["abstain_risk"].astype(np.float32)
+
+    def _compute_local_risk_features(self, base_risk, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        return _relation_aware_scalar_risk_features(
+            base_risk,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+        )
 
     def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
         self.budgets = parse_budget_list(kwargs.get("budgets", self.budgets), default=RESIDUAL_RISK_PAPER_BUDGETS)
@@ -2126,13 +2591,32 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
         preds = posterior.argmax(axis=1)
         wrong = (preds[:labeled_count] != labels_np).astype(np.int32)
         r0 = self._base_scalar_risk(logits, probs)
-        local_features = _relation_aware_scalar_risk_features(
+        local_features = self._compute_local_risk_features(
             r0,
             edge_index=edge_index,
             edge_type=edge_type,
             node_repr=node_repr,
+            posterior=posterior,
+            labeled_count=labeled_count,
+            **kwargs,
         )
+        self.local_risk_feature_metadata_ = dict(local_features.pop("_metadata", {}))
         self.local_risk_features_ = {name: values.astype(np.float32) for name, values in local_features.items()}
+        override = (
+            str(kwargs.get("conformal_knn_score_family_override", "auto") or "auto").strip()
+            if bool(getattr(self, "ALLOW_SCORE_FAMILY_OVERRIDE", False))
+            else "auto"
+        )
+        if override and override.lower() != "auto":
+            if override not in self.SCORE_FAMILIES:
+                raise ValueError(
+                    f"Unsupported conformal_knn_score_family_override={override!r}; "
+                    f"available families: {sorted(self.SCORE_FAMILIES)}."
+                )
+            self.score_family_override = override
+        else:
+            self.score_family_override = "auto"
+
         best_key = None
         best_metrics = None
         best_score = None
@@ -2150,6 +2634,9 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
                 best_score = family_score
                 best_key = family_name
                 best_metrics = metrics
+        if self.score_family_override != "auto":
+            best_key = self.score_family_override
+            best_metrics = candidate_metrics.get(best_key, {})
         self.selected_score_family = str(best_key or "base_only")
         self.selected_score_family_metrics = dict(best_metrics or {})
         self.candidate_score_family_metrics = dict(candidate_metrics)
@@ -2162,14 +2649,16 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
         }
         self.fit_summary = {
             **dict(self.fit_summary),
-            "source": "calibrated_local_risk_router",
+            "source": self.ESTIMATOR_SOURCE,
             "fit_scope": "validation_split_labels_only_posterior_then_local_risk_v2",
             "base_risk_source": "posthoc_calibrated_ranker",
-            "local_risk_contract": "relation_aware_scalar_risk_aggregation_v2",
+            "local_risk_contract": self.LOCAL_RISK_CONTRACT,
             "selected_score_family": self.selected_score_family,
             "selected_score_family_metrics": dict(self.selected_score_family_metrics),
             "candidate_score_family_metrics": dict(self.candidate_score_family_metrics),
+            "score_family_override": self.score_family_override,
             "local_risk_features": list(self.local_risk_features_.keys()),
+            "local_risk_feature_metadata": dict(self.local_risk_feature_metadata_),
             "posterior_smoothed": False,
             "risk_object_smoothed": True,
             "graph_context_used": edge_index is not None,
@@ -2181,46 +2670,47 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             "localized_similarity_used": node_repr is not None,
             "local_hop_contract": "one_hop_only",
             "local_graph_scope": "relation_aware_directional_channels",
-            "literature_basis": [
-                "Localized Conformal Prediction",
-                "SNAPS",
-                "RR-GNN",
-                "CoRel",
-                "Post-hoc Calibrated Ranker",
-            ],
-            "literature_boundary": (
-                "Keeps posterior calibration scalar-only, then adjusts the risk object with localized 1-hop relation/direction-aware aggregation; "
-                "does not smooth posterior, does not introduce a learned router head, and uses tune/cal split discipline for family selection vs conformal calibration."
-            ),
+            "literature_basis": list(self.LITERATURE_BASIS),
+            "literature_boundary": self.LOCAL_RISK_BOUNDARY,
             **self.split_selection_metadata,
         }
         self.calibration_metadata = dict(self.fit_summary)
         return self
 
+    def _score_from_local_risk_features(self, r0, local_features):
+        scorer = self.SCORE_FAMILIES[self.selected_score_family]
+        return np.clip(np.asarray(scorer(r0, local_features), dtype=np.float32), 0.0, 1.0)
+
     def score(self, logits, probs, edge_index=None, edge_type=None, node_repr=None, **kwargs):
         r0 = self._base_scalar_risk(logits, probs)
-        features = _relation_aware_scalar_risk_features(
+        posterior = self._posterior(logits=logits, probs=probs)
+        features = self._compute_local_risk_features(
             r0,
             edge_index=edge_index,
             edge_type=edge_type,
             node_repr=node_repr,
+            posterior=posterior,
+            **kwargs,
         )
-        scorer = self.SCORE_FAMILIES[self.selected_score_family]
-        return np.clip(np.asarray(scorer(r0, features), dtype=np.float32), 0.0, 1.0)
+        features.pop("_metadata", None)
+        return self._score_from_local_risk_features(r0, features)
 
     def build_manifest(self, logits, probs, labels, val_idx, test_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
         posterior = self._posterior(logits=logits, probs=probs)
         base_risk = self._prediction_set_payload(posterior)["abstain_risk"].astype(np.float32)
-        local_features = _relation_aware_scalar_risk_features(
+        labels_np = _labels_to_numpy(labels).astype(np.int64)
+        labeled_count = int(labels_np.shape[0])
+        local_features = self._compute_local_risk_features(
             base_risk,
             edge_index=edge_index,
             edge_type=edge_type,
             node_repr=node_repr,
+            posterior=posterior,
+            labeled_count=labeled_count,
+            **kwargs,
         )
-        scorer = self.SCORE_FAMILIES[self.selected_score_family]
-        risk_score = np.clip(np.asarray(scorer(base_risk, local_features), dtype=np.float32), 0.0, 1.0)
-        labels_np = _labels_to_numpy(labels).astype(np.int64)
-        labeled_count = int(labels_np.shape[0])
+        local_metadata = dict(local_features.pop("_metadata", {}))
+        risk_score = self._score_from_local_risk_features(base_risk, local_features)
         preds = posterior.argmax(axis=1)
         preds_labeled = preds[:labeled_count]
         pred_label_score = posterior[np.arange(posterior.shape[0]), preds]
@@ -2234,29 +2724,94 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             self.val_threshold = float(np.sort(risk_score[val_idx_np])[-k]) if k else float("inf")
         metadata = {
             **dict(self.calibration_metadata),
-            "source": "calibrated_local_risk_router",
+            "source": self.ESTIMATOR_SOURCE,
             "threshold_source": "validation_calibrated_local_risk",
             "base_risk_source": "posthoc_calibrated_ranker",
-            "local_risk_contract": "relation_aware_scalar_risk_aggregation_v2",
+            "local_risk_contract": self.LOCAL_RISK_CONTRACT,
             "selected_score_family": self.selected_score_family,
             "selected_score_family_metrics": dict(self.selected_score_family_metrics),
             "candidate_score_family": dict(self.candidate_score_family_metrics),
             "local_risk_features": list(local_features.keys()),
+            "local_risk_feature_metadata": local_metadata,
             "posterior_smoothed": False,
             "risk_object_smoothed": True,
             "embedding_context_used": node_repr is not None,
             "node_repr_used": node_repr is not None,
+            "learned_router_metadata": dict(getattr(self, "learned_router_metadata_", {}) or {}),
         }
+        target_top_n = int(
+            kwargs.get(
+                "conformal_knn_target_top_n",
+                kwargs.get("conformal_knn_anchor_top_n", kwargs.get("anchor_top_n", 200)),
+            )
+            or 0
+        )
+        selected_nodes = _split_selected_nodes_from_risk(
+            risk_score,
+            train_idx=kwargs.get("train_idx", []),
+            val_idx=val_idx,
+            test_idx=test_idx,
+            budgets=budgets,
+        )
+        default_selected_key = next(iter(selected_nodes), "")
+        default_selected_nodes = dict(selected_nodes.get(default_selected_key, {}))
+        default_selected_nodes["source_budget_key"] = default_selected_key
         return {
             "risk_score": risk_score,
             "router_score": risk_score,
             "abstain_risk": base_risk,
             "pred_label_score": pred_label_score.astype(np.float32),
             "local_risk_features": {name: values.astype(np.float32).tolist() for name, values in local_features.items()},
+            "local_risk_feature_metadata": local_metadata,
             "selected_score_family": self.selected_score_family,
             "selected_score_family_metrics": dict(self.selected_score_family_metrics),
             "candidate_score_family": dict(self.candidate_score_family_metrics),
+            "learned_router_metadata": dict(getattr(self, "learned_router_metadata_", {}) or {}),
             "base_risk_source": "posthoc_calibrated_ranker",
+            "selected_nodes": default_selected_nodes,
+            "selected_nodes_by_budget": selected_nodes,
+            "target_selection_contract": "rank_target_nodes_by_target_plus_optional_support_evidence_v1",
+            "support_group_contract": "knn_neighbors_are_evidence_only_not_routed_outputs",
+            "top_ranked_targets": {
+                "test": _top_target_rows(
+                    risk_score,
+                    test_idx,
+                    target_top_n,
+                    preds=preds,
+                    pred_label_score=pred_label_score,
+                    base_risk=base_risk,
+                    local_features=local_features,
+                ),
+                "valid": _top_target_rows(
+                    risk_score,
+                    val_idx,
+                    target_top_n,
+                    preds=preds,
+                    pred_label_score=pred_label_score,
+                    base_risk=base_risk,
+                    local_features=local_features,
+                ),
+            },
+            "top_ranked_anchors": {
+                "test": _top_target_rows(
+                    risk_score,
+                    test_idx,
+                    target_top_n,
+                    preds=preds,
+                    pred_label_score=pred_label_score,
+                    base_risk=base_risk,
+                    local_features=local_features,
+                ),
+                "valid": _top_target_rows(
+                    risk_score,
+                    val_idx,
+                    target_top_n,
+                    preds=preds,
+                    pred_label_score=pred_label_score,
+                    base_risk=base_risk,
+                    local_features=local_features,
+                ),
+            },
             "thresholds": {
                 "validation_risk_threshold": float(self.val_threshold),
                 "conformal_nonconformity_threshold": float(self.threshold if self.threshold is not None else 1.0),
@@ -2276,6 +2831,232 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             "fit_summary": self.fit_summary,
             "selected_score_family": self.selected_score_family,
         }
+
+
+class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
+    metadata = {
+        "claim_role": "stage2_target_node_conformal_knn_risk_selector",
+        "stage2_role": "posthoc_calibrated_target_knn_risk_ranker",
+        "canonical_stage2": False,
+        "scientific_gate": "posterior_calibration_then_target_node_knn_similarity_risk_aggregation",
+        "paper_identity": "Target-node Conformal-KNN Risk Router",
+        "paper_identity_risk": "medium_combination_innovation_if_used_for_llm_anchor_selection",
+        "promotion_rule": "candidate_after_target_knn_risk_ablation",
+        "prediction_set_estimator": True,
+        "diagnosis_or_action": False,
+        "input_boundary": "frozen_gnn_posterior_plus_target_node_knn_similarity_group_risk",
+    }
+    ESTIMATOR_SOURCE = "conformal_knn_risk_router"
+    ALLOW_SCORE_FAMILY_OVERRIDE = True
+    LOCAL_RISK_CONTRACT = "target_node_ncp_weighted_knn_similarity_risk_aggregation_v2"
+    LOCAL_RISK_BOUNDARY = (
+        "Reuses the calibrated_local_risk_router conformal threshold and split discipline, "
+        "but replaces relation-neighbor aggregation with target-node KNN support-group risk features, "
+        "including NCP-style exp(-distance/lambda_L) weighted support evidence. "
+        "It ranks target nodes by fixed or tune-split learned KNN-informed risk for downstream LLM/refiner use and does not alter classifier logits."
+    )
+    LITERATURE_BASIS = [
+        "Localized Conformal Prediction",
+        "Neighborhood Conformal Prediction",
+        "1995subhankar1995/NCP official code",
+        "SNAPS",
+        "Conformal Risk Control",
+        "HyperScan-style dynamic KNN group structure",
+    ]
+    SCORE_FAMILIES = {
+        "base_only": lambda r0, f: r0,
+        "knn_mean_blend": lambda r0, f: 0.62 * r0 + 0.25 * f["knn_mean_risk"] + 0.13 * f["knn_prediction_disagreement"],
+        "knn_peak_threat": lambda r0, f: (
+            0.54 * r0
+            + 0.18 * f["knn_max_risk"]
+            + 0.12 * f["knn_high_risk_mass"]
+            + 0.10 * f["knn_prediction_disagreement"]
+            + 0.06 * f["knn_similarity_gap"]
+        ),
+        "knn_conflict_dispersion": lambda r0, f: (
+            0.52 * r0
+            + 0.18 * f["knn_mean_risk"]
+            + 0.12 * f["knn_risk_std"]
+            + 0.12 * f["knn_prediction_disagreement"]
+            + 0.06 * f["knn_high_risk_mass"]
+        ),
+        "knn_safe_support_subtract": lambda r0, f: (
+            0.60 * r0
+            + 0.20 * f["knn_mean_risk"]
+            + 0.12 * f["knn_prediction_disagreement"]
+            + 0.08 * f["knn_high_risk_mass"]
+            - 0.10 * f["knn_safe_support_mass"]
+        ),
+    }
+    LEARNED_FEATURE_NAMES = (
+        "base_abstain_risk",
+        "knn_mean_risk",
+        "knn_max_risk",
+        "knn_risk_std",
+        "knn_prediction_disagreement",
+        "knn_high_risk_mass",
+        "knn_safe_support_mass",
+        "knn_similarity_mean",
+        "knn_similarity_gap",
+        "knn_effective_neighbor_count",
+        "ncp_weighted_mean_risk",
+        "ncp_shrunk_weighted_mean_risk",
+        "ncp_weighted_risk_std",
+        "ncp_weighted_risk_q80",
+        "ncp_weighted_prediction_disagreement",
+        "ncp_weighted_high_risk_mass",
+        "ncp_weighted_safe_support_mass",
+        "ncp_effective_sample_size",
+        "ncp_weight_max",
+    )
+
+    def __init__(self, alpha=0.20, budgets=RESIDUAL_RISK_PAPER_BUDGETS):
+        super().__init__(alpha=alpha, budgets=budgets)
+        self.learning_mode = "fixed"
+        self.learned_router_scaler = None
+        self.learned_router_model = None
+        self.learned_router_metadata_ = {}
+
+    def _learned_feature_matrix(self, r0, local_features):
+        r0_np = np.asarray(r0, dtype=np.float32).reshape(-1)
+        columns = []
+        for name in self.LEARNED_FEATURE_NAMES:
+            if name == "base_abstain_risk":
+                values = r0_np
+            else:
+                values = np.asarray(local_features.get(name, np.zeros_like(r0_np)), dtype=np.float32).reshape(-1)
+            if values.shape[0] != r0_np.shape[0]:
+                values = np.zeros_like(r0_np)
+            columns.append(np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0))
+        return np.stack(columns, axis=1).astype(np.float32)
+
+    def _fit_learned_router(self, r0, local_features, wrong, tune_idx_np):
+        self.learned_router_scaler = None
+        self.learned_router_model = None
+        self.learned_router_metadata_ = {
+            "learning_mode": self.learning_mode,
+            "learned_router_active": False,
+            "learned_router_fallback_reason": "",
+            "learned_feature_names": list(self.LEARNED_FEATURE_NAMES),
+            "official_ncp_alignment": "exp(-distance/lambda_L) KNN support weighting from 1995subhankar1995/NCP; logistic layer learns target residual-error risk on tune split.",
+        }
+        if self.learning_mode != "logistic":
+            self.learned_router_metadata_["learned_router_fallback_reason"] = "learning_mode_not_logistic"
+            return
+        fit_idx = _valid_index_array(tune_idx_np, int(np.asarray(r0).reshape(-1).shape[0]))
+        fit_idx = fit_idx[fit_idx < int(np.asarray(wrong).reshape(-1).shape[0])]
+        if fit_idx.size < 10:
+            self.learned_router_metadata_["learned_router_fallback_reason"] = "too_few_tune_samples"
+            return
+        y = np.asarray(wrong, dtype=np.int32).reshape(-1)[fit_idx]
+        if np.unique(y).size < 2:
+            self.learned_router_metadata_["learned_router_fallback_reason"] = "single_class_tune_labels"
+            return
+        x = self._learned_feature_matrix(r0, local_features)[fit_idx]
+        try:
+            scaler = StandardScaler()
+            x_scaled = scaler.fit_transform(x)
+            model = LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs")
+            model.fit(x_scaled, y)
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            self.learned_router_metadata_["learned_router_fallback_reason"] = f"logistic_fit_failed:{type(exc).__name__}"
+            return
+        self.learned_router_scaler = scaler
+        self.learned_router_model = model
+        train_score = model.predict_proba(x_scaled)[:, 1].astype(np.float32)
+        self.learned_router_metadata_.update(
+            {
+                "learned_router_active": True,
+                "learned_router_model": "StandardScaler+LogisticRegression(class_weight=balanced)",
+                "learned_router_train_count": int(fit_idx.size),
+                "learned_router_train_error_count": int(y.sum()),
+                "learned_router_train_metrics": residual_risk_metrics(y, train_score, budgets=(0.15,)),
+                "learned_router_coefficients": {
+                    name: float(value)
+                    for name, value in zip(self.LEARNED_FEATURE_NAMES, model.coef_[0].tolist())
+                },
+                "learned_router_intercept": float(model.intercept_[0]),
+            }
+        )
+
+    def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        self.learning_mode = str(kwargs.get("conformal_knn_learning_mode", "fixed") or "fixed").strip().lower()
+        if self.learning_mode not in {"fixed", "logistic"}:
+            raise ValueError("--conformal_knn_learning_mode must be one of {fixed, logistic}.")
+        super().fit(
+            logits=logits,
+            probs=probs,
+            labels=labels,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+            **kwargs,
+        )
+        labels_np = _labels_to_numpy(labels).astype(np.int64)
+        tune_idx_np = _valid_index_array(kwargs.get("tune_idx", val_idx), int(labels_np.shape[0]))
+        posterior = self._posterior(logits=logits, probs=probs)
+        wrong = (posterior.argmax(axis=1)[: int(labels_np.shape[0])] != labels_np).astype(np.int32)
+        r0 = self._base_scalar_risk(logits, probs)
+        self._fit_learned_router(r0, self.local_risk_features_, wrong, tune_idx_np)
+        if self.learning_mode == "logistic" and self.learned_router_metadata_.get("learned_router_active"):
+            learned_score = self._score_from_local_risk_features(r0, self.local_risk_features_)
+            learned_metrics = residual_risk_metrics(wrong[tune_idx_np], learned_score[tune_idx_np], budgets=(0.15,)) if tune_idx_np.size else {}
+            self.selected_score_family = "learned_ncp_logistic"
+            self.selected_score_family_metrics = dict(learned_metrics)
+            self.candidate_score_family_metrics = {
+                **dict(self.candidate_score_family_metrics),
+                "learned_ncp_logistic": dict(learned_metrics),
+            }
+            self.fit_summary = {
+                **dict(self.fit_summary),
+                "selected_score_family": self.selected_score_family,
+                "selected_score_family_metrics": dict(self.selected_score_family_metrics),
+                "candidate_score_family_metrics": dict(self.candidate_score_family_metrics),
+            }
+        self.fit_summary = {
+            **dict(self.fit_summary),
+            "learning_mode": self.learning_mode,
+            "learned_router_metadata": dict(self.learned_router_metadata_),
+        }
+        self.calibration_metadata = dict(self.fit_summary)
+        return self
+
+    def _score_from_local_risk_features(self, r0, local_features):
+        if (
+            self.learning_mode == "logistic"
+            and self.learned_router_scaler is not None
+            and self.learned_router_model is not None
+        ):
+            feature_matrix = self._learned_feature_matrix(r0, local_features)
+            scaled = self.learned_router_scaler.transform(feature_matrix)
+            return self.learned_router_model.predict_proba(scaled)[:, 1].astype(np.float32)
+        return super()._score_from_local_risk_features(r0, local_features)
+
+    def _compute_local_risk_features(self, base_risk, edge_index=None, edge_type=None, node_repr=None, **kwargs):
+        return _conformal_knn_scalar_risk_features(
+            base_risk,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_repr=node_repr,
+            posterior=kwargs.get("posterior"),
+            labeled_count=kwargs.get("labeled_count"),
+            knn_k=kwargs.get("conformal_knn_k", kwargs.get("knn_k", 8)),
+            candidate_scope=kwargs.get("conformal_knn_candidate_scope", kwargs.get("candidate_scope", "labeled_full")),
+            shrinkage_tau=kwargs.get("conformal_knn_shrinkage_tau", 3.0),
+            ncp_lambda=kwargs.get("conformal_knn_ncp_lambda", 1.0),
+        )
+
+    def state_dict_payload(self):
+        payload = super().state_dict_payload()
+        payload.update(
+            {
+                "learning_mode": self.learning_mode,
+                "learned_router_metadata": dict(self.learned_router_metadata_),
+            }
+        )
+        return payload
 
 
 class GNN2HopConformalEstimator(GraphConformalSetEstimator):
@@ -3298,6 +4079,8 @@ def build_estimator(mode):
         return PostHocCalibratedRanker()
     if mode == "calibrated_local_risk_router":
         return CalibratedLocalRiskRouter()
+    if mode == "conformal_knn_risk_router":
+        return ConformalKNNRiskRouter()
     if mode == "login_uncertainty_router":
         return LOGINUncertaintyRouter()
     if mode == "graph_conformal_set_estimator":

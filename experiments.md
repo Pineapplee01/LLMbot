@@ -50,11 +50,64 @@ Do not create a second timestamped clone for reruns.
 |---|---|---|
 | high-base frozen SimTeG root | `/root/workspace/LMbot/LLMbot/server_prompt_expert_highbase_preiter_roberta_20260527/seed_1` | canonical high-base seed-1 frozen GNN root |
 | high-base routed nodes | `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json` | train 752, valid 592, test 296, total 1640 |
+| routed Glance/BotSay prompt patch | local code patch on `2026-06-07` | direct `expert_ego` now uses a BotSay-aligned `tweet + metadata` classifier shell; direct `expert_graph_following` / `expert_graph_follower` now use Glance-style `EGO + HOP1 + Category?`; routed refiner adds `raw_concat_ego_following` and `raw_concat_ego_follower` |
 | clean v2 routed explanations | `/root/workspace/LMbot/datasets/TwiBot-20/prompt_expert_v2_clean_routed_preiter_cache_20260531` | clean sidecars for graph_following, graph_follower, tweet, conflict |
 | clean v2 finetuned-RoBERTa cache | `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_concat_v2_roberta_finetuned_simteg_clean_routed_highbase_preiter_seed1_20260531.pt` | routed explanation expert cache |
 | pretrained roberta-base snapshot | `/root/.cache/huggingface/hub/models--roberta-base/snapshots/e2da8e2f811d1448a5b465c236feacd80ffbac7b` | explicit pretrained encoder path |
 
 ## Experiment Registry
+
+### dgp__v2_strict_answer_token__highbase_routed_ctxfull__seed1
+
+- Status: pending launch.
+- Scope: strict-DGP prompt shell, routed-node answer-token finetune.
+- Boundary:
+  - uses the modified strict-DGP `precompute.py` prompt shell:
+    - predictor prompt uses minimal `Instruct / Query / ASSISTANT_ANSWER`
+    - summary prompts use task-agnostic
+      `Summarize ... within 10 tokens`
+  - supervision scope is the fixed routed split:
+    `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+  - neighbor/context support is drawn from `full_graph_support` during
+    precompute through `--context_graph_variant full_graph_support`
+  - semantic finetune remains on the labeled graph runtime contract and
+    consumes the generated prompt sidecar via
+    `--semantic_text_source_path`
+  - backbone path is Qwen2.5 answer-token SFT:
+    `semantic_encoder_finetune --semantic_encoder qwen3_peft --semantic_supervision_mode answer_token`
+- Planned prompt cache:
+  `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_strict_norm_text_following_summary_qwen25_routed_ctxfull_seed1.pt`
+- Planned artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_strict_answer_token__highbase_routed_ctxfull__seed1`
+- Planned log:
+  `/root/workspace/LMbot/LLMbot/server_logs/dgp__v2_strict_answer_token__highbase_routed_ctxfull__seed1.log`
+
+### dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1
+
+- Status: pending launch.
+- Scope: strict-DGP prompt shell, labeled-node answer-token finetune with
+  full-graph support context.
+- Boundary:
+  - uses the modified strict-DGP `precompute.py` prompt shell:
+    - predictor prompt uses minimal `Instruct / Query / ASSISTANT_ANSWER`
+    - summary prompts use task-agnostic
+      `Summarize ... within 10 tokens`
+  - supervision scope is the default labeled train/valid/test split
+  - prompt construction targets labeled nodes only through
+    `--center_node_scope labeled`
+  - neighbor/context support is drawn from `full_graph_support` during
+    precompute through `--context_graph_variant full_graph_support`
+  - semantic finetune remains on the labeled graph runtime contract and
+    consumes the generated prompt sidecar via
+    `--semantic_text_source_path`
+  - backbone path is Qwen2.5 answer-token SFT:
+    `semantic_encoder_finetune --semantic_encoder qwen3_peft --semantic_supervision_mode answer_token`
+- Planned prompt cache:
+  `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_strict_norm_text_following_summary_qwen25_labeled_ctxfull_seed1.pt`
+- Planned artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1`
+- Planned log:
+  `/root/workspace/LMbot/LLMbot/server_logs/dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1.log`
 
 ### dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1
 
@@ -84,8 +137,11 @@ Do not create a second timestamped clone for reruns.
     means human
   - no dataset labels, frozen SimTeG correctness, or oracle fix/break outcomes
     are inserted into the prompt text
-  - this is still DGP-style until a later task adds faithful generative
-    answer-token SFT
+  - `semantic_encoder_finetune --semantic_encoder qwen3_peft
+    --semantic_supervision_mode answer_token` is now the active faithful
+    answer-token route for this prompt sidecar
+  - `--semantic_supervision_mode classifier` remains the compatibility ablation
+    that trains a hidden-state classifier head on the same prompt text
 - Stable routed split:
   `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
 - Planned prompt cache:
@@ -98,11 +154,41 @@ Do not create a second timestamped clone for reruns.
   1. routed prompt precompute smoke with `--limit 2`
   2. full routed prompt precompute over routed union
   3. `semantic_encoder_finetune` over the prompt sidecar with Qwen2.5 PEFT
+     and `--semantic_supervision_mode answer_token`
   4. `semantic_embedding_classifier` over the Qwen2.5 query embedding cache
 - Primary comparisons:
   - frozen SimTeG full-test Acc/F1: `0.8639 / 0.8624`
   - previous DGP v1 Qwen2.5 PEFT predictor: fix/break/net `42 / 76 / -34`
   - previous CALM v1 query-embedding MLP: fix/break/net `57 / 114 / -57`
+
+### dgp__v2_qwen25_answer_token__highbase_routed__seed1
+
+- Status: pending server smoke / full run.
+- Scope: latest DGP v2 prompt sidecar plus answer-token finetune.
+- Boundary:
+  - reuses the existing routed DGP v2 prompt sidecar:
+    `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed_prompts.jsonl`
+  - does not rebuild prompts or summary sidecars
+  - trains `semantic_encoder_finetune --semantic_encoder qwen3_peft
+    --semantic_supervision_mode answer_token`
+  - label mapping is fixed to `Yes -> bot`, `No -> human`
+  - runtime evaluation remains deterministic by scoring the conditional
+    completion likelihood of `Yes` versus `No`, then writing back the standard
+    `outputs.pt {logits, prob, pred, labels}` contract
+  - this is the active faithful DGP token-finetune route in the current
+    mainline; the older hidden-state classifier route remains a compatibility
+    ablation
+- Stable routed split:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Planned artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_answer_token__highbase_routed__seed1`
+- Planned validation steps:
+  1. smoke finetune with routed train cap and small step count
+  2. full routed answer-token finetune
+  3. replay against frozen high-base SimTeG for routed-node fix/break/net
+- Primary comparison:
+  - `dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1`
+    as the old hidden-state classifier-head baseline on the same prompt sidecar
 
 ### dgp__qwen25_peft_predictor__highbase_routed__seed1
 
@@ -494,6 +580,38 @@ Do not create a second timestamped clone for reruns.
 - Runtime note:
   to avoid memory contention on the server, this chain is queued to start after
   the running `descandmeta` ICL job exits.
+
+### botsay__qwen25_structure_nolabel__twibot20__routed_test
+
+- Status: pending server smoke / full routed-test run
+- Scope: external-reference ablation
+- Claim boundary:
+  this is a fair BotSay-style structure prompt ablation, not the official
+  BotSay structure setting. It preserves the direction-split graph prompt
+  layout (`followers` block, `followings` block, `Target user`, `Label:`),
+  but removes neighbor `Label:` lines to avoid test-time label leakage.
+- Code root:
+  `/root/workspace/LMbot/botsay_official`
+- Dataset:
+  `Twibot-20`
+- Model:
+  `Qwen2.5-7B-Instruct`
+- Prompt variant:
+  `approach-structure.py -t random --neighbor_label_mode none`
+- Routed split:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Planned smoke command:
+  `CUDA_VISIBLE_DEVICES=1 /root/mambaforge/envs/Qwen/bin/python approach-structure.py -m qwen25 -d Twibot-20 -t random --neighbor_label_mode none --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json --routed_split test --limit 32 --batch_size 4 --max_new_tokens 32 --temperature 0.0 --output_path /root/workspace/LMbot/botsay_official/probs/structure_routed_test_qwen25_random_nolabel_smoke32.json --allow_offload`
+- Planned full command:
+  `CUDA_VISIBLE_DEVICES=1 /root/mambaforge/envs/Qwen/bin/python -u approach-structure.py -m qwen25 -d Twibot-20 -t random --neighbor_label_mode none --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json --routed_split test --batch_size 4 --max_new_tokens 32 --temperature 0.0 --output_path /root/workspace/LMbot/botsay_official/probs/structure_routed_test_qwen25_random_nolabel.json --allow_offload`
+- Planned output:
+  `/root/workspace/LMbot/botsay_official/probs/structure_routed_test_qwen25_random_nolabel.json`
+- Planned log:
+  `/root/workspace/LMbot/LLMbot/server_logs/botsay_structure_routed_test_qwen25_random_nolabel.log`
+- Comparison note:
+  compare against the label-informed reference run
+  `/root/workspace/LMbot/botsay_official/probs/structure_routed_test_qwen25_random.json`
+  and keep the leakage caveat explicit in any result table.
 
 ### mpe__botsay_precompute_smoke_preview32__seed1
 
@@ -3154,3 +3272,856 @@ CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python -u main.py \
   `raw_concat_follower_triplet` anchor. Under the current high-base setting,
   `conflict` is acting more like a stabilizing calibration channel than a
   disposable extra expert.
+
+### dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1
+
+- Status: completed on server
+- Scope: DGP-inspired routed-node prompt construction and two downstream
+  consumers over the fixed high-base routed union
+- Claim boundary:
+  this is a DGP-style migration, not a full DGP reproduction. It does not
+  perform answer-token generative SFT. The prompt cache uses Qwen2.5-Instruct
+  to summarize top-K following neighbor evidence, builds a final
+  Yes/No-style routed-node predictor prompt, then evaluates two consumers:
+  a Qwen2.5 LoRA semantic predictor and a cached embedding MLP.
+- Baseline:
+  canonical high-base frozen SimTeG seed 1
+  - Acc: `0.863905325443787`
+  - Macro-F1: `0.862442357206568`
+- Inputs:
+  - routed union:
+    `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+  - Qwen instruct / embedding model:
+    `/root/workspace/LMbot/hf_models/Qwen2.5-7B-Instruct`
+  - base outputs for replay:
+    `/root/workspace/LMbot/LLMbot/server_prompt_expert_v2_clean_routed_classifier_qwen3_20260601/base_outputs_for_routed_classifier.pt`
+- Prompt construction:
+  - prompt mode: `dgp_predictor_v2`
+  - variant: `norm_text_following_summary`
+  - target evidence: LLM-friendly rendering of `norm_user_text` into
+    `PROFILE`, `TWEET_BEHAVIOR`, and `TWEET_SAMPLES`
+  - neighbor evidence: top-K following neighbors with `K=5`
+  - neighbor summary language: English only
+  - empty following context policy:
+    `deterministic_sparse_summary_no_llm`
+- Precompute command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python -u precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode dgp_predictor_v2 \
+  --dgp_prompt_variant norm_text_following_summary \
+  --dgp_neighbor_summary_k 5 \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --routed_nodes_split all \
+  --explain_model_path /root/workspace/LMbot/hf_models/Qwen2.5-7B-Instruct \
+  --model_path /root/workspace/LMbot/hf_models/Qwen2.5-7B-Instruct \
+  --explain_required \
+  --explain_batch_size 2 \
+  --explain_max_input_length 1024 \
+  --explain_max_new_tokens 96 \
+  --explain_log_every 50 \
+  --explain_component_cache_dir /root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_component_cache_clean_english \
+  --batch_size 2 \
+  --max_length_hop 1024 \
+  --output_path /root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed.pt \
+  --device cuda \
+  --disable_wandb \
+  --overwrite
+```
+
+- Precompute artifacts:
+  - cache:
+    `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed.pt`
+  - manifest:
+    `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed_manifest.json`
+  - final prompts:
+    `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed_prompts.jsonl`
+  - generated summaries sidecar:
+    `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed_explanations.jsonl`
+  - component cache:
+    `/root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_component_cache_clean_english`
+- Precompute audit:
+  - `semantic_view_mode`: `dgp_predictor_v2`
+  - `target_node_count`: `1640`
+  - `num_nodes / embedding_dim / dtype`: `11826 / 3584 / torch.float16`
+  - prompt rows / unique node ids: `1640 / 1640`
+  - bad raw markers in final prompts: `0`
+  - context-summary sidecar rows: `189`, all `llm_generation`
+  - neighbor-summary sidecar rows: `338`, with `333 llm_generation` and
+    `5 quality_fallback` rows due to `too_short`
+
+#### dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1
+
+- Status: completed on server
+- Stage: `semantic_encoder_finetune`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1/seed_1/preparation/semantic_encoder`
+- Server log:
+  `/root/workspace/LMbot/LLMbot/server_logs/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1.log`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `outputs.pt`
+  - `embeddings.pt`
+  - `classifier.pt`
+  - `adapter/adapter_model.safetensors`
+  - `replay_against_frozen_simteg.json`
+  - `per_node_test_replay.jsonl`
+- Command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python -u main.py \
+  --experiment_task semantic_encoder_finetune \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --seeds 1 \
+  --semantic_encoder qwen3_peft \
+  --qwen_model_path /root/workspace/LMbot/hf_models/Qwen2.5-7B-Instruct \
+  --semantic_text_source_path /root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed_prompts.jsonl \
+  --semantic_text_field prompt \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --lm_batch_size 1 \
+  --max_length 1024 \
+  --semantic_max_steps 0 \
+  --LM_pretrain_epochs 1 \
+  --peft_rank 8 \
+  --peft_alpha 16 \
+  --artifact_root /root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1 \
+  --device 0 \
+  --disable_wandb
+```
+
+- Routed-node training contract:
+  - routed train / valid / test: `752 / 592 / 296`
+  - max steps: `752`
+  - max length: `1024`
+  - trainable LoRA params: `2523136`
+  - trainable classifier params: `459138`
+- Routed-test classifier result:
+  - Acc / Macro-F1: `0.5641891891891891 / 0.47675231243576566`
+  - Bot-F1: `0.6906474820143885`
+- Frozen SimTeG replay on routed test:
+  - full-test Acc / Macro-F1 after routed replacement:
+    `0.8453085376162299 / 0.840942403530156`
+  - delta vs high-base frozen SimTeG:
+    `-0.018596787827557026 / -0.021499953676411998`
+  - fix / break / net: `47 / 69 / -22`
+  - changed predictions: `116`
+  - conditional fix rate on routed wrong:
+    `0.4392523364485981`
+  - correct-node break rate:
+    `0.36507936507936506`
+  - routed prediction distribution:
+    base `{0: 116, 1: 180}`, method `{0: 42, 1: 254}`
+
+#### calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1
+
+- Status: completed on server
+- Stage: `semantic_embedding_classifier`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1/seed_1/preparation/semantic_embedding_classifier`
+- Server log:
+  `/root/workspace/LMbot/LLMbot/server_logs/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1.log`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `outputs.pt`
+  - `classifier.pt`
+  - `embeddings_ref.pt`
+  - `replay_against_frozen_simteg.json`
+  - `per_node_test_replay.jsonl`
+- Command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+CUDA_VISIBLE_DEVICES=1 /root/mambaforge/envs/lmbot/bin/python -u main.py \
+  --experiment_task semantic_embedding_classifier \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --seeds 1 \
+  --embedding_path /root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed.pt \
+  --semantic_text_source_path /root/workspace/LMbot/datasets/TwiBot-20/dgp_predictor_v2_norm_text_following_summary_qwen25_embed_prompts.jsonl \
+  --semantic_text_field prompt \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --LM_classifier_n_layers 2 \
+  --LM_classifier_hidden_dim 128 \
+  --dropout 0.4 \
+  --LM_pretrain_epochs 5 \
+  --artifact_root /root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1 \
+  --device 0 \
+  --disable_wandb
+```
+
+- Routed-node training contract:
+  - routed train / valid / test: `752 / 592 / 296`
+  - embedding dim / rows: `3584 / 11826`
+  - trainable classifier params: `459394`
+- Routed-test classifier result:
+  - Acc / Macro-F1: `0.44932432432432434 / 0.31002331002331`
+  - Bot-F1: `0.0`
+- Frozen SimTeG replay on routed test:
+  - full-test Acc / Macro-F1 after routed replacement:
+    `0.8165680473372781 / 0.8161260632106724`
+  - delta vs high-base frozen SimTeG:
+    `-0.047337278106508895 / -0.04631629399589565`
+  - fix / break / net: `62 / 118 / -56`
+  - changed predictions: `180`
+  - conditional fix rate on routed wrong:
+    `0.5794392523364486`
+  - correct-node break rate:
+    `0.6243386243386243`
+  - routed prediction distribution:
+    base `{0: 116, 1: 180}`, method `{0: 296}`
+
+- Summary:
+  Both DGP-v2 consumers have real wrong-node recovery, but neither is safe as
+  a direct routed-node replacement under the high-base frozen SimTeG setting.
+  The Qwen2.5 PEFT predictor is less collapsed than the embedding MLP, but it
+  still breaks more correct nodes than it fixes (`47 / 69 / -22`). The cached
+  embedding MLP collapses to predicting every routed-test node as class `0`
+  and is strongly negative (`62 / 118 / -56`). This supports keeping DGP-style
+  evidence as candidate evidence for a calibrated keep/change refiner rather
+  than replacing frozen SimTeG predictions directly.
+
+### semantic_gate__dgp_v2_peft_mlp__highbase_routed__seed1
+
+- Status: completed on server
+- Stage: `semantic_correction_gate`
+- Scope: base-aware keep/change gate over two fixed DGP-v2 semantic
+  candidates:
+  - `qwen25_peft`
+  - `dgp_embed_mlp`
+- Claim boundary:
+  this is a routed-node learning-to-defer / selective-correction diagnostic.
+  It does not regenerate prompts, update the Qwen PEFT predictor, update the
+  embedding MLP, modify the graph, or retrain frozen SimTeG. It trains only a
+  lightweight gate over base/candidate probability meta-features and locks the
+  accept threshold on routed validation nodes.
+- Baseline:
+  canonical high-base frozen SimTeG seed 1
+  - full-test Acc: `0.863905325443787`
+  - full-test Macro-F1: `0.862442357206568`
+- Inputs:
+  - routed split:
+    `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+  - base outputs:
+    `/root/workspace/LMbot/LLMbot/server_prompt_expert_v2_clean_routed_classifier_qwen3_20260601/base_outputs_for_routed_classifier.pt`
+  - Qwen2.5 PEFT candidate outputs:
+    `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1/seed_1/preparation/semantic_encoder/outputs.pt`
+  - DGP/CALM embedding-MLP candidate outputs:
+    `/root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1/seed_1/preparation/semantic_embedding_classifier/outputs.pt`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/semantic_gate__dgp_v2_peft_mlp__highbase_routed__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/semantic_gate__dgp_v2_peft_mlp__highbase_routed__seed1/seed_1/preparation/semantic_correction_gate`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `outputs.pt`
+  - `checkpoint.pt`
+  - `per_node_test.jsonl`
+- Command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+/root/mambaforge/envs/lmbot/bin/python -u main.py \
+  --experiment_task semantic_correction_gate \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --seeds 1 \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --semantic_gate_base_outputs_path /root/workspace/LMbot/LLMbot/server_prompt_expert_v2_clean_routed_classifier_qwen3_20260601/base_outputs_for_routed_classifier.pt \
+  --semantic_gate_candidate_output_paths /root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1/seed_1/preparation/semantic_encoder/outputs.pt,/root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1/seed_1/preparation/semantic_embedding_classifier/outputs.pt \
+  --semantic_gate_candidate_names qwen25_peft,dgp_embed_mlp \
+  --semantic_gate_epochs 200 \
+  --semantic_gate_hidden_dim 64 \
+  --semantic_gate_learning_rate 0.001 \
+  --semantic_gate_weight_decay 0.0001 \
+  --semantic_gate_break_weight 2.0 \
+  --artifact_root /root/workspace/LMbot/LLMbot/experiments/semantic_gate__dgp_v2_peft_mlp__highbase_routed__seed1 \
+  --device 0 \
+  --disable_wandb
+```
+
+- Gate contract:
+  - contract: `semantic_correction_gate_v1`
+  - candidate names: `qwen25_peft`, `dgp_embed_mlp`
+  - validation-locked threshold: `0.16848692297935486`
+  - action utility: `base wrong + candidate correct` is positive;
+    `base correct + candidate wrong` is a weighted negative with
+    `break_weight=2.0`
+- Validation split result:
+  - base Acc / Macro-F1: `0.6621621621621622 / 0.6530382595648913`
+  - gated Acc / Macro-F1: `0.6722972972972973 / 0.668663089262016`
+  - fix / break / net: `20 / 14 / +6`
+- Routed-test result:
+  - base Acc / Macro-F1: `0.6385135135135135 / 0.6291638858641564`
+  - gated Acc / Macro-F1: `0.6283783783783784 / 0.6254888428801473`
+  - fix / break / net: `9 / 12 / -3`
+  - selected actions: `base=275`, `qwen25_peft=3`, `dgp_embed_mlp=18`
+  - fixes by action: `qwen25_peft=2`, `dgp_embed_mlp=7`
+  - breaks by action: `qwen25_peft=1`, `dgp_embed_mlp=11`
+- Canonical full-test replay:
+  - base Acc / Macro-F1: `0.863905325443787 / 0.862442357206568`
+  - gated Acc / Macro-F1: `0.8613693998309383 / 0.8603514893960071`
+  - fix / break / net: `9 / 12 / -3`
+- Candidate direct-replacement diagnostics on routed test:
+  - `qwen25_peft`: fix / break / net `47 / 69 / -22`
+  - `dgp_embed_mlp`: fix / break / net `62 / 118 / -56`
+- Summary:
+  The gate successfully reduces break compared with direct candidate
+  replacement (`69` or `118` breaks down to `12`), and validation improves
+  by `+6` net. However, the validation-locked policy does not generalize to
+  routed test (`net=-3`) and therefore is not a positive high-base result.
+  The evidence supports the research direction of base-aware accept/defer
+  correction, but not a claim that the current probability-only gate solves the
+  routed-node refiner problem. The next narrow step is to add node attributes,
+  graph-density/router-score features, and candidate-specific calibration
+  before considering heavier MoE/fusion heads.
+
+### semantic_gate_nodeattr__dgp_v2_peft_mlp__highbase_routed__seed1
+
+- Status: completed on server
+- Stage: `semantic_correction_gate`
+- Scope: node-attribute competence gate over the same two fixed DGP-v2 semantic
+  candidates used by `semantic_gate__dgp_v2_peft_mlp__highbase_routed__seed1`.
+- Claim boundary:
+  this is a diagnostic node-attribute gate, not a positive main result. It
+  appends target-account metadata/tweet cues and labeled-graph attributes to
+  the probability-only gate, but keeps the same fixed candidate outputs,
+  routed split, frozen SimTeG base, and validation-locked threshold protocol.
+- Literature motivation:
+  - BotRGCN / BotMoE / TwiBot-20 support profile, tweet, and graph attributes
+    as real social-bot evidence channels
+  - META-DES supports classifier competence features beyond raw posterior
+    scores
+  - SelectiveNet / Learning-to-Defer support accept/defer gating rather than
+    direct candidate replacement
+- Stable routed split:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Artifact roots:
+  - break weight 2:
+    `/root/workspace/LMbot/LLMbot/experiments/semantic_gate_nodeattr__dgp_v2_peft_mlp__highbase_routed__seed1`
+  - break weight 4:
+    `/root/workspace/LMbot/LLMbot/experiments/semantic_gate_nodeattr_bw4__dgp_v2_peft_mlp__highbase_routed__seed1`
+  - break weight 8:
+    `/root/workspace/LMbot/LLMbot/experiments/semantic_gate_nodeattr_bw8__dgp_v2_peft_mlp__highbase_routed__seed1`
+- Feature contract:
+  - `--semantic_gate_feature_family node_attribute`
+  - final action feature dim: `52`
+  - appended node-attribute dim: `36`
+  - graph attribute source: `dataset_labeled_graph`
+  - graph attributes available: `true`
+  - attribute normalization: train-split z-score with clamp 10
+- Command template:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+/root/mambaforge/envs/lmbot/bin/python -u main.py \
+  --experiment_task semantic_correction_gate \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --seeds 1 \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --semantic_gate_base_outputs_path /root/workspace/LMbot/LLMbot/server_prompt_expert_v2_clean_routed_classifier_qwen3_20260601/base_outputs_for_routed_classifier.pt \
+  --semantic_gate_candidate_output_paths /root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1/seed_1/preparation/semantic_encoder/outputs.pt,/root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1/seed_1/preparation/semantic_embedding_classifier/outputs.pt \
+  --semantic_gate_candidate_names qwen25_peft,dgp_embed_mlp \
+  --semantic_gate_feature_family node_attribute \
+  --semantic_gate_break_weight 2.0 \
+  --artifact_root /root/workspace/LMbot/LLMbot/experiments/semantic_gate_nodeattr__dgp_v2_peft_mlp__highbase_routed__seed1 \
+  --device 0 \
+  --disable_wandb
+```
+
+- Result table:
+
+| run | feature family | break weight | valid fix/break/net | routed-test fix/break/net | full-test Acc | full-test Macro-F1 | selected routed-test actions |
+|---|---|---:|---:|---:|---:|---:|---|
+| probability baseline | probability | 2 | `20 / 14 / +6` | `9 / 12 / -3` | `0.8613693998309383` | `0.8603514893960071` | base `275`, qwen `3`, mlp `18` |
+| nodeattr bw2 | node_attribute | 2 | `42 / 41 / +1` | `12 / 26 / -14` | `0.8520710059171598` | `0.8508277340442779` | base `254`, qwen `16`, mlp `26` |
+| nodeattr bw4 | node_attribute | 4 | `4 / 3 / +1` | `2 / 8 / -6` | `0.8588334742180896` | `0.8574629896979364` | base `282`, qwen `2`, mlp `12` |
+| nodeattr bw8 | node_attribute | 8 | `3 / 2 / +1` | `1 / 4 / -3` | `0.8613693998309383` | `0.8599523001051015` | base `288`, qwen `1`, mlp `7` |
+
+- Diagnostic finding:
+  The node-attribute gate does not improve over the probability-only gate.
+  At break weight 2 it becomes too aggressive and chooses more candidate
+  actions, but the extra actions break many base-correct nodes. Stronger break
+  weights reduce break but also collapse fixes, returning to an almost-abstain
+  policy.
+- Attribute slice observation:
+  On routed test, the nodeattr bw2 changed nodes are below train-average in
+  `tweet_count_log1p` and `tweet_char_len_log1p` and above average in graph
+  follower/following availability. Break nodes have higher
+  `graph_following_log1p`, `graph_has_following`, `graph_has_follower`, and
+  `graph_follower_log1p` than fix nodes. This confirms the earlier failure
+  diagnosis: node attributes identify the dense/sparse hard-node regime, but
+  still do not identify whether a semantic candidate can safely correct the
+  node.
+- Summary:
+  Node attributes alone are not enough as a gate. They provide node-type
+  context, but in this routed set the same dense/low-text regimes contain both
+  fixable wrong nodes and fragile base-correct nodes. The next method should
+  add candidate-specific evidence alignment or validation-calibrated
+  per-candidate rules, not only more generic attributes.
+
+### mpe__raw_concat_ego_following__qwen3embed__highbase__seed1
+
+- Status: completed on server
+- Stage: `joint_router_refinement`
+- Scope:
+  direct-prompt routed-node refiner using:
+  - `expert_ego`: BotSay-style `tweet + metadata`
+  - `expert_graph_following`: Glance-style `EGO + HOP1_FOLLOWING + Category?`
+  - embedding model: `Qwen3-Embedding-8B`
+  - fusion: `raw_concat_ego_following`
+- Baseline:
+  canonical high-base frozen SimTeG seed 1
+  - full-test Acc / Macro-F1:
+    `0.863905325443787 / 0.862442357206568`
+- Execution note:
+  the server `lmbot` env was not usable for this line after the transformers
+  upgrade because `torch==2.0.1+cu117` is incompatible with
+  `transformers>=4.56` model/optimization imports. This run therefore used the
+  server `Qwen` env for both `precompute.py` and `main.py`.
+- Routed source:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Component caches:
+  - ego:
+    `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_ego_qwen3embed_routed_glance_botsay_seed1.pt`
+  - graph_following:
+    `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_graph_following_qwen3embed_routed_glance_seed1.pt`
+- Merged bundle used by the refiner:
+  `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_ego_following_qwen3embed_routed_glance_botsay_seed1.pt`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/mpe__raw_concat_ego_following__qwen3embed__highbase__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/mpe__raw_concat_ego_following__qwen3embed__highbase__seed1/seed_1/stages/joint_router_refinement`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `analysis_summary.json`
+  - `outputs.pt`
+  - `checkpoint.pt`
+  - `per_node_test.jsonl`
+- Validation-locked comparable result:
+  - selected budget:
+    `0.10`
+  - test Acc / Macro-F1 under the validation-selected budget:
+    `0.863905325443787 / 0.8625376651402136`
+  - fix / break / net:
+    `7 / 7 / 0`
+- Post-hoc test-curve best point:
+  - full-test Acc / Macro-F1:
+    `0.8681318681318682 / 0.8667838952219258`
+  - delta vs base:
+    `+0.004226542688081203 / +0.004341538015357749`
+  - fix / break / net:
+    `15 / 10 / +5`
+  - routed wrong precision:
+    `0.3614864864864865`
+  - wrong-node fix rate:
+    `0.09316770186335403`
+  - correct-node break rate:
+    `0.009784735812133072`
+- Summary:
+  This BotSay-ego + Glance-following line has real correction signal, but it
+  does not beat the high-base frozen SimTeG under the validation-locked budget
+  protocol: the comparable routed-test result is exactly net-neutral
+  (`7 / 7 / 0`). The positive `+5` net gain appears only at the post-hoc best
+  test budget, so it should be treated as diagnostic headroom rather than a
+  claim-grade improvement.
+
+### mpe__raw_concat_ego_follower__qwen3embed__highbase__seed1
+
+- Status: completed on server
+- Stage: `joint_router_refinement`
+- Scope:
+  same direct-prompt routed-node refiner family as above, but replacing the
+  graph branch with `expert_graph_follower` and using
+  `raw_concat_ego_follower`
+- Baseline:
+  canonical high-base frozen SimTeG seed 1
+  - full-test Acc / Macro-F1:
+    `0.863905325443787 / 0.862442357206568`
+- Routed source:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Component caches:
+  - ego:
+    `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_ego_qwen3embed_routed_glance_botsay_seed1.pt`
+  - graph_follower:
+    `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_graph_follower_qwen3embed_routed_glance_seed1.pt`
+- Merged bundle used by the refiner:
+  `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_ego_follower_qwen3embed_routed_glance_botsay_seed1.pt`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/mpe__raw_concat_ego_follower__qwen3embed__highbase__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/mpe__raw_concat_ego_follower__qwen3embed__highbase__seed1/seed_1/stages/joint_router_refinement`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `analysis_summary.json`
+  - `outputs.pt`
+  - `checkpoint.pt`
+  - `per_node_test.jsonl`
+- Validation-locked comparable result:
+  - selected budget:
+    `0.05`
+  - test Acc / Macro-F1 under the validation-selected budget:
+    `0.863905325443787 / 0.8626744391450274`
+  - fix / break / net:
+    `7 / 7 / 0`
+- Post-hoc test-curve best point:
+  - full-test Acc / Macro-F1:
+    `0.8647506339814032 / 0.8639807756430157`
+  - delta vs base:
+    `+0.0008453085376162184 / +0.0015384184364476416`
+  - fix / break / net:
+    `24 / 23 / +1`
+  - routed wrong precision:
+    `0.3614864864864865`
+  - wrong-node fix rate:
+    `0.14906832298136646`
+  - correct-node break rate:
+    `0.022504892367906065`
+- Summary:
+  The follower ablation is weaker than the following mainline. It fixes more
+  wrong nodes at the post-hoc best point (`24`) but also breaks substantially
+  more correct nodes (`23`), leaving only `+1` net. Under the validation-locked
+  budget protocol it is again net-neutral (`7 / 7 / 0`), so there is no
+  claim-grade improvement over the high-base frozen SimTeG baseline.
+
+### qwen3embed_direct_prompt_routed_glance_botsay__execution_note
+
+- Status: recorded
+- Scope:
+  execution note for the direct-prompt `Qwen3-Embedding-8B` routed-node line
+- Note:
+  an initial full-bundle `expert_concat_v1` precompute over
+  `ego + graph_following + graph_follower + tweet + conflict` was started on
+  the server but then abandoned as an inefficient path for this question. The
+  actual downstream experiments in this section consume only:
+  - `ego + graph_following`
+  - `ego + graph_follower`
+  so the final claim-supporting runs were produced from targeted component
+  caches plus a minimal merged bundle per fusion mode. This does not change the
+  model family; it only removes unused prompt-expert components from the
+  runtime path.
+
+### mpe__raw_concat_ego_following_follower__qwen3embed__highbase__seed1
+
+- Status: completed on server
+- Stage: `joint_router_refinement`
+- Scope:
+  direct-prompt routed-node refiner using:
+  - `expert_ego`: BotSay-style `tweet + metadata`
+  - `expert_graph_following`: Glance-style `EGO + HOP1_FOLLOWING + Category?`
+  - `expert_graph_follower`: Glance-style `EGO + HOP1_FOLLOWER + Category?`
+  - embedding model: `Qwen3-Embedding-8B`
+  - fusion: `raw_concat_ego_following_follower`
+- Baseline:
+  canonical high-base frozen SimTeG seed 1
+  - full-test Acc / Macro-F1:
+    `0.863905325443787 / 0.862442357206568`
+- Routed source:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Merged bundle used by the refiner:
+  `/root/workspace/LMbot/datasets/TwiBot-20/glance_prompt_expert_ego_following_follower_qwen3embed_routed_glance_botsay_seed1.pt`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/mpe__raw_concat_ego_following_follower__qwen3embed__highbase__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/mpe__raw_concat_ego_following_follower__qwen3embed__highbase__seed1/seed_1/stages/joint_router_refinement`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `analysis_summary.json`
+  - `outputs.pt`
+  - `checkpoint.pt`
+  - `per_node_test.jsonl`
+- Validation-locked comparable result:
+  - selected budget:
+    `0.05`
+  - test Acc / Macro-F1 under the validation-selected budget:
+    `0.8630600169061707 / 0.8618875071345797`
+  - fix / break / net:
+    `7 / 8 / -1`
+- Post-hoc test-curve result recorded in `overall_test`:
+  - full-test Acc / Macro-F1:
+    `0.8622147083685545 / 0.8613392413492079`
+  - delta vs base:
+    `-0.0016906170752324368 / -0.0011031158573601152`
+  - fix / break / net:
+    `21 / 23 / -2`
+  - routed wrong precision:
+    `0.3614864864864865`
+  - wrong-node fix rate:
+    `0.13043478260869565`
+  - correct-node break rate:
+    `0.022504892367906065`
+- Summary:
+  Adding both directional graph experts to the BotSay-style `ego` branch does
+  not improve this routed-node refiner line. Compared with the two smaller
+  ablations, the three-way raw concat increases recovery on wrong nodes but
+  also increases breaks enough to become clearly negative (`21 / 23 / -2` at
+  the recorded test curve, `7 / 8 / -1` under the validation-locked budget).
+  In this setting, `following` is the safer directional signal; naively adding
+  `follower` on top does not yield useful complementarity.
+
+### semantic_gate_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1
+
+- Status: completed on server
+- Stage: `semantic_correction_gate`
+- Scope:
+  literature-backed local-competence gate over the same two fixed DGP-v2
+  semantic candidates used by the probability-only and node-attribute gate
+  diagnostics:
+  - `qwen25_peft`
+  - `dgp_embed_mlp`
+- Claim boundary:
+  this is a routed-node learning-to-defer / dynamic-selection diagnostic. It
+  does not regenerate prompts, update Qwen PEFT, update the embedding MLP,
+  change the router, modify graph structure, or retrain frozen SimTeG.
+- Literature basis:
+  - META-DES: candidate competence should be estimated in a local region, not
+    only from global posterior scores.
+  - Learning-to-Defer / SelectiveNet: the downstream decision is accept/defer
+    against a strong base, not direct semantic replacement.
+  - Multicalibration: global calibration can fail on selected subgroups, so
+    subgroup/local competence features are a reasonable next diagnostic after
+    static node attributes failed.
+- Stable routed split:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/semantic_gate_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/semantic_gate_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1/seed_1/preparation/semantic_correction_gate`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `outputs.pt`
+  - `checkpoint.pt`
+  - `per_node_test.jsonl`
+- Command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+/root/mambaforge/envs/lmbot/bin/python -u main.py \
+  --experiment_task semantic_correction_gate \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --seeds 1 \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --semantic_gate_base_outputs_path /root/workspace/LMbot/LLMbot/server_prompt_expert_v2_clean_routed_classifier_qwen3_20260601/base_outputs_for_routed_classifier.pt \
+  --semantic_gate_candidate_output_paths /root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1/seed_1/preparation/semantic_encoder/outputs.pt,/root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1/seed_1/preparation/semantic_embedding_classifier/outputs.pt \
+  --semantic_gate_candidate_names qwen25_peft,dgp_embed_mlp \
+  --semantic_gate_feature_family local_competence \
+  --semantic_gate_local_k 25 \
+  --semantic_gate_break_weight 2.0 \
+  --artifact_root /root/workspace/LMbot/LLMbot/experiments/semantic_gate_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1 \
+  --device 0 \
+  --disable_wandb
+```
+
+- Feature contract:
+  - `--semantic_gate_feature_family local_competence`
+  - `--semantic_gate_local_k 25`
+  - final action feature dim: `64`
+  - node-attribute descriptor dim: `52`
+  - local competence appended dim: `12`
+  - competence source: routed train nodes only
+  - nearest-neighbor policy:
+    `cosine_topk_on_train_standardized_action_descriptors`
+  - self-neighbor policy: excluded for train queries
+- Validation-locked result:
+  - validation threshold:
+    `0.17996224761009216`
+  - validation fix / break / net:
+    `12 / 7 / +5`
+  - routed test fix / break / net:
+    `4 / 6 / -2`
+  - routed test base Acc / Macro-F1:
+    `0.6385135135135135 / 0.6291638858641564`
+  - routed test gated Acc / Macro-F1:
+    `0.6317567567567568 / 0.625911625911626`
+  - canonical full-test gated Acc / Macro-F1:
+    `0.8622147083685545 / 0.8609685315567668`
+  - canonical high-base frozen SimTeG Acc / Macro-F1:
+    `0.863905325443787 / 0.862442357206568`
+- Routed test selected action counts:
+  - `base`: `247`
+  - `qwen25_peft`: `7`
+  - `dgp_embed_mlp`: `42`
+- Comparison to previous gate diagnostics:
+
+| run | feature family | break weight | valid fix/break/net | test fix/break/net | full-test Acc | full-test Macro-F1 |
+|---|---|---:|---:|---:|---:|---:|
+| probability baseline | probability | 2 | `20 / 14 / +6` | `9 / 12 / -3` | `0.8613693998309383` | `0.8603514893960071` |
+| nodeattr bw2 | node_attribute | 2 | `42 / 41 / +1` | `12 / 26 / -14` | `0.8520710059171598` | `0.8508277340442779` |
+| nodeattr bw4 | node_attribute | 4 | `4 / 3 / +1` | `2 / 8 / -6` | `0.8588334742180896` | `0.8574629896979364` |
+| nodeattr bw8 | node_attribute | 8 | `3 / 2 / +1` | `1 / 4 / -3` | `0.8613693998309383` | `0.8599523001051015` |
+| local competence k25 | local_competence | 2 | `12 / 7 / +5` | `4 / 6 / -2` | `0.8622147083685545` | `0.8609685315567668` |
+
+- Interpretation boundary:
+  The literature-backed local-competence gate improves the failure mode of the
+  node-attribute bw2 run by becoming much more conservative on routed test
+  (`10` changed nodes rather than `38`), but it still fails to beat frozen
+  SimTeG and does not solve valid-test mismatch. The result supports the
+  negative diagnosis that static attributes and train-neighborhood competence
+  estimates are still insufficient to reliably identify safe semantic
+  corrections under the fixed high-base routed split.
+
+### semantic_gate_defer_breakfirst_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1
+
+- Status: completed on server
+- Stage: `semantic_correction_gate`
+- Scope:
+  P0/P1 gate optimization over the same fixed DGP-v2 semantic candidates:
+  - `qwen25_peft`
+  - `dgp_embed_mlp`
+- Claim boundary:
+  this run changes only the routed-node gate selection policy. It does not
+  regenerate prompts, update Qwen PEFT, update the embedding MLP, change the
+  router, modify graph structure, or retrain frozen SimTeG.
+- Method contract:
+  - `--semantic_gate_feature_family local_competence`
+  - `--semantic_gate_local_k 25`
+  - `--semantic_gate_selection_policy defer_softmax`
+  - `--semantic_gate_safety_policy break_first`
+  - action space: `{keep_base, qwen25_peft, dgp_embed_mlp}`
+  - safety head: per-candidate break-risk, threshold locked on routed validation
+- Stable routed split:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/semantic_gate_defer_breakfirst_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/semantic_gate_defer_breakfirst_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1/seed_1/preparation/semantic_correction_gate`
+- Completed artifacts:
+  - `manifest.json`
+  - `metrics.json`
+  - `outputs.pt`
+  - `checkpoint.pt`
+  - `per_node_test.jsonl`
+- Command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+/root/mambaforge/envs/lmbot/bin/python -u main.py \
+  --experiment_task semantic_correction_gate \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --seeds 1 \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_highbase_preiter_budget020_seed1_20260529.json \
+  --semantic_gate_base_outputs_path /root/workspace/LMbot/LLMbot/server_prompt_expert_v2_clean_routed_classifier_qwen3_20260601/base_outputs_for_routed_classifier.pt \
+  --semantic_gate_candidate_output_paths /root/workspace/LMbot/LLMbot/experiments/dgp__v2_qwen25_peft_predictor_norm_text_following_summary__highbase_routed__seed1/seed_1/preparation/semantic_encoder/outputs.pt,/root/workspace/LMbot/LLMbot/experiments/calm__dgp_v2_norm_text_following_summary_qwen25__highbase_routed__seed1/seed_1/preparation/semantic_embedding_classifier/outputs.pt \
+  --semantic_gate_candidate_names qwen25_peft,dgp_embed_mlp \
+  --semantic_gate_feature_family local_competence \
+  --semantic_gate_local_k 25 \
+  --semantic_gate_selection_policy defer_softmax \
+  --semantic_gate_safety_policy break_first \
+  --semantic_gate_break_weight 2.0 \
+  --artifact_root /root/workspace/LMbot/LLMbot/experiments/semantic_gate_defer_breakfirst_localcompetence__dgp_v2_peft_mlp__highbase_routed__seed1 \
+  --device 0 \
+  --disable_wandb
+```
+
+- Validation-locked result:
+  - validation threshold:
+    accept `0.5`, break `0.6399999856948853`
+  - validation fix / break / net:
+    `5 / 4 / +1`
+  - routed test fix / break / net:
+    `1 / 3 / -2`
+  - canonical full-test gated Acc / Macro-F1:
+    `0.8622147083685545 / 0.8608300584959926`
+  - canonical high-base frozen SimTeG Acc / Macro-F1:
+    `0.863905325443787 / 0.862442357206568`
+- Routed test selected action counts:
+  - `base`: `292`
+  - `dgp_embed_mlp`: `4`
+  - `qwen25_peft`: `0`
+- Narrow ablations:
+
+| run | selection | safety | break budget | valid fix/break/net | test fix/break/net | full-test Acc | full-test Macro-F1 | selected test actions |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| probability baseline | independent BCE | none | n/a | `20 / 14 / +6` | `9 / 12 / -3` | `0.8613693998309383` | `0.8603514893960071` | base `275`, qwen `3`, mlp `18` |
+| local threshold | independent BCE | none | n/a | `12 / 7 / +5` | `4 / 6 / -2` | `0.8622147083685545` | `0.8609685315567668` | base `247`, qwen `7`, mlp `42` |
+| defer only | defer_softmax | none | n/a | `6 / 6 / 0` | `2 / 4 / -2` | `0.8622147083685545` | `0.8608770498249321` | base `290`, mlp `6` |
+| defer + break-first | defer_softmax | break_first | -1 | `5 / 4 / +1` | `1 / 3 / -2` | `0.8622147083685545` | `0.8608300584959926` | base `292`, mlp `4` |
+| defer + break-first budget0 | defer_softmax | break_first | 0 | `1 / 0 / +1` | `0 / 0 / 0` | `0.863905325443787` | `0.862442357206568` | base `296` |
+
+- Interpretation boundary:
+  The action-level learning-to-defer gate and break-first safety head did not
+  recover positive routed-test utility. They reduced coverage and break, but
+  the accepted candidate actions still had lower test fix than break. With a
+  zero-break validation budget the policy collapses to full abstain on routed
+  test. This supports the current diagnosis that the fixed semantic candidate
+  outputs do not expose a stable enough correction-utility boundary for small
+  post-hoc gates to exploit under this high-base routed split.
+
+### hyperscan_labeled_dynamic_neighborloader_originaldetector_step200_20260609_seed1
+
+- Status: completed on server
+- Purpose:
+  detector/fusion-head ablation for the closest labeled-graph
+  NeighborLoader HyperScan-style branch.
+- Claim boundary:
+  single-seed, fixed 200 optimizer-step ablation. It changes only
+  `--hyperscan_detector_style` from the current residual detector to the
+  HyperScan-style bidirectional cross-attention + concat/ReLU + linear
+  detector. It does not change the labeled split, semantic embedding tensor,
+  relation backbone, batch-local KNN construction, NeighborLoader fanout,
+  graph batch size, or update budget.
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/hyperscan_labeled_dynamic_neighborloader_originaldetector_step200_20260609_seed1`
+- Stage root:
+  `/root/workspace/LMbot/LLMbot/experiments/hyperscan_labeled_dynamic_neighborloader_originaldetector_step200_20260609_seed1/seed_1/preparation/graph_detector`
+- Completed artifacts:
+  - `manifest.json`
+  - `selection_metrics.json`
+  - `graph_refine_stats.json`
+  - `outputs.pt`
+  - `checkpoint.pt`
+  - `run.log`
+- Command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot
+CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python main.py \
+  --experiment_task graph_detector_prepare \
+  --experiment_name experiments/hyperscan_labeled_dynamic_neighborloader_originaldetector_step200_20260609_seed1 \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_routed \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_refine_mode hyperscan_neighborloader_batch_local_branch \
+  --graph_neighbor_num_neighbors 64 \
+  --graph_refine_knn_k 8 \
+  --hyperscan_detector_style original_cross_attention \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --device 0 \
+  --disable_wandb
+```
+
+- Same-budget ablation:
+
+| run | dynamic KNN | detector | optimizer steps | Val Acc | Val Macro-F1 | Val Loss | node_repr dim |
+|---|---|---|---:|---:|---:|---:|---:|
+| `hyperscan_labeled_base_neighborloader_step200_20260609_seed1` | no | residual graph baseline | 200 | `0.8596194503` | `0.8567800295` | `0.3191002905` | 128 |
+| `hyperscan_labeled_dynamic_neighborloader_step200_20260609_seed1` | yes | residual | 200 | `0.8600422833` | `0.8571940407` | `0.3178465664` | 128 |
+| `hyperscan_labeled_dynamic_neighborloader_originaldetector_step200_20260609_seed1` | yes | original cross-attention | 200 | `0.8668076110` | `0.8644175976` | `0.3118747771` | 256 |
+
+- Interpretation boundary:
+  Under this single-seed same-budget ablation, swapping in the paper-style
+  detector/fusion head gives a clear validation improvement over both the
+  residual dynamic branch and the no-dynamic NeighborLoader control. This
+  supports testing the paper detector in longer/multi-seed HyperScan-style
+  runs, but does not by itself establish a claim-grade reproduction.

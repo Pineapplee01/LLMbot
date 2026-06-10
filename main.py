@@ -18,10 +18,13 @@ from parser_args import parser_args
 from stage_registry import get_stage_spec, resolve_stage_spec
 from artifact_contracts import MissingFrozenArtifactError, PHASE_A_CONTRACT, PHASE_A_DISABLED_COMPONENTS
 from runtime_env import _resolve_device
-from stage_runner import StageRunner
 from trainer_distillation import run_legacy_graph_seed
 from trainer_preparation import build_or_load_faithful_gats, build_or_load_frozen_g0, load_frozen_g0
-from trainer_semantic import run_semantic_embedding_classifier_seed, run_semantic_finetune_seed
+from trainer_semantic import (
+    run_semantic_correction_gate_seed,
+    run_semantic_embedding_classifier_seed,
+    run_semantic_finetune_seed,
+)
 from utils import (
     build_experiment_root,
     build_stage_dir,
@@ -632,6 +635,15 @@ def _run_seed_stage(args, seed, data, run, execution_stage, experiment_root):
             result=result,
         )
 
+    if execution_stage == "semantic_correction_gate":
+        result = run_semantic_correction_gate_seed(args, seed, data, experiment_root, run)
+        return _stage_result(
+            "semantic_correction_gate",
+            seed,
+            result.get("artifact_dir") or result.get("stage_dir"),
+            result=result,
+        )
+
     if execution_stage == "graph_detector_prepare":
         result = build_or_load_frozen_g0(args, seed, data, experiment_root)
         return _stage_result("graph_detector_prepare", seed, result.get("artifact_dir"), result=result)
@@ -651,6 +663,8 @@ def _run_seed_stage(args, seed, data, run, execution_stage, experiment_root):
     if execution_stage == "distillation_pipeline":
         run_legacy_graph_seed(args, seed, data, run)
         return _stage_result("distillation_pipeline", seed, experiment_root)
+
+    from stage_runner import StageRunner
 
     runner = StageRunner(args=args, seed=seed, data=data, run=run)
     result = runner.run()
@@ -682,7 +696,12 @@ def main(args):
     args.execution_task = execution_stage
     args.stage = execution_stage
     args.reset_split = reset_split_value
-    if execution_stage not in {"distillation_pipeline", "semantic_encoder_finetune", "semantic_embedding_classifier"}:
+    if execution_stage not in {
+        "distillation_pipeline",
+        "semantic_encoder_finetune",
+        "semantic_embedding_classifier",
+        "semantic_correction_gate",
+    }:
         args.use_GNN = True
 
     stage_results = []
