@@ -90,6 +90,9 @@ First-round full-graph support:
     it keeps the original relation graph unchanged, then inside each forward
     it builds routed-node local KNN hyperedges from `x_low + x_in` and runs a
     separate HypergraphConv branch before fusion
+    `graph_detector_prepare` now exports those true `x_low` / `x_new`
+    intermediates into frozen `outputs.pt`, so later router stages can consume
+    the exact HyperScan KNN feature space
   - `--graph_second_view_scope labeled_prefix` runs the same dynamic second
     view over the labeled-prefix centers when no routed-node file should be
     consumed
@@ -137,6 +140,13 @@ First-round full-graph support:
   - `graph_detector_prepare --mhlgc_enable` consumes that embedding tensor via
     `--mhlgc_semantic_embedding_path` and adds an auxiliary LLM-guided
     hard-negative contrastive loss in `GNNs.py`
+  - `--mhlgc_hyperedge_mask_probability` extends the augmented branch to the
+    active second-view hypergraph by Bernoulli-masking node-hyperedge
+    incidence entries; leaving it at `0` preserves the earlier
+    feature/edge-only augmentation behavior
+  - `--mhlgc_negative_count 3` switches the auxiliary loss from the legacy
+    all-negatives weighting to a paper-style top-3 hard-negative setting per
+    selected anchor; the default `0` preserves existing all-negative behavior
   - this is an MH-LGC-style task adaptation: the LLM guides training through
     semantic hard-negative weights; it is not an LLM predictor and the LLM is
     not used at graph-detector inference
@@ -323,6 +333,8 @@ python main.py \
   --mhlgc_beta 1.0 \
   --mhlgc_gamma 0.5 \
   --mhlgc_temperature 1.0 \
+  --mhlgc_hyperedge_mask_probability 0.10 \
+  --mhlgc_negative_count 3 \
   --seeds 1 \
   --disable_wandb
 ```
@@ -1369,6 +1381,8 @@ python main.py \
 # If the frozen G0 artifact was trained with a HyperScan-style second-view KNN
 # branch, omitted --conformal_knn_k / --conformal_knn_candidate_scope /
 # --conformal_knn_repr_source values inherit that artifact's Hyper KNN config.
+# When such an artifact exports x_low / x_new, the router consumes those exact
+# tensors first; older frozen outputs fall back to post-hoc reconstruction.
 # Explicit --conformal_knn_* flags still override the inherited defaults, and
 # the effective source is written to risk_manifest.calibration_metadata.
 # Only labeled centers are risk-updated and routed; support nodes keep their
@@ -1377,13 +1391,33 @@ python main.py \
 # risk_manifest.selected_nodes for the default budget and
 # risk_manifest.selected_nodes_by_budget for the full budget sweep.
 # Use --conformal_knn_score_family_override base_only for the strict target-only
-# control; leave it as auto for the target + KNN support-group router.
+# control; use ncp_local_conformal, ncp_local_margin, or
+# ncp_knn_weighted_mean for direct NCP-local evidence baselines; leave it as auto
+# for the validation-selected target + KNN support-group router. Under
+# --conformal_knn_local_calibration_scope same_hyperedge, auto now selects from
+# same-hyperedge tail-risk families, including a calibration-only inner-tail
+# variant, so the router can share the HyperScan-aligned support hyperedge while
+# still restricting the final risk reference to calibration members when desired.
+# The current stabilized follow-up is an ESS-shrunk calibration-tail variant:
+# it keeps the HyperScan support hyperedge fixed, computes a calibration-only
+# inner-tail risk inside that group, then shrinks toward the broader
+# same-hyperedge global-tail risk when the local effective sample size is small.
+# Treat `same_hyperedge_calibration_shrunk_tail` as the current same-hyperedge
+# router anchor: future KNN-router, learned-router, and LLM-consuming router
+# variants should report matched comparisons against this fixed family even when
+# `auto` remains available for exploratory score-family selection.
 # The default --conformal_knn_learning_mode fixed preserves the historical
 # validation-selected score families. Set --conformal_knn_learning_mode ncp_local
 # to enable NCP-style local calibration: each target uses KNN calibration
 # neighbors weighted as exp(-distance/lambda_L), then derives a local conformal
 # threshold/features and selects among nonparametric NCP-local score families
 # on the tune split by AUPRC-error first, without fitting a logistic router head.
+# --conformal_knn_local_calibration_scope same_hyperedge is the closer
+# HyperScan-aligned router setting: it reuses the target-centered HyperScan KNN
+# hyperedge as the direct selected-K risk neighborhood instead of issuing a second
+# calibration-only KNN query. When --conformal_knn_candidate_scope hyperscan_full
+# is inherited from a HyperScan-style frozen G0 and this flag is omitted, the
+# router now defaults to same_hyperedge.
 # Non-model KNN support-quality controls are available for router-only ablation
 # sweeps: --conformal_knn_neighbor_mode {standard,mutual,threshold,adaptive,mutual_adaptive},
 # --conformal_knn_similarity_threshold, --conformal_knn_min_support,

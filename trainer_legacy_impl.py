@@ -6647,6 +6647,9 @@ class StageRunner:
                 getattr(self.args, "conformal_knn_score_family_override", "auto") or "auto"
             ),
             "conformal_knn_repr_source": str(getattr(self.args, "conformal_knn_repr_source", "node_repr") or "node_repr"),
+            "conformal_knn_local_calibration_scope": str(
+                getattr(self.args, "conformal_knn_local_calibration_scope", "independent_knn") or "independent_knn"
+            ),
         }
         metadata = {
             "source": str(getattr(self.args, "conformal_knn_config_source", "explicit_cli_or_router_defaults")),
@@ -6678,6 +6681,12 @@ class StageRunner:
             }:
                 config["conformal_knn_repr_source"] = "x_new"
                 inherited_fields.append("repr_source")
+            if (
+                "--conformal_knn_local_calibration_scope" not in explicit_flags
+                and config["conformal_knn_candidate_scope"] == "hyperscan_full"
+            ):
+                config["conformal_knn_local_calibration_scope"] = "same_hyperedge"
+                inherited_fields.append("local_calibration_scope")
             if inherited_fields:
                 metadata["source"] = "frozen_g0_hyper_knn_second_view"
                 metadata["inherited_fields"] = inherited_fields
@@ -6692,6 +6701,11 @@ class StageRunner:
             raise ValueError("--conformal_knn_repr_source must resolve to one of {node_repr, x_low, x_new}.")
         if config["conformal_knn_learning_mode"] not in {"fixed", "ncp_local"}:
             raise ValueError("--conformal_knn_learning_mode must resolve to one of {fixed, ncp_local}.")
+        if config["conformal_knn_local_calibration_scope"] not in {"independent_knn", "same_hyperedge"}:
+            raise ValueError(
+                "--conformal_knn_local_calibration_scope must resolve to one of "
+                "{independent_knn, same_hyperedge}."
+            )
         if config["conformal_knn_neighbor_mode"] not in {
             "standard",
             "mutual",
@@ -6718,22 +6732,87 @@ class StageRunner:
         repr_source = str(repr_source or getattr(self.args, "conformal_knn_repr_source", "node_repr") or "node_repr").strip().lower()
         if repr_source not in {"node_repr", "x_low", "x_new"}:
             raise ValueError("--conformal_knn_repr_source must be one of {node_repr, x_low, x_new}.")
-        if node_repr is None:
-            raise MissingFrozenArtifactError("conformal_knn_risk_router requires frozen G0 node_repr.")
-        x_low = node_repr.detach().cpu().float() if torch.is_tensor(node_repr) else torch.tensor(node_repr, dtype=torch.float32)
+
+        def _to_cpu_float_view(value, name):
+            if value is None:
+                return None
+            tensor = value.detach().cpu().float() if torch.is_tensor(value) else torch.tensor(value, dtype=torch.float32)
+            if tensor.dim() != 2:
+                raise MissingFrozenArtifactError(
+                    f"conformal_knn {name} expects a 2-D tensor, got {tuple(tensor.shape)}."
+                )
+            return tensor
+
+        node_repr_tensor = _to_cpu_float_view(node_repr, "node_repr")
+        x_low_export = _to_cpu_float_view(gnn_outputs.get("x_low"), "x_low")
+        x_new_export = _to_cpu_float_view(gnn_outputs.get("x_new"), "x_new")
         metadata = {
             "requested_repr_source": repr_source,
-            "effective_repr_source": "node_repr" if repr_source in {"node_repr", "x_low"} else "x_new",
-            "x_low_source": "frozen_g0.node_repr",
-            "x_low_shape": [int(x_low.shape[0]), int(x_low.shape[1])] if x_low.dim() == 2 else list(x_low.shape),
-            "hyperscan_alignment_note": (
-                "For the current RGCN frozen G0, node_repr is the relation-view x_low-like embedding. "
-                "x_new follows HyperScan's KNN feature contract by concatenating x_low with the frozen G0 input features."
-            ),
+            "available_repr_fields": {
+                "node_repr": bool(node_repr_tensor is not None),
+                "x_low": bool(x_low_export is not None),
+                "x_new": bool(x_new_export is not None),
+            },
         }
-        if repr_source in {"node_repr", "x_low"}:
-            metadata["repr_shape"] = list(metadata["x_low_shape"])
+        if repr_source == "node_repr":
+            if node_repr_tensor is None:
+                raise MissingFrozenArtifactError("conformal_knn_risk_router requires frozen G0 node_repr.")
+            metadata.update(
+                {
+                    "effective_repr_source": "node_repr",
+                    "repr_resolution": "direct_node_repr",
+                    "repr_shape": [int(node_repr_tensor.shape[0]), int(node_repr_tensor.shape[1])],
+                    "hyperscan_alignment_note": (
+                        "Router consumed the detector fused node_repr directly because "
+                        "--conformal_knn_repr_source node_repr was requested."
+                    ),
+                }
+            )
+            return node_repr_tensor, metadata
+
+        x_low = x_low_export
+        x_low_source = "frozen_g0.x_low"
+        if x_low is None:
+            if node_repr_tensor is None:
+                raise MissingFrozenArtifactError(
+                    "conformal_knn_risk_router requires frozen G0 node_repr or exported x_low."
+                )
+            x_low = node_repr_tensor
+            x_low_source = "frozen_g0.node_repr_legacy_proxy"
+        metadata["x_low_source"] = x_low_source
+        metadata["x_low_shape"] = [int(x_low.shape[0]), int(x_low.shape[1])]
+
+        if repr_source == "x_low":
+            metadata.update(
+                {
+                    "effective_repr_source": "x_low",
+                    "repr_resolution": (
+                        "exported_x_low" if x_low_source == "frozen_g0.x_low" else "legacy_node_repr_proxy_for_x_low"
+                    ),
+                    "repr_shape": [int(x_low.shape[0]), int(x_low.shape[1])],
+                    "hyperscan_alignment_note": (
+                        "Router consumed the relation-view x_low directly from frozen G0."
+                        if x_low_source == "frozen_g0.x_low"
+                        else "Frozen G0 did not export x_low, so router fell back to node_repr as an x_low proxy."
+                    ),
+                }
+            )
             return x_low, metadata
+
+        if x_new_export is not None:
+            metadata.update(
+                {
+                    "effective_repr_source": "x_new",
+                    "repr_resolution": "exported_x_new",
+                    "x_new_source": "frozen_g0.x_new",
+                    "repr_shape": [int(x_new_export.shape[0]), int(x_new_export.shape[1])],
+                    "hyperscan_alignment_note": (
+                        "Router consumed the exact HyperScan x_new exported by frozen G0, instead of reconstructing "
+                        "it from node_repr."
+                    ),
+                }
+            )
+            return x_new_export, metadata
 
         x_in = self._strict_glance_backbone_input_features()
         x_in = x_in.detach().cpu().float() if torch.is_tensor(x_in) else torch.tensor(x_in, dtype=torch.float32)
@@ -6755,12 +6834,23 @@ class StageRunner:
         )
         metadata.update(
             {
+                "effective_repr_source": "x_new",
+                "repr_resolution": (
+                    "reconstructed_x_new_from_exported_x_low_and_x_in"
+                    if x_low_source == "frozen_g0.x_low"
+                    else "reconstructed_x_new_from_node_repr_and_x_in"
+                ),
+                "x_new_source": "reconstructed_cat_x_low_x_in",
                 "x_in_source": "frozen_g0.input_pipeline.projected_features",
                 "x_in_shape": [int(x_in.shape[0]), int(x_in.shape[1])],
                 "repr_shape": [int(x_new.shape[0]), int(x_new.shape[1])],
                 "feature_manifest_path": str(feature_manifest.get("path", "") or ""),
                 "feature_manifest_projector": str(feature_manifest.get("projector", "") or ""),
                 "feature_manifest_projected_dim": feature_manifest.get("projected_dim"),
+                "hyperscan_alignment_note": (
+                    "Frozen G0 did not export x_new, so router reconstructed cat(x_low, x_in) post-hoc. "
+                    "This is backward-compatible but less exact than consuming exported x_new directly."
+                ),
             }
         )
         return x_new, metadata
@@ -6841,6 +6931,7 @@ class StageRunner:
                 "adaptive_max_k": int(conformal_knn_config["conformal_knn_adaptive_max_k"]),
                 "hubness_correction": str(conformal_knn_config["conformal_knn_hubness_correction"]),
                 "learning_mode": str(conformal_knn_config["conformal_knn_learning_mode"]),
+                "local_calibration_scope": str(conformal_knn_config["conformal_knn_local_calibration_scope"]),
                 "score_family_override": str(conformal_knn_config["conformal_knn_score_family_override"]),
                 "repr_source": str(conformal_knn_config["conformal_knn_repr_source"]),
                 "repr_metadata": dict(conformal_knn_repr_metadata or {}),
@@ -6860,6 +6951,10 @@ class StageRunner:
                     "k_semantics": (
                         "hyperscan_full uses k as hyperedge size including center; "
                         "relation-local scopes use k as the maximum non-center support-neighbor count"
+                    ),
+                    "local_calibration_scope_note": (
+                        "same_hyperedge reuses the target-centered HyperScan KNN hyperedge for local calibration; "
+                        "independent_knn queries calibration neighbors separately in the same representation space"
                     ),
                 },
                 "target_selection_contract": "target_node_to_knn_support_group_risk_v1",

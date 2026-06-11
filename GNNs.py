@@ -46,7 +46,7 @@ class BaseGraphBackbone(nn.Module):
             return nn.ELU()
         raise ValueError('Please choose activation function from "leakyrelu", "relu" or "elu".')
 
-    def forward_outputs(self, x, edge_index, edge_type):
+    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
         hidden = self.encode(x, edge_index, edge_type)
         logits = self.linear_out(hidden)
         return {
@@ -56,8 +56,13 @@ class BaseGraphBackbone(nn.Module):
             "aux_features": {},
         }
 
-    def forward(self, x, edge_index, edge_type):
-        return self.forward_outputs(x, edge_index, edge_type)["logits"]
+    def forward(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
+        return self.forward_outputs(
+            x,
+            edge_index,
+            edge_type,
+            hyperedge_mask_probability=hyperedge_mask_probability,
+        )["logits"]
 
 
 def _as_long_tensor_list(values):
@@ -265,6 +270,59 @@ def mhlgc_mask_edges(edge_index, edge_type, mask_probability=0.0):
     return masked_edge_index, edge_type.view(-1)[keep].contiguous()
 
 
+def mhlgc_mask_hyperedge_membership(
+    hyperedge_index,
+    incident_mask=None,
+    num_nodes=None,
+    mask_probability=0.0,
+):
+    p = float(mask_probability or 0.0)
+    stats = {
+        "hyperedge_membership_mask_probability": p,
+        "hyperedge_membership_mask_applied": False,
+    }
+    if hyperedge_index is None:
+        return hyperedge_index, incident_mask, stats
+    if p <= 0.0:
+        return hyperedge_index, incident_mask, stats
+    if p >= 1.0:
+        raise ValueError("mhlgc hyperedge membership mask probability must be < 1.0.")
+    if hyperedge_index.dim() != 2 or int(hyperedge_index.size(0)) != 2:
+        raise ValueError("hyperedge_index must be shaped [2, incidence_count].")
+
+    if num_nodes is None:
+        if incident_mask is not None:
+            num_nodes = int(incident_mask.numel())
+        elif int(hyperedge_index.numel()) > 0:
+            num_nodes = int(hyperedge_index[0].max().item()) + 1
+        else:
+            num_nodes = 0
+    num_nodes = int(num_nodes)
+
+    incidence_count_before = int(hyperedge_index.size(1))
+    keep = torch.rand(incidence_count_before, device=hyperedge_index.device) >= p
+    if incidence_count_before > 0 and not bool(keep.any().item()):
+        keep[torch.randint(incidence_count_before, (1,), device=hyperedge_index.device)] = True
+    masked_hyperedge_index = hyperedge_index[:, keep].contiguous()
+    if int(masked_hyperedge_index.numel()) == 0:
+        masked_hyperedge_index = hyperedge_index.new_empty((2, 0))
+
+    masked_incident_mask = torch.zeros(num_nodes, dtype=torch.bool, device=hyperedge_index.device)
+    if int(masked_hyperedge_index.numel()) > 0 and num_nodes > 0:
+        masked_incident_mask[masked_hyperedge_index[0].long().unique()] = True
+
+    stats.update(
+        {
+            "hyperedge_membership_mask_applied": True,
+            "hyperedge_membership_incidence_before": incidence_count_before,
+            "hyperedge_membership_incidence_after": int(masked_hyperedge_index.size(1)),
+            "hyperedge_membership_drop_count": int(incidence_count_before - int(masked_hyperedge_index.size(1))),
+            "hyperedge_membership_nodes_after": int(masked_incident_mask.sum().item()),
+        }
+    )
+    return masked_hyperedge_index, masked_incident_mask, stats
+
+
 def mhlgc_select_borderline_anchors(labels, fraud_scores, positive_label=1, anchors_per_batch=1, anchor_mask=None):
     labels = labels.detach().view(-1)
     positive_mask = labels == int(positive_label)
@@ -292,6 +350,7 @@ def mhlgc_llm_guided_contrastive_loss(
     beta=1.0,
     gamma=0.5,
     temperature=1.0,
+    negative_count=0,
     negative_mask=None,
 ):
     """MH-LGC-style hardness-aware InfoNCE for routed hard-node training.
@@ -312,6 +371,7 @@ def mhlgc_llm_guided_contrastive_loss(
         raise ValueError("mhlgc temperature must be > 0.")
     gamma = min(max(float(gamma or 0.0), 0.0), 1.0)
     beta = float(beta or 0.0)
+    negative_count = max(int(negative_count or 0), 0)
     semantic_embeddings_clean = None
     anchor_mask = None
     if semantic_embeddings is not None and gamma > 0.0:
@@ -335,6 +395,10 @@ def mhlgc_llm_guided_contrastive_loss(
         anchors_per_batch=anchors_per_batch,
         anchor_mask=anchor_mask,
     )
+    anchor_candidate_mask = labels == int(positive_label)
+    if anchor_mask is not None:
+        anchor_candidate_mask = anchor_candidate_mask & anchor_mask
+    anchor_candidate_count = int(anchor_candidate_mask.sum().item())
     if negative_mask is None:
         negative_mask = labels != int(positive_label)
     else:
@@ -344,8 +408,11 @@ def mhlgc_llm_guided_contrastive_loss(
     if anchors.numel() == 0 or negative_idx.numel() == 0:
         return zero, {
             "mhlgc_anchor_count": int(anchors.numel()),
-            "mhlgc_anchor_candidate_count": int(anchor_mask.sum().item()) if anchor_mask is not None else int((labels == int(positive_label)).sum().item()),
-            "mhlgc_negative_count": int(negative_idx.numel()),
+            "mhlgc_anchor_candidate_count": int(anchor_candidate_count),
+            "mhlgc_negative_count": 0,
+            "mhlgc_negative_candidate_count": int(negative_idx.numel()),
+            "mhlgc_negative_count_per_anchor": int(negative_count),
+            "mhlgc_negative_selection": "hard_topk" if negative_count > 0 else "all",
             "mhlgc_active": False,
         }
 
@@ -370,14 +437,28 @@ def mhlgc_llm_guided_contrastive_loss(
     else:
         hardness = structure_sim
 
+    negative_candidate_count = int(negative_idx.numel())
+    if negative_count > 0 and negative_candidate_count > negative_count:
+        _, selected_negative_pos = torch.topk(
+            hardness.detach(),
+            k=int(negative_count),
+            dim=1,
+            largest=True,
+        )
+        neg_logits = torch.gather(neg_logits, dim=1, index=selected_negative_pos)
+        hardness = torch.gather(hardness, dim=1, index=selected_negative_pos)
+
     weights = F.softmax(beta * hardness, dim=1)
     log_weight = torch.log(weights.clamp_min(1e-12))
     log_neg = torch.logsumexp(neg_logits + log_weight, dim=1)
     loss = F.softplus(log_neg - pos_logits).mean()
     return loss, {
         "mhlgc_anchor_count": int(anchors.numel()),
-        "mhlgc_anchor_candidate_count": int(anchor_mask.sum().item()) if anchor_mask is not None else int((labels == int(positive_label)).sum().item()),
-        "mhlgc_negative_count": int(negative_idx.numel()),
+        "mhlgc_anchor_candidate_count": int(anchor_candidate_count),
+        "mhlgc_negative_count": int(neg_logits.numel()),
+        "mhlgc_negative_candidate_count": int(negative_candidate_count),
+        "mhlgc_negative_count_per_anchor": int(negative_count),
+        "mhlgc_negative_selection": "hard_topk" if negative_count > 0 else "all",
         "mhlgc_active": True,
         "mhlgc_beta": float(beta),
         "mhlgc_gamma": float(gamma),
@@ -586,11 +667,19 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
             static_stats=self.dynamic_branch_static_stats,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type):
+    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
         x_low = self._encode_relation_view(x, edge_index, edge_type)
         x_new = torch.cat([x_low, x], dim=1)
         hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
-        if hyperedge_index is None:
+        hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
+            hyperedge_index,
+            incident_mask=incident_mask,
+            num_nodes=int(x_new.size(0)),
+            mask_probability=hyperedge_mask_probability,
+        )
+        branch_stats = dict(branch_stats or {})
+        branch_stats.update(mask_stats)
+        if hyperedge_index is None or int(hyperedge_index.numel()) == 0:
             x_high = torch.zeros_like(x_low)
             incident_scale = torch.zeros((x_low.size(0), 1), dtype=x_low.dtype, device=x_low.device)
         else:
@@ -607,6 +696,8 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "x_low": x_low,
+            "x_new": x_new,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
             },
@@ -709,12 +800,20 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
             static_stats=self.dynamic_branch_static_stats,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type):
+    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
         x_in, x_rel = self._encode_node_input(x)
         x_low = self._encode_relation_view(x_rel, edge_index, edge_type)
         x_new = torch.cat([x_low, x_in], dim=1)
         hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
-        if hyperedge_index is None:
+        hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
+            hyperedge_index,
+            incident_mask=incident_mask,
+            num_nodes=int(x_new.size(0)),
+            mask_probability=hyperedge_mask_probability,
+        )
+        branch_stats = dict(branch_stats or {})
+        branch_stats.update(mask_stats)
+        if hyperedge_index is None or int(hyperedge_index.numel()) == 0:
             x_high = torch.zeros_like(x_low)
             incident_scale = torch.zeros((x_low.size(0), 1), dtype=x_low.dtype, device=x_low.device)
         else:
@@ -731,6 +830,8 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "x_low": x_low,
+            "x_new": x_new,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
             },
@@ -835,11 +936,19 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
             static_stats=self.dynamic_branch_static_stats,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type):
+    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
         x_in, x_rel = self._encode_node_input(x)
         x_low = self._encode_relation_view(x_rel, edge_index, edge_type)
         x_new = torch.cat([x_low, x_in], dim=1)
         hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
+        hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
+            hyperedge_index,
+            incident_mask=incident_mask,
+            num_nodes=int(x_new.size(0)),
+            mask_probability=hyperedge_mask_probability,
+        )
+        branch_stats = dict(branch_stats or {})
+        branch_stats.update(mask_stats)
         hg = _dhg_hypergraph_from_incidence(hyperedge_index, x_new.size(0), x_new.device)
         if hg is None:
             x_high = torch.zeros_like(x_low)
@@ -854,6 +963,8 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "x_low": x_low,
+            "x_new": x_new,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
             },
@@ -933,10 +1044,18 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
             static_stats=self.dynamic_branch_static_stats,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type):
+    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
         x_low = self._encode_relation_view(x, edge_index, edge_type)
         x_new = torch.cat([x_low, x], dim=1)
         hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
+        hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
+            hyperedge_index,
+            incident_mask=incident_mask,
+            num_nodes=int(x_new.size(0)),
+            mask_probability=hyperedge_mask_probability,
+        )
+        branch_stats = dict(branch_stats or {})
+        branch_stats.update(mask_stats)
         hg = _dhg_hypergraph_from_incidence(hyperedge_index, x_new.size(0), x_new.device)
         if hg is None:
             x_high = torch.zeros_like(x_low)
@@ -951,6 +1070,8 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "x_low": x_low,
+            "x_new": x_new,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
             },

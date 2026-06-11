@@ -858,10 +858,29 @@ def parser_args(argv=None):
         help="Edge masking probability used to create the positive augmented relation view in MH-LGC.",
     )
     parser.add_argument(
+        "--mhlgc_hyperedge_mask_probability",
+        type=float,
+        default=0.0,
+        help=(
+            "Incidence masking probability applied to the dynamically built second-view hypergraph "
+            "during the MH-LGC augmented branch. Default 0 preserves prior feature/edge-only behavior."
+        ),
+    )
+    parser.add_argument(
         "--mhlgc_anchors_per_batch",
         type=int,
         default=1,
         help="Number of lowest-positive-score positive-label nodes used as borderline anchors per batch.",
+    )
+    parser.add_argument(
+        "--mhlgc_negative_count",
+        type=int,
+        default=0,
+        help=(
+            "Number of hard negatives retained per MH-LGC anchor. 0 keeps the legacy behavior "
+            "of using all negative-label nodes in the batch; 3 matches the paper-style anchor plus "
+            "three negatives setting."
+        ),
     )
     parser.add_argument(
         "--mhlgc_positive_label",
@@ -1524,13 +1543,29 @@ def parser_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--conformal_knn_local_calibration_scope",
+        type=str,
+        default="independent_knn",
+        choices=["independent_knn", "same_hyperedge"],
+        help=(
+            "Local calibration neighborhood source for conformal_knn_risk_router when "
+            "--conformal_knn_learning_mode ncp_local is enabled. `independent_knn` preserves "
+            "the previous behavior by querying calibration neighbors separately in the same "
+            "representation space; `same_hyperedge` scores each target directly from the "
+            "selected-K members of its target-centered HyperScan-style KNN hyperedge."
+        ),
+    )
+    parser.add_argument(
         "--conformal_knn_score_family_override",
         type=str,
         default="auto",
         help=(
             "Optional score-family override for conformal_knn_risk_router. "
             "`auto` selects on the validation tune split; `base_only` is the strict target-only "
-            "risk baseline for target->KNN support-group ablations."
+            "risk baseline for target->KNN support-group ablations. Under "
+            "`--conformal_knn_local_calibration_scope same_hyperedge`, `auto` now selects from "
+            "same-hyperedge tail-risk families, including calibration-only inner-tail variants, "
+            "instead of forcing a local-conformal risk family."
         ),
     )
     parser.add_argument("--router_oof_mode", type=str, default="artifact", choices=["artifact"])

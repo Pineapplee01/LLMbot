@@ -139,6 +139,25 @@ def _load_mhlgc_semantic_embeddings(path, expected_rows):
     return payload.contiguous()
 
 
+def _float_cli_arg(value, default):
+    """Preserve explicit 0.0 values instead of falling back through Python truthiness."""
+    return float(default if value is None else value)
+
+
+def _expand_labeled_targets_to_graph(y_cpu, graph_num_nodes, ignore_index=-100):
+    y_cpu = y_cpu.detach().cpu().long().view(-1) if torch.is_tensor(y_cpu) else torch.tensor(y_cpu, dtype=torch.long).view(-1)
+    graph_num_nodes = int(graph_num_nodes)
+    if int(y_cpu.numel()) > graph_num_nodes:
+        raise ValueError(
+            f"Labeled target rows ({int(y_cpu.numel())}) exceed graph nodes ({graph_num_nodes})."
+        )
+    if int(y_cpu.numel()) == graph_num_nodes:
+        return y_cpu.contiguous()
+    y_full = torch.full((graph_num_nodes,), int(ignore_index), dtype=torch.long)
+    y_full[: int(y_cpu.numel())] = y_cpu
+    return y_full.contiguous()
+
+
 def _train_graph_backbone_once(
     config,
     x_projected,
@@ -167,7 +186,9 @@ def _train_graph_backbone_once(
     mhlgc_temperature=1.0,
     mhlgc_feature_mask_probability=0.15,
     mhlgc_edge_mask_probability=0.10,
+    mhlgc_hyperedge_mask_probability=0.0,
     mhlgc_anchors_per_batch=1,
+    mhlgc_negative_count=0,
     mhlgc_positive_label=1,
 ):
     device = config["device"]
@@ -206,6 +227,7 @@ def _train_graph_backbone_once(
         "loss_sum": 0.0,
         "anchor_count_sum": 0,
         "negative_count_sum": 0,
+        "negative_candidate_count_sum": 0,
     }
 
     def _record_mhlgc(loss_tensor, stats):
@@ -215,6 +237,7 @@ def _train_graph_backbone_once(
             mhlgc_stats["loss_sum"] += float(loss_tensor.detach().cpu().item())
             mhlgc_stats["anchor_count_sum"] += int(stats.get("mhlgc_anchor_count", 0))
             mhlgc_stats["negative_count_sum"] += int(stats.get("mhlgc_negative_count", 0))
+            mhlgc_stats["negative_candidate_count_sum"] += int(stats.get("mhlgc_negative_candidate_count", 0))
 
     if str(training_loader_mode).lower() == "neighbor_subgraph":
         edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
@@ -222,6 +245,9 @@ def _train_graph_backbone_once(
         x_projected_cpu = x_projected.detach().cpu().float() if torch.is_tensor(x_projected) else torch.tensor(x_projected, dtype=torch.float32)
         x_raw_cpu = x_raw.detach().cpu().float() if torch.is_tensor(x_raw) else torch.tensor(x_raw, dtype=torch.float32)
         y_cpu = y.detach().cpu().long() if torch.is_tensor(y) else torch.tensor(y, dtype=torch.long)
+        graph_num_nodes = int(x_projected_cpu.shape[0])
+        labeled_node_count = int(y_cpu.numel())
+        y_full_cpu = _expand_labeled_targets_to_graph(y_cpu, graph_num_nodes)
         train_idx_cpu = train_idx.detach().cpu().long().view(-1)
         valid_idx_cpu = valid_idx.detach().cpu().long().view(-1)
         n_layers = int(config.get("gnn_n_layers", config.get("n_layers", 2)))
@@ -229,12 +255,12 @@ def _train_graph_backbone_once(
         loader_data = Data(
             x=x_projected_cpu,
             raw_x=x_raw_cpu,
-            y=y_cpu,
+            y=y_full_cpu,
             edge_index=edge_index_cpu,
             edge_type=edge_type_cpu,
-            node_id=torch.arange(int(x_projected_cpu.shape[0]), dtype=torch.long),
+            node_id=torch.arange(graph_num_nodes, dtype=torch.long),
         )
-        loader_data.num_nodes = int(x_projected_cpu.shape[0])
+        loader_data.num_nodes = graph_num_nodes
         batch_size = max(int(graph_batch_size), 1)
         train_loader = NeighborLoader(
             data=loader_data,
@@ -282,7 +308,12 @@ def _train_graph_backbone_once(
                         batch.edge_type.view(-1),
                         mask_probability=float(mhlgc_edge_mask_probability),
                     )
-                    aug_outputs = model.forward_outputs(x_aug, edge_index_aug, edge_type_aug)
+                    aug_outputs = model.forward_outputs(
+                        x_aug,
+                        edge_index_aug,
+                        edge_type_aug,
+                        hyperedge_mask_probability=float(mhlgc_hyperedge_mask_probability),
+                    )
                     semantic_batch = None
                     if mhlgc_semantic_embeddings is not None:
                         semantic_batch = mhlgc_semantic_embeddings[
@@ -299,6 +330,7 @@ def _train_graph_backbone_once(
                         beta=float(mhlgc_beta),
                         gamma=float(mhlgc_gamma if semantic_batch is not None else 0.0),
                         temperature=float(mhlgc_temperature),
+                        negative_count=int(mhlgc_negative_count),
                     )
                     _record_mhlgc(mhlgc_loss, mhlgc_step_stats)
                     loss = loss + mhlgc_loss_weight * mhlgc_loss
@@ -311,19 +343,34 @@ def _train_graph_backbone_once(
             model.eval()
             if input_adapter is not None:
                 input_adapter.eval()
-            eval_logits = []
-            eval_labels = []
+            eval_logits_by_node = None
+            eval_seen = torch.zeros((labeled_node_count,), dtype=torch.bool)
             with torch.no_grad():
                 for batch in valid_loader:
                     batch = batch.to(device)
                     x_eval = input_adapter(batch.x, batch.raw_x) if input_adapter is not None else batch.x
                     logits_eval = model(x_eval, batch.edge_index, batch.edge_type.view(-1))
                     seed_count = int(batch.batch_size)
-                    eval_logits.append(logits_eval[:seed_count].detach().cpu())
-                    eval_labels.append(batch.y[:seed_count].detach().cpu())
-            stacked_logits = torch.cat(eval_logits, dim=0) if eval_logits else torch.empty((0, 2), dtype=torch.float32)
-            stacked_labels = torch.cat(eval_labels, dim=0) if eval_labels else torch.empty((0,), dtype=torch.long)
-            val_metrics = _score_logits(stacked_logits, stacked_labels, torch.arange(stacked_labels.numel(), dtype=torch.long))
+                    global_ids = batch.node_id[:seed_count].detach().cpu().long()
+                    batch_logits = logits_eval[:seed_count].detach().cpu()
+                    valid_seed_mask = (global_ids >= 0) & (global_ids < labeled_node_count)
+                    if not bool(valid_seed_mask.any()):
+                        continue
+                    if eval_logits_by_node is None:
+                        eval_logits_by_node = torch.zeros(
+                            (labeled_node_count, int(batch_logits.shape[1])),
+                            dtype=batch_logits.dtype,
+                        )
+                    eval_ids = global_ids[valid_seed_mask]
+                    eval_logits_by_node[eval_ids] = batch_logits[valid_seed_mask]
+                    eval_seen[eval_ids] = True
+            if eval_logits_by_node is None or not bool(torch.all(eval_seen[valid_idx_cpu]).item()):
+                missing = valid_idx_cpu[~eval_seen[valid_idx_cpu]]
+                raise RuntimeError(
+                    "NeighborLoader validation did not produce aligned logits for every valid node. "
+                    f"Missing {int(missing.numel())} ids."
+                )
+            val_metrics = _score_logits(eval_logits_by_node, y_cpu, valid_idx_cpu)
             val_metrics["epoch"] = int(epoch)
             if _is_better(val_metrics, best_metrics):
                 best_metrics = val_metrics
@@ -363,7 +410,12 @@ def _train_graph_backbone_once(
                     edge_type,
                     mask_probability=float(mhlgc_edge_mask_probability),
                 )
-                aug_outputs = model.forward_outputs(x_aug, edge_index_aug, edge_type_aug)
+                aug_outputs = model.forward_outputs(
+                    x_aug,
+                    edge_index_aug,
+                    edge_type_aug,
+                    hyperedge_mask_probability=float(mhlgc_hyperedge_mask_probability),
+                )
                 semantic_train = (
                     mhlgc_semantic_embeddings[train_idx.detach().cpu().long()].to(device)
                     if mhlgc_semantic_embeddings is not None
@@ -380,6 +432,7 @@ def _train_graph_backbone_once(
                     beta=float(mhlgc_beta),
                     gamma=float(mhlgc_gamma if semantic_train is not None else 0.0),
                     temperature=float(mhlgc_temperature),
+                    negative_count=int(mhlgc_negative_count),
                 )
                 _record_mhlgc(mhlgc_loss, mhlgc_step_stats)
                 loss = loss + mhlgc_loss_weight * mhlgc_loss
@@ -422,11 +475,12 @@ def _train_graph_backbone_once(
         x_projected_cpu = x_projected.detach().cpu().float() if torch.is_tensor(x_projected) else torch.tensor(x_projected, dtype=torch.float32)
         x_raw_cpu = x_raw.detach().cpu().float() if torch.is_tensor(x_raw) else torch.tensor(x_raw, dtype=torch.float32)
         y_cpu = y.detach().cpu().long() if torch.is_tensor(y) else torch.tensor(y, dtype=torch.long)
+        y_full_cpu = _expand_labeled_targets_to_graph(y_cpu, int(x_projected_cpu.shape[0]))
         n_layers = int(config.get("gnn_n_layers", config.get("n_layers", 2)))
         infer_data = Data(
             x=x_projected_cpu,
             raw_x=x_raw_cpu,
-            y=y_cpu,
+            y=y_full_cpu,
             edge_index=edge_index_cpu,
             edge_type=edge_type_cpu,
             node_id=torch.arange(int(x_projected_cpu.shape[0]), dtype=torch.long),
@@ -442,6 +496,8 @@ def _train_graph_backbone_once(
         logits_full = None
         prob_full = None
         repr_full = None
+        x_low_full = None
+        x_new_full = None
         aux_accumulator = {}
         aux_weight = 0.0
         with torch.no_grad():
@@ -454,13 +510,31 @@ def _train_graph_backbone_once(
                 batch_logits = batch_outputs["logits"][:seed_count].detach().cpu()
                 batch_prob = batch_outputs["prob"][:seed_count].detach().cpu()
                 batch_repr = batch_outputs["node_repr"][:seed_count].detach().cpu()
+                batch_x_low = batch_outputs.get("x_low")
+                if torch.is_tensor(batch_x_low):
+                    batch_x_low = batch_x_low[:seed_count].detach().cpu()
+                else:
+                    batch_x_low = None
+                batch_x_new = batch_outputs.get("x_new")
+                if torch.is_tensor(batch_x_new):
+                    batch_x_new = batch_x_new[:seed_count].detach().cpu()
+                else:
+                    batch_x_new = None
                 if logits_full is None:
                     logits_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_logits.shape[1])), dtype=batch_logits.dtype)
                     prob_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_prob.shape[1])), dtype=batch_prob.dtype)
                     repr_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_repr.shape[1])), dtype=batch_repr.dtype)
+                if batch_x_low is not None and x_low_full is None:
+                    x_low_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_x_low.shape[1])), dtype=batch_x_low.dtype)
+                if batch_x_new is not None and x_new_full is None:
+                    x_new_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_x_new.shape[1])), dtype=batch_x_new.dtype)
                 logits_full[global_ids] = batch_logits
                 prob_full[global_ids] = batch_prob
                 repr_full[global_ids] = batch_repr
+                if batch_x_low is not None and x_low_full is not None:
+                    x_low_full[global_ids] = batch_x_low
+                if batch_x_new is not None and x_new_full is not None:
+                    x_new_full[global_ids] = batch_x_new
                 branch_stats = batch_outputs.get("aux_features", {}).get("dynamic_similarity_branch", {})
                 if isinstance(branch_stats, dict):
                     weight = float(seed_count)
@@ -488,6 +562,10 @@ def _train_graph_backbone_once(
                 "dynamic_similarity_branch": aggregated_aux,
             },
         }
+        if x_low_full is not None:
+            outputs["x_low"] = x_low_full
+        if x_new_full is not None:
+            outputs["x_new"] = x_new_full
     else:
         with torch.no_grad():
             x_final = input_adapter(x_projected, x_raw) if input_adapter is not None else x_projected
@@ -799,30 +877,43 @@ def train_frozen_g0(args, seed, data, experiment_root):
         max_update_steps=int(getattr(args, "graph_training_max_steps", 0) or 0),
         mhlgc_enabled=mhlgc_enabled,
         mhlgc_semantic_embeddings=mhlgc_semantic_embeddings,
-        mhlgc_loss_weight=float(getattr(args, "mhlgc_loss_weight", 0.0) or 0.0),
-        mhlgc_beta=float(getattr(args, "mhlgc_beta", 1.0) or 1.0),
-        mhlgc_gamma=float(getattr(args, "mhlgc_gamma", 0.5) or 0.5),
-        mhlgc_temperature=float(getattr(args, "mhlgc_temperature", 1.0) or 1.0),
-        mhlgc_feature_mask_probability=float(getattr(args, "mhlgc_feature_mask_probability", 0.15) or 0.0),
-        mhlgc_edge_mask_probability=float(getattr(args, "mhlgc_edge_mask_probability", 0.10) or 0.0),
+        mhlgc_loss_weight=_float_cli_arg(getattr(args, "mhlgc_loss_weight", None), 0.0),
+        mhlgc_beta=_float_cli_arg(getattr(args, "mhlgc_beta", None), 1.0),
+        mhlgc_gamma=_float_cli_arg(getattr(args, "mhlgc_gamma", None), 0.5),
+        mhlgc_temperature=_float_cli_arg(getattr(args, "mhlgc_temperature", None), 1.0),
+        mhlgc_feature_mask_probability=_float_cli_arg(
+            getattr(args, "mhlgc_feature_mask_probability", None), 0.15
+        ),
+        mhlgc_edge_mask_probability=_float_cli_arg(
+            getattr(args, "mhlgc_edge_mask_probability", None), 0.10
+        ),
+        mhlgc_hyperedge_mask_probability=_float_cli_arg(
+            getattr(args, "mhlgc_hyperedge_mask_probability", None), 0.0
+        ),
         mhlgc_anchors_per_batch=int(getattr(args, "mhlgc_anchors_per_batch", 1) or 1),
+        mhlgc_negative_count=int(getattr(args, "mhlgc_negative_count", 0) or 0),
         mhlgc_positive_label=int(getattr(args, "mhlgc_positive_label", 1) or 1),
     )
     model = training_result["model"]
     input_adapter = training_result["input_adapter"]
     outputs = training_result["outputs"]
+    raw_outputs = outputs
     best_metrics = training_result["best_metrics"]
     best_state = training_result["best_state"]
     if input_adapter is not None:
         feature_manifest["peft"]["trainable_parameter_count"] = count_trainable_parameters(input_adapter)
     outputs = {
-        "logits": outputs["logits"].detach().cpu(),
-        "prob": outputs["prob"].detach().cpu(),
-        "pred": outputs["prob"].argmax(dim=1).detach().cpu(),
+        "logits": raw_outputs["logits"].detach().cpu(),
+        "prob": raw_outputs["prob"].detach().cpu(),
+        "pred": raw_outputs["prob"].argmax(dim=1).detach().cpu(),
         "labels": data["labels"].detach().cpu() if torch.is_tensor(data["labels"]) else torch.tensor(data["labels"]),
-        "node_repr": outputs["node_repr"].detach().cpu(),
-        "aux_features": outputs.get("aux_features", {}),
+        "node_repr": raw_outputs["node_repr"].detach().cpu(),
+        "aux_features": raw_outputs.get("aux_features", {}),
     }
+    if torch.is_tensor(raw_outputs.get("x_low")):
+        outputs["x_low"] = raw_outputs["x_low"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("x_new")):
+        outputs["x_new"] = raw_outputs["x_new"].detach().cpu()
     if dynamic_similarity_branch_stats is not None:
         runtime_branch_stats = outputs["aux_features"].get("dynamic_similarity_branch", {})
         if isinstance(runtime_branch_stats, dict):
@@ -924,12 +1015,20 @@ def train_frozen_g0(args, seed, data, experiment_root):
             "mhlgc": {
                 **training_result.get("mhlgc_stats", {"enabled": False}),
                 "semantic_embedding_path": str(getattr(args, "mhlgc_semantic_embedding_path", "") or ""),
-                "beta": float(getattr(args, "mhlgc_beta", 1.0) or 1.0),
-                "gamma": float(getattr(args, "mhlgc_gamma", 0.5) or 0.5),
-                "temperature": float(getattr(args, "mhlgc_temperature", 1.0) or 1.0),
-                "feature_mask_probability": float(getattr(args, "mhlgc_feature_mask_probability", 0.15) or 0.0),
-                "edge_mask_probability": float(getattr(args, "mhlgc_edge_mask_probability", 0.10) or 0.0),
+                "beta": _float_cli_arg(getattr(args, "mhlgc_beta", None), 1.0),
+                "gamma": _float_cli_arg(getattr(args, "mhlgc_gamma", None), 0.5),
+                "temperature": _float_cli_arg(getattr(args, "mhlgc_temperature", None), 1.0),
+                "feature_mask_probability": _float_cli_arg(
+                    getattr(args, "mhlgc_feature_mask_probability", None), 0.15
+                ),
+                "edge_mask_probability": _float_cli_arg(
+                    getattr(args, "mhlgc_edge_mask_probability", None), 0.10
+                ),
+                "hyperedge_mask_probability": _float_cli_arg(
+                    getattr(args, "mhlgc_hyperedge_mask_probability", None), 0.0
+                ),
                 "anchors_per_batch": int(getattr(args, "mhlgc_anchors_per_batch", 1) or 1),
+                "negative_count_per_anchor": int(getattr(args, "mhlgc_negative_count", 0) or 0),
                 "positive_label": int(getattr(args, "mhlgc_positive_label", 1) or 1),
                 "paper_alignment": (
                     "LLM-as-guide semantic hard-negative weighting over original and augmented graph views; "
@@ -955,6 +1054,11 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 "labels_sha256": tensor_sha256(data["labels"]),
             },
             "graph_data_variant": graph_data_variant,
+            "output_tensors": [
+                name
+                for name in ["logits", "prob", "pred", "labels", "node_repr", "x_low", "x_new", "aux_features"]
+                if name in outputs
+            ],
             "graph_override": graph_override_manifest if graph_override_manifest is not None else {"mode": "none"},
             **(
                 {
@@ -1651,13 +1755,21 @@ def _mhlgc_manifest_request(args):
     return {
         "enabled": enabled,
         "semantic_embedding_path": str(getattr(args, "mhlgc_semantic_embedding_path", "") or "") if enabled else "",
-        "loss_weight": float(getattr(args, "mhlgc_loss_weight", 0.0) or 0.0),
-        "beta": float(getattr(args, "mhlgc_beta", 1.0) or 1.0),
-        "gamma": float(getattr(args, "mhlgc_gamma", 0.5) or 0.5),
-        "temperature": float(getattr(args, "mhlgc_temperature", 1.0) or 1.0),
-        "feature_mask_probability": float(getattr(args, "mhlgc_feature_mask_probability", 0.15) or 0.0),
-        "edge_mask_probability": float(getattr(args, "mhlgc_edge_mask_probability", 0.10) or 0.0),
+        "loss_weight": _float_cli_arg(getattr(args, "mhlgc_loss_weight", None), 0.0),
+        "beta": _float_cli_arg(getattr(args, "mhlgc_beta", None), 1.0),
+        "gamma": _float_cli_arg(getattr(args, "mhlgc_gamma", None), 0.5),
+        "temperature": _float_cli_arg(getattr(args, "mhlgc_temperature", None), 1.0),
+        "feature_mask_probability": _float_cli_arg(
+            getattr(args, "mhlgc_feature_mask_probability", None), 0.15
+        ),
+        "edge_mask_probability": _float_cli_arg(
+            getattr(args, "mhlgc_edge_mask_probability", None), 0.10
+        ),
+        "hyperedge_mask_probability": _float_cli_arg(
+            getattr(args, "mhlgc_hyperedge_mask_probability", None), 0.0
+        ),
         "anchors_per_batch": int(getattr(args, "mhlgc_anchors_per_batch", 1) or 1),
+        "negative_count_per_anchor": int(getattr(args, "mhlgc_negative_count", 0) or 0),
         "positive_label": int(getattr(args, "mhlgc_positive_label", 1) or 1),
     }
 
@@ -1673,7 +1785,15 @@ def _mhlgc_manifest_matches_request(args, manifest):
         return True
     if str(existing.get("semantic_embedding_path", "") or "") != requested["semantic_embedding_path"]:
         return False
-    for key in ("loss_weight", "beta", "gamma", "temperature", "feature_mask_probability", "edge_mask_probability"):
+    for key in (
+        "loss_weight",
+        "beta",
+        "gamma",
+        "temperature",
+        "feature_mask_probability",
+        "edge_mask_probability",
+        "hyperedge_mask_probability",
+    ):
         if not math.isclose(
             float(existing.get(key, -1.0)),
             float(requested[key]),
@@ -1681,7 +1801,7 @@ def _mhlgc_manifest_matches_request(args, manifest):
             abs_tol=1e-12,
         ):
             return False
-    for key in ("anchors_per_batch", "positive_label"):
+    for key in ("anchors_per_batch", "negative_count_per_anchor", "positive_label"):
         if int(existing.get(key, -1)) != int(requested[key]):
             return False
     return True

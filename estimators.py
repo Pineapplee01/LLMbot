@@ -2147,6 +2147,7 @@ def _conformal_knn_scalar_risk_features(
     local_calibration_idx=None,
     local_calibration_alpha=0.20,
     global_conformal_threshold=None,
+    local_calibration_scope="independent_knn",
 ):
     del edge_type
     risk = np.asarray(base_risk, dtype=np.float32).reshape(-1)
@@ -2218,6 +2219,12 @@ def _conformal_knn_scalar_risk_features(
     hubness_correction_value = str(hubness_correction or "none").strip().lower()
     if hubness_correction_value not in {"none", "degree"}:
         raise ValueError("--conformal_knn_hubness_correction must be one of {none, degree}.")
+    local_calibration_scope_value = str(local_calibration_scope or "independent_knn").strip().lower()
+    if local_calibration_scope_value not in {"independent_knn", "same_hyperedge"}:
+        raise ValueError(
+            "--conformal_knn_local_calibration_scope must be one of "
+            "{independent_knn, same_hyperedge}."
+        )
     mutual_required = neighbor_mode_value in {"mutual", "mutual_adaptive"}
     threshold_active = bool(sim_threshold > -1.0) and neighbor_mode_value in {
         "threshold",
@@ -2258,6 +2265,19 @@ def _conformal_knn_scalar_risk_features(
     ncp_local_calibration_neighbor_count = np.zeros(num_nodes, dtype=np.float64)
     ncp_local_effective_calibration_sample_size = np.zeros(num_nodes, dtype=np.float64)
     ncp_local_fallback_to_global = np.ones(num_nodes, dtype=np.float64)
+    same_hyperedge_target_nonconformity = risk.copy().astype(np.float64)
+    same_hyperedge_global_tail_risk = risk.copy().astype(np.float64)
+    same_hyperedge_selected_tail_pvalue = np.ones(num_nodes, dtype=np.float64)
+    same_hyperedge_selected_tail_risk = risk.copy().astype(np.float64)
+    same_hyperedge_selected_effective_sample_size = np.zeros(num_nodes, dtype=np.float64)
+    same_hyperedge_selected_fallback_to_global = np.ones(num_nodes, dtype=np.float64)
+    same_hyperedge_calibration_global_tail_risk = risk.copy().astype(np.float64)
+    same_hyperedge_calibration_tail_pvalue = np.ones(num_nodes, dtype=np.float64)
+    same_hyperedge_calibration_tail_risk = risk.copy().astype(np.float64)
+    same_hyperedge_calibration_effective_sample_size = np.zeros(num_nodes, dtype=np.float64)
+    same_hyperedge_calibration_fallback_to_global = np.ones(num_nodes, dtype=np.float64)
+    same_hyperedge_calibration_shrink_weight = np.zeros(num_nodes, dtype=np.float64)
+    same_hyperedge_calibration_shrunk_tail_risk = risk.copy().astype(np.float64)
 
     high_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.80)) if labeled_limit else 1.0
     low_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.35)) if labeled_limit else 0.0
@@ -2295,6 +2315,35 @@ def _conformal_knn_scalar_risk_features(
     global_threshold = float(np.clip(global_threshold, 1e-8, 1.0))
     ncp_local_threshold.fill(global_threshold)
     local_calibration_active = bool(calibration_idx_np.size > 0 and posterior_np is not None and posterior_np.ndim == 2)
+    same_hyperedge_tail_active = bool(
+        local_calibration_scope_value == "same_hyperedge"
+        and posterior_np is not None
+        and posterior_np.ndim == 2
+    )
+    same_hyperedge_global_reference_count = 0
+    if same_hyperedge_tail_active:
+        same_hyperedge_target_nonconformity = (1.0 - posterior_np.max(axis=1)).astype(np.float64)
+        same_hyperedge_global_reference_count = int(labeled_limit if labeled_limit > 0 else num_nodes)
+        global_scores = same_hyperedge_target_nonconformity[:same_hyperedge_global_reference_count]
+        if global_scores.size and center_limit > 0:
+            sorted_global_scores = np.sort(global_scores, kind="stable")
+            center_scores = same_hyperedge_target_nonconformity[:center_limit]
+            ge_count = int(sorted_global_scores.size) - np.searchsorted(sorted_global_scores, center_scores, side="left")
+            tail_pvalue = (ge_count.astype(np.float64) + 1.0) / (float(sorted_global_scores.size) + 1.0)
+            tail_risk = 1.0 - tail_pvalue
+            same_hyperedge_selected_tail_pvalue[:center_limit] = np.clip(tail_pvalue, 1e-8, 1.0)
+            same_hyperedge_global_tail_risk[:center_limit] = np.clip(tail_risk, 0.0, 1.0)
+            same_hyperedge_selected_tail_risk[:center_limit] = same_hyperedge_global_tail_risk[:center_limit]
+        if calibration_nonconformity.size and center_limit > 0:
+            sorted_calibration_scores = np.sort(calibration_nonconformity, kind="stable")
+            center_scores = same_hyperedge_target_nonconformity[:center_limit]
+            ge_count = int(sorted_calibration_scores.size) - np.searchsorted(sorted_calibration_scores, center_scores, side="left")
+            cal_tail_pvalue = (ge_count.astype(np.float64) + 1.0) / (float(sorted_calibration_scores.size) + 1.0)
+            cal_tail_risk = 1.0 - cal_tail_pvalue
+            same_hyperedge_calibration_tail_pvalue[:center_limit] = np.clip(cal_tail_pvalue, 1e-8, 1.0)
+            same_hyperedge_calibration_global_tail_risk[:center_limit] = np.clip(cal_tail_risk, 0.0, 1.0)
+            same_hyperedge_calibration_tail_risk[:center_limit] = same_hyperedge_calibration_global_tail_risk[:center_limit]
+            same_hyperedge_calibration_shrunk_tail_risk[:center_limit] = same_hyperedge_calibration_global_tail_risk[:center_limit]
 
     def _torch_exact_feature_topk(query_repr, candidate_repr, query_k, backend_label="feature_pool"):
         if query_repr.shape[0] == 0 or candidate_repr.shape[0] == 0 or query_k <= 0:
@@ -2509,6 +2558,93 @@ def _conformal_knn_scalar_risk_features(
         )
         ncp_local_fallback_to_global[center] = 0.0
 
+    def _apply_same_hyperedge_tail_risk(center, selected, sims):
+        if not same_hyperedge_tail_active or selected.size == 0:
+            return
+        selected = selected.astype(np.int64, copy=False)
+        keep = (selected >= 0) & (selected < num_nodes) & (selected != int(center))
+        selected = selected[keep]
+        sims = sims[keep] if sims.size == keep.size else np.asarray([], dtype=np.float32)
+        if selected.size == 0:
+            return
+        support_scores = same_hyperedge_target_nonconformity[selected].astype(np.float64)
+        target_score = float(same_hyperedge_target_nonconformity[int(center)])
+        if sims.size:
+            clipped_sims = np.clip(sims.astype(np.float64), -1.0, 1.0)
+            distances = np.sqrt(np.clip(2.0 - 2.0 * clipped_sims, 0.0, None))
+            weights = np.exp(-distances / ncp_lambda_value)
+        else:
+            weights = np.ones_like(support_scores, dtype=np.float64)
+        weights = np.clip(weights.astype(np.float64), 0.0, None)
+        if hubness_correction_value == "degree" and hubness_counts.size:
+            weights = weights / np.sqrt(1.0 + hubness_counts[selected])
+        weight_sum = float(weights.sum())
+        if weight_sum <= 0.0:
+            return
+        tail_weight = float(weights[support_scores >= target_score].sum())
+        tail_pvalue = (tail_weight + 1.0) / (weight_sum + 1.0)
+        same_hyperedge_selected_tail_pvalue[center] = float(np.clip(tail_pvalue, 1e-8, 1.0))
+        same_hyperedge_selected_tail_risk[center] = float(np.clip(1.0 - tail_pvalue, 0.0, 1.0))
+        same_hyperedge_selected_effective_sample_size[center] = float(
+            (weight_sum ** 2) / max(float(np.sum(weights ** 2)), 1e-12)
+        )
+        same_hyperedge_selected_fallback_to_global[center] = 0.0
+
+    def _apply_same_hyperedge_calibration_tail_risk(center, selected, sims):
+        if not same_hyperedge_tail_active or not local_calibration_active or selected.size == 0:
+            return
+        selected = selected.astype(np.int64, copy=False)
+        keep = (selected >= 0) & (selected < num_nodes) & calibration_lookup[selected] & (selected != int(center))
+        selected = selected[keep]
+        sims = sims[keep] if sims.size == keep.size else np.asarray([], dtype=np.float32)
+        if selected.size == 0:
+            return
+        cal_positions = np.searchsorted(calibration_idx_np, selected)
+        valid_positions = (
+            (cal_positions >= 0)
+            & (cal_positions < calibration_idx_np.size)
+            & (calibration_idx_np[cal_positions] == selected)
+        )
+        if not np.all(valid_positions):
+            selected = selected[valid_positions]
+            sims = sims[valid_positions] if sims.size == valid_positions.size else np.asarray([], dtype=np.float32)
+            cal_positions = cal_positions[valid_positions]
+        if selected.size == 0:
+            return
+        support_scores = calibration_nonconformity[cal_positions].astype(np.float64)
+        target_score = float(same_hyperedge_target_nonconformity[int(center)])
+        if sims.size:
+            clipped_sims = np.clip(sims.astype(np.float64), -1.0, 1.0)
+            distances = np.sqrt(np.clip(2.0 - 2.0 * clipped_sims, 0.0, None))
+            weights = np.exp(-distances / ncp_lambda_value)
+        else:
+            weights = np.ones_like(support_scores, dtype=np.float64)
+        weights = np.clip(weights.astype(np.float64), 0.0, None)
+        if hubness_correction_value == "degree" and hubness_counts.size:
+            weights = weights / np.sqrt(1.0 + hubness_counts[selected])
+        weight_sum = float(weights.sum())
+        if weight_sum <= 0.0:
+            return
+        tail_weight = float(weights[support_scores >= target_score].sum())
+        tail_pvalue = (tail_weight + 1.0) / (weight_sum + 1.0)
+        same_hyperedge_calibration_tail_pvalue[center] = float(np.clip(tail_pvalue, 1e-8, 1.0))
+        same_hyperedge_calibration_tail_risk[center] = float(np.clip(1.0 - tail_pvalue, 0.0, 1.0))
+        effective_sample_size = float(
+            (weight_sum ** 2) / max(float(np.sum(weights ** 2)), 1e-12)
+        )
+        same_hyperedge_calibration_effective_sample_size[center] = effective_sample_size
+        shrink = effective_sample_size / (effective_sample_size + float(shrinkage_tau))
+        same_hyperedge_calibration_shrink_weight[center] = float(np.clip(shrink, 0.0, 1.0))
+        same_hyperedge_calibration_shrunk_tail_risk[center] = float(
+            np.clip(
+                shrink * same_hyperedge_calibration_tail_risk[center]
+                + (1.0 - shrink) * same_hyperedge_calibration_global_tail_risk[center],
+                0.0,
+                1.0,
+            )
+        )
+        same_hyperedge_calibration_fallback_to_global[center] = 0.0
+
     if scope in {"labeled_full", "hyperscan_full"}:
         candidate_limit = num_nodes if scope == "hyperscan_full" else labeled_limit
         for center in range(center_limit):
@@ -2530,13 +2666,47 @@ def _conformal_knn_scalar_risk_features(
                 selected, sims = _filter_support(center, selected.astype(np.int64), sims.astype(np.float32))
                 member_count = min(int(support_k), int(selected.size) + 1)
                 _apply_selected(center, selected.astype(np.int64), sims.astype(np.float32), member_count=member_count)
+                if same_hyperedge_tail_active:
+                    _apply_same_hyperedge_tail_risk(
+                        center,
+                        selected.astype(np.int64),
+                        sims.astype(np.float32),
+                    )
+                    _apply_same_hyperedge_calibration_tail_risk(
+                        center,
+                        selected.astype(np.int64),
+                        sims.astype(np.float32),
+                    )
+                if local_calibration_active and local_calibration_scope_value == "same_hyperedge":
+                    _apply_local_calibration(
+                        center,
+                        selected.astype(np.int64),
+                        sims.astype(np.float32),
+                    )
             else:
                 keep = (row_valid != int(center))
                 selected = row_valid[keep][:support_k]
                 sims = sim_valid[keep][:support_k]
                 selected, sims = _filter_support(center, selected.astype(np.int64), sims.astype(np.float32))
                 _apply_selected(center, selected.astype(np.int64), sims.astype(np.float32))
-        if local_calibration_active:
+                if same_hyperedge_tail_active:
+                    _apply_same_hyperedge_tail_risk(
+                        center,
+                        selected.astype(np.int64),
+                        sims.astype(np.float32),
+                    )
+                    _apply_same_hyperedge_calibration_tail_risk(
+                        center,
+                        selected.astype(np.int64),
+                        sims.astype(np.float32),
+                    )
+                if local_calibration_active and local_calibration_scope_value == "same_hyperedge":
+                    _apply_local_calibration(
+                        center,
+                        selected.astype(np.int64),
+                        sims.astype(np.float32),
+                    )
+        if local_calibration_active and local_calibration_scope_value == "independent_knn":
             calibration_candidate_count = int(calibration_idx_np.size)
             query_k = min(support_k + 1, calibration_candidate_count)
             if query_k > 0:
@@ -2602,7 +2772,12 @@ def _conformal_knn_scalar_risk_features(
                 sims[order].astype(np.float32),
             )
             _apply_selected(center, selected.astype(np.int64), selected_sims.astype(np.float32))
-            if local_calibration_active:
+            if same_hyperedge_tail_active:
+                _apply_same_hyperedge_tail_risk(center, selected.astype(np.int64), selected_sims.astype(np.float32))
+                _apply_same_hyperedge_calibration_tail_risk(center, selected.astype(np.int64), selected_sims.astype(np.float32))
+            if local_calibration_active and local_calibration_scope_value == "same_hyperedge":
+                _apply_local_calibration(center, selected.astype(np.int64), selected_sims.astype(np.float32))
+            if local_calibration_active and local_calibration_scope_value == "independent_knn":
                 cal_mask = calibration_lookup[candidate_arr]
                 cal_candidates = candidate_arr[cal_mask]
                 if cal_candidates.size:
@@ -2673,6 +2848,19 @@ def _conformal_knn_scalar_risk_features(
         "ncp_local_calibration_neighbor_count": ncp_local_calibration_neighbor_count.astype(np.float32),
         "ncp_local_effective_calibration_sample_size": ncp_local_effective_calibration_sample_size.astype(np.float32),
         "ncp_local_fallback_to_global": ncp_local_fallback_to_global.astype(np.float32),
+        "same_hyperedge_target_nonconformity": np.clip(same_hyperedge_target_nonconformity, 0.0, 1.0).astype(np.float32),
+        "same_hyperedge_global_tail_risk": np.clip(same_hyperedge_global_tail_risk, 0.0, 1.0).astype(np.float32),
+        "same_hyperedge_selected_tail_pvalue": np.clip(same_hyperedge_selected_tail_pvalue, 0.0, 1.0).astype(np.float32),
+        "same_hyperedge_selected_tail_risk": np.clip(same_hyperedge_selected_tail_risk, 0.0, 1.0).astype(np.float32),
+        "same_hyperedge_selected_effective_sample_size": same_hyperedge_selected_effective_sample_size.astype(np.float32),
+        "same_hyperedge_selected_fallback_to_global": same_hyperedge_selected_fallback_to_global.astype(np.float32),
+        "same_hyperedge_calibration_global_tail_risk": np.clip(same_hyperedge_calibration_global_tail_risk, 0.0, 1.0).astype(np.float32),
+        "same_hyperedge_calibration_tail_pvalue": np.clip(same_hyperedge_calibration_tail_pvalue, 0.0, 1.0).astype(np.float32),
+        "same_hyperedge_calibration_tail_risk": np.clip(same_hyperedge_calibration_tail_risk, 0.0, 1.0).astype(np.float32),
+        "same_hyperedge_calibration_effective_sample_size": same_hyperedge_calibration_effective_sample_size.astype(np.float32),
+        "same_hyperedge_calibration_fallback_to_global": same_hyperedge_calibration_fallback_to_global.astype(np.float32),
+        "same_hyperedge_calibration_shrink_weight": same_hyperedge_calibration_shrink_weight.astype(np.float32),
+        "same_hyperedge_calibration_shrunk_tail_risk": np.clip(same_hyperedge_calibration_shrunk_tail_risk, 0.0, 1.0).astype(np.float32),
         "knn_has_candidates": has_candidates,
     }
     features["_metadata"] = {
@@ -2711,8 +2899,32 @@ def _conformal_knn_scalar_risk_features(
         "ncp_local_mean_calibration_neighbor_count_on_centers": float(ncp_local_calibration_neighbor_count[:center_limit].mean()) if center_limit else 0.0,
         "ncp_local_mean_effective_calibration_sample_size_on_centers": float(ncp_local_effective_calibration_sample_size[:center_limit].mean()) if center_limit else 0.0,
         "ncp_local_fallback_count_on_centers": int((ncp_local_fallback_to_global[:center_limit] > 0).sum()) if center_limit else 0,
-        "ncp_local_score_semantics": "weighted_local_conformal_prediction_set_abstain_risk",
+        "ncp_local_calibration_scope": str(local_calibration_scope_value),
+        "ncp_local_score_semantics": (
+            "weighted_same_hyperedge_selected_k_tail_risk_on_predicted_class_nonconformity"
+            if same_hyperedge_tail_active
+            else "weighted_local_conformal_prediction_set_abstain_risk"
+        ),
         "ncp_local_quantile": "weighted_quantile_of_calibration_nonconformity_with_finite_sample_correction",
+        "same_hyperedge_tail_active": bool(same_hyperedge_tail_active),
+        "same_hyperedge_tail_reference": "target_centered_selected_k_support" if same_hyperedge_tail_active else "inactive",
+        "same_hyperedge_tail_nonconformity": "1_minus_max_posterior" if same_hyperedge_tail_active else "inactive",
+        "same_hyperedge_tail_global_reference_count": int(same_hyperedge_global_reference_count),
+        "same_hyperedge_mean_effective_sample_size_on_centers": float(
+            same_hyperedge_selected_effective_sample_size[:center_limit].mean()
+        ) if center_limit else 0.0,
+        "same_hyperedge_fallback_count_on_centers": int(
+            (same_hyperedge_selected_fallback_to_global[:center_limit] > 0).sum()
+        ) if center_limit else 0,
+        "same_hyperedge_calibration_mean_effective_sample_size_on_centers": float(
+            same_hyperedge_calibration_effective_sample_size[:center_limit].mean()
+        ) if center_limit else 0.0,
+        "same_hyperedge_calibration_mean_shrink_weight_on_centers": float(
+            same_hyperedge_calibration_shrink_weight[:center_limit].mean()
+        ) if center_limit else 0.0,
+        "same_hyperedge_calibration_fallback_count_on_centers": int(
+            (same_hyperedge_calibration_fallback_to_global[:center_limit] > 0).sum()
+        ) if center_limit else 0,
     }
     return features
 
@@ -2803,6 +3015,11 @@ def _top_target_rows(risk_score, split_idx, top_n, *, preds=None, pred_label_sco
             "ncp_local_calibration_neighbor_count",
             "ncp_local_effective_calibration_sample_size",
             "ncp_local_fallback_to_global",
+            "same_hyperedge_global_tail_risk",
+            "same_hyperedge_selected_tail_risk",
+            "same_hyperedge_calibration_tail_risk",
+            "same_hyperedge_calibration_shrunk_tail_risk",
+            "same_hyperedge_calibration_fallback_to_global",
         ):
             values = local_features.get(name)
             if values is not None:
@@ -3226,6 +3443,8 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
     }
     NCP_LOCAL_SCORE_FAMILIES = {
         "ncp_local_conformal": lambda r0, f: f["ncp_local_abstain_risk"],
+        "ncp_local_margin": lambda r0, f: f["ncp_local_margin_risk"],
+        "ncp_knn_weighted_mean": lambda r0, f: f["ncp_shrunk_weighted_mean_risk"],
         "ncp_local_base_blend": lambda r0, f: 0.80 * r0 + 0.20 * f["ncp_local_abstain_risk"],
         "ncp_local_margin_blend": lambda r0, f: 0.80 * r0 + 0.20 * f["ncp_local_margin_risk"],
         "ncp_local_knn_conformal_blend": lambda r0, f: (
@@ -3239,12 +3458,20 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             + 0.15 * f["ncp_local_margin_risk"]
         ),
     }
+    SAME_HYPEREDGE_SUPPORT_SCORE_FAMILIES = {
+        "same_hyperedge_selected_tail": lambda r0, f: f["same_hyperedge_selected_tail_risk"],
+        "same_hyperedge_global_tail": lambda r0, f: f["same_hyperedge_global_tail_risk"],
+        "same_hyperedge_calibration_tail": lambda r0, f: f["same_hyperedge_calibration_tail_risk"],
+        "same_hyperedge_calibration_shrunk_tail": lambda r0, f: f["same_hyperedge_calibration_shrunk_tail_risk"],
+    }
     def __init__(self, alpha=0.20, budgets=RESIDUAL_RISK_PAPER_BUDGETS):
         super().__init__(alpha=alpha, budgets=budgets)
         self.learning_mode = "fixed"
         self.local_calibration_router_metadata_ = {}
         self.local_calibration_labels_ = None
         self.local_calibration_idx_ = np.empty(0, dtype=np.int64)
+        self.local_calibration_scope_ = "independent_knn"
+        self.nonparametric_family_pool_name_ = "ncp_local"
 
     def _local_calibration_kwargs(self, kwargs):
         payload = dict(kwargs)
@@ -3260,6 +3487,11 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
         self.learning_mode = str(kwargs.get("conformal_knn_learning_mode", "fixed") or "fixed").strip().lower()
         if self.learning_mode not in {"fixed", "ncp_local"}:
             raise ValueError("--conformal_knn_learning_mode must be one of {fixed, ncp_local}.")
+        requested_override = str(kwargs.get("conformal_knn_score_family_override", "auto") or "auto").strip()
+        requested_override_key = requested_override.lower()
+        self.local_calibration_scope_ = str(
+            kwargs.get("conformal_knn_local_calibration_scope", "independent_knn") or "independent_knn"
+        ).strip().lower()
         labels_np = _labels_to_numpy(labels).astype(np.int64)
         self.local_calibration_labels_ = labels
         self.local_calibration_idx_ = _valid_index_array(
@@ -3267,6 +3499,24 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             int(labels_np.shape[0]),
         )
         fit_kwargs = self._local_calibration_kwargs(kwargs)
+        if self.learning_mode == "ncp_local" and requested_override_key != "auto":
+            available = (
+                set(self.SCORE_FAMILIES)
+                | set(self.NCP_LOCAL_SCORE_FAMILIES)
+                | set(self.SAME_HYPEREDGE_SUPPORT_SCORE_FAMILIES)
+            )
+            if requested_override not in available:
+                raise ValueError(
+                    f"Unsupported conformal_knn_score_family_override={requested_override!r}; "
+                    f"available families: {sorted(available)}."
+                )
+            if (
+                requested_override in self.NCP_LOCAL_SCORE_FAMILIES
+                or requested_override in self.SAME_HYPEREDGE_SUPPORT_SCORE_FAMILIES
+            ):
+                # Parent fit only knows fixed KNN score families; compute features
+                # there, then apply the NCP-local override below.
+                fit_kwargs["conformal_knn_score_family_override"] = "auto"
         super().fit(
             logits=logits,
             probs=probs,
@@ -3294,8 +3544,9 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             if self.learning_mode == "ncp_local"
             else "fixed_validation_selected_knn_risk_family",
             "official_ncp_alignment": (
-                "Uses NCP-style KNN neighborhood samples, exp(-distance/lambda_L) localization weights, "
-                "and a local conformal quantile over calibration nonconformity scores; no learned logistic risk head."
+                "Uses NCP-style KNN neighborhood localization weights with no learned logistic risk head. "
+                "Under independent_knn it keeps calibration-only local conformal thresholds; under same_hyperedge "
+                "it now scores the target directly from the selected-K HyperScan-aligned support tail risk."
             ),
             "local_risk_feature_metadata": {
                 key: local_metadata.get(key)
@@ -3319,12 +3570,26 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
                 if key in local_metadata
             },
         }
-        if self.learning_mode == "ncp_local":
+        if self.learning_mode == "ncp_local" and requested_override_key != "auto" and requested_override in self.SCORE_FAMILIES:
+            self.score_family_override = requested_override
+            self.local_calibration_router_metadata_["selected_ncp_local_family"] = self.selected_score_family
+            self.local_calibration_router_metadata_["ncp_local_family_selection_rule"] = (
+                "explicit_fixed_score_family_override"
+            )
+        elif self.learning_mode == "ncp_local":
+            if self.local_calibration_scope_ == "same_hyperedge":
+                candidate_family_pool = dict(self.SAME_HYPEREDGE_SUPPORT_SCORE_FAMILIES)
+                default_family = "same_hyperedge_selected_tail"
+                self.nonparametric_family_pool_name_ = "same_hyperedge_selected_tail"
+            else:
+                candidate_family_pool = dict(self.NCP_LOCAL_SCORE_FAMILIES)
+                default_family = "ncp_local_conformal"
+                self.nonparametric_family_pool_name_ = "ncp_local"
             local_candidate_metrics = {}
             best_key = None
             best_score = None
             best_metrics = None
-            for family_name, scorer in self.NCP_LOCAL_SCORE_FAMILIES.items():
+            for family_name, scorer in candidate_family_pool.items():
                 score = np.clip(np.asarray(scorer(r0, self.local_risk_features_), dtype=np.float32), 0.0, 1.0)
                 metrics = residual_risk_metrics(wrong[tune_idx_np], score[tune_idx_np], budgets=(0.15,)) if tune_idx_np.size else {}
                 local_candidate_metrics[family_name] = metrics
@@ -3338,12 +3603,23 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
                     best_score = family_score
                     best_key = family_name
                     best_metrics = metrics
-            self.selected_score_family = str(best_key or "ncp_local_conformal")
+            if requested_override_key != "auto":
+                best_key = requested_override
+                best_metrics = local_candidate_metrics.get(best_key, {})
+                self.score_family_override = requested_override
+            self.selected_score_family = str(best_key or default_family)
             self.selected_score_family_metrics = dict(best_metrics or {})
             self.local_calibration_router_metadata_["ncp_local_candidate_family_metrics"] = dict(local_candidate_metrics)
             self.local_calibration_router_metadata_["selected_ncp_local_family"] = self.selected_score_family
+            self.local_calibration_router_metadata_["nonparametric_family_pool"] = self.nonparametric_family_pool_name_
             self.local_calibration_router_metadata_["ncp_local_family_selection_rule"] = (
-                "valid_tune_auprc_error_then_lower_aurc_then_utility_at_15_then_auroc_error"
+                "explicit_ncp_local_score_family_override"
+                if requested_override_key != "auto"
+                else (
+                    "valid_tune_auprc_error_then_lower_aurc_then_utility_at_15_then_auroc_error_same_hyperedge_selected_tail"
+                    if self.local_calibration_scope_ == "same_hyperedge"
+                    else "valid_tune_auprc_error_then_lower_aurc_then_utility_at_15_then_auroc_error"
+                )
             )
             self.candidate_score_family_metrics = {
                 **dict(self.candidate_score_family_metrics),
@@ -3366,6 +3642,10 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
     def _score_from_local_risk_features(self, r0, local_features):
         if self.learning_mode == "ncp_local" and self.selected_score_family in self.NCP_LOCAL_SCORE_FAMILIES:
             scorer = self.NCP_LOCAL_SCORE_FAMILIES[self.selected_score_family]
+            values = np.asarray(scorer(r0, local_features), dtype=np.float32).reshape(-1)
+            return np.clip(values, 0.0, 1.0).astype(np.float32)
+        if self.learning_mode == "ncp_local" and self.selected_score_family in self.SAME_HYPEREDGE_SUPPORT_SCORE_FAMILIES:
+            scorer = self.SAME_HYPEREDGE_SUPPORT_SCORE_FAMILIES[self.selected_score_family]
             values = np.asarray(scorer(r0, local_features), dtype=np.float32).reshape(-1)
             return np.clip(values, 0.0, 1.0).astype(np.float32)
         return super()._score_from_local_risk_features(r0, local_features)
@@ -3392,6 +3672,7 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             local_calibration_idx=kwargs.get("conformal_knn_local_calibration_idx"),
             local_calibration_alpha=kwargs.get("conformal_knn_local_calibration_alpha", self.alpha),
             global_conformal_threshold=kwargs.get("conformal_knn_global_threshold", self.threshold),
+            local_calibration_scope=kwargs.get("conformal_knn_local_calibration_scope", "independent_knn"),
         )
 
     def state_dict_payload(self):
