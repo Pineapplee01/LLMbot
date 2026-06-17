@@ -10,7 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 
 from LM import LM_Model
-from GNNs import BotRGCN, GATv2Bot, HGT, RGCN, RGCNHyperScanDHGProxy, RGCNHyperScanNodeInputDHG, RGCNHyperScanNodeInputProxy, RGCNHyperScanProxy, RGT, SimpleHGN
+from GNNs import BotRGCN, GATv2Bot, HGT, RGCN, RGCNH2FAGDualSpace, RGCNH2FAGDualSpaceHyperScan, RGCNH2FAGDualSpaceHyperScanNodeInput, RGCNH2FAGDualSpaceNodeInput, RGCNHyperScanDHGProxy, RGCNHyperScanNodeInputDHG, RGCNHyperScanNodeInputProxy, RGCNHyperScanProxy, RGT, SimpleHGN
 from estimators import build_estimator as _build_estimator
 from operators import build_repair_operator as _build_repair_operator
 from operators import build_semantic_operator as _build_semantic_operator
@@ -38,6 +38,10 @@ _EXTRA_TOKENS = ["@USER", "#HASHTAG", "HTTPURL", "EMOJI", "RT", "None"]
 _GNN_BUILDERS = {
     "botrgcn": BotRGCN,
     "rgcn": RGCN,
+    "rgcn_h2fag_dualspace": RGCNH2FAGDualSpace,
+    "rgcn_h2fag_dualspace_hyperscan": RGCNH2FAGDualSpaceHyperScan,
+    "rgcn_h2fag_dualspace_nodeinput": RGCNH2FAGDualSpaceNodeInput,
+    "rgcn_h2fag_dualspace_hyperscan_nodeinput": RGCNH2FAGDualSpaceHyperScanNodeInput,
     "rgcn_hyperscan": RGCNHyperScanProxy,
     "rgcn_hyperscan_routed": RGCNHyperScanProxy,
     "rgcn_hyperscan_dhg": RGCNHyperScanDHGProxy,
@@ -55,6 +59,8 @@ _HYPERSCAN_BACKBONES = {
     "rgcn_hyperscan_dhg",
     "rgcn_hyperscan_nodeinput",
     "rgcn_hyperscan_dhg_nodeinput",
+    "rgcn_h2fag_dualspace_hyperscan",
+    "rgcn_h2fag_dualspace_hyperscan_nodeinput",
 }
 
 
@@ -779,6 +785,11 @@ def resolve_g0_feature_bundle(args, data):
     feature_path = getattr(args, "emb_path", None) or getattr(args, "g0_feature_path", None)
     graph_data_variant = str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower()
     node_input_family = str(getattr(args, "graph_node_input_family", "semantic_embedding") or "semantic_embedding").lower()
+    requested_backbone = str(getattr(args, "GNN_model", getattr(args, "graph_backbone", "rgcn")) or "rgcn").lower()
+    dualspace_nodeinput_backbone = (
+        "rgcn_h2fag_dualspace" in requested_backbone
+        and "nodeinput" in requested_backbone
+    )
     if feature_path:
         feature_path = Path(feature_path)
     else:
@@ -798,7 +809,7 @@ def resolve_g0_feature_bundle(args, data):
             "full_graph_support requires --embedding_path to point to the labeled RoBERTa embedding tensor."
         )
 
-    if node_input_family == "hyperscan_meta_tweet_proxy":
+    if node_input_family == "hyperscan_meta_tweet_proxy" and not dualspace_nodeinput_backbone:
         if feature_path is None:
             raise ValueError(
                 "--graph_node_input_family hyperscan_meta_tweet_proxy requires --embedding_path "
@@ -889,9 +900,27 @@ def build_LM_model(model_config):
 
 def build_GNN_model(model_config):
     model_name = model_config["GNN_model"].lower()
-    builder = _resolve_hyperscan_builder(model_name, model_config) if model_name in _HYPERSCAN_BACKBONES else _GNN_BUILDERS.get(model_name)
+    builder = _GNN_BUILDERS.get(model_name)
+    if builder is None and model_name in _HYPERSCAN_BACKBONES:
+        builder = _resolve_hyperscan_builder(model_name, model_config)
     if builder is None:
         raise ValueError(f"Unknown GNN model '{model_name}'")
+    if "rgcn_h2fag_dualspace_hyperscan" in model_name:
+        construct_dim = int(model_config.get("construct_input_dim", 0) or 0)
+        if construct_dim <= 0:
+            raise ValueError(
+                "dualspace hyperscan backbones require a clean construct tensor; missing construct_input_dim."
+            )
+        construct_manifest = dict(model_config.get("construct_feature_manifest", {}) or {})
+        construct_path = str(model_config.get("graph_construct_embedding_path", "") or construct_manifest.get("path", "") or "")
+        construct_source = str(construct_manifest.get("construct_source", "") or "").strip().lower()
+        lowered_path = construct_path.lower()
+        if construct_source != "nodeinput_raw_features" and any(
+            token in lowered_path for token in ["iter_-1", "iter_minus1", "node_repr"]
+        ):
+            raise ValueError(
+                "dualspace hyperscan construct space must not use iter_-1 decision embeddings or final node_repr artifacts."
+            )
 
     gnn_model = builder(model_config).to(model_config["device"])
     _print_model_info("GNN", gnn_model, include_repr=True)

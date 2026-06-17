@@ -190,6 +190,31 @@ def normalize_args(args, raw_args=None):
             )
         args.graph_training_loader_mode = "neighbor_subgraph"
 
+    graph_neighborloader_contract = str(
+        getattr(args, "graph_neighborloader_contract", "seed_only") or "seed_only"
+    ).strip().lower()
+    if graph_neighborloader_contract not in {"seed_only", "hyperscan_sampled_subgraph"}:
+        raise ValueError(
+            "--graph_neighborloader_contract must be one of "
+            "{seed_only, hyperscan_sampled_subgraph}."
+        )
+    if graph_neighborloader_contract == "hyperscan_sampled_subgraph":
+        if second_view_scope != "neighborloader_batch":
+            raise ValueError(
+                "--graph_neighborloader_contract hyperscan_sampled_subgraph requires "
+                "--graph_second_view_scope neighborloader_batch."
+            )
+        if str(getattr(args, "graph_training_loader_mode", "full_batch") or "full_batch").strip().lower() != "neighbor_subgraph":
+            raise ValueError(
+                "--graph_neighborloader_contract hyperscan_sampled_subgraph requires "
+                "--graph_training_loader_mode neighbor_subgraph."
+            )
+        if str(getattr(args, "graph_data_variant", "labeled") or "labeled").strip().lower() != "labeled":
+            raise ValueError(
+                "--graph_neighborloader_contract hyperscan_sampled_subgraph requires "
+                "--graph_data_variant labeled."
+            )
+
     legacy_dhg_backbones = {"rgcn_hyperscan_dhg", "rgcn_hyperscan_dhg_nodeinput"}
     legacy_pyg_backbones = {"rgcn_hyperscan_routed", "rgcn_hyperscan_nodeinput"}
     if "--graph_second_view_hypergraph_backend" not in raw_flags:
@@ -549,6 +574,10 @@ def parser_args(argv=None):
         choices=[
             "botrgcn",
             "rgcn",
+            "rgcn_h2fag_dualspace",
+            "rgcn_h2fag_dualspace_hyperscan",
+            "rgcn_h2fag_dualspace_nodeinput",
+            "rgcn_h2fag_dualspace_hyperscan_nodeinput",
             "rgcn_hyperscan",
             "rgcn_hyperscan_routed",
             "rgcn_hyperscan_dhg",
@@ -569,6 +598,10 @@ def parser_args(argv=None):
         choices=[
             "botrgcn",
             "rgcn",
+            "rgcn_h2fag_dualspace",
+            "rgcn_h2fag_dualspace_hyperscan",
+            "rgcn_h2fag_dualspace_nodeinput",
+            "rgcn_h2fag_dualspace_hyperscan_nodeinput",
             "rgcn_hyperscan",
             "rgcn_hyperscan_routed",
             "rgcn_hyperscan_dhg",
@@ -974,6 +1007,21 @@ def parser_args(argv=None):
             "Graph-detector optimization regime. "
             "`full_batch` keeps the current all-node update. "
             "`neighbor_subgraph` trains on NeighborLoader sampled subgraph batches."
+        ),
+    )
+    parser.add_argument(
+        "--graph_neighborloader_contract",
+        type=str,
+        default="seed_only",
+        choices=["seed_only", "hyperscan_sampled_subgraph"],
+        help=(
+            "NeighborLoader supervision/evaluation contract for graph-detector training. "
+            "`seed_only` preserves the current active-mainline behavior that supervises and scores "
+            "only the first batch_size seed rows. "
+            "`hyperscan_sampled_subgraph` aligns the sampled-subgraph supervision/evaluation contract "
+            "to HyperScan TwiBot20: train/valid/test all consume the full sampled subgraph rows, "
+            "validation/test allow repeated node counting across batches, and checkpoint selection "
+            "switches to validation accuracy."
         ),
     )
     parser.add_argument(
@@ -1748,6 +1796,16 @@ def parser_args(argv=None):
         default="pca",
         choices=["pca"],
         help="Unlabeled projection method used to align Phase A semantic embedding widths.",
+    )
+    parser.add_argument(
+        "--graph_construct_embedding_path",
+        type=str,
+        default="",
+        help=(
+            "Optional clean construct/high-order tensor path used by dualspace HyperScan-style backbones. "
+            "This tensor defines the Hyperscan clean representation space for x_new/KNN/hypergraph construction. "
+            "It must not point to iter_-1 decision embeddings or final detector node_repr exports."
+        ),
     )
     parser.add_argument(
         "--graph_node_input_family",

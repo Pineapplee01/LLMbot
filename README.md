@@ -18,6 +18,7 @@ Preferred public flags:
 - `--text_encoder`
 - `--semantic_encoder`
 - `--embedding_path`
+- `--graph_construct_embedding_path`
 - `--graph_data_variant`
 - `--support_embedding_path`
 - `--joint_refiner_embedding_path`
@@ -116,6 +117,13 @@ First-round full-graph support:
     it requires `--graph_data_variant labeled` and trains with
     `NeighborLoader` subgraph batches, rebuilding a batch-local KNN hypergraph
     from `x_low + x_in` inside each sampled subgraph
+  - `--graph_neighborloader_contract seed_only` keeps the current active-mainline
+    seed-row supervision/evaluation contract for NeighborLoader runs
+  - `--graph_neighborloader_contract hyperscan_sampled_subgraph` switches that
+    same `neighborloader_batch` path to the HyperScan-faithful sampled-subgraph
+    supervision/evaluation contract: train/valid/test all score full sampled
+    batches, repeated nodes across batches are counted repeatedly, and checkpoint
+    selection uses validation accuracy
   - `--graph_second_view_hypergraph_backend {pyg,dhg}` and
     `--graph_second_view_fusion {residual,multiattn,multiattn_adaptive}` split
     second-view realization into two parser axes. `dhg` now consumes the same
@@ -132,6 +140,21 @@ First-round full-graph support:
   HyperScan-style node input from the labeled graph:
   current tweet embedding stays as the tweet channel, while numeric and
   categorical metadata proxies are parsed from `norm_user_text.json`
+- `--graph_construct_embedding_path` is the dual-space construct/high-order
+  input for `rgcn_h2fag_dualspace_hyperscan*`. It defines the clean Hyperscan
+  representation used for `x_new`, KNN, and hypergraph construction, while
+  `--embedding_path` continues to define the iter_-1 decision-space detector
+  input. It must not point to iter_-1 decision embeddings or exported final
+  `node_repr`.
+  In the current dual-space implementation, the clean branch first encodes this
+  tensor into `x_clean_base -> x_new_clean`, and dynamic KNN / hypergraph
+  construction consumes `x_new_clean` rather than the raw construct tensor.
+  For `rgcn_h2fag_dualspace_hyperscan_nodeinput`, `--graph_node_input_family
+  hyperscan_meta_tweet_proxy` applies only to that construct-side clean branch;
+  it does not replace the iter_-1 decision input from `--embedding_path`.
+  Legacy `rgcn_hyperscan_nodeinput` backbones still read their tweet/num/cat
+  dimensions from the ordinary `feature_manifest`, while dual-space nodeinput
+  backbones read them from `construct_feature_manifest`.
 - `--graph_node_input_family hyperscan_meta_tweet_proxy` uses that
   paper-inspired tweet/num/cat preprocessing before the current
   HyperScan-style KNN branch
@@ -144,6 +167,10 @@ First-round full-graph support:
     dynamic branch to build a `base labeled + NeighborLoader` control
   - `--graph_training_max_steps` caps total optimizer updates so
     NeighborLoader and full-batch runs can be matched on update budget
+  - even under `hyperscan_sampled_subgraph`, exported `outputs.pt` stays a
+    full-graph one-row-per-node artifact; the repeated sampled-subgraph
+    validation/test metrics are written separately to
+    `neighborloader_contract_metrics.json`
   - `--graph_second_view_candidate_scope labeled_relation_1hop` restricts
     relation-local KNN candidates to the labeled prefix instead of allowing
     support nodes from the full graph
@@ -280,10 +307,18 @@ First-round full-graph support:
   - representation-role contract:
     - `z_sem` = LM / RoBERTa semantic input space
     - `z_construct = x_new` = high-order construction space only
+    - `z_decision = iter_minus1` = low-order decision propagation space when dual-space backbones are used
     - `z_pred = fused_x` = final detector space only
     - do not reuse the same task-shaped semantic tensor as construction space,
       final detector space, and contrast space without marking it as an
       explicit control
+  - dual-space H2GCN/FAGCN backbones extend this contract by separating:
+    - clean Hyperscan construct space for `x_new` / KNN / `x_high`
+    - iter_-1 decision space for low-order relation propagation
+    - `fused_x` as the only final detector space
+  - v1 keeps this family as a clean detector-consumption line only: it does not
+    mix in `--mhlgc_enable`, `--routed_contrast_family`, or
+    `--routed_highpass_mode`
 - `relation_overlap_knn_proxy_augment` reads centers from
   `--routed_nodes_path` plus `--routed_nodes_split {all,train,valid,test}`
   when provided; otherwise it defaults to the labeled-node prefix
@@ -352,6 +387,7 @@ python main.py \
   --graph_backbone rgcn_hyperscan \
   --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
   --graph_second_view_scope neighborloader_batch \
+  --graph_neighborloader_contract hyperscan_sampled_subgraph \
   --graph_second_view_hypergraph_backend pyg \
   --graph_second_view_fusion residual \
   --graph_neighbor_num_neighbors 64 \
@@ -371,6 +407,7 @@ python main.py \
   --graph_backbone rgcn_hyperscan \
   --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
   --graph_second_view_scope neighborloader_batch \
+  --graph_neighborloader_contract seed_only \
   --graph_second_view_hypergraph_backend pyg \
   --graph_second_view_fusion multiattn \
   --graph_neighbor_num_neighbors 64 \

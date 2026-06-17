@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import f1_score
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 
@@ -26,6 +27,7 @@ from hypergnn import (
 )
 from model_building import (
     PhaseAInputAdapter,
+    _build_hyperscan_meta_tweet_proxy_bundle,
     _idx_tensor,
     _labels_to_index,
     _score_logits,
@@ -89,6 +91,147 @@ def count_trainable_parameters(module):
     return int(sum(param.numel() for param in module.parameters() if param.requires_grad))
 
 
+def _load_dualspace_construct_bundle(args, data):
+    requested_backbone = str(getattr(args, "GNN_model", getattr(args, "graph_backbone", "rgcn"))).lower()
+    if "rgcn_h2fag_dualspace" not in requested_backbone:
+        return None
+    if "hyperscan" not in requested_backbone:
+        return None
+
+    graph_node_input_family = str(getattr(args, "graph_node_input_family", "semantic_embedding") or "semantic_embedding").lower()
+    construct_path = str(getattr(args, "graph_construct_embedding_path", "") or "").strip()
+
+    if "nodeinput" in requested_backbone:
+        if graph_node_input_family != "hyperscan_meta_tweet_proxy":
+            raise ValueError(
+                "dualspace *_nodeinput backbones require --graph_node_input_family hyperscan_meta_tweet_proxy."
+            )
+        if not construct_path:
+            raise ValueError(
+                "dualspace *_nodeinput hyperscan backbones require --graph_construct_embedding_path "
+                "pointing to the clean construct-side tweet or tweet|num|cat tensor."
+            )
+        lowered_construct_path = construct_path.lower()
+        if any(token in lowered_construct_path for token in ["iter_-1", "iter_minus1", "node_repr"]):
+            raise ValueError(
+                "dualspace *_nodeinput hyperscan construct space must not use iter_-1 decision embeddings "
+                "or final detector node_repr artifacts."
+            )
+        construct_path_obj = Path(construct_path)
+        sidecar_manifest_path = construct_path_obj.with_suffix(".manifest.json")
+        sidecar_manifest = read_json(sidecar_manifest_path, default=None) if sidecar_manifest_path.exists() else None
+        sidecar_hint_text = " ".join(
+            str(item or "")
+            for item in (
+                (sidecar_manifest or {}).get("contract"),
+                (sidecar_manifest or {}).get("artifact"),
+                (sidecar_manifest or {}).get("source_path"),
+                (sidecar_manifest or {}).get("output_path"),
+                construct_path_obj.name,
+            )
+        ).lower()
+        precomputed_nodeinput = (
+            "tweet_num_cat" in sidecar_hint_text
+            or "node_input" in sidecar_hint_text
+            or str((sidecar_manifest or {}).get("contract", "")).strip().lower()
+            == "hyperscan_meta_tweet_proxy_full_graph_node_input"
+        )
+
+        construct_tensor = safe_torch_load(construct_path_obj, map_location="cpu")
+        if isinstance(construct_tensor, dict):
+            for key in ("embeddings", "features", "x"):
+                if key in construct_tensor:
+                    construct_tensor = construct_tensor[key]
+                    break
+        if not torch.is_tensor(construct_tensor):
+            construct_tensor = torch.as_tensor(construct_tensor, dtype=torch.float32)
+        construct_tensor = construct_tensor.detach().cpu().float()
+        graph_variant = str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower()
+        if int(construct_tensor.dim()) != 2:
+            raise ValueError(
+                "dualspace *_nodeinput hyperscan construct tensor must be 2-D [num_nodes, dim]."
+            )
+        if graph_variant == "labeled":
+            expected_rows = int(data.get("labeled_node_count", int(data.get("graph_node_count", int(construct_tensor.shape[0])))))
+        else:
+            expected_rows = int(data.get("graph_node_count", int(construct_tensor.shape[0])))
+        if int(construct_tensor.shape[0]) != expected_rows:
+            raise ValueError(
+                "dualspace *_nodeinput hyperscan construct tensor row count must match the active graph view: "
+                f"expected {expected_rows}, got {int(construct_tensor.shape[0])}."
+            )
+        if precomputed_nodeinput:
+            if int(construct_tensor.shape[1]) <= 8:
+                raise ValueError(
+                    "dualspace *_nodeinput hyperscan precomputed construct tensors must be ordered as tweet|num|cat "
+                    "with feature dim > 8."
+                )
+            tweet_dim = int(construct_tensor.shape[1]) - 8
+            manifest_source = "hyperscan_meta_tweet_proxy_precomputed_construct"
+            construct_features = construct_tensor.contiguous()
+            manifest = {
+                "source": manifest_source,
+                "path": str(construct_path_obj),
+                "tweet_embedding_path": str(construct_path_obj),
+                "graph_data_variant": graph_variant,
+                "node_input_family": "hyperscan_meta_tweet_proxy",
+                "projection_applied": False,
+                "projector": "node_input_proxy",
+                "fit_scope": "all_nodes_unlabeled" if graph_variant == "full_graph_support" else "labeled_nodes_only",
+                "raw_dim": int(construct_features.shape[1]),
+                "projected_dim": int(construct_features.shape[1]),
+                "raw_sha256": tensor_sha256(construct_features),
+                "projected_sha256": tensor_sha256(construct_features),
+                "sha256": tensor_sha256(construct_features),
+                "projection_time_seconds": 0.0,
+                "tweet_dim": int(tweet_dim),
+                "num_prop_dim": 5,
+                "cat_prop_dim": 3,
+            }
+            if isinstance(sidecar_manifest, dict):
+                manifest["source_manifest_path"] = str(sidecar_manifest_path)
+                manifest["sidecar_contract"] = str(sidecar_manifest.get("contract", "") or "")
+        else:
+            bundle = _build_hyperscan_meta_tweet_proxy_bundle(args, data, construct_path_obj)
+            construct_features = bundle["raw_features"].detach().cpu().float()
+            manifest = dict(bundle["feature_manifest"])
+        manifest["dualspace_role"] = "hyperscan_clean_representation"
+        manifest["construct_source"] = "graph_construct_embedding_path"
+        manifest["path"] = str(construct_path_obj)
+        manifest["tweet_embedding_path"] = str(construct_path_obj)
+        return {"features": construct_features, "feature_manifest": manifest}
+
+    if not construct_path:
+        raise ValueError(
+            "dualspace hyperscan backbones require --graph_construct_embedding_path pointing to the clean Hyperscan construct tensor."
+        )
+    construct_tensor = safe_torch_load(construct_path, map_location="cpu")
+    if not torch.is_tensor(construct_tensor):
+        construct_tensor = torch.as_tensor(construct_tensor, dtype=torch.float32)
+    construct_tensor = construct_tensor.detach().cpu().float()
+    graph_node_count = int(data.get("graph_node_count", int(construct_tensor.shape[0])))
+    if int(construct_tensor.shape[0]) != graph_node_count:
+        raise ValueError(
+            f"dualspace construct tensor rows ({int(construct_tensor.shape[0])}) must match graph_node_count ({graph_node_count})."
+        )
+    manifest = {
+        "source": "tensor_file",
+        "path": str(construct_path),
+        "dualspace_role": "hyperscan_clean_representation",
+        "construct_source": "graph_construct_embedding_path",
+        "graph_data_variant": str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower(),
+        "raw_dim": int(construct_tensor.shape[1]),
+        "projected_dim": int(construct_tensor.shape[1]),
+        "projection_applied": False,
+        "projector": "construct_identity",
+        "fit_scope": "all_nodes_unlabeled",
+        "sha256": tensor_sha256(construct_tensor),
+        "raw_sha256": tensor_sha256(construct_tensor),
+        "projected_sha256": tensor_sha256(construct_tensor),
+    }
+    return {"features": construct_tensor, "feature_manifest": manifest}
+
+
 def _is_better(candidate, incumbent):
     if incumbent is None:
         return True
@@ -97,6 +240,51 @@ def _is_better(candidate, incumbent):
     if candidate["macro_f1"] == incumbent["macro_f1"] and candidate["loss"] < incumbent["loss"]:
         return True
     return False
+
+
+def _is_better_with_policy(candidate, incumbent, primary="validation_macro_f1", tie_breaker="validation_loss"):
+    if incumbent is None:
+        return True
+    primary = str(primary or "validation_macro_f1").strip().lower()
+    tie_breaker = str(tie_breaker or "validation_loss").strip().lower()
+    if primary == "validation_accuracy":
+        candidate_primary = float(candidate.get("accuracy", float("-inf")))
+        incumbent_primary = float(incumbent.get("accuracy", float("-inf")))
+    else:
+        candidate_primary = float(candidate.get("macro_f1", float("-inf")))
+        incumbent_primary = float(incumbent.get("macro_f1", float("-inf")))
+    if candidate_primary > incumbent_primary:
+        return True
+    if candidate_primary < incumbent_primary:
+        return False
+    if tie_breaker == "validation_loss":
+        return float(candidate.get("loss", float("inf"))) < float(incumbent.get("loss", float("inf")))
+    return False
+
+
+def _score_repeated_neighborloader_logits(logits_cpu, labels_cpu):
+    logits_cpu = logits_cpu.detach().cpu()
+    labels_cpu = labels_cpu.detach().cpu().long().view(-1)
+    if int(logits_cpu.size(0)) != int(labels_cpu.numel()):
+        raise ValueError("Repeated NeighborLoader logits and labels must have the same row count.")
+    prob = torch.softmax(logits_cpu, dim=1)
+    pred = prob.argmax(dim=1)
+    accuracy = float((pred == labels_cpu).float().mean().item()) if int(labels_cpu.numel()) > 0 else 0.0
+    macro_f1 = float(
+        f1_score(
+            labels_cpu.numpy(),
+            pred.numpy(),
+            average="macro",
+            zero_division=0,
+        )
+    ) if int(labels_cpu.numel()) > 0 else 0.0
+    loss = float(F.cross_entropy(logits_cpu, labels_cpu).item()) if int(labels_cpu.numel()) > 0 else 0.0
+    return {
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "loss": loss,
+        "count": int(labels_cpu.numel()),
+    }
 
 
 def _model_config(args, features, device):
@@ -111,6 +299,8 @@ def _model_config(args, features, device):
         "gnn_hidden_dim": getattr(args, "hidden_dim", 128),
         "hidden_dim": getattr(args, "hidden_dim", 128),
         "lm_input_dim": int(features.shape[1]),
+        "construct_input_dim": int(getattr(args, "_construct_input_dim", 0) or 0),
+        "graph_construct_embedding_path": str(getattr(args, "graph_construct_embedding_path", "") or ""),
         "SimpleHGN_att_res": getattr(args, "SimpleHGN_att_res", 0.2),
         "att_heads": getattr(args, "att_heads", 8),
         "hyperscan_detector_style": getattr(args, "hyperscan_detector_style", "residual"),
@@ -1049,6 +1239,7 @@ def _train_graph_backbone_once(
     config,
     x_projected,
     x_raw,
+    x_construct,
     y,
     edge_index,
     edge_type,
@@ -1062,6 +1253,7 @@ def _train_graph_backbone_once(
     weight_decay=1e-5,
     max_epochs=1,
     training_loader_mode="full_batch",
+    graph_neighborloader_contract="seed_only",
     graph_batch_size=1024,
     neighbor_num_neighbors=64,
     max_update_steps=0,
@@ -1134,7 +1326,25 @@ def _train_graph_backbone_once(
     max_update_steps = max(int(max_update_steps), 0)
     best_state = None
     best_metrics = None
+    best_checkpoint_primary = "validation_macro_f1"
+    best_checkpoint_tie_breaker = "validation_loss"
     optimizer_steps = 0
+    neighborloader_contract = str(graph_neighborloader_contract or "seed_only").strip().lower()
+    if neighborloader_contract not in {"seed_only", "hyperscan_sampled_subgraph"}:
+        raise ValueError(
+            "--graph_neighborloader_contract must be one of {seed_only, hyperscan_sampled_subgraph}."
+        )
+    neighborloader_contract_metrics = {
+        "contract": neighborloader_contract,
+        "supervision_scope": "seed_only_first_batch_rows",
+        "validation_scope": "canonical_valid_seed_nodes",
+        "test_scope": "full_graph_deduplicated_export_only",
+        "duplicate_counting": "none",
+        "checkpoint_selection_primary": "validation_macro_f1",
+        "checkpoint_selection_tie_breaker": "validation_loss",
+        "valid_best_checkpoint": {},
+        "test_best_checkpoint": {},
+    }
     mhlgc_enabled = bool(mhlgc_enabled)
     mhlgc_loss_weight = float(mhlgc_loss_weight or 0.0)
     mhlgc_contrast_space = str(mhlgc_contrast_space or "fused_x").strip().lower()
@@ -1536,6 +1746,7 @@ def _train_graph_backbone_once(
                 x,
                 edge_index_aug_local,
                 edge_type_aug_local,
+                construct_x=x_construct,
                 routed_multiview_bundle=routed_bundle_full,
             )
             positive_fused = positive_outputs.get("fused_x")
@@ -1556,6 +1767,17 @@ def _train_graph_backbone_once(
         return total_loss, base_stats
 
     if str(training_loader_mode).lower() == "neighbor_subgraph":
+        if neighborloader_contract == "hyperscan_sampled_subgraph":
+            best_checkpoint_primary = "validation_accuracy"
+            neighborloader_contract_metrics.update(
+                {
+                    "supervision_scope": "sampled_subgraph_all_rows",
+                    "validation_scope": "sampled_subgraph_all_rows",
+                    "test_scope": "sampled_subgraph_all_rows",
+                    "duplicate_counting": "repeated_batch_rows",
+                    "checkpoint_selection_primary": "validation_accuracy",
+                }
+            )
         edge_index_cpu = edge_index.detach().cpu().long() if torch.is_tensor(edge_index) else torch.tensor(edge_index, dtype=torch.long)
         edge_type_cpu = edge_type.detach().cpu().long().view(-1) if torch.is_tensor(edge_type) else torch.tensor(edge_type, dtype=torch.long).view(-1)
         x_projected_cpu = x_projected.detach().cpu().float() if torch.is_tensor(x_projected) else torch.tensor(x_projected, dtype=torch.float32)
@@ -1571,6 +1793,11 @@ def _train_graph_backbone_once(
         loader_data = Data(
             x=x_projected_cpu,
             raw_x=x_raw_cpu,
+            construct_x=(
+                x_construct.detach().cpu().float()
+                if torch.is_tensor(x_construct)
+                else torch.tensor(x_construct, dtype=torch.float32)
+            ),
             y=y_full_cpu,
             edge_index=edge_index_cpu,
             edge_type=edge_type_cpu,
@@ -1601,6 +1828,7 @@ def _train_graph_backbone_once(
                 batch = batch.to(device)
                 optimizer.zero_grad()
                 x_batch = input_adapter(batch.x, batch.raw_x) if input_adapter is not None else batch.x
+                construct_batch = batch.construct_x if hasattr(batch, "construct_x") else None
                 semantic_batch = None
                 semantic_batch_all = None
                 if mhlgc_semantic_embeddings is not None:
@@ -1618,12 +1846,16 @@ def _train_graph_backbone_once(
                     x_batch,
                     batch.edge_index,
                     batch.edge_type.view(-1),
+                    construct_x=construct_batch,
                     routed_multiview_bundle=routed_bundle_batch,
                     batch_node_ids=batch.node_id,
                 )
                 logits = batch_outputs["logits"]
                 seed_count = int(batch.batch_size)
-                loss = F.cross_entropy(logits[:seed_count], batch.y[:seed_count])
+                if neighborloader_contract == "hyperscan_sampled_subgraph":
+                    loss = F.cross_entropy(logits, batch.y)
+                else:
+                    loss = F.cross_entropy(logits[:seed_count], batch.y[:seed_count])
                 if mhlgc_enabled and mhlgc_loss_weight > 0.0:
                     x_aug_projected = mhlgc_mask_node_features(
                         batch.x,
@@ -1647,6 +1879,7 @@ def _train_graph_backbone_once(
                         x_aug,
                         edge_index_aug,
                         edge_type_aug,
+                        construct_x=construct_batch,
                         hyperedge_mask_probability=float(mhlgc_hyperedge_mask_probability),
                         routed_multiview_bundle=routed_bundle_batch,
                         batch_node_ids=batch.node_id,
@@ -1710,6 +1943,7 @@ def _train_graph_backbone_once(
                                 x_batch,
                                 batch.edge_index,
                                 batch.edge_type.view(-1),
+                                construct_x=construct_batch,
                                 second_view_repair_delta=semantic_repair_all,
                                 second_view_repair_mask=repair_mask_batch_all,
                                 routed_multiview_bundle=routed_bundle_batch,
@@ -1755,6 +1989,8 @@ def _train_graph_backbone_once(
                 input_adapter.eval()
             eval_logits_by_node = None
             eval_seen = torch.zeros((labeled_node_count,), dtype=torch.bool)
+            repeated_eval_logits = []
+            repeated_eval_labels = []
             with torch.no_grad():
                 for batch in valid_loader:
                     batch = batch.to(device)
@@ -1772,32 +2008,50 @@ def _train_graph_backbone_once(
                         x_eval,
                         batch.edge_index,
                         batch.edge_type.view(-1),
+                        construct_x=(batch.construct_x if hasattr(batch, "construct_x") else None),
                         routed_multiview_bundle=routed_bundle_eval,
                         batch_node_ids=batch.node_id,
                     )
-                    seed_count = int(batch.batch_size)
-                    global_ids = batch.node_id[:seed_count].detach().cpu().long()
-                    batch_logits = logits_eval[:seed_count].detach().cpu()
-                    valid_seed_mask = (global_ids >= 0) & (global_ids < labeled_node_count)
-                    if not bool(valid_seed_mask.any()):
-                        continue
-                    if eval_logits_by_node is None:
-                        eval_logits_by_node = torch.zeros(
-                            (labeled_node_count, int(batch_logits.shape[1])),
-                            dtype=batch_logits.dtype,
-                        )
-                    eval_ids = global_ids[valid_seed_mask]
-                    eval_logits_by_node[eval_ids] = batch_logits[valid_seed_mask]
-                    eval_seen[eval_ids] = True
-            if eval_logits_by_node is None or not bool(torch.all(eval_seen[valid_idx_cpu]).item()):
-                missing = valid_idx_cpu[~eval_seen[valid_idx_cpu]]
-                raise RuntimeError(
-                    "NeighborLoader validation did not produce aligned logits for every valid node. "
-                    f"Missing {int(missing.numel())} ids."
+                    if neighborloader_contract == "hyperscan_sampled_subgraph":
+                        repeated_eval_logits.append(logits_eval.detach().cpu())
+                        repeated_eval_labels.append(batch.y.detach().cpu().long())
+                    else:
+                        seed_count = int(batch.batch_size)
+                        global_ids = batch.node_id[:seed_count].detach().cpu().long()
+                        batch_logits = logits_eval[:seed_count].detach().cpu()
+                        valid_seed_mask = (global_ids >= 0) & (global_ids < labeled_node_count)
+                        if not bool(valid_seed_mask.any()):
+                            continue
+                        if eval_logits_by_node is None:
+                            eval_logits_by_node = torch.zeros(
+                                (labeled_node_count, int(batch_logits.shape[1])),
+                                dtype=batch_logits.dtype,
+                            )
+                        eval_ids = global_ids[valid_seed_mask]
+                        eval_logits_by_node[eval_ids] = batch_logits[valid_seed_mask]
+                        eval_seen[eval_ids] = True
+            if neighborloader_contract == "hyperscan_sampled_subgraph":
+                if not repeated_eval_logits:
+                    raise RuntimeError("NeighborLoader validation did not produce any sampled-subgraph logits.")
+                val_metrics = _score_repeated_neighborloader_logits(
+                    torch.cat(repeated_eval_logits, dim=0),
+                    torch.cat(repeated_eval_labels, dim=0),
                 )
-            val_metrics = _score_logits(eval_logits_by_node, y_cpu, valid_idx_cpu)
+            else:
+                if eval_logits_by_node is None or not bool(torch.all(eval_seen[valid_idx_cpu]).item()):
+                    missing = valid_idx_cpu[~eval_seen[valid_idx_cpu]]
+                    raise RuntimeError(
+                        "NeighborLoader validation did not produce aligned logits for every valid node. "
+                        f"Missing {int(missing.numel())} ids."
+                    )
+                val_metrics = _score_logits(eval_logits_by_node, y_cpu, valid_idx_cpu)
             val_metrics["epoch"] = int(epoch)
-            if _is_better(val_metrics, best_metrics):
+            if _is_better_with_policy(
+                val_metrics,
+                best_metrics,
+                primary=best_checkpoint_primary,
+                tie_breaker=best_checkpoint_tie_breaker,
+            ):
                 best_metrics = val_metrics
                 best_state = {
                     "model": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
@@ -1821,7 +2075,13 @@ def _train_graph_backbone_once(
                 list(range(int(x.shape[0]))),
                 semantic_rows=semantic_all,
             )
-            base_outputs = model.forward_outputs(x, edge_index, edge_type, routed_multiview_bundle=routed_bundle_full)
+            base_outputs = model.forward_outputs(
+                x,
+                edge_index,
+                edge_type,
+                construct_x=x_construct,
+                routed_multiview_bundle=routed_bundle_full,
+            )
             outputs = base_outputs
             logits = outputs["logits"]
             loss = F.cross_entropy(logits[train_idx], y[train_idx])
@@ -1858,6 +2118,7 @@ def _train_graph_backbone_once(
                     x_aug,
                     edge_index_aug,
                     edge_type_aug,
+                    construct_x=x_construct,
                     hyperedge_mask_probability=float(mhlgc_hyperedge_mask_probability),
                     routed_multiview_bundle=routed_bundle_full,
                 )
@@ -1921,6 +2182,7 @@ def _train_graph_backbone_once(
                             x,
                             edge_index,
                             edge_type,
+                            construct_x=x_construct,
                             second_view_repair_delta=semantic_repair_all,
                             second_view_repair_mask=repair_mask_all,
                             routed_multiview_bundle=routed_bundle_full,
@@ -1968,7 +2230,13 @@ def _train_graph_backbone_once(
                     list(range(int(x_eval.shape[0]))),
                     semantic_rows=semantic_eval_full,
                 )
-                eval_outputs = model.forward_outputs(x_eval, edge_index, edge_type, routed_multiview_bundle=routed_bundle_eval)
+                eval_outputs = model.forward_outputs(
+                    x_eval,
+                    edge_index,
+                    edge_type,
+                    construct_x=x_construct,
+                    routed_multiview_bundle=routed_bundle_eval,
+                )
                 logits_eval = eval_outputs["logits"]
             val_metrics = _score_logits(logits_eval.detach().cpu(), y.detach().cpu(), valid_idx.detach().cpu())
             val_metrics["epoch"] = int(epoch)
@@ -2028,6 +2296,7 @@ def _train_graph_backbone_once(
                 x_stage2,
                 edge_index,
                 edge_type,
+                construct_x=x_construct,
                 routed_multiview_bundle=routed_bundle_stage2,
             )
 
@@ -2042,6 +2311,7 @@ def _train_graph_backbone_once(
                 x_stage2,
                 edge_index,
                 edge_type,
+                construct_x=x_construct,
                 routed_multiview_bundle=routed_bundle_stage2,
                 routed_highpass_bundle=highpass_bundle,
             )
@@ -2066,6 +2336,7 @@ def _train_graph_backbone_once(
                     x_eval,
                     edge_index,
                     edge_type,
+                    construct_x=x_construct,
                     routed_multiview_bundle=routed_bundle_eval,
                     routed_highpass_bundle=eval_highpass_bundle,
                 )
@@ -2102,6 +2373,11 @@ def _train_graph_backbone_once(
         infer_data = Data(
             x=x_projected_cpu,
             raw_x=x_raw_cpu,
+            construct_x=(
+                x_construct.detach().cpu().float()
+                if torch.is_tensor(x_construct)
+                else torch.tensor(x_construct, dtype=torch.float32)
+            ),
             y=y_full_cpu,
             edge_index=edge_index_cpu,
             edge_type=edge_type_cpu,
@@ -2121,8 +2397,29 @@ def _train_graph_backbone_once(
         fused_x_full = None
         x_low_full = None
         x_new_full = None
+        extra_full_tensors = {}
         aux_accumulator = {}
         aux_weight = 0.0
+        extra_tensor_keys = [
+            "x_ego_dec",
+            "x_rel_low1_dec",
+            "x_rel_high1_dec",
+            "x_rel_state1_dec",
+            "x_rel_low2_dec",
+            "x_rel_high2_dec",
+            "x_rel_state2_dec",
+            "x_clean_base",
+            "x_new_clean",
+            "x_high_low1_clean",
+            "x_high_high1_clean",
+            "x_high_state1_clean",
+            "x_high_low2_clean",
+            "x_high_high2_clean",
+            "x_high_clean",
+            "x_high",
+        ]
+        repeated_test_logits = []
+        repeated_test_labels = []
         with torch.no_grad():
             for batch in infer_loader:
                 batch = batch.to(device)
@@ -2140,9 +2437,13 @@ def _train_graph_backbone_once(
                     x_final,
                     batch.edge_index,
                     batch.edge_type.view(-1),
+                    construct_x=(batch.construct_x if hasattr(batch, "construct_x") else None),
                     routed_multiview_bundle=routed_bundle_infer,
                     batch_node_ids=batch.node_id,
                 )
+                if neighborloader_contract == "hyperscan_sampled_subgraph":
+                    repeated_test_logits.append(batch_outputs["logits"].detach().cpu())
+                    repeated_test_labels.append(batch.y.detach().cpu().long())
                 seed_count = int(batch.batch_size)
                 global_ids = batch.node_id[:seed_count].detach().cpu().long()
                 batch_logits = batch_outputs["logits"][:seed_count].detach().cpu()
@@ -2163,6 +2464,11 @@ def _train_graph_backbone_once(
                     batch_x_new = batch_x_new[:seed_count].detach().cpu()
                 else:
                     batch_x_new = None
+                batch_extra_tensors = {}
+                for key in extra_tensor_keys:
+                    value = batch_outputs.get(key)
+                    if torch.is_tensor(value):
+                        batch_extra_tensors[key] = value[:seed_count].detach().cpu()
                 if logits_full is None:
                     logits_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_logits.shape[1])), dtype=batch_logits.dtype)
                     prob_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_prob.shape[1])), dtype=batch_prob.dtype)
@@ -2180,6 +2486,13 @@ def _train_graph_backbone_once(
                     x_low_full[global_ids] = batch_x_low
                 if batch_x_new is not None and x_new_full is not None:
                     x_new_full[global_ids] = batch_x_new
+                for key, value in batch_extra_tensors.items():
+                    if key not in extra_full_tensors:
+                        extra_full_tensors[key] = torch.zeros(
+                            (int(x_projected_cpu.shape[0]), int(value.shape[1])),
+                            dtype=value.dtype,
+                        )
+                    extra_full_tensors[key][global_ids] = value
                 branch_stats = batch_outputs.get("aux_features", {}).get("dynamic_similarity_branch", {})
                 if isinstance(branch_stats, dict):
                     weight = float(seed_count)
@@ -2199,6 +2512,13 @@ def _train_graph_backbone_once(
                 aggregated_aux[key] = value / aux_weight
             else:
                 aggregated_aux[key] = value
+        if neighborloader_contract == "hyperscan_sampled_subgraph":
+            if not repeated_test_logits:
+                raise RuntimeError("NeighborLoader test/infer pass did not produce any sampled-subgraph logits.")
+            neighborloader_contract_metrics["test_best_checkpoint"] = _score_repeated_neighborloader_logits(
+                torch.cat(repeated_test_logits, dim=0),
+                torch.cat(repeated_test_labels, dim=0),
+            )
         outputs = {
             "logits": logits_full if logits_full is not None else torch.empty((0, 2), dtype=torch.float32),
             "prob": prob_full if prob_full is not None else torch.empty((0, 2), dtype=torch.float32),
@@ -2212,6 +2532,8 @@ def _train_graph_backbone_once(
             outputs["x_low"] = x_low_full
         if x_new_full is not None:
             outputs["x_new"] = x_new_full
+        for key, value in extra_full_tensors.items():
+            outputs[key] = value
     else:
         with torch.no_grad():
             x_final = input_adapter(x_projected, x_raw) if input_adapter is not None else x_projected
@@ -2224,6 +2546,7 @@ def _train_graph_backbone_once(
                 x_final,
                 edge_index,
                 edge_type,
+                construct_x=x_construct,
                 routed_multiview_bundle=routed_bundle_final,
             )
             outputs = base_final_outputs
@@ -2233,6 +2556,7 @@ def _train_graph_backbone_once(
                     x_final,
                     edge_index,
                     edge_type,
+                    construct_x=x_construct,
                     routed_multiview_bundle=routed_bundle_final,
                     routed_highpass_bundle=final_highpass_bundle,
                 )
@@ -2243,6 +2567,12 @@ def _train_graph_backbone_once(
         "best_metrics": best_metrics or {},
         "best_state": best_state,
         "optimizer_steps": int(optimizer_steps),
+        "neighborloader_contract_metrics": {
+            **neighborloader_contract_metrics,
+            "checkpoint_selection_primary": best_checkpoint_primary,
+            "checkpoint_selection_tie_breaker": best_checkpoint_tie_breaker,
+            "valid_best_checkpoint": dict(best_metrics or {}),
+        },
         "mhlgc_stats": {
             **mhlgc_stats,
             "loss_mean_active": (
@@ -2330,6 +2660,23 @@ def train_frozen_g0(args, seed, data, experiment_root):
     raw_features = feature_bundle["raw_features"]
     feature_manifest = feature_bundle["feature_manifest"]
     projector_state = feature_bundle["projector_state"]
+    construct_bundle = _load_dualspace_construct_bundle(args, data)
+    construct_features = (
+        construct_bundle["features"]
+        if construct_bundle is not None
+        else raw_features
+    )
+    construct_feature_manifest = (
+        construct_bundle["feature_manifest"]
+        if construct_bundle is not None
+        else {
+            "source": "raw_features_fallback",
+            "dualspace_role": "shared_with_raw_features",
+            "path": feature_manifest.get("path", ""),
+            "raw_dim": int(raw_features.shape[1]),
+            "projected_dim": int(raw_features.shape[1]),
+        }
+    )
     refine_request = _graph_refine_request(args)
     hyperscan_backbone_names = {
         "rgcn_hyperscan",
@@ -2337,6 +2684,8 @@ def train_frozen_g0(args, seed, data, experiment_root):
         "rgcn_hyperscan_dhg",
         "rgcn_hyperscan_nodeinput",
         "rgcn_hyperscan_dhg_nodeinput",
+        "rgcn_h2fag_dualspace_hyperscan",
+        "rgcn_h2fag_dualspace_hyperscan_nodeinput",
     }
     if refine_request["mode"] == "routed_dynamic_hyperscan_branch":
         requested_backbone = str(getattr(args, "GNN_model", getattr(args, "graph_backbone", "rgcn"))).lower()
@@ -2362,6 +2711,8 @@ def train_frozen_g0(args, seed, data, experiment_root):
         raise ValueError(f"G0 feature rows ({int(features.shape[0])}) must match graph_node_count ({graph_node_count}).")
     if int(raw_features.shape[0]) != graph_node_count:
         raise ValueError(f"G0 raw feature rows ({int(raw_features.shape[0])}) must match graph_node_count ({graph_node_count}).")
+    if int(construct_features.shape[0]) != graph_node_count:
+        raise ValueError(f"construct feature rows ({int(construct_features.shape[0])}) must match graph_node_count ({graph_node_count}).")
     if int(labels.numel()) != labeled_node_count:
         raise ValueError(f"Label rows ({int(labels.numel())}) must match labeled_node_count ({labeled_node_count}).")
 
@@ -2371,6 +2722,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
 
     x_projected = features.to(device)
     x_raw = raw_features.to(device)
+    x_construct = construct_features.to(device)
     y = labels.to(device)
     edge_index = data["edge_index"]
     edge_type = data["edge_type"]
@@ -2566,11 +2918,21 @@ def train_frozen_g0(args, seed, data, experiment_root):
     valid_idx = valid_idx_cpu.to(device)
 
     config = _model_config(args, features, device)
+    config["construct_input_dim"] = int(construct_features.shape[1])
+    config["construct_feature_manifest"] = construct_feature_manifest
     config["n_relations"] = int(active_relation_cardinality)
-    if str(feature_manifest.get("node_input_family", "semantic_embedding")).lower() == "hyperscan_meta_tweet_proxy":
-        config["tweet_dim"] = int(feature_manifest.get("tweet_dim", 0))
-        config["num_prop_dim"] = int(feature_manifest.get("num_prop_dim", 0))
-        config["cat_prop_dim"] = int(feature_manifest.get("cat_prop_dim", 0))
+    requested_backbone_name = str(
+        getattr(args, "GNN_model", getattr(args, "graph_backbone", "rgcn")) or "rgcn"
+    ).lower()
+    uses_dualspace_nodeinput = (
+        "rgcn_h2fag_dualspace" in requested_backbone_name
+        and "nodeinput" in requested_backbone_name
+    )
+    node_input_manifest = construct_feature_manifest if uses_dualspace_nodeinput else feature_manifest
+    if str(node_input_manifest.get("node_input_family", "semantic_embedding")).lower() == "hyperscan_meta_tweet_proxy":
+        config["tweet_dim"] = int(node_input_manifest.get("tweet_dim", 0))
+        config["num_prop_dim"] = int(node_input_manifest.get("num_prop_dim", 0))
+        config["cat_prop_dim"] = int(node_input_manifest.get("cat_prop_dim", 0))
         config["node_input_family"] = "hyperscan_meta_tweet_proxy"
     if dynamic_similarity_branch is not None:
         config["dynamic_similarity_branch"] = {
@@ -2618,6 +2980,12 @@ def train_frozen_g0(args, seed, data, experiment_root):
     mhlgc_enabled = bool(getattr(args, "mhlgc_enable", False))
     routed_contrast_family = str(getattr(args, "routed_contrast_family", "none") or "none").strip().lower()
     routed_contrast_enabled = routed_contrast_family != "none"
+    requested_backbone = str(getattr(args, "GNN_model", getattr(args, "graph_backbone", "rgcn"))).lower()
+    dualspace_hyperscan_active = "rgcn_h2fag_dualspace_hyperscan" in requested_backbone
+    if dualspace_hyperscan_active and mhlgc_enabled:
+        raise ValueError("dualspace hyperscan backbones do not support --mhlgc_enable in v1.")
+    if dualspace_hyperscan_active and routed_contrast_enabled:
+        raise ValueError("dualspace hyperscan backbones do not support --routed_contrast_family in v1.")
     mhlgc_semantic_embeddings = None
     mhlgc_target_mask = None
     mhlgc_routed_multiview_rows = None
@@ -2641,6 +3009,8 @@ def train_frozen_g0(args, seed, data, experiment_root):
     routed_contrast_train_node_ids = None
     routed_highpass_mode = str(getattr(args, "routed_highpass_mode", "off") or "off").strip().lower()
     routed_highpass_enabled = routed_highpass_mode != "off"
+    if dualspace_hyperscan_active and routed_highpass_enabled:
+        raise ValueError("dualspace hyperscan backbones do not support --routed_highpass_mode in v1.")
     routed_highpass_node_ids = None
     routed_highpass_train_node_ids = None
     routed_highpass_risk_scores = None
@@ -2697,6 +3067,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
         config=config,
         x_projected=x_projected,
         x_raw=x_raw,
+        x_construct=x_construct,
         y=y,
         edge_index=edge_index,
         edge_type=edge_type,
@@ -2714,6 +3085,9 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 "training_loader_mode",
                 getattr(args, "graph_training_loader_mode", "full_batch"),
             )
+        ),
+        graph_neighborloader_contract=str(
+            getattr(args, "graph_neighborloader_contract", "seed_only") or "seed_only"
         ),
         graph_batch_size=int(getattr(args, "batch_size_GNN", 1024)),
         neighbor_num_neighbors=int(refine_request.get("neighbor_num_neighbors", getattr(args, "graph_neighbor_num_neighbors", 64))),
@@ -2771,6 +3145,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
     raw_outputs = outputs
     best_metrics = training_result["best_metrics"]
     best_state = training_result["best_state"]
+    neighborloader_contract_metrics = dict(training_result.get("neighborloader_contract_metrics", {}) or {})
     if input_adapter is not None:
         feature_manifest["peft"]["trainable_parameter_count"] = count_trainable_parameters(input_adapter)
     outputs = {
@@ -2794,6 +3169,26 @@ def train_frozen_g0(args, seed, data, experiment_root):
         outputs["x_high_base"] = raw_outputs["x_high_base"].detach().cpu()
     if torch.is_tensor(raw_outputs.get("x_new")):
         outputs["x_new"] = raw_outputs["x_new"].detach().cpu()
+    extra_tensor_keys = [
+        "x_ego_dec",
+        "x_rel_low1_dec",
+        "x_rel_high1_dec",
+        "x_rel_state1_dec",
+        "x_rel_low2_dec",
+        "x_rel_high2_dec",
+        "x_rel_state2_dec",
+        "x_clean_base",
+        "x_new_clean",
+        "x_high_low1_clean",
+        "x_high_high1_clean",
+        "x_high_state1_clean",
+        "x_high_low2_clean",
+        "x_high_high2_clean",
+        "x_high_clean",
+    ]
+    for key in extra_tensor_keys:
+        if torch.is_tensor(raw_outputs.get(key)):
+            outputs[key] = raw_outputs[key].detach().cpu()
     if dynamic_similarity_branch_stats is not None:
         runtime_branch_stats = outputs["aux_features"].get("dynamic_similarity_branch", {})
         if isinstance(runtime_branch_stats, dict):
@@ -2826,12 +3221,15 @@ def train_frozen_g0(args, seed, data, experiment_root):
         },
         "model_config": {key: str(value) if isinstance(value, torch.device) else value for key, value in config.items()},
         "selection_metrics": best_metrics or {},
+        "neighborloader_contract_metrics": neighborloader_contract_metrics,
         "mhlgc": training_result.get("mhlgc_stats", {"enabled": False}),
         "routed_highpass": training_result.get("routed_highpass_stats", {"enabled": False}),
     }
     write_torch(out_dir / "checkpoint.pt", checkpoint)
     write_torch(out_dir / "outputs.pt", outputs)
     write_json(out_dir / "selection_metrics.json", best_metrics or {})
+    if neighborloader_contract_metrics.get("contract") == "hyperscan_sampled_subgraph":
+        write_json(out_dir / "neighborloader_contract_metrics.json", neighborloader_contract_metrics)
     write_json(
         out_dir / "manifest.json",
         {
@@ -2899,14 +3297,25 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 else "disabled"
             ),
             "representation_roles": {
-                "z_sem": "semantic_input_space",
-                "z_construct": "x_new_high_order_construction_space",
-                "z_pred": "fused_x_final_detector_space",
-            },
+            "z_sem": "semantic_input_space",
+            "z_construct": (
+                "hyperscan_clean_representation"
+                if construct_bundle is not None
+                else "x_new_high_order_construction_space"
+            ),
+            "z_decision": "iter_minus1",
+            "z_pred": "fused_x_final_detector_space",
+        },
             "pseudo_label_policy": "disabled_by_default",
             "checkpoint_selection": {
-                "primary": "validation_macro_f1",
-                "tie_breaker": "validation_loss",
+                "primary": str(
+                    neighborloader_contract_metrics.get("checkpoint_selection_primary", "validation_macro_f1")
+                    or "validation_macro_f1"
+                ),
+                "tie_breaker": str(
+                    neighborloader_contract_metrics.get("checkpoint_selection_tie_breaker", "validation_loss")
+                    or "validation_loss"
+                ),
             },
             "training_loader": {
                 "mode": str(
@@ -2917,6 +3326,25 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 ),
                 "neighbor_num_neighbors": int(refine_request.get("neighbor_num_neighbors", getattr(args, "graph_neighbor_num_neighbors", 64))),
                 "graph_batch_size": int(getattr(args, "batch_size_GNN", 1024)),
+                "neighborloader_contract": str(
+                    neighborloader_contract_metrics.get("contract", getattr(args, "graph_neighborloader_contract", "seed_only"))
+                    or "seed_only"
+                ),
+                "supervision_scope": str(
+                    neighborloader_contract_metrics.get("supervision_scope", "seed_only_first_batch_rows")
+                    or "seed_only_first_batch_rows"
+                ),
+                "validation_metric_scope": str(
+                    neighborloader_contract_metrics.get("validation_scope", "canonical_valid_seed_nodes")
+                    or "canonical_valid_seed_nodes"
+                ),
+                "test_metric_scope": str(
+                    neighborloader_contract_metrics.get("test_scope", "full_graph_deduplicated_export_only")
+                    or "full_graph_deduplicated_export_only"
+                ),
+                "duplicate_counting": str(
+                    neighborloader_contract_metrics.get("duplicate_counting", "none") or "none"
+                ),
                 "optimizer_steps": int(training_result.get("optimizer_steps", 0)),
                 "max_update_steps": int(getattr(args, "graph_training_max_steps", 0) or 0),
             },
@@ -2983,6 +3411,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 ),
             },
             "feature_manifest": feature_manifest,
+            "construct_feature_manifest": construct_feature_manifest,
             "input_projection": {
                 "enabled": feature_manifest.get("projection_applied", False),
                 "method": feature_manifest.get("projector"),
@@ -3047,6 +3476,7 @@ def load_frozen_g0(experiment_root):
         "checkpoint": out_dir / "checkpoint.pt",
         "selection_metrics": out_dir / "selection_metrics.json",
     }
+    neighborloader_contract_metrics_path = out_dir / "neighborloader_contract_metrics.json"
     missing = [name for name, path in required.items() if not path.exists()]
     manifest = read_json(required["manifest"])
     if missing or manifest is None:
@@ -3060,6 +3490,7 @@ def load_frozen_g0(experiment_root):
         "manifest": manifest,
         "outputs": safe_torch_load(required["outputs"], map_location="cpu"),
         "selection_metrics": read_json(required["selection_metrics"], default={}),
+        "neighborloader_contract_metrics": read_json(neighborloader_contract_metrics_path, default={}),
         "checkpoint_path": str(required["checkpoint"]),
         "artifact_dir": str(out_dir),
         "dir": out_dir,
@@ -3542,6 +3973,7 @@ def _relation_overlap_knn_repr_prefit_augment(
         config=config,
         x_projected=feature_cpu.to(device),
         x_raw=raw_feature_cpu.to(device),
+        x_construct=raw_feature_cpu.to(device),
         y=labels_cpu.to(device),
         edge_index=edge_index_cpu.to(device),
         edge_type=edge_type_cpu.to(device),
@@ -3934,6 +4366,18 @@ def _detector_manifest_matches_request(args, manifest):
     return existing_fusion == requested_fusion
 
 
+def _neighborloader_contract_manifest_matches_request(args, manifest):
+    requested_loader_mode = str(getattr(args, "graph_training_loader_mode", "full_batch") or "full_batch").strip().lower()
+    if requested_loader_mode != "neighbor_subgraph":
+        return True
+    requested_contract = str(getattr(args, "graph_neighborloader_contract", "seed_only") or "seed_only").strip().lower()
+    training_loader = manifest.get("training_loader", {})
+    if not isinstance(training_loader, dict):
+        training_loader = {}
+    existing_contract = str(training_loader.get("neighborloader_contract", "seed_only") or "seed_only").strip().lower()
+    return existing_contract == requested_contract
+
+
 def _existing_g0_matches_request(args, manifest):
     if manifest.get("contract") != FROZEN_G0_CONTRACT:
         return False
@@ -3942,6 +4386,8 @@ def _existing_g0_matches_request(args, manifest):
     if not _mhlgc_manifest_matches_request(args, manifest):
         return False
     if not _routed_contrast_manifest_matches_request(args, manifest):
+        return False
+    if not _neighborloader_contract_manifest_matches_request(args, manifest):
         return False
 
     requested_graph_override = _graph_override_manifest_request(args)
@@ -3961,6 +4407,18 @@ def _existing_g0_matches_request(args, manifest):
     feature_manifest = manifest.get("feature_manifest", {})
     if requested_path is not None and feature_manifest.get("path") != requested_path:
         return False
+    requested_construct_path = str(getattr(args, "graph_construct_embedding_path", "") or "").strip()
+    existing_construct_manifest = manifest.get("construct_feature_manifest", {})
+    existing_construct_path = str(existing_construct_manifest.get("path", "") or "").strip()
+    if requested_construct_path:
+        if not existing_construct_path:
+            return False
+        if str(Path(existing_construct_path)) != str(Path(requested_construct_path)):
+            return False
+    elif existing_construct_path and str(existing_construct_manifest.get("dualspace_role", "") or "").strip().lower() == "hyperscan_clean_representation":
+        requested_backbone = str(getattr(args, "GNN_model", getattr(args, "graph_backbone", "rgcn")) or "rgcn").lower()
+        if "rgcn_h2fag_dualspace_hyperscan" in requested_backbone:
+            return False
     projected_dim = feature_manifest.get("projected_dim")
     if projected_dim is not None and int(projected_dim) != phase_a_project_dim(args):
         return False

@@ -5614,3 +5614,312 @@ Interpretation boundary:
   semantic regime and fixed 200-step NeighborLoader contract, explicit
   cross-attention consumption and adaptive low/high fusion do not provide a
   stable full-test gain over the lighter residual second-view consumer.
+
+## 2026-06-17 - NeighborLoader contract comparison (official nodeinput-788, same backbone / same geometry)
+
+Question:
+
+- This block compares NeighborLoader supervision / evaluation contracts, not a
+  new method. The goal is to keep two result families separate:
+  - `seed_only`: deduplicated canonical valid seed-node selection and
+    full-graph one-node-one-row export.
+  - `hyperscan_sampled_subgraph`: whole sampled-subgraph supervision plus
+    repeated sampled-row validation / test sidecar metrics.
+
+Fixed setup across all four runs:
+
+- code root:
+  `/root/workspace/LMbot/LLMbot_neighborloader_contract_20260617`
+- dataset: `TwiBot-20`
+- split: canonical `train_idx.pt / valid_idx.pt / test_idx.pt`
+- input tensor:
+  `/root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt`
+- backbone: `rgcn_hyperscan_nodeinput`
+- node-input family: `hyperscan_meta_tweet_proxy`
+- hidden dim: `788`
+- loader geometry: `neighbor_subgraph`
+- second-view scope when enabled: `neighborloader_batch`
+- second-view hypergraph backend: `pyg`
+- KNN: `k=8`
+- NeighborLoader fanout: `64`
+- batch size: `1024`
+- max steps: `200`
+- seed: `1`
+
+Exact run commands:
+
+Shared shell context:
+
+```bash
+cd /root/workspace/LMbot/LLMbot_neighborloader_contract_20260617
+source /root/mambaforge/etc/profile.d/conda.sh
+conda activate lmbot
+```
+
+1. `RGCN/control + seed_only`
+
+```bash
+/root/mambaforge/envs/lmbot/bin/python - <<'PY'
+from parser_args import parser_args
+from main import main
+args = parser_args([
+    '--experiment_task','graph_detector_prepare',
+    '--dataset','TwiBot-20',
+    '--reset_split','-1',
+    '--graph_data_variant','labeled',
+    '--use_GNN',
+    '--graph_backbone','rgcn_hyperscan_nodeinput',
+    '--graph_node_input_family','hyperscan_meta_tweet_proxy',
+    '--embedding_path','/root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt',
+    '--hidden_dim','788',
+    '--graph_neighbor_num_neighbors','64',
+    '--gnn_batch_size','1024',
+    '--graph_training_max_steps','200',
+    '--seeds','1',
+    '--device','0',
+    '--disable_wandb',
+    '--force_retrain_backbone',
+    '--artifact_root','/root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_rgcn_seedonly_seed1_20260617',
+    '--graph_training_loader_mode','neighbor_subgraph',
+    '--graph_second_view_scope','neighborloader_batch',
+    '--graph_neighborloader_contract','seed_only',
+    '--graph_second_view_hypergraph_backend','pyg',
+    '--graph_refine_knn_k','8',
+    '--graph_second_view_fusion','residual',
+])
+args.graph_refine_mode = 'none'
+args.graph_refine_positioning = 'none'
+args.graph_refine_control_only = False
+main(args)
+PY
+```
+
+2. `RGCN/control + hyperscan_sampled_subgraph`
+
+```bash
+/root/mambaforge/envs/lmbot/bin/python - <<'PY'
+from parser_args import parser_args
+from main import main
+args = parser_args([
+    '--experiment_task','graph_detector_prepare',
+    '--dataset','TwiBot-20',
+    '--reset_split','-1',
+    '--graph_data_variant','labeled',
+    '--use_GNN',
+    '--graph_backbone','rgcn_hyperscan_nodeinput',
+    '--graph_node_input_family','hyperscan_meta_tweet_proxy',
+    '--embedding_path','/root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt',
+    '--hidden_dim','788',
+    '--graph_neighbor_num_neighbors','64',
+    '--gnn_batch_size','1024',
+    '--graph_training_max_steps','200',
+    '--seeds','1',
+    '--device','0',
+    '--disable_wandb',
+    '--force_retrain_backbone',
+    '--artifact_root','/root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_rgcn_faithful_seed1_20260617',
+    '--graph_training_loader_mode','neighbor_subgraph',
+    '--graph_second_view_scope','neighborloader_batch',
+    '--graph_neighborloader_contract','hyperscan_sampled_subgraph',
+    '--graph_second_view_hypergraph_backend','pyg',
+    '--graph_refine_knn_k','8',
+    '--graph_second_view_fusion','residual',
+])
+args.graph_refine_mode = 'none'
+args.graph_refine_positioning = 'none'
+args.graph_refine_control_only = False
+main(args)
+PY
+```
+
+3. `multiattn + seed_only`
+
+```bash
+/root/mambaforge/envs/lmbot/bin/python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_nodeinput \
+  --graph_node_input_family hyperscan_meta_tweet_proxy \
+  --embedding_path /root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt \
+  --hidden_dim 788 \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --device 0 \
+  --disable_wandb \
+  --force_retrain_backbone \
+  --artifact_root /root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_multiattn_seedonly_seed1_20260617 \
+  --graph_training_loader_mode neighbor_subgraph \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_neighborloader_contract seed_only \
+  --graph_second_view_hypergraph_backend pyg \
+  --graph_refine_knn_k 8 \
+  --graph_second_view_fusion multiattn
+```
+
+4. `multiattn + hyperscan_sampled_subgraph`
+
+```bash
+/root/mambaforge/envs/lmbot/bin/python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_nodeinput \
+  --graph_node_input_family hyperscan_meta_tweet_proxy \
+  --embedding_path /root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt \
+  --hidden_dim 788 \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --device 0 \
+  --disable_wandb \
+  --force_retrain_backbone \
+  --artifact_root /root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_multiattn_faithful_seed1_20260617 \
+  --graph_training_loader_mode neighbor_subgraph \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_neighborloader_contract hyperscan_sampled_subgraph \
+  --graph_second_view_hypergraph_backend pyg \
+  --graph_refine_knn_k 8 \
+  --graph_second_view_fusion multiattn
+```
+
+Implementation note:
+
+- The two `RGCN/control` runs intentionally use an inline Python wrapper
+  instead of a pure public CLI call. Reason: the current parser gate ties
+  `hyperscan_sampled_subgraph` to `graph_second_view_scope=neighborloader_batch`.
+  The wrapper keeps the same NeighborLoader geometry but forces
+  `graph_refine_mode = none`, so this is a clean control under the same
+  nodeinput-788 / NeighborLoader setting rather than a second-view mainline.
+
+Artifact roots:
+
+- `/root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_rgcn_seedonly_seed1_20260617`
+- `/root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_rgcn_faithful_seed1_20260617`
+- `/root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_multiattn_seedonly_seed1_20260617`
+- `/root/workspace/LMbot/LLMbot_neighborloader_contract_20260617/experiments/neighborloader_contract_official788_multiattn_faithful_seed1_20260617`
+
+Run-level artifact checks:
+
+- all four runs produced:
+  - `manifest.json`
+  - `outputs.pt`
+  - `selection_metrics.json`
+  - `checkpoint.pt`
+- both multiattn runs additionally produced:
+  - `graph_refine_stats.json`
+- both faithful runs additionally produced:
+  - `neighborloader_contract_metrics.json`
+- seed-only runs correctly do not have the faithful sidecar
+
+Manifest / sidecar checks:
+
+- `RGCN/control + seed_only`
+  - `training_loader.mode = neighbor_subgraph`
+  - `training_loader.neighborloader_contract = seed_only`
+  - `training_loader.supervision_scope = seed_only_first_batch_rows`
+  - `training_loader.validation_metric_scope = canonical_valid_seed_nodes`
+  - `training_loader.test_metric_scope = full_graph_deduplicated_export_only`
+  - `graph_refine = null`
+  - `detector.graph_second_view_fusion = residual`
+  - `checkpoint_selection.primary = validation_macro_f1`
+- `RGCN/control + hyperscan_sampled_subgraph`
+  - `training_loader.neighborloader_contract = hyperscan_sampled_subgraph`
+  - `training_loader.supervision_scope = sampled_subgraph_all_rows`
+  - `training_loader.validation_metric_scope = sampled_subgraph_all_rows`
+  - `training_loader.test_metric_scope = sampled_subgraph_all_rows`
+  - `training_loader.duplicate_counting = repeated_batch_rows`
+  - `graph_refine = null`
+  - `checkpoint_selection.primary = validation_accuracy`
+  - sidecar agrees:
+    `contract = hyperscan_sampled_subgraph`,
+    `duplicate_counting = repeated_batch_rows`
+- `multiattn + seed_only`
+  - `graph_refine.mode = hyperscan_neighborloader_batch_local_branch`
+  - `graph_refine.positioning = second_view_mainline`
+  - `graph_refine.control_only = false`
+  - `detector.graph_second_view_fusion = multiattn`
+  - `detector.hyperscan_detector_style = original_cross_attention`
+  - `checkpoint_selection.primary = validation_macro_f1`
+- `multiattn + hyperscan_sampled_subgraph`
+  - `graph_refine.mode = hyperscan_neighborloader_batch_local_branch`
+  - `graph_refine.positioning = second_view_mainline`
+  - `graph_refine.control_only = false`
+  - `detector.graph_second_view_fusion = multiattn`
+  - `detector.hyperscan_detector_style = original_cross_attention`
+  - `checkpoint_selection.primary = validation_accuracy`
+  - sidecar agrees:
+    `contract = hyperscan_sampled_subgraph`,
+    `duplicate_counting = repeated_batch_rows`
+
+Metric computation note:
+
+- Contract-native metrics were read exactly from the artifact family produced by
+  each contract:
+  - `seed_only`: `selection_metrics.json` only (validation checkpoint record)
+  - `hyperscan_sampled_subgraph`: `neighborloader_contract_metrics.json`
+    (`valid_best_checkpoint` and `test_best_checkpoint`)
+- Canonical full-test metrics were recomputed from `outputs.pt` plus canonical
+  `test_idx.pt`.
+- In these artifacts `labels.pt` is one-hot `[N, 2]`, so canonical recompute
+  uses `argmax(labels, dim=1)` before scoring.
+- Important: `outputs.pt` remains full-graph one-node-one-row export. It must
+  not be reinterpreted as the repeated sampled-subgraph test stream used by the
+  faithful sidecar.
+
+Contract-native metrics:
+
+| run | contract | native valid Acc | native valid Macro-F1 | native test Acc | native test Macro-F1 |
+|---|---|---:|---:|---:|---:|
+| `rgcn_control` | `seed_only` | `0.8677` | `0.8647` | `-` | `-` |
+| `rgcn_control` | `hyperscan_sampled_subgraph` | `0.8858` | `0.8794` | `0.8894` | `0.8837` |
+| `multiattn` | `seed_only` | `0.8677` | `0.8645` | `-` | `-` |
+| `multiattn` | `hyperscan_sampled_subgraph` | `0.8744` | `0.8655` | `0.8744` | `0.8663` |
+
+Canonical deduplicated full-test metrics:
+
+| run | contract | Test Acc | Test Macro-F1 | Bot-F1 | Human-F1 |
+|---|---|---:|---:|---:|---:|
+| `rgcn_control` | `seed_only` | `0.8648` | `0.8628` | `0.8792` | `0.8464` |
+| `rgcn_control` | `hyperscan_sampled_subgraph` | `0.8774` | `0.8755` | `0.8911` | `0.8599` |
+| `multiattn` | `seed_only` | `0.8664` | `0.8646` | `0.8803` | `0.8489` |
+| `multiattn` | `hyperscan_sampled_subgraph` | `0.8732` | `0.8702` | `0.8899` | `0.8506` |
+
+Contract-difference interpretation boundary:
+
+- `hyperscan_sampled_subgraph` allows repeated sampled rows across loader
+  batches in validation / test sidecar metrics; `seed_only` does not.
+- `seed_only` and faithful contracts also select checkpoints with different
+  validation targets:
+  - `seed_only`: `validation_macro_f1`
+  - `hyperscan_sampled_subgraph`: `validation_accuracy`
+- Therefore raw validation numbers and faithful repeated-row test sidecar
+  numbers cannot be mixed directly with `seed_only` validation records.
+- For method comparison and downstream citation in this repo, the default full
+  test number should be the canonical deduplicated recompute from
+  `outputs.pt + canonical test_idx.pt`, not the repeated sampled-subgraph
+  sidecar.
+
+Local conclusion from this 4-run matrix:
+
+- Under identical official nodeinput-788 backbone / geometry, switching from
+  `seed_only` to `hyperscan_sampled_subgraph` raises canonical full-test
+  Macro-F1 for both detector families:
+  - `rgcn_control`: `0.8628 -> 0.8755` (`+0.0127`)
+  - `multiattn`: `0.8646 -> 0.8702` (`+0.0056`)
+- Within the `seed_only` contract, `multiattn` is only slightly above
+  `rgcn_control` on canonical full-test Macro-F1:
+  `0.8646 - 0.8628 = +0.0018`.
+- Within the faithful contract, `rgcn_control` is stronger than `multiattn` on
+  canonical full-test Macro-F1:
+  `0.8755 - 0.8702 = +0.0053`.
+- This block should be read as a contract audit and same-geometry detector
+  comparison only. It does not by itself justify mixing repeated sampled-row
+  faithful metrics into the repo's default full-test comparison tables.

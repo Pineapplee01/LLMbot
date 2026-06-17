@@ -53,6 +53,7 @@ class BaseGraphBackbone(nn.Module):
         x,
         edge_index,
         edge_type,
+        construct_x=None,
         hyperedge_mask_probability=0.0,
         second_view_repair_delta=None,
         second_view_repair_mask=None,
@@ -85,6 +86,7 @@ class BaseGraphBackbone(nn.Module):
         x,
         edge_index,
         edge_type,
+        construct_x=None,
         hyperedge_mask_probability=0.0,
         second_view_repair_delta=None,
         second_view_repair_mask=None,
@@ -96,6 +98,7 @@ class BaseGraphBackbone(nn.Module):
             x,
             edge_index,
             edge_type,
+            construct_x=construct_x,
             hyperedge_mask_probability=hyperedge_mask_probability,
             second_view_repair_delta=second_view_repair_delta,
             second_view_repair_mask=second_view_repair_mask,
@@ -695,6 +698,213 @@ def _apply_routed_highpass_x_high_correction(module, x_high, routed_highpass_bun
             }
         )
     return refined_x_high, stats, aux
+
+
+class NeighborOnlyRGCNConv(nn.Module):
+    """Relation-aware neighbor-only aggregation without root/self mixing."""
+
+    def __init__(self, in_channels, out_channels, num_relations):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.num_relations = int(num_relations)
+        self.relation_linears = nn.ModuleList(
+            [nn.Linear(self.in_channels, self.out_channels, bias=False) for _ in range(self.num_relations)]
+        )
+
+    def forward(self, x, edge_index, edge_type):
+        if edge_index is None or int(edge_index.numel()) == 0:
+            return x.new_zeros((int(x.size(0)), self.out_channels))
+        if edge_type is None:
+            edge_type = torch.zeros((int(edge_index.size(1)),), dtype=torch.long, device=edge_index.device)
+        src = edge_index[0].long()
+        dst = edge_index[1].long()
+        out = x.new_zeros((int(x.size(0)), self.out_channels))
+        degree = x.new_zeros((int(x.size(0)), 1))
+        for rel_id, linear in enumerate(self.relation_linears):
+            rel_mask = edge_type == int(rel_id)
+            if not bool(rel_mask.any().item()):
+                continue
+            rel_src = src[rel_mask]
+            rel_dst = dst[rel_mask]
+            rel_msg = linear(x[rel_src])
+            out.index_add_(0, rel_dst, rel_msg)
+            degree.index_add_(
+                0,
+                rel_dst,
+                torch.ones((int(rel_dst.numel()), 1), dtype=out.dtype, device=out.device),
+            )
+        return out / degree.clamp_min(1.0)
+
+
+class SelfLowHighGate(nn.Module):
+    """Node-wise adaptive self/low/high mixing used by dual-space encoders."""
+
+    def __init__(self, hidden_dim, dropout_rate=0.4):
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        self.hidden_dim = hidden_dim
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 5, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(float(dropout_rate)),
+            nn.Linear(hidden_dim, 3),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, self_hidden, low_hidden, high_hidden):
+        context = torch.cat(
+            [
+                self_hidden,
+                low_hidden,
+                high_hidden,
+                self_hidden - low_hidden,
+                self_hidden - high_hidden,
+            ],
+            dim=-1,
+        )
+        gate = torch.softmax(self.gate_mlp(context), dim=-1)
+        mixed = (
+            gate[:, 0:1] * self_hidden
+            + gate[:, 1:2] * low_hidden
+            + gate[:, 2:3] * high_hidden
+        )
+        return self.norm(mixed), gate
+
+
+class DualSpaceRelationEncoder(nn.Module):
+    """Strict H2GCN/FAGCN-style relation encoder in the decision space."""
+
+    def __init__(self, input_dim, hidden_dim, num_relations, dropout_rate=0.4, activation=None):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.activation = activation if activation is not None else nn.LeakyReLU()
+        self.dropout = nn.Dropout(float(dropout_rate))
+        self.linear_in = nn.Linear(self.input_dim, self.hidden_dim)
+        self.rel_conv1 = NeighborOnlyRGCNConv(self.hidden_dim, self.hidden_dim, num_relations=num_relations)
+        self.rel_conv2 = NeighborOnlyRGCNConv(self.hidden_dim, self.hidden_dim, num_relations=num_relations)
+        self.gate1 = SelfLowHighGate(self.hidden_dim, dropout_rate=dropout_rate)
+        self.gate2 = SelfLowHighGate(self.hidden_dim, dropout_rate=dropout_rate)
+        self.out_linear = nn.Linear(self.hidden_dim * 6, self.hidden_dim)
+        self.out_norm = nn.LayerNorm(self.hidden_dim)
+
+    def forward(self, x, edge_index, edge_type):
+        z0 = self.dropout(self.activation(self.linear_in(x)))
+        low1 = self.rel_conv1(z0, edge_index, edge_type)
+        high1 = z0 - low1
+        state1, gate1 = self.gate1(z0, low1, high1)
+        state1 = self.dropout(self.activation(state1))
+
+        low2 = self.rel_conv2(state1, edge_index, edge_type)
+        high2 = state1 - low2
+        state2, gate2 = self.gate2(state1, low2, high2)
+        state2 = self.dropout(self.activation(state2))
+
+        x_low = self.out_linear(torch.cat([z0, low1, high1, low2, high2, state2], dim=-1))
+        x_low = self.out_norm(self.activation(x_low))
+        x_low = self.dropout(x_low)
+        return {
+            "x_low": x_low,
+            "x_ego_dec": z0,
+            "x_rel_low1_dec": low1,
+            "x_rel_high1_dec": high1,
+            "x_rel_state1_dec": state1,
+            "x_rel_low2_dec": low2,
+            "x_rel_high2_dec": high2,
+            "x_rel_state2_dec": state2,
+            "gate1_dec": gate1,
+            "gate2_dec": gate2,
+        }
+
+
+class DualSpaceHighOrderEncoder(nn.Module):
+    """Strict clean-space high-order encoder with self/low/high separation."""
+
+    def __init__(self, clean_input_dim, hidden_dim, dropout_rate=0.4, activation=None):
+        super().__init__()
+        self.clean_input_dim = int(clean_input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.activation = activation if activation is not None else nn.LeakyReLU()
+        self.dropout = nn.Dropout(float(dropout_rate))
+        self.clean_linear = nn.Linear(self.clean_input_dim, self.hidden_dim)
+        self.hyper_conv1 = HypergraphConv(self.hidden_dim, self.hidden_dim, use_attention=False)
+        self.hyper_conv2 = HypergraphConv(self.hidden_dim, self.hidden_dim, use_attention=False)
+        self.gate1 = SelfLowHighGate(self.hidden_dim, dropout_rate=dropout_rate)
+        self.gate2 = SelfLowHighGate(self.hidden_dim, dropout_rate=dropout_rate)
+        self.clean_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.clean_norm = nn.LayerNorm(self.hidden_dim)
+        self.out_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.out_norm = nn.LayerNorm(self.hidden_dim)
+
+    def encode_clean_base(self, construct_x):
+        base = self.clean_linear(construct_x)
+        base = self.clean_norm(self.activation(base))
+        base = self.dropout(base)
+        return base
+
+    def build_construct_space(self, construct_x):
+        clean_base = self.encode_clean_base(construct_x)
+        x_new_clean = self.clean_proj(clean_base)
+        x_new_clean = self.clean_norm(self.activation(x_new_clean))
+        x_new_clean = self.dropout(x_new_clean)
+        return clean_base, x_new_clean
+
+    def forward(self, construct_x, hyperedge_index, incident_mask, prepared_construct=None):
+        if prepared_construct is None:
+            clean_base, x_new_clean = self.build_construct_space(construct_x)
+        else:
+            clean_base = prepared_construct["x_clean_base"]
+            x_new_clean = prepared_construct["x_new_clean"]
+
+        if hyperedge_index is None or int(hyperedge_index.numel()) == 0:
+            zero = torch.zeros_like(x_new_clean)
+            incident_scale = torch.zeros((int(x_new_clean.size(0)), 1), dtype=x_new_clean.dtype, device=x_new_clean.device)
+            return {
+                "x_clean_base": clean_base,
+                "x_new_clean": x_new_clean,
+                "x_high_low1_clean": zero,
+                "x_high_high1_clean": zero,
+                "x_high_state1_clean": zero,
+                "x_high_low2_clean": zero,
+                "x_high_high2_clean": zero,
+                "x_high_clean": zero,
+                "x_high": zero,
+                "incident_scale": incident_scale,
+                "gate1_clean": None,
+                "gate2_clean": None,
+            }
+
+        hg_low1 = self.hyper_conv1(x_new_clean, hyperedge_index)
+        hg_low1 = self.dropout(self.activation(hg_low1))
+        hg_high1 = x_new_clean - hg_low1
+        hg_state1, gate1 = self.gate1(x_new_clean, hg_low1, hg_high1)
+        hg_state1 = self.dropout(self.activation(hg_state1))
+
+        hg_low2 = self.hyper_conv2(hg_state1, hyperedge_index)
+        hg_low2 = self.dropout(self.activation(hg_low2))
+        hg_high2 = hg_state1 - hg_low2
+        x_high_clean, gate2 = self.gate2(hg_state1, hg_low2, hg_high2)
+        x_high_clean = self.dropout(self.activation(x_high_clean))
+
+        x_high = self.out_proj(x_high_clean)
+        x_high = self.out_norm(self.activation(x_high))
+        x_high = self.dropout(x_high)
+        incident_scale = incident_mask.to(dtype=x_high.dtype).unsqueeze(-1)
+        return {
+            "x_clean_base": clean_base,
+            "x_new_clean": x_new_clean,
+            "x_high_low1_clean": hg_low1,
+            "x_high_high1_clean": hg_high1,
+            "x_high_state1_clean": hg_state1,
+            "x_high_low2_clean": hg_low2,
+            "x_high_high2_clean": hg_high2,
+            "x_high_clean": x_high_clean,
+            "x_high": x_high,
+            "incident_scale": incident_scale,
+            "gate1_clean": gate1,
+            "gate2_clean": gate2,
+        }
 
 
 def _second_view_feature_source(branch_cfg):
@@ -1418,6 +1628,245 @@ class RGCN(BaseGraphBackbone):
         return x
 
 
+class RGCNH2FAGDualSpace(BaseGraphBackbone):
+    """Dual-space relation backbone: iter_-1 decision propagation only."""
+
+    export_relation_x_new = False
+
+    def __init__(self, model_config):
+        super().__init__(model_config)
+        input_dim = _cfg(model_config, "lm_input_dim")
+        self.decision_encoder = DualSpaceRelationEncoder(
+            input_dim=input_dim,
+            hidden_dim=self.hidden_dim,
+            num_relations=self.n_relations,
+            dropout_rate=float(_cfg(model_config, "dropout", default=0.4)),
+            activation=self.activation,
+        )
+
+    def forward_outputs(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        construct_x=None,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
+        rel = self.decision_encoder(x, edge_index, edge_type)
+        x_low = rel["x_low"]
+        logits = self.linear_out(x_low)
+        return {
+            "logits": logits,
+            "prob": torch.softmax(logits, dim=-1),
+            "node_repr": x_low,
+            "fused_x": x_low,
+            "x_low": x_low,
+            "x_ego_dec": rel["x_ego_dec"],
+            "x_rel_low1_dec": rel["x_rel_low1_dec"],
+            "x_rel_high1_dec": rel["x_rel_high1_dec"],
+            "x_rel_state1_dec": rel["x_rel_state1_dec"],
+            "x_rel_low2_dec": rel["x_rel_low2_dec"],
+            "x_rel_high2_dec": rel["x_rel_high2_dec"],
+            "x_rel_state2_dec": rel["x_rel_state2_dec"],
+            "aux_features": {
+                "dualspace_relation_encoder": {
+                    "enabled": True,
+                    "space": "iter_minus1_decision",
+                    "gate1_self_mean": float(rel["gate1_dec"][:, 0].detach().mean().cpu().item()),
+                    "gate1_low_mean": float(rel["gate1_dec"][:, 1].detach().mean().cpu().item()),
+                    "gate1_high_mean": float(rel["gate1_dec"][:, 2].detach().mean().cpu().item()),
+                    "gate2_self_mean": float(rel["gate2_dec"][:, 0].detach().mean().cpu().item()),
+                    "gate2_low_mean": float(rel["gate2_dec"][:, 1].detach().mean().cpu().item()),
+                    "gate2_high_mean": float(rel["gate2_dec"][:, 2].detach().mean().cpu().item()),
+                }
+            },
+        }
+
+
+class RGCNH2FAGDualSpaceHyperScan(BaseGraphBackbone):
+    """Dual-space backbone: iter_-1 decision relation view + clean construct/high-order view."""
+
+    def __init__(self, model_config):
+        super().__init__(model_config)
+        input_dim = _cfg(model_config, "lm_input_dim")
+        clean_input_dim = _cfg(model_config, "construct_input_dim")
+        branch_cfg = dict(model_config.get("dynamic_similarity_branch", {}) or {})
+        self.decision_encoder = DualSpaceRelationEncoder(
+            input_dim=input_dim,
+            hidden_dim=self.hidden_dim,
+            num_relations=self.n_relations,
+            dropout_rate=float(_cfg(model_config, "dropout", default=0.4)),
+            activation=self.activation,
+        )
+        self.clean_encoder = DualSpaceHighOrderEncoder(
+            clean_input_dim=clean_input_dim,
+            hidden_dim=self.hidden_dim,
+            dropout_rate=float(_cfg(model_config, "dropout", default=0.4)),
+            activation=self.activation,
+        )
+        _init_hyperscan_detector(self, model_config, self.hidden_dim)
+        self.dynamic_branch_enabled = bool(branch_cfg.get("enabled", False))
+        self.dynamic_hyper_k = int(branch_cfg.get("knn_k", 8))
+        self.dynamic_candidate_scope = str(branch_cfg.get("candidate_scope", "undirected_relation_1hop"))
+        self.dynamic_similarity_metric = str(branch_cfg.get("similarity_metric", "cosine"))
+        self.dynamic_feature_source = str(branch_cfg.get("feature_source", "hyperscan_clean_representation"))
+        self.dynamic_center_source = str(branch_cfg.get("center_source", "labeled_prefix"))
+        self.dynamic_routed_nodes_path = str(branch_cfg.get("routed_nodes_path", "") or "")
+        self.dynamic_routed_nodes_split = str(branch_cfg.get("routed_nodes_split", "all") or "all")
+        self.dynamic_batch_local_knn = bool(branch_cfg.get("batch_local_knn", False))
+        self._dynamic_batch_local_routed_node_ids = _as_long_tensor(branch_cfg.get("batch_local_routed_node_ids", []))
+        center_node_ids = list(branch_cfg.get("center_node_ids", []) or [])
+        center_candidate_node_ids = list(branch_cfg.get("center_candidate_node_ids", []) or [])
+        self.register_buffer("_dynamic_center_node_ids", torch.tensor(center_node_ids, dtype=torch.long), persistent=False)
+        self._dynamic_center_candidate_node_ids = _as_long_tensor_list(center_candidate_node_ids)
+        center_candidate_role_ids = list(branch_cfg.get("center_candidate_role_ids", []) or [])
+        self._dynamic_center_candidate_role_ids = (
+            _as_long_tensor_list(center_candidate_role_ids) if center_candidate_role_ids else None
+        )
+        center_candidate_keep_mask = list(branch_cfg.get("center_candidate_keep_mask", []) or [])
+        self._dynamic_center_candidate_keep_mask = (
+            [torch.tensor(item, dtype=torch.bool) for item in center_candidate_keep_mask]
+            if center_candidate_keep_mask
+            else None
+        )
+        self.dynamic_candidate_policy_config = _dynamic_branch_policy_config(branch_cfg)
+        self.dynamic_branch_static_stats = {
+            "enabled": self.dynamic_branch_enabled,
+            "center_count": int(len(center_node_ids)),
+            "knn_k": int(self.dynamic_hyper_k),
+            "candidate_scope": self.dynamic_candidate_scope,
+            "similarity_metric": self.dynamic_similarity_metric,
+            "feature_source": self.dynamic_feature_source,
+            "center_source": self.dynamic_center_source,
+            "routed_nodes_path": self.dynamic_routed_nodes_path,
+            "routed_nodes_split": self.dynamic_routed_nodes_split,
+            "batch_local_knn": self.dynamic_batch_local_knn,
+            "hypergraph_backend": "pyg",
+            "fusion": self.graph_second_view_fusion,
+            "representation_roles": "construct_clean_decision_iter_minus1",
+            **_dynamic_branch_policy_stats(branch_cfg),
+        }
+
+    def _build_dynamic_hypergraph(self, feature_tensor, batch_node_ids=None):
+        if self.dynamic_batch_local_knn:
+            return build_batch_local_knn_hypergraph(
+                feature_tensor,
+                branch_enabled=self.dynamic_branch_enabled,
+                knn_k=self.dynamic_hyper_k,
+                static_stats=self.dynamic_branch_static_stats,
+                node_ids=batch_node_ids,
+                routed_node_ids=self._dynamic_batch_local_routed_node_ids,
+                **self.dynamic_candidate_policy_config,
+            )
+        return build_dynamic_hypergraph(
+            feature_tensor,
+            center_node_ids=self._dynamic_center_node_ids,
+            center_candidate_node_ids=self._dynamic_center_candidate_node_ids,
+            branch_enabled=self.dynamic_branch_enabled,
+            knn_k=self.dynamic_hyper_k,
+            static_stats=self.dynamic_branch_static_stats,
+            center_candidate_role_ids=self._dynamic_center_candidate_role_ids,
+            center_candidate_keep_mask=self._dynamic_center_candidate_keep_mask,
+            **self.dynamic_candidate_policy_config,
+        )
+
+    def forward_outputs(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        construct_x=None,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
+        if construct_x is None or not torch.is_tensor(construct_x):
+            raise ValueError("dualspace hyperscan backbones require construct_x from Hyperscan clean representation.")
+        if second_view_repair_delta is not None or second_view_repair_mask is not None:
+            raise ValueError("dualspace hyperscan backbones do not support MH-LGC repair-aware second-view deltas in v1.")
+        if routed_multiview_bundle is not None:
+            raise ValueError("dualspace hyperscan backbones do not support routed multiview refinement in v1.")
+        if routed_highpass_bundle is not None:
+            raise ValueError("dualspace hyperscan backbones do not support routed high-pass correction in v1.")
+        if float(hyperedge_mask_probability or 0.0) != 0.0:
+            raise ValueError("dualspace hyperscan backbones do not support hyperedge masking in v1.")
+        rel = self.decision_encoder(x, edge_index, edge_type)
+        x_low = rel["x_low"]
+        clean_base, x_new_clean = self.clean_encoder.build_construct_space(construct_x)
+        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(
+            x_new_clean,
+            batch_node_ids=batch_node_ids,
+        )
+        high = self.clean_encoder(
+            construct_x,
+            hyperedge_index,
+            incident_mask,
+            prepared_construct={
+                "x_clean_base": clean_base,
+                "x_new_clean": x_new_clean,
+            },
+        )
+        hidden, logits = _apply_hyperscan_detector(self, x_low, high["x_high"], high["incident_scale"])
+        gate1 = high["gate1_clean"]
+        gate2 = high["gate2_clean"]
+        aux = {
+            "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
+            "dualspace_relation_encoder": {
+                "enabled": True,
+                "space": "iter_minus1_decision",
+                "gate1_self_mean": float(rel["gate1_dec"][:, 0].detach().mean().cpu().item()),
+                "gate1_low_mean": float(rel["gate1_dec"][:, 1].detach().mean().cpu().item()),
+                "gate1_high_mean": float(rel["gate1_dec"][:, 2].detach().mean().cpu().item()),
+                "gate2_self_mean": float(rel["gate2_dec"][:, 0].detach().mean().cpu().item()),
+                "gate2_low_mean": float(rel["gate2_dec"][:, 1].detach().mean().cpu().item()),
+                "gate2_high_mean": float(rel["gate2_dec"][:, 2].detach().mean().cpu().item()),
+            },
+            "dualspace_highorder_encoder": {
+                "enabled": True,
+                "space": "hyperscan_clean_construct",
+                "gate1_self_mean": float(gate1[:, 0].detach().mean().cpu().item()) if torch.is_tensor(gate1) else 0.0,
+                "gate1_low_mean": float(gate1[:, 1].detach().mean().cpu().item()) if torch.is_tensor(gate1) else 0.0,
+                "gate1_high_mean": float(gate1[:, 2].detach().mean().cpu().item()) if torch.is_tensor(gate1) else 0.0,
+                "gate2_self_mean": float(gate2[:, 0].detach().mean().cpu().item()) if torch.is_tensor(gate2) else 0.0,
+                "gate2_low_mean": float(gate2[:, 1].detach().mean().cpu().item()) if torch.is_tensor(gate2) else 0.0,
+                "gate2_high_mean": float(gate2[:, 2].detach().mean().cpu().item()) if torch.is_tensor(gate2) else 0.0,
+            },
+        }
+        return {
+            "logits": logits,
+            "prob": torch.softmax(logits, dim=-1),
+            "node_repr": hidden,
+            "fused_x": hidden,
+            "x_low": x_low,
+            "x_ego_dec": rel["x_ego_dec"],
+            "x_rel_low1_dec": rel["x_rel_low1_dec"],
+            "x_rel_high1_dec": rel["x_rel_high1_dec"],
+            "x_rel_state1_dec": rel["x_rel_state1_dec"],
+            "x_rel_low2_dec": rel["x_rel_low2_dec"],
+            "x_rel_high2_dec": rel["x_rel_high2_dec"],
+            "x_rel_state2_dec": rel["x_rel_state2_dec"],
+            "x_clean_base": high["x_clean_base"],
+            "x_new_clean": high["x_new_clean"],
+            "x_new": high["x_new_clean"],
+            "x_high_low1_clean": high["x_high_low1_clean"],
+            "x_high_high1_clean": high["x_high_high1_clean"],
+            "x_high_state1_clean": high["x_high_state1_clean"],
+            "x_high_low2_clean": high["x_high_low2_clean"],
+            "x_high_high2_clean": high["x_high_high2_clean"],
+            "x_high_clean": high["x_high_clean"],
+            "x_high": high["x_high"],
+            "aux_features": aux,
+        }
+
+
 class RGCNHyperScanProxy(BaseGraphBackbone):
     """RGCN relation view plus a routed-node dynamic similarity hypergraph branch."""
 
@@ -1524,6 +1973,7 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
         x,
         edge_index,
         edge_type,
+        construct_x=None,
         hyperedge_mask_probability=0.0,
         second_view_repair_delta=None,
         second_view_repair_mask=None,
@@ -1729,6 +2179,7 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
         x,
         edge_index,
         edge_type,
+        construct_x=None,
         hyperedge_mask_probability=0.0,
         second_view_repair_delta=None,
         second_view_repair_mask=None,
@@ -1807,6 +2258,20 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
             },
             "routed_highpass_aux": highpass_aux,
         }
+
+
+class RGCNH2FAGDualSpaceNodeInput(RGCNH2FAGDualSpace):
+    """Dual-space relation-only backbone with explicit clean node-input contract."""
+
+    def __init__(self, model_config):
+        super().__init__(model_config)
+
+
+class RGCNH2FAGDualSpaceHyperScanNodeInput(RGCNH2FAGDualSpaceHyperScan):
+    """Dual-space hyperscan backbone using Hyperscan node-input clean features."""
+
+    def __init__(self, model_config):
+        super().__init__(model_config)
 
 
 class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
@@ -1937,6 +2402,7 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
         x,
         edge_index,
         edge_type,
+        construct_x=None,
         hyperedge_mask_probability=0.0,
         second_view_repair_delta=None,
         second_view_repair_mask=None,
@@ -2117,6 +2583,7 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
         x,
         edge_index,
         edge_type,
+        construct_x=None,
         hyperedge_mask_probability=0.0,
         second_view_repair_delta=None,
         second_view_repair_mask=None,
