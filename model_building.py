@@ -129,10 +129,55 @@ def _split_norm_user_text(text):
 
 def _build_hyperscan_meta_tweet_proxy_bundle(args, data, tweet_embedding_path):
     graph_variant = str(data.get("graph_data_variant", getattr(args, "graph_data_variant", "labeled"))).lower()
+    tweet_tensor = _load_tensor_features(tweet_embedding_path)
+    if graph_variant == "full_graph_support":
+        if int(tweet_tensor.shape[1]) <= 8:
+            raise ValueError(
+                "--graph_node_input_family hyperscan_meta_tweet_proxy with "
+                "--graph_data_variant full_graph_support expects a preprocessed full-graph tensor "
+                "ordered as tweet|num|cat, with feature dim > 8."
+            )
+        tweet_dim = int(tweet_tensor.shape[1]) - 8
+        num_prop_dim = 5
+        cat_prop_dim = 3
+        raw_features = tweet_tensor.contiguous()
+        feature_manifest = {
+            "source": "hyperscan_meta_tweet_proxy_precomputed_full_graph",
+            "path": str(tweet_embedding_path),
+            "tweet_embedding_path": str(tweet_embedding_path),
+            "graph_data_variant": graph_variant,
+            "node_input_family": "hyperscan_meta_tweet_proxy",
+            "projection_applied": False,
+            "projector": "node_input_proxy",
+            "fit_scope": "all_nodes_unlabeled",
+            "raw_dim": int(raw_features.shape[1]),
+            "projected_dim": int(raw_features.shape[1]),
+            "raw_sha256": tensor_sha256(raw_features),
+            "projected_sha256": tensor_sha256(raw_features),
+            "sha256": tensor_sha256(raw_features),
+            "projection_time_seconds": 0.0,
+            "tweet_dim": int(tweet_dim),
+            "num_prop_dim": int(num_prop_dim),
+            "cat_prop_dim": int(cat_prop_dim),
+            "peft": {
+                "enabled": bool(getattr(args, "peft", False)),
+                "rank": int(getattr(args, "peft_rank", 8)),
+                "alpha": float(getattr(args, "peft_alpha", 16.0)),
+                "trainable_parameter_count": 0,
+            },
+        }
+        return {
+            "features": raw_features,
+            "raw_features": raw_features,
+            "feature_manifest": feature_manifest,
+            "projector_state": {"projector": "node_input_proxy"},
+        }
+
     if graph_variant != "labeled":
         raise ValueError(
-            "--graph_node_input_family hyperscan_meta_tweet_proxy currently requires "
-            "--graph_data_variant labeled."
+            "--graph_node_input_family hyperscan_meta_tweet_proxy currently supports "
+            "--graph_data_variant labeled, or full_graph_support when --embedding_path points to a "
+            "faithful preprocessed full-graph tweet|num|cat tensor."
         )
     if not data.get("user_text_loaded", False):
         raise ValueError(
@@ -140,7 +185,6 @@ def _build_hyperscan_meta_tweet_proxy_bundle(args, data, tweet_embedding_path):
             "to be loaded from norm_user_text.json."
         )
 
-    tweet_tensor = _load_tensor_features(tweet_embedding_path)
     user_text = list(data.get("user_text") or [])
     row_count = int(tweet_tensor.shape[0])
     if len(user_text) < row_count:

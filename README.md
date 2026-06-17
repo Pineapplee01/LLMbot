@@ -73,17 +73,32 @@ First-round full-graph support:
 - the semantic tensor is built at runtime by concatenating:
   - labeled RoBERTa embeddings from `--embedding_path`
   - support RoBERTa embeddings from `--support_embedding_path`
+- current `rgcn` and `botrgcn` frozen SimTeG `graph_detector_prepare`
+  artifacts export forward-native `x_low` and `x_new=cat(x_low,x_in)` alongside
+  `fused_x` / `node_repr`. Router experiments that request
+  `--conformal_knn_repr_source x_new` should verify the run metadata reports
+  `repr_resolution=exported_x_new`; older artifacts that do not export `x_new`
+  must be regenerated or used only as explicit final-hidden controls.
+- HyperScan-aligned KNN support must use `x_new`, not `node_repr`.
+  `node_repr` is the final detector hidden space and is kept only for legacy or
+  non-HyperScan control ablations because it can echo base predictions on
+  routed hard nodes.
+  Dynamic second-view branches also fail fast if their `feature_source`
+  metadata names final `node_repr`; the only allowed mainline description is
+  `x_low_plus_x_in_dynamic_forward`.
 - optional graph-only refine modes before `graph_detector_prepare`:
   - `--graph_refine_mode hyperscan_knn_hypergraph_proxy_augment`
-    adds a full-graph feature-KNN proxy relation
+    adds a full-graph feature-KNN proxy relation and is diagnostic-only rather
+    than a mainline graph-consumption path
   - `--graph_refine_mode relation_overlap_knn_proxy_augment`
     restricts similarity grouping to relation-supported 1-hop neighbors and is
-    the preferred routed-node follow-up when `--routed_nodes_path` is
-    available
+    a simple KNN control when `--routed_nodes_path` is available, not the
+    preferred mainline routed-node method
   - `--graph_refine_mode relation_overlap_knn_repr_prefit_augment`
     is the closer HyperScan-style follow-up: it first fits a relation-view GNN
     on the original graph, then builds routed-node local overlap KNN groups
-    from `node_repr + g0_input` instead of from the raw Phase-A input alone
+    from `node_repr + g0_input` instead of from the raw Phase-A input alone;
+    keep it as a diagnostic control rather than the mainline detector path
   - `--graph_second_view_scope routed_nodes` with
     `--graph_backbone rgcn_hyperscan` is the canonical parser spelling for the
     current closest active mainline proxy to HyperScan's real mechanism:
@@ -102,17 +117,29 @@ First-round full-graph support:
     `NeighborLoader` subgraph batches, rebuilding a batch-local KNN hypergraph
     from `x_low + x_in` inside each sampled subgraph
   - `--graph_second_view_hypergraph_backend {pyg,dhg}` and
-    `--graph_second_view_fusion {residual,multiattn}` split second-view
-    realization into two parser axes. `dhg` now consumes the same dynamic
-    incidence specification as `pyg`; `multiattn` swaps the residual detector
-    for the HyperScan-style bidirectional MultiAttn concat detector.
-  - `--graph_node_input_family hyperscan_meta_tweet_proxy` rebuilds a
-    HyperScan-style node input from the labeled graph:
-    current tweet embedding stays as the tweet channel, while numeric and
-    categorical metadata proxies are parsed from `norm_user_text.json`
-  - `--graph_node_input_family hyperscan_meta_tweet_proxy` uses that
-    paper-inspired tweet/num/cat preprocessing before the current
-    HyperScan-style KNN branch
+    `--graph_second_view_fusion {residual,multiattn,multiattn_adaptive}` split
+    second-view realization into two parser axes. `dhg` now consumes the same
+    dynamic incidence specification as `pyg`; `multiattn` swaps the residual
+    detector for the HyperScan-style bidirectional MultiAttn concat detector;
+    `multiattn_adaptive` keeps the same cross-attention detector tokens but
+    adds a FAGCN-style node-wise adaptive low/high mix before the final linear
+    classifier.
+  - active mainline runs should prefer `multiattn` or `multiattn_adaptive`
+    when the goal is to test whether high-order KNN information is useful
+    after explicit low/high view separation rather than as a simple RGCN-side
+    augment
+- `--graph_node_input_family hyperscan_meta_tweet_proxy` rebuilds a
+  HyperScan-style node input from the labeled graph:
+  current tweet embedding stays as the tweet channel, while numeric and
+  categorical metadata proxies are parsed from `norm_user_text.json`
+- `--graph_node_input_family hyperscan_meta_tweet_proxy` uses that
+  paper-inspired tweet/num/cat preprocessing before the current
+  HyperScan-style KNN branch
+  - for `graph_data_variant=full_graph_support`, the same node-input family can
+    now consume a faithful preprocessed full-graph tensor directly through
+    `--embedding_path`, as long as the tensor is already ordered
+    `tweet | num | cat` and therefore does not require `norm_user_text.json`
+    reconstruction inside `LLMbot`
   - `--graph_training_loader_mode neighbor_subgraph` can also be used without a
     dynamic branch to build a `base labeled + NeighborLoader` control
   - `--graph_training_max_steps` caps total optimizer updates so
@@ -120,7 +147,42 @@ First-round full-graph support:
   - `--graph_second_view_candidate_scope labeled_relation_1hop` restricts
     relation-local KNN candidates to the labeled prefix instead of allowing
     support nodes from the full graph
-- optional MH-LGC-style graph training:
+  - `--graph_second_view_candidate_scope labeled_full` and `hyperscan_full`
+    are diagnostic candidate pools for routed second-view ablations: they let
+    routed centers form dynamic `x_new` hyperedges against all labeled nodes or
+    all graph nodes respectively, while still ranking members inside the model
+    forward pass
+  - `--graph_second_view_candidate_policy {default,exclude_routed,post_topk_exclude_routed,stable_quota,mixed_quota,llm_retain,router_support_transfer}`
+    is a diagnostic-only KNN support ablation for dynamic second-view branches.
+    `default` keeps ordinary `x_new` top-k, `exclude_routed` removes routed
+    candidates before filling top-k from the remaining pool,
+    `post_topk_exclude_routed` first retrieves ordinary top-k members and then
+    drops routed candidates without refilling, `stable_quota` reserves low-risk non-routed support, and
+    `mixed_quota` reserves hard/stable/counterfactual support buckets before
+    filling the remaining slots by `x_new` similarity. Quota policies require a
+    label-free full-graph risk vector from
+    `--graph_second_view_candidate_risk_path`; `mixed_quota` also requires
+    `--graph_second_view_candidate_pred_path` to define counterfactual support
+    by base-prediction disagreement rather than by ground-truth labels.
+    `llm_retain` consumes an offline Qwen edge-retention cache from
+    `precompute.py --prompt_mode llm_knn_edge_retain_v1` via
+    `--graph_second_view_llm_edge_retain_path`; it keeps only LLM-retained
+    non-routed KNN members before the HGNN `x_high` branch and never treats the
+    Qwen output as a bot/human label. `router_support_transfer` instead reads
+    `--graph_second_view_router_support_path` and directly reuses the conformal
+    router's exported support neighborhood as the second-view candidate row for
+    each routed center; this is a neighborhood-transfer diagnostic, not a new
+    routing method.
+    `--graph_second_view_candidate_routed_nodes_path` can supply the routed
+    mask used only for member filtering; this keeps `--routed_nodes_path`
+    available for selecting routed centers, while allowing labeled-prefix
+    centers with post-K routed-member filtering. In
+    `--graph_second_view_scope neighborloader_batch`, only `default`,
+    `exclude_routed`, and `post_topk_exclude_routed` are supported; the routed
+    mask is mapped onto each sampled subgraph through `batch.node_id` so
+    filtering changes KNN members without changing the NeighborLoader seed
+    nodes or batch-local training geometry.
+- optional legacy MH-LGC-style graph training branch:
   - `precompute.py --prompt_mode mhlgc_llm_guide --routed_nodes_path ...`
     builds graph-node-aligned LLM guide embeddings for routed hard nodes from
     two serialized views: the original directed relation view and a
@@ -137,19 +199,91 @@ First-round full-graph support:
     dedicated embedding model
   - the routed-node cache is still saved as a full-graph tensor with non-routed
     rows zero-filled, so downstream stages can keep graph-node alignment
-  - `graph_detector_prepare --mhlgc_enable` consumes that embedding tensor via
-    `--mhlgc_semantic_embedding_path` and adds an auxiliary LLM-guided
-    hard-negative contrastive loss in `GNNs.py`
-  - `--mhlgc_hyperedge_mask_probability` extends the augmented branch to the
-    active second-view hypergraph by Bernoulli-masking node-hyperedge
-    incidence entries; leaving it at `0` preserves the earlier
-    feature/edge-only augmentation behavior
+- `graph_detector_prepare --mhlgc_enable` consumes that embedding tensor via
+  `--mhlgc_semantic_embedding_path` and adds an auxiliary LLM-guided
+  hard-negative contrastive loss in `GNNs.py`
+- `--mhlgc_contrast_space {fused_x,node_repr,x_new,low_high_concat,low_high,semantic}` now separates five
+  analysis/optimization spaces:
+  - `fused_x`: preferred explicit final detector hidden state
+  - `node_repr`: legacy alias for the same final detector hidden state
+  - `x_new`: HyperScan-style high-order construction space
+  - `x_high`: HyperScan-style HGNN high-order branch before detector fusion
+  - `low_high_concat`: HyperScan-style pre-detector view pair
+    `cat(x_low,x_high)`, useful for testing whether contrast belongs before
+    or after cross-attention fusion
+  - `semantic`: input LM embedding space for mechanism diagnosis only
+- `--mhlgc_anchor_source routed_target_mask` lets routed nodes from the prompt
+  cache act as explicit anchors instead of relying on the legacy nonzero-guide
+  heuristic
+- `--mhlgc_pair_mode repair_aware` turns the guide into a routed-node repair
+  signal: for HyperScan-style backbones it now injects the guide into the
+  second-view construction path (`x_new -> hypergraph -> x_high`) and uses the
+  resulting repaired view as the contrastive positive in the selected space,
+  rather than only adding the guide directly to the contrast embedding
+- `--mhlgc_hyperedge_mask_probability` extends the augmented branch to the
+  active second-view hypergraph by Bernoulli-masking node-hyperedge
+  incidence entries; leaving it at `0` preserves the earlier
+  feature/edge-only augmentation behavior
   - `--mhlgc_negative_count 3` switches the auxiliary loss from the legacy
     all-negatives weighting to a paper-style top-3 hard-negative setting per
     selected anchor; the default `0` preserves existing all-negative behavior
   - this is an MH-LGC-style task adaptation: the LLM guides training through
     semantic hard-negative weights; it is not an LLM predictor and the LLM is
     not used at graph-detector inference
+  - keep this branch in the repo as a bounded contrastive/repair diagnostic,
+    not as the canonical explanation-first routed-only mainline
+- `graph_detector_prepare` also exposes a separate routed-node contrast ablation
+  namespace:
+  - `--routed_contrast_family {none,low_high,three_view_control,supcon_class,hybrid,bot_edge_mask_human}`
+    is intentionally distinct from `--mhlgc_*`
+  - this branch is full-batch only and is restricted to routed **train** nodes
+    from `--routed_nodes_path`
+  - `low_high` applies same-node `x_low <-> x_high` InfoNCE on eligible routed
+    nodes, `three_view_control` adds a stop-grad frozen semantic teacher
+    aligned only to `x_low`, `supcon_class` is a BotSCL-style same-class
+    positive / different-class negative control over `fused_x`, and `hybrid`
+    combines the low/high same-node path with the class-aware control
+  - `bot_edge_mask_human` is the asymmetric routed contrast variant:
+    routed bot nodes act as anchors, the same routed bot under edge-masked
+    graph propagation provides the positive `fused_x`, and routed human nodes
+    provide negatives
+  - `--routed_contrast_gate heuristic_reliable` is the current reliability-first
+    contract: it keeps only routed train nodes whose routed multiview support
+    has at least two members, includes reciprocal/common-neighbor evidence, and
+    has above-median mean semantic similarity within the routed-train set
+  - this branch currently reuses routed multiview rows stored in
+    `precompute.py --prompt_mode mhlgc_llm_guide` payloads via
+    `--mhlgc_semantic_embedding_path`, but it does not use MH-LGC hard-negative
+    weighting or claim MH-LGC faithfulness
+  - `--routed_contrast_frozen_path` optionally pins the frozen semantic teacher;
+    when omitted it falls back to the base `--embedding_path` tensor
+- `graph_detector_prepare` now also exposes routed high-pass correction:
+  - `--routed_highpass_mode {off,low_only,high_only,adaptive}` enables
+    routed-only correction
+  - `--routed_highpass_target {logits,x_high}` chooses the insertion point:
+    `logits` preserves the legacy post-detector delta-logit correction, while
+    `x_high` corrects the HyperScan high-order branch before original
+    cross-attention fusion
+  - it requires `--routed_nodes_path` and full-batch graph training
+  - training is staged: first select a clean base detector with supervised CE,
+    then freeze the base detector and train only the routed high-pass
+    correction module
+  - candidates default to relation-supported 1-hop neighbors through
+    `--routed_highpass_candidate_scope relation_1hop`
+  - `relation_1hop_plus_xnew_knn` is an ablation that adds forward-native
+    `x_new` semantic KNN candidates before top-k truncation. `x_new` remains a
+    construction/candidate space, not the final detector space
+  - `--routed_highpass_risk_path` is optional and, when provided, supervises
+    correction/high-pass utility rather than bot probability
+  - this branch is mutually exclusive with MH-LGC and routed contrast so a run
+    isolates one correction mechanism
+  - representation-role contract:
+    - `z_sem` = LM / RoBERTa semantic input space
+    - `z_construct = x_new` = high-order construction space only
+    - `z_pred = fused_x` = final detector space only
+    - do not reuse the same task-shaped semantic tensor as construction space,
+      final detector space, and contrast space without marking it as an
+      explicit control
 - `relation_overlap_knn_proxy_augment` reads centers from
   `--routed_nodes_path` plus `--routed_nodes_split {all,train,valid,test}`
   when provided; otherwise it defaults to the labeled-node prefix
@@ -198,8 +332,9 @@ python main.py \
   --support_embedding_path /root/workspace/LMbot/datasets/TwiBot-20/support_roberta_embeddings_new.pt \
   --routed_nodes_path /root/workspace/LMbot/LLMbot/experiments/knn_routed_eval_reliability_router_20260608_remote_inputs/routed_nodes_reliability_budget010_seed1.json \
   --routed_nodes_split all \
-  --graph_second_view_scope labeled_prefix \
+  --graph_second_view_scope routed_nodes \
   --graph_second_view_candidate_scope labeled_relation_1hop \
+  --graph_second_view_candidate_policy default \
   --graph_second_view_hypergraph_backend pyg \
   --graph_second_view_fusion residual \
   --graph_refine_knn_k 8 \
@@ -281,7 +416,7 @@ python main.py \
   --disable_wandb
 ```
 
-Example routed-node MH-LGC-style prompt cache plus graph-detector GCL:
+Example legacy routed-node MH-LGC-style prompt cache plus graph-detector GCL:
 
 ```bash
 python precompute.py \
@@ -505,10 +640,11 @@ Prompt-cache helper modes:
     over `tweet + metadata`: it verbalizes target metadata/profile plus target
     tweet behavior and sampled tweets, then requests `Label: bot or human`
     followed by `Explanation: ...`
-  - direct `expert_graph_following` / `expert_graph_follower` now use a narrow
-    GLANCE-style classifier shell for social bot detection:
-    `Instruct: Predict the node's category ... Query: EGO: ... HOP1: ... Category? </END>`
-    rather than the older heavier social-hint encoder prompt body
+  - direct `expert_graph_following` / `expert_graph_follower` use natural-language
+    embedding prompts for social-neighborhood evidence. The prompt body uses
+    lowercase sections such as `target account:` and
+    `accounts following the target account:`; it no longer asks for
+    `Category?` or exposes uppercase schema fields.
 
 Prompt-family versioning:
 
@@ -579,6 +715,9 @@ Relation-aware center-induced prompt-expert selection:
 
 - `precompute.py` now supports
   `--neighbor_sampling_policy center_induced_relation_aware`
+- this is a separate KNN-coupled prompt-construction diagnostic for
+  `prompt_expert_bundle_center_induced_v1`; it is not the canonical
+  explanation-first routed-only evidence path
 - HyperScan-style local KNN grouping and support/contrast partition helpers now
   live in `LLMbot/hypergnn.py`, while `precompute.py` only orchestrates prompt
   rows, explanation generation, and embedding-cache writing
@@ -607,6 +746,14 @@ Relation-aware center-induced prompt-expert selection:
 - ranking is centered on cosine similarity between the center node and
   candidate neighbor embeddings, with deterministic tie-breakers from
   reciprocity, common-neighbor count, degree, and text length
+- prompt text renders those internal support/contrast partitions as natural
+  language sections such as `similar accounts following the target account:`
+  and `contrasting accounts followed by the target account:`. Fragmented numeric
+  retrieval metadata such as candidate counts, mean similarities, selected
+  counts, and reciprocal ratios is kept in sidecars/scalar features rather than
+  inserted into the encoder prompt body. Target accounts, neighbor accounts, and
+  tweet behavior are rendered as short natural-language evidence summaries
+  instead of uppercase metadata cards.
 - the output payload keeps the same expert-component contract
   (`ego/graph_following/graph_follower/tweet/conflict`) but upgrades the
   semantic marker to `prompt_expert_bundle_center_induced_v1` and adds
@@ -664,6 +811,17 @@ python precompute.py \
   --experiment_name prompt_expert_v2 \
   --output_path datasets/TwiBot-20/glance_prompt_expert_concat_v2_roberta_finetuned_embed.pt
 ```
+
+Mainline boundary for explanation-first `v2/v3`:
+
+- use `--routed_nodes_path` to target the already selected routed set
+- keep the default direction-split ranked-neighbor prompt construction
+- do not pass `--selection_embedding_path`,
+  `--support_selection_embedding_path`, or
+  `--neighbor_sampling_policy center_induced_relation_aware`
+- those KNN-coupled prompt modes belong to separate diagnostics such as
+  `prompt_expert_bundle_center_induced_v1` or `mhlgc_llm_guide`, not to the
+  routed-only evidence/classifier mainline
 
 Use `--model_path roberta_finetuned` or `--model_path /path/to/local/finetuned-roberta`
 when you want to make the encoder choice explicit. Passing `--model_path
@@ -785,6 +943,44 @@ faithful answer-token finetune path over the final `ASSISTANT_ANSWER:` slot.
 `--semantic_supervision_mode classifier` remains the compatibility ablation
 that trains a hidden-state classifier head on the same prompt text.
 
+`botsay_knn_summary_predictor_v1` is the routed-node BotSay-style KNN evidence
+predictor surface. It is intentionally narrower than `mhlgc_llm_guide`: the
+conformal router fixes routed center nodes before any LLM call, account
+neighbors are selected from `--selection_embedding_path`, each retrieved account is
+compressed with a label-free account-summary prompt, and the final prompt asks
+Qwen to answer the routed center node with the same `ASSISTANT_ANSWER:` contract
+used by answer-token finetuning. It borrows BotSay's structural task framing
+and profile/neighborhood textualization style, but it does not copy BotSay's
+neighbor true-label fields or labeled in-context examples. The final support
+block is explicitly ordered by semantic similarity from highest to lowest; the
+prompt intentionally omits numeric KNN similarity values, describes the entries
+as accounts rather than social support nodes, and reports only a
+natural-language observed social-connection description. The summary prompt also
+hides similarity scores so the generated summaries cannot reintroduce numeric
+KNN values into the prediction prompt. Internal relation tags remain sidecar
+metadata rather than prompt text. Graph-global node ids are also kept in sidecar
+metadata for auditing and are not exposed in the visible final prediction
+prompt.
+
+Example routed-node BotSay-KNN prompt cache:
+
+```bash
+python precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode botsay_knn_summary_predictor_v1 \
+  --neighbor_sampling_policy center_induced_relation_aware \
+  --selection_embedding_path /path/to/exported_x_new.pt \
+  --neighbor_cap 5 \
+  --routed_nodes_path /path/to/routed_nodes.json \
+  --routed_nodes_split all \
+  --explain_model_path /root/workspace/LMbot/hf_models/Qwen3.5-9B \
+  --model_path /root/workspace/LMbot/hf_models/Qwen3.5-9B \
+  --embedding_model_class causal_lm \
+  --embedding_pooling_mode causal_last_hidden_last_token \
+  --max_length_hop 4096 \
+  --output_path datasets/TwiBot-20/botsay_knn_summary_predictor_v1_qwen35_embed.pt
+```
+
 Example routed-node DGP v2 answer-token finetune:
 
 ```bash
@@ -905,7 +1101,12 @@ python precompute.py \
 For prompt-expert explanation generation, `precompute.py` resolves
 `--explain_model_path` in offline-first mode:
 
+- if `--explain_model_path` is omitted, the active mainline now defaults to
+  `/root/workspace/LMbot/hf_models/Qwen3.5-9B`
 - if the argument points to a local snapshot path, it loads that model
+- Qwen3.5 conditional-generation snapshots are loaded through the generation
+  fallback path when the standard causal-LM auto class does not support the
+  checkpoint architecture
 - if the argument points to a local model parent directory with exactly one
   snapshot/model child, it resolves that child automatically
 - if the argument is an HF repo id that already exists in the local HF cache, it
@@ -943,9 +1144,9 @@ For prompt-expert explanation generation, `precompute.py` resolves
   updates during long generation loops
 
 For the current local/server layout, `LLMbot/models/` is a Python package, not a
-pretrained model snapshot. Use the actual instruct model snapshot path instead,
-for example `../models/Qwen2.5-7B-Instruct` locally or
-`/root/workspace/LMbot/hf_models/Qwen2.5-7B-Instruct` on the GPU server.
+pretrained model snapshot. The active default explain model is
+`/root/workspace/LMbot/hf_models/Qwen3.5-9B`; override `--explain_model_path`
+only when a run needs a different local instruct snapshot.
 
 Prompt precompute wandb monitoring is optional. Passing `--project_name` starts
 a wandb run and logs prompt-bundle construction, per-batch explanation progress,
@@ -1381,8 +1582,17 @@ python main.py \
 # If the frozen G0 artifact was trained with a HyperScan-style second-view KNN
 # branch, omitted --conformal_knn_k / --conformal_knn_candidate_scope /
 # --conformal_knn_repr_source values inherit that artifact's Hyper KNN config.
-# When such an artifact exports x_low / x_new, the router consumes those exact
-# tensors first; older frozen outputs fall back to post-hoc reconstruction.
+# When such an artifact exports x_low / x_new / fused_x, the router consumes
+# those exact tensors first. HyperScan-aligned x_new runs do not post-hoc
+# reconstruct that construction space from legacy node_repr.
+# HyperScan-aligned KNN support must stay on x_new. Use node_repr only for an
+# explicit non-HyperScan final-hidden control; it is rejected when paired with a
+# HyperScan second-view graph mode because it can replay base-detector errors.
+# For a clean same-protocol SimTeG fused_x vs HyperScan fused_x comparison,
+# explicitly set --conformal_knn_repr_source fused_x and
+# --mhlgc_contrast_space fused_x. For HyperScan's cross-attention fused hidden,
+# pair this with --graph_second_view_fusion multiattn or
+# --graph_second_view_fusion multiattn_adaptive.
 # Explicit --conformal_knn_* flags still override the inherited defaults, and
 # the effective source is written to risk_manifest.calibration_metadata.
 # Only labeled centers are risk-updated and routed; support nodes keep their
@@ -1412,6 +1622,12 @@ python main.py \
 # neighbors weighted as exp(-distance/lambda_L), then derives a local conformal
 # threshold/features and selects among nonparametric NCP-local score families
 # on the tune split by AUPRC-error first, without fitting a logistic router head.
+# Set --conformal_knn_learning_mode learned_logistic for the bounded
+# learnable-router ablation: it keeps the same target-node KNN/conformal
+# feature bundle, fits a balanced logistic residual-risk scorer on train labels,
+# and uses that scorer only for target-node ranking. It does not change the
+# frozen graph-detector logits and should be compared against fixed/ncp_local
+# as a router-quality ablation, not as a new classifier.
 # --conformal_knn_local_calibration_scope same_hyperedge is the closer
 # HyperScan-aligned router setting: it reuses the target-centered HyperScan KNN
 # hyperedge as the direct selected-K risk neighborhood instead of issuing a second
@@ -1564,12 +1780,14 @@ Prompt-expert bundle v2 note:
   - keep target-node cues relatively detailed
   - keep directed neighborhood evidence compressed
   - require each view to emit only:
-    - `OBSERVED_SUSPICIOUS_CUES`
-    - `OBSERVED_ORGANIC_OR_BENIGN_CUES`
-    - `AMBIGUITY_OR_MISSING_EVIDENCE`
-    - `LOCAL_LEANING` (`bot_like`, `human_like`, or `inconclusive`)
-    - `RATIONALE`
-  - do not emit a final account-level label
+    - `Bot-like Evidence`
+    - `Human-like Evidence`
+    - `Uncertainty`
+    - `View Leaning` (`bot-like`, `human-like`, or `inconclusive`)
+    - `Rationale`
+    - `Judgement` (`bot` or `human`)
+  - the explain model first completes the view-level explanation template, then
+    gives the final bot/human judgment from that explanation
   - sparse or missing evidence is treated as a limitation, not as direct proof
     of automation
 - prompt text for both v1 semantic prompts and v2/v3 explanation prompts is now
@@ -1730,6 +1948,14 @@ Frozen-router reuse note:
   - router scaler
   - selected validation budget
   - selected beta
+- canonical explanation-first mainline:
+  `router -> routed nodes -> LLM evidence -> routed-only node classifier`
+  - router selection is completed first
+  - routed nodes are then passed to `precompute.py` through
+    `--routed_nodes_path`
+  - LLM evidence is consumed only in the routed-node branch
+  - LLM outputs do not participate in KNN construction or router-side node
+    selection
 - this path is the claim-grade comparison mode for refiner-only evidence
   upgrades because it keeps the routed set fixed while changing only the
   routed-node evidence/refiner branch

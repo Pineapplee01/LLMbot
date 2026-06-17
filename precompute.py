@@ -59,6 +59,7 @@ DEFAULT_QWEN_MODEL_PATH = (
     "/root/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-8B/"
     "snapshots/1d8ad4ca9b3dd8059ad90a75d4983776a23d44af"
 )
+DEFAULT_EXPLAIN_MODEL_PATH = "/root/workspace/LMbot/hf_models/Qwen3.5-9B"
 DEFAULT_FINETUNED_ROBERTA_MODEL_PATH = "yzxjb/roberta-finetuned-20"
 DEFAULT_FINETUNED_ROBERTA_MODEL_ALIAS = "roberta_finetuned"
 DEFAULT_OUTPUT_NAME = "glance_qwen3_prompt_cache.pt"
@@ -97,6 +98,12 @@ DGP_PROMPT_MODES = (
     "dgp_predictor_v1",
     "dgp_predictor_v2",
 )
+BOTSAY_KNN_PROMPT_MODES = (
+    "botsay_knn_summary_predictor_v1",
+)
+LLM_EDGE_RETAIN_PROMPT_MODES = (
+    "llm_knn_edge_retain_v1",
+)
 MHLGC_PROMPT_MODES = (
     "mhlgc_llm_guide",
 )
@@ -106,6 +113,8 @@ PROMPT_MODE_CHOICES = (
     + ULTRATAG_PROMPT_MODES
     + RESIDUAL_AUDIT_PROMPT_MODES
     + DGP_PROMPT_MODES
+    + BOTSAY_KNN_PROMPT_MODES
+    + LLM_EDGE_RETAIN_PROMPT_MODES
     + MHLGC_PROMPT_MODES
 )
 PROMPT_FAMILY_VERSION_CHOICES = ("v1", "v2", "v3")
@@ -1023,6 +1032,20 @@ def _scatter_selected_tensor_to_full_graph(value: torch.Tensor, target_index_ten
     return out
 
 
+def _scatter_selected_python_rows_to_full_graph(rows, target_index_tensor: torch.Tensor, full_node_count: int):
+    out = [None for _ in range(int(full_node_count))]
+    if not rows:
+        return out
+    if len(rows) != int(target_index_tensor.numel()):
+        raise ValueError(
+            f"Cannot scatter python rows with {len(rows)} entries into full graph of size {full_node_count}; "
+            f"expected {int(target_index_tensor.numel())} target rows."
+        )
+    for row, idx in zip(rows, target_index_tensor.tolist()):
+        out[int(idx)] = row
+    return out
+
+
 def _node_text(text):
     if not isinstance(text, str):
         return ""
@@ -1364,6 +1387,74 @@ def _neighbor_card(record):
     )
 
 
+def _neighbor_account_sentence(record):
+    name = record["display_name"] or "an unnamed account"
+    handle = f"@{record['screen_name']}" if record["screen_name"] else "without a visible handle"
+    bio = _truncate_chars(record["bio"], 140) or "no profile description"
+    traits = []
+    traits.append("verified" if record["verified"] else "not verified")
+    if record["protected"]:
+        traits.append("protected")
+    if record["account_age_bucket"]:
+        traits.append(f"{record['account_age_bucket']} account")
+    if record["follow_ratio_bucket"]:
+        traits.append(f"{record['follow_ratio_bucket']} follow ratio")
+    if record["posting_density_bucket"]:
+        traits.append(f"{record['posting_density_bucket']} posting density")
+    trait_text = ", ".join(traits)
+    if trait_text:
+        return f"- {name} ({handle}) is {trait_text}; bio: {bio}"
+    return f"- {name} ({handle}); bio: {bio}"
+
+
+def _ratio_level(value):
+    value = float(value or 0.0)
+    if value >= 0.6:
+        return "high"
+    if value >= 0.25:
+        return "moderate"
+    return "low"
+
+
+def _tweet_behavior_for_embedding(record, tweet_stats):
+    tweet_count = int(tweet_stats.get("tweet_count", 0))
+    sample_count = len(tweet_stats.get("sampled_tweets", []))
+    if tweet_count <= 0:
+        return "No usable public tweets were available in the sampled text."
+    return (
+        f"The sampled timeline contains {sample_count} representative tweet examples from {tweet_count} non-empty tweets. "
+        f"Retweeting is {_ratio_level(tweet_stats.get('rt_ratio', 0.0))}; "
+        f"link sharing is {_ratio_level(tweet_stats.get('url_ratio', 0.0))}; "
+        f"hashtag use is {_ratio_level(tweet_stats.get('hashtag_ratio', 0.0))}; "
+        f"duplicate wording is {_ratio_level(tweet_stats.get('duplicate_ratio', 0.0))}. "
+        f"Tweet length is {tweet_stats.get('avg_tweet_len_bucket')} and posting density is {record['posting_density_bucket']}."
+    )
+
+
+def _account_embedding_text(record, tweet_stats=None):
+    name = record["display_name"] or "Unknown"
+    handle = f"@{record['screen_name']}" if record["screen_name"] else "without a visible handle"
+    visibility = "protected" if record["protected"] else "public"
+    verification = "verified" if record["verified"] else "not verified"
+    bio = _truncate_chars(record["bio"], 180) or "no profile description"
+    lines = [
+        "account overview:",
+        (
+            f"{name} ({handle}) is a {visibility}, {verification}, {record['account_age_bucket']} account "
+            f"with a {record['follow_ratio_bucket']} follow ratio and {record['posting_density_bucket']} posting density."
+        ),
+        f"bio: {bio}",
+    ]
+    if tweet_stats is not None:
+        lines.extend(
+            [
+                "posting overview:",
+                _tweet_behavior_for_embedding(record, tweet_stats),
+            ]
+        )
+    return "\n".join(lines)
+
+
 def _profile_cue_summary(record, include_identity=True):
     lines = []
     if include_identity:
@@ -1700,13 +1791,27 @@ def _tweet_samples_block(tweet_stats):
 
 
 def _deterministic_ego_explain_fallback(record):
-    return " ".join(
-        [
-            f"The account uses the display name {record['display_name'] or 'unknown'} and the handle @{record['screen_name'] or 'unknown'}.",
-            f"It is verified={_format_bool(record['verified'])}, protected={_format_bool(record['protected'])}, and has followers={record['followers_count']} and following={record['following_count']}.",
-            f"The account age bucket is {record['account_age_bucket']} and the posting density bucket is {record['posting_density_bucket']}.",
-            f"The bio is {_truncate_chars(record['bio'], 160) or 'missing'}, which provides additional profile context.",
-        ]
+    bot_like = []
+    human_like = []
+    uncertainty = []
+    if not record.get("bio_present"):
+        bot_like.append("Profile bio is missing or empty.")
+    if record.get("verified", False):
+        human_like.append("Account is verified in the profile metadata.")
+    if record.get("protected", False):
+        human_like.append("Account is protected, limiting public evidence.")
+    if record.get("display_name") and record.get("screen_name"):
+        human_like.append("Display name and handle are both present.")
+    uncertainty.append("This judgement is based only on observable profile presentation and metadata.")
+    judgement = "human" if len(human_like) >= len(bot_like) else "bot"
+    view_leaning = "human-like" if judgement == "human" else "bot-like"
+    return _summary_template_lines(
+        bot_like_evidence=bot_like,
+        human_like_evidence=human_like,
+        uncertainty=uncertainty,
+        view_leaning=view_leaning,
+        rationale="Profile evidence is limited, so this is only a weak view-level judgement.",
+        judgement=judgement,
     )
 
 
@@ -1717,6 +1822,34 @@ def _coverage_bucket(count):
     if count <= 2:
         return "partial"
     return "rich"
+
+
+def _summary_template_lines(
+    *,
+    bot_like_evidence=None,
+    human_like_evidence=None,
+    uncertainty=None,
+    view_leaning="inconclusive",
+    rationale="",
+    judgement="human",
+):
+    def _items(values):
+        values = [str(item).strip().lstrip("- ").strip() for item in (values or []) if str(item).strip()]
+        return values or ["None observed"]
+
+    lines = [
+        "Response Template:",
+        "Bot-like Evidence:",
+        *[f"- {item}" for item in _items(bot_like_evidence)],
+        "Human-like Evidence:",
+        *[f"- {item}" for item in _items(human_like_evidence)],
+        "Uncertainty:",
+        *[f"- {item}" for item in _items(uncertainty)],
+        f"View Leaning: {str(view_leaning)}",
+        f"Rationale: {str(rationale).strip() or 'Limited evidence from this view.'}",
+        f"Judgement: {str(judgement)}",
+    ]
+    return "\n".join(lines)
 
 
 def _structured_card_lines(
@@ -1777,13 +1910,28 @@ def _deterministic_ego_evidence_card_fallback(record):
 
 
 def _deterministic_tweet_explain_fallback(record, tweet_stats):
-    return " ".join(
-        [
-            f"The account shows a posting density bucket of {record['posting_density_bucket']} and a tweet count of {tweet_stats['tweet_count']}.",
-            f"Its retweet ratio is {tweet_stats['rt_ratio']:.2f}, url ratio is {tweet_stats['url_ratio']:.2f}, and hashtag ratio is {tweet_stats['hashtag_ratio']:.2f}.",
-            f"The average tweet length bucket is {tweet_stats['avg_tweet_len_bucket']} with duplicate ratio {tweet_stats['duplicate_ratio']:.2f}.",
-            "These cues summarize the account's observable posting style and content behavior.",
-        ]
+    bot_like = []
+    human_like = []
+    uncertainty = []
+    tweet_count = int(tweet_stats.get("tweet_count", 0) or 0)
+    if float(tweet_stats.get("rt_ratio", 0.0)) >= 0.6:
+        bot_like.append(f"Retweet ratio is high ({float(tweet_stats['rt_ratio']):.2f}).")
+    if max(float(tweet_stats.get("url_ratio", 0.0)), float(tweet_stats.get("hashtag_ratio", 0.0))) >= 0.5:
+        bot_like.append("Posting sample contains heavy URL or hashtag usage.")
+    if float(tweet_stats.get("duplicate_ratio", 0.0)) >= 0.3:
+        bot_like.append(f"Duplicate ratio is elevated ({float(tweet_stats['duplicate_ratio']):.2f}).")
+    if tweet_count > 0 and float(tweet_stats.get("duplicate_ratio", 0.0)) < 0.3:
+        human_like.append("Sampled tweets are not dominated by duplicates.")
+    uncertainty.append("Tweet sample is limited and may not represent long-term behavior.")
+    judgement = "human" if len(human_like) > len(bot_like) else "bot"
+    view_leaning = "human-like" if judgement == "human" else "bot-like"
+    return _summary_template_lines(
+        bot_like_evidence=bot_like,
+        human_like_evidence=human_like,
+        uncertainty=uncertainty,
+        view_leaning=view_leaning,
+        rationale="The judgement reflects only observable posting patterns in the sampled tweets.",
+        judgement=judgement,
     )
 
 
@@ -1818,20 +1966,31 @@ def _deterministic_tweet_evidence_card_fallback(record, tweet_stats):
 
 
 def _deterministic_graph_explain_fallback(direction_name, total_count, reciprocal_ratio_selected, neighbor_records):
-    label = "follows" if direction_name == "following" else "is followed by"
-    top_neighbor = neighbor_records[0] if neighbor_records else None
-    neighbor_text = (
-        f"The strongest visible neighbor is {top_neighbor['display_name'] or 'unknown'} (@{top_neighbor['screen_name'] or 'unknown'})."
-        if top_neighbor is not None
-        else "No informative directed neighbors are available."
-    )
-    return " ".join(
-        [
-            f"The account {label} {int(total_count)} directed neighbors in this view.",
-            f"The selected reciprocal ratio is {float(reciprocal_ratio_selected):.2f}.",
-            neighbor_text,
-            "This summary captures the directed neighborhood evidence in this view.",
-        ]
+    bot_like = []
+    human_like = []
+    uncertainty = []
+    total_count = int(total_count or 0)
+    if total_count > 0 and float(reciprocal_ratio_selected) > 0.1:
+        human_like.append(f"Selected directed neighbors show some reciprocity ({float(reciprocal_ratio_selected):.2f}).")
+    if total_count <= 0:
+        uncertainty.append("No informative directed neighbors are available in this view.")
+    else:
+        top_neighbor = neighbor_records[0] if neighbor_records else None
+        if top_neighbor is not None:
+            uncertainty.append(
+                f"Visible neighbor context includes {top_neighbor['display_name'] or 'unknown'} (@{top_neighbor['screen_name'] or 'unknown'})."
+            )
+    if direction_name == "following":
+        uncertainty.append("Similar followed accounts may reflect either strategic camouflage or ordinary topical interests.")
+    else:
+        uncertainty.append("Suspicious followers may reflect amplification, purchased audience, or victimization of the center account.")
+    return _summary_template_lines(
+        bot_like_evidence=bot_like,
+        human_like_evidence=human_like,
+        uncertainty=uncertainty,
+        view_leaning="human-like" if human_like else "inconclusive",
+        rationale="Directed-neighbor evidence is inherently ambiguous in social bot detection and should be interpreted cautiously.",
+        judgement="human",
     )
 
 
@@ -1873,16 +2032,24 @@ def _deterministic_graph_evidence_card_fallback(direction_name, total_count, rec
 
 def _deterministic_conflict_explain_fallback(row):
     hints = row.get("conflict_mismatch_hints", []) or []
-    if hints:
-        hint_text = " ".join(item.lstrip("- ").strip() for item in hints[:3])
-    else:
-        hint_text = "The profile, posting behavior, and social neighborhood do not expose a strong explicit mismatch cue."
-    return " ".join(
-        [
-            "Cross-view evidence can be summarized by comparing profile cues, posting behavior, and directed neighborhood role.",
-            hint_text,
-            "This summary preserves the main agreements, tensions, and missing evidence across views.",
-        ]
+    bot_like = []
+    human_like = []
+    uncertainty = []
+    for hint in hints[:3]:
+        clean = hint.lstrip("- ").strip()
+        if "retweet" in clean.lower() or "promotion" in clean.lower() or "sparse profile" in clean.lower():
+            bot_like.append(clean)
+        else:
+            uncertainty.append(clean)
+    if not hints:
+        uncertainty.append("Profile, posting behavior, and social neighborhood do not expose a strong explicit mismatch cue.")
+    return _summary_template_lines(
+        bot_like_evidence=bot_like,
+        human_like_evidence=human_like,
+        uncertainty=uncertainty,
+        view_leaning="bot-like" if bot_like else "inconclusive",
+        rationale="Cross-view conflict is useful for diagnosis, but it remains noisy when source views are sparse or mixed.",
+        judgement="bot" if bot_like else "human",
     )
 
 
@@ -2683,6 +2850,32 @@ def _mhlgc_neighbor_card(node_id, candidate_id, texts, context, similarity=None,
     return card
 
 
+def _mhlgc_relation_specific_view(node_id, candidate_ids, texts, context, view_type, selection_policy, similarities=None):
+    members = []
+    candidate_ids = list(candidate_ids or [])
+    for rank, candidate_id in enumerate(candidate_ids, start=1):
+        similarity = None
+        if similarities is not None and rank - 1 < len(similarities):
+            similarity = similarities[rank - 1]
+        members.append(
+            _mhlgc_neighbor_card(
+                node_id,
+                candidate_id,
+                texts,
+                context,
+                similarity=similarity,
+                rank=rank,
+            )
+        )
+    return {
+        "view_type": str(view_type),
+        "node_id": int(node_id),
+        "selection_policy": str(selection_policy),
+        "member_count": int(len(members)),
+        "members": members,
+    }
+
+
 def _mhlgc_original_view(node_id, texts, context, following_quota, follower_quota):
     following_ranked = _rank_directional_candidates(
         node_id,
@@ -2762,6 +2955,68 @@ def _mhlgc_hypergraph_view(node_id, texts, context, selection_features, knn_k):
     }
 
 
+def _mhlgc_explicit_views(node_id, texts, context, selection_features, following_quota, follower_quota, knn_k):
+    original_view = _mhlgc_original_view(
+        node_id,
+        texts,
+        context,
+        following_quota=following_quota,
+        follower_quota=follower_quota,
+    )
+    following_ids = [int(item["node_id"]) for item in original_view["selected_following_neighbors"]]
+    follower_ids = [int(item["node_id"]) for item in original_view["selected_follower_neighbors"]]
+    mutual_ids = sorted(set(following_ids).intersection(set(follower_ids)))
+    hypergraph_view = _mhlgc_hypergraph_view(
+        node_id,
+        texts,
+        context,
+        selection_features,
+        knn_k=knn_k,
+    )
+    semantic_knn_ids = [int(item["node_id"]) for item in hypergraph_view["members"]]
+    following_view = _mhlgc_relation_specific_view(
+        node_id,
+        following_ids,
+        texts,
+        context,
+        view_type="following_view",
+        selection_policy="directional_heuristic_fixed_quota_following",
+    )
+    follower_view = _mhlgc_relation_specific_view(
+        node_id,
+        follower_ids,
+        texts,
+        context,
+        view_type="follower_view",
+        selection_policy="directional_heuristic_fixed_quota_follower",
+    )
+    mutual_view = _mhlgc_relation_specific_view(
+        node_id,
+        mutual_ids,
+        texts,
+        context,
+        view_type="mutual_view",
+        selection_policy="intersection_of_following_and_follower_selected_sets",
+    )
+    semantic_knn_view = _mhlgc_relation_specific_view(
+        node_id,
+        semantic_knn_ids,
+        texts,
+        context,
+        view_type="semantic_knn_view",
+        selection_policy="selection_embedding_topk_knn",
+        similarities=[float(item.get("semantic_similarity", 0.0)) for item in hypergraph_view["members"]],
+    )
+    return {
+        "original_view": original_view,
+        "hypergraph_view": hypergraph_view,
+        "following_view": following_view,
+        "follower_view": follower_view,
+        "mutual_view": mutual_view,
+        "semantic_knn_view": semantic_knn_view,
+    }
+
+
 def _resolve_mhlgc_prompt_bundle(args, texts, edge_index, edge_type, target_node_ids=None, selection_features=None):
     num_nodes = len(texts)
     context = _build_graph_context(edge_index, edge_type, num_nodes)
@@ -2770,30 +3025,37 @@ def _resolve_mhlgc_prompt_bundle(args, texts, edge_index, edge_type, target_node
     counts = {
         "original_following_nodes": [],
         "original_follower_nodes": [],
+        "mutual_view_nodes": [],
+        "semantic_knn_view_nodes": [],
         "hypergraph_member_nodes": [],
     }
     target_ids = list(target_node_ids) if target_node_ids is not None else list(range(num_nodes))
     for node_id in target_ids:
         node_id = int(node_id)
-        original_view = _mhlgc_original_view(
-            node_id,
-            texts,
-            context,
-            following_quota=int(args.following_quota),
-            follower_quota=int(args.follower_quota),
-        )
-        hypergraph_view = _mhlgc_hypergraph_view(
+        explicit_views = _mhlgc_explicit_views(
             node_id,
             texts,
             context,
             selection_features,
+            following_quota=int(args.following_quota),
+            follower_quota=int(args.follower_quota),
             knn_k=int(args.neighbor_cap),
         )
+        original_view = explicit_views["original_view"]
+        hypergraph_view = explicit_views["hypergraph_view"]
+        following_view = explicit_views["following_view"]
+        follower_view = explicit_views["follower_view"]
+        mutual_view = explicit_views["mutual_view"]
+        semantic_knn_view = explicit_views["semantic_knn_view"]
         target_text = _node_text(texts[node_id])
         guide_prompt = build_mhlgc_llm_guide_prompt(
             node_id=node_id,
             original_view=original_view,
             hypergraph_view=hypergraph_view,
+            following_view=following_view,
+            follower_view=follower_view,
+            mutual_view=mutual_view,
+            semantic_knn_view=semantic_knn_view,
             target_text=target_text,
             role="borderline_anchor",
         )
@@ -2801,6 +3063,10 @@ def _resolve_mhlgc_prompt_bundle(args, texts, edge_index, edge_type, target_node
             node_id=node_id,
             original_view=original_view,
             hypergraph_view=hypergraph_view,
+            following_view=following_view,
+            follower_view=follower_view,
+            mutual_view=mutual_view,
+            semantic_knn_view=semantic_knn_view,
             target_text=target_text,
             role="borderline_anchor",
         )
@@ -2817,6 +3083,10 @@ def _resolve_mhlgc_prompt_bundle(args, texts, edge_index, edge_type, target_node
                 "target_text": target_text,
                 "original_view": original_view,
                 "hypergraph_view": hypergraph_view,
+                "following_view": following_view,
+                "follower_view": follower_view,
+                "mutual_view": mutual_view,
+                "semantic_knn_view": semantic_knn_view,
             }
         )
         counts["original_following_nodes"].append(
@@ -2825,6 +3095,8 @@ def _resolve_mhlgc_prompt_bundle(args, texts, edge_index, edge_type, target_node
         counts["original_follower_nodes"].append(
             int(len(original_view["selected_follower_neighbors"]))
         )
+        counts["mutual_view_nodes"].append(int(mutual_view["member_count"]))
+        counts["semantic_knn_view_nodes"].append(int(semantic_knn_view["member_count"]))
         counts["hypergraph_member_nodes"].append(int(hypergraph_view["member_count"]))
     return {
         "prompt_family": "mhlgc_llm_guide_v1",
@@ -2846,6 +3118,7 @@ def _resolve_mhlgc_prompt_bundle(args, texts, edge_index, edge_type, target_node
         "selected_components": ["mhlgc_llm_guide"],
         "scalar_features": {},
         "prompt_rows": prompt_rows,
+        "routed_multiview_rows": prompt_rows,
         "semantic_view_mode": "mhlgc_llm_guide_v1",
         "selection_policy_note": (
             "MH-LGC-style prompt cache serializes the original directed relation view and one "
@@ -3489,6 +3762,7 @@ def _dgp_v2_clean_norm_text(text, limit=2400):
 
 def _dgp_v2_clean_generated_summary(text, limit=600):
     text = _sanitize_generated_explanation(text)
+    text = re.sub(r"^(?:account\s+summary\s*:\s*)+", "", text, flags=re.IGNORECASE).strip()
     text = _dgp_v2_clean_evidence_text(text, limit=limit)
     return text or "No usable summary was available."
 
@@ -3826,6 +4100,336 @@ def _attach_dgp_v2_context_summaries(prompt_bundle, explanations):
     return prompt_bundle
 
 
+def _botsay_knn_summary_system():
+    return "You are summarizing a social media account for downstream social bot detection."
+
+
+def _botsay_knn_relation_description(tags):
+    tags = [str(item) for item in (tags or []) if str(item)]
+    if "mutual" in tags:
+        return "mutual follow relation"
+    if "target_follows_candidate" in tags and "candidate_follows_target" in tags:
+        return "mutual follow relation"
+    if "target_follows_candidate" in tags:
+        return "the target account follows this account"
+    if "candidate_follows_target" in tags:
+        return "this account follows the target account"
+    if "undirected_relation_1hop" in tags:
+        return "one-hop relation neighbor"
+    return "selected from the retrieved account set; no observed follow edge to the target in this graph"
+
+
+def _botsay_knn_prepare_features(selection_features, num_nodes):
+    if selection_features is None:
+        raise ValueError(
+            "botsay_knn_summary_predictor_v1 requires --selection_embedding_path via "
+            "--neighbor_sampling_policy center_induced_relation_aware."
+        )
+    features = selection_features.detach().cpu().float()
+    if features.dim() != 2:
+        raise ValueError("botsay_knn_summary_predictor_v1 selection features must be a 2-D tensor.")
+    if int(features.shape[0]) < int(num_nodes):
+        raise ValueError(
+            "botsay_knn_summary_predictor_v1 selection feature rows are fewer than graph text rows: "
+            f"features={int(features.shape[0])}, text_rows={int(num_nodes)}."
+        )
+    features = features[: int(num_nodes)].contiguous()
+    return F.normalize(features, p=2, dim=1, eps=1e-12)
+
+
+def _botsay_knn_support_members(node_id, texts, context, normalized_features, knn_k):
+    node_id = int(node_id)
+    num_nodes = int(len(texts))
+    if not (0 <= node_id < num_nodes):
+        raise ValueError(f"botsay_knn_summary_predictor_v1 node_id {node_id} is outside graph text rows.")
+    k = max(int(knn_k), 1)
+    center = normalized_features[node_id].view(1, -1)
+    scores = torch.matmul(normalized_features, center.t()).view(-1)
+    topk = min(int(k) + 1, int(scores.numel()))
+    values, indices = torch.topk(scores, k=topk, largest=True)
+    members = []
+    for candidate, similarity in zip(indices.tolist(), values.tolist()):
+        candidate = int(candidate)
+        if candidate == node_id:
+            continue
+        relation_tags = _mhlgc_relation_tags(node_id, candidate, context)
+        members.append(
+            {
+                "node_id": candidate,
+                "rank": int(len(members) + 1),
+                "semantic_similarity": float(similarity),
+                "relation_to_target": relation_tags,
+                "relation_description": _botsay_knn_relation_description(relation_tags),
+                "text": _node_text(texts[candidate]),
+            }
+        )
+        if len(members) >= k:
+            break
+    return members
+
+
+def _botsay_knn_neighbor_summary_prompt(neighbor_text, relation_description, semantic_similarity=None):
+    rendered_neighbor = _dgp_v2_clean_norm_text(neighbor_text, limit=2200)
+    user = "\n\n".join(
+        [
+            "Input:",
+            rendered_neighbor,
+            "Metadata:",
+            f"Observed graph relation to target account: {relation_description}",
+            "Task:",
+            (
+                "Write a concise, label-free account summary. Describe only observable profile, "
+                "content, activity, and social-behavior signals. Do not decide whether the account "
+                "is a bot or human. Do not mention embedding selection, nearest-neighbor rank, "
+                "or similarity scores in the summary."
+            ),
+            "Output:",
+            "Account summary:",
+        ]
+    )
+    return {
+        "system": _botsay_knn_summary_system(),
+        "user": user,
+        "fallback_explanation": (
+            "The account has limited observable text. "
+            f"Relation to target: {relation_description}. "
+            f"{_dgp_v2_clean_norm_text(neighbor_text, limit=420)}"
+        ),
+        "prompt_role": "botsay_knn_account_summary",
+    }
+
+
+def _botsay_knn_predictor_system():
+    return (
+        "You are an expert social network analyser helping evaluate whether a "
+        "Twitter user is a bot or a human. Use only the provided evidence. "
+        "Treat unavailable information as unknown. Output the label first."
+    )
+
+
+def _botsay_knn_support_block(support_summary_rows):
+    if not support_summary_rows:
+        return "Retrieved accounts:\n- None"
+    ordered_rows = sorted(
+        list(support_summary_rows),
+        key=lambda item: (
+            int(item.get("neighbor_rank", 0) or 0),
+            -float(item.get("semantic_similarity", 0.0) or 0.0),
+        ),
+    )
+    support_count = int(len(ordered_rows))
+    lines = [
+        (
+            "The following accounts are retrieved from the fixed embedding "
+            "space and are ordered from most similar to less similar:"
+        )
+    ]
+    for row in ordered_rows:
+        rank = int(row.get("neighbor_rank", 0))
+        lines.extend(
+            [
+                f"Account {rank}:",
+                f"Observed social connection to the target account: {str(row.get('relation_description', 'unknown'))}",
+                f"Account summary: {_dgp_v2_clean_generated_summary(row.get('summary', ''), limit=700)}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _botsay_knn_predictor_prompt_parts(target_text, support_summary_rows):
+    user = "\n\n".join(
+        [
+            (
+                "The following task focuses on evaluating whether a Twitter user is a bot or human "
+                "with the help of the user's profile, tweets, and retrieved accounts."
+            ),
+            "Target user:",
+            _dgp_v2_clean_norm_text(target_text, limit=3600),
+            _botsay_knn_support_block(support_summary_rows),
+            "Question:",
+            "Is the target user a bot or human?",
+            "Answer with exactly one token: Yes for bot, No for human.",
+        ]
+    )
+    full_prompt = "\n\n".join(
+        [
+            "SYSTEM_MESSAGE:",
+            _botsay_knn_predictor_system(),
+            "USER_MESSAGE:",
+            user,
+            "ASSISTANT_ANSWER:",
+        ]
+    )
+    return {"system": _botsay_knn_predictor_system(), "user": user, "full": full_prompt}
+
+
+def _resolve_botsay_knn_summary_predictor_bundle(
+    args,
+    texts,
+    edge_index,
+    edge_type,
+    classes,
+    target_node_ids=None,
+    selection_features=None,
+):
+    if not getattr(args, "routed_nodes_path", None):
+        raise ValueError("botsay_knn_summary_predictor_v1 requires --routed_nodes_path.")
+    num_nodes = len(texts)
+    context = _build_graph_context(edge_index, edge_type, num_nodes)
+    normalized_features = _botsay_knn_prepare_features(selection_features, num_nodes)
+    target_ids = list(target_node_ids) if target_node_ids is not None else list(range(num_nodes))
+    knn_k = int(getattr(args, "neighbor_cap", 5))
+    if knn_k <= 0:
+        raise ValueError("botsay_knn_summary_predictor_v1 requires --neighbor_cap > 0.")
+    prompts = []
+    prompt_rows = []
+    generation_rows = []
+    counts = {
+        "target_nodes": [],
+        "support_knn_nodes": [],
+        "support_relation_edges": [],
+        "support_semantic_only_nodes": [],
+    }
+    for node_id in target_ids:
+        node_id = int(node_id)
+        members = _botsay_knn_support_members(
+            node_id,
+            texts,
+            context,
+            normalized_features,
+            knn_k=knn_k,
+        )
+        row = {
+            "node_id": node_id,
+            "component_name": "botsay_knn_predictor",
+            "prompt_role": "botsay_knn_summary_yes_no_predictor",
+            "target_norm_user_text": _dgp_v2_clean_norm_text(texts[node_id], limit=3600),
+            "support_knn_members": [
+                {
+                    "neighbor_node_id": int(item["node_id"]),
+                    "neighbor_rank": int(item["rank"]),
+                    "semantic_similarity": float(item["semantic_similarity"]),
+                    "relation_to_target": list(item["relation_to_target"]),
+                    "relation_description": str(item["relation_description"]),
+                }
+                for item in members
+            ],
+            "support_account_summaries": [],
+            "selected_components": ["botsay_knn_predictor"],
+        }
+        for item in members:
+            generation_prompt = _botsay_knn_neighbor_summary_prompt(
+                item["text"],
+                item["relation_description"],
+                semantic_similarity=item["semantic_similarity"],
+            )
+            generation_rows.append(
+                {
+                    "node_id": node_id,
+                    "component_name": "botsay_knn_neighbor_summary",
+                    "system": generation_prompt["system"],
+                    "user": generation_prompt["user"],
+                    "fallback_explanation": generation_prompt["fallback_explanation"],
+                    "prompt_role": generation_prompt["prompt_role"],
+                    "neighbor_node_id": int(item["node_id"]),
+                    "neighbor_rank": int(item["rank"]),
+                    "semantic_similarity": float(item["semantic_similarity"]),
+                    "relation_to_target": list(item["relation_to_target"]),
+                    "relation_description": str(item["relation_description"]),
+                }
+            )
+        relation_supported = sum(
+            1 for item in members if "semantic_knn_only" not in set(item.get("relation_to_target", []))
+        )
+        counts["target_nodes"].append(1)
+        counts["support_knn_nodes"].append(int(len(members)))
+        counts["support_relation_edges"].append(int(relation_supported))
+        counts["support_semantic_only_nodes"].append(int(len(members) - relation_supported))
+        prompts.append("")
+        prompt_rows.append(row)
+    return {
+        "prompt_family": "botsay_knn_summary_predictor_v1",
+        "prompt_style": "botsay_style_target_text_plus_knn_support_summaries",
+        "prompt_family_version": "botsay_knn_summary_predictor_v1",
+        "evidence_schema": "botsay_knn_label_free_support_summary_predictor",
+        "norm_user_text_rendering": "llm_friendly_profile_tweet_behavior_samples",
+        "norm_user_text_rendering_note": (
+            "Target and support norm_user_text rows are rendered into PROFILE, TWEET_BEHAVIOR, "
+            "and TWEET_SAMPLES sections; support accounts are summarized without bot/human labels."
+        ),
+        "evidence_card_fields": ["answer_token"],
+        "prompt_components": {"botsay_knn_predictor": prompts},
+        "structured_components": {},
+        "structured_component_schema": {},
+        "generation_rows_by_component": {"botsay_knn_neighbor_summary": generation_rows},
+        "component_max_length_group": {
+            "botsay_knn_predictor": "hop",
+            "botsay_knn_neighbor_summary": "hop",
+        },
+        "component_prompt_roles": {
+            "botsay_knn_predictor": "botsay_knn_summary_yes_no_predictor",
+            "botsay_knn_neighbor_summary": "label_free_support_account_summary",
+        },
+        "counts": counts,
+        "neighbor_sample_policy": "selection_embedding_topk_knn_support_summary",
+        "botsay_knn_support_k": int(knn_k),
+        "component_order": {"botsay_knn_summary_predictor_v1": ["botsay_knn_predictor"]},
+        "selected_components": ["botsay_knn_predictor"],
+        "scalar_features": {},
+        "prompt_rows": prompt_rows,
+        "semantic_view_mode": "botsay_knn_summary_predictor_v1",
+        "selection_policy_note": (
+            "The conformal router fixes routed center nodes before any LLM call. This prompt mode then "
+            "uses KNN support accounts from --selection_embedding_path as evidence only, summarizes each "
+            "support account with a label-free prompt, and builds a BotSay-style routed-node Yes/No "
+            "classifier prompt. Neighbor true labels, oracle fix/break outcomes, and LLM-based KNN "
+            "selection are never inserted."
+        ),
+        "class_names": ["No", "Yes"],
+        "needs_botsay_knn_summary_generation": True,
+    }
+
+
+def _attach_botsay_knn_neighbor_summaries(prompt_bundle, explanations):
+    generation_rows = list(prompt_bundle.get("generation_rows_by_component", {}).get("botsay_knn_neighbor_summary", []))
+    if generation_rows and len(explanations) != len(generation_rows):
+        raise ValueError("Generated BotSay-KNN neighbor summary count does not match generation rows.")
+    summaries_by_node = defaultdict(list)
+    for generation_row, explanation in zip(generation_rows, explanations):
+        node_id = int(generation_row["node_id"])
+        item = {
+            "neighbor_node_id": int(generation_row.get("neighbor_node_id", -1)),
+            "neighbor_rank": int(generation_row.get("neighbor_rank", 0)),
+            "semantic_similarity": float(generation_row.get("semantic_similarity", 0.0)),
+            "relation_to_target": list(generation_row.get("relation_to_target", [])),
+            "relation_description": str(generation_row.get("relation_description", "")),
+            "summary": _dgp_v2_clean_generated_summary(explanation, limit=700),
+        }
+        summaries_by_node[node_id].append(item)
+    prompts = []
+    for row in prompt_bundle.get("prompt_rows", []):
+        node_id = int(row["node_id"])
+        summaries = sorted(
+            summaries_by_node.get(node_id, []),
+            key=lambda item: int(item.get("neighbor_rank", 0)),
+        )
+        row["support_account_summaries"] = summaries
+        prompt_parts = _botsay_knn_predictor_prompt_parts(
+            row.get("target_norm_user_text", ""),
+            summaries,
+        )
+        row.update(
+            {
+                "system": prompt_parts["system"],
+                "user": prompt_parts["user"],
+                "prompt": prompt_parts["full"],
+            }
+        )
+        prompts.append(prompt_parts["full"])
+    prompt_bundle["prompt_components"]["botsay_knn_predictor"] = prompts
+    return prompt_bundle
+
+
 def _resolve_dgp_predictor_prompt_bundle(
     args,
     records,
@@ -3956,6 +4560,18 @@ def _dgp_output_name(prompt_mode, dgp_prompt_variant="target_fine_neighbor_coars
     return f"{prompt_mode}_{variant}_{embedding_encoder_tag}_embed.pt"
 
 
+def _botsay_knn_output_name(prompt_mode, embedding_encoder_tag="qwen3"):
+    if prompt_mode not in BOTSAY_KNN_PROMPT_MODES:
+        raise ValueError(f"Unsupported BotSay-KNN prompt mode: {prompt_mode}")
+    return f"{prompt_mode}_{embedding_encoder_tag}_embed.pt"
+
+
+def _llm_edge_retain_output_name(prompt_mode):
+    if prompt_mode not in LLM_EDGE_RETAIN_PROMPT_MODES:
+        raise ValueError(f"Unsupported LLM edge-retain prompt mode: {prompt_mode}")
+    return f"{prompt_mode}_cache.pt"
+
+
 def _default_output_path(
     dataset_path: Path,
     prompt_mode: str,
@@ -3986,6 +4602,13 @@ def _default_output_path(
             dgp_prompt_variant=dgp_prompt_variant,
             embedding_encoder_tag=embedding_encoder_tag,
         )
+    if prompt_mode in BOTSAY_KNN_PROMPT_MODES:
+        return dataset_path / _botsay_knn_output_name(
+            prompt_mode,
+            embedding_encoder_tag=embedding_encoder_tag,
+        )
+    if prompt_mode in LLM_EDGE_RETAIN_PROMPT_MODES:
+        return dataset_path / _llm_edge_retain_output_name(prompt_mode)
     if prompt_mode in MHLGC_PROMPT_MODES:
         return dataset_path / f"{prompt_mode}_{embedding_encoder_tag}_embed.pt"
     return dataset_path / f"glance_qwen3_prompt_cache_{prompt_mode}.pt"
@@ -4001,8 +4624,8 @@ def _graph_prompt(
     tweet_stats = _get_tweet_stats(ego_record, sample_size=5)
     return build_graph_prompt(
         direction_name,
-        _target_account_text_for_llm(ego_record, tweet_stats, include_identity=True, brief=True),
-        [_neighbor_card(record) for record in neighbor_records],
+        _account_embedding_text(ego_record, tweet_stats),
+        [_neighbor_account_sentence(record) for record in neighbor_records],
         total_count,
         reciprocal_count,
     )
@@ -4023,9 +4646,9 @@ def _graph_prompt_partitioned(
 ):
     return build_graph_prompt_partitioned(
         direction_name,
-        _profile_card(ego_record, brief=True),
-        [_neighbor_card(record) for record in support_records],
-        [_neighbor_card(record) for record in contrast_records],
+        _account_embedding_text(ego_record, _get_tweet_stats(ego_record, sample_size=3)),
+        [_neighbor_account_sentence(record) for record in support_records],
+        [_neighbor_account_sentence(record) for record in contrast_records],
         total_count,
         reciprocal_count,
         candidate_count,
@@ -4038,8 +4661,8 @@ def _graph_prompt_partitioned(
 
 def _tweet_prompt(record, tweet_stats):
     return build_tweet_prompt(
-        _profile_card(record, brief=True),
-        _tweet_behavior_summary(record, tweet_stats),
+        _account_embedding_text(record),
+        _tweet_behavior_for_embedding(record, tweet_stats),
         _tweet_samples_block(tweet_stats),
     )
 
@@ -4099,11 +4722,11 @@ def _conflict_prompt(record, tweet_stats, following_records, follower_records, c
     mismatch_hints = _conflict_mismatch_hints(flags, tweet_stats, count_following, count_follower)
     return (
         build_conflict_prompt(
-            _profile_card(record, brief=False),
-            _tweet_behavior_summary(record, tweet_stats),
+            _account_embedding_text(record),
+            _tweet_behavior_for_embedding(record, tweet_stats),
             _tweet_samples_block(tweet_stats),
-            [_neighbor_card(item) for item in following_records],
-            [_neighbor_card(item) for item in follower_records],
+            [_neighbor_account_sentence(item) for item in following_records],
+            [_neighbor_account_sentence(item) for item in follower_records],
             mismatch_hints,
         ),
         flags,
@@ -4131,13 +4754,13 @@ def _conflict_prompt_partitioned(
     )
     return (
         build_conflict_prompt_partitioned(
-            _profile_card(record, brief=False),
-            _tweet_behavior_summary(record, tweet_stats),
+            _account_embedding_text(record),
+            _tweet_behavior_for_embedding(record, tweet_stats),
             _tweet_samples_block(tweet_stats),
-            [_neighbor_card(item) for item in following_support_records],
-            [_neighbor_card(item) for item in following_contrast_records],
-            [_neighbor_card(item) for item in follower_support_records],
-            [_neighbor_card(item) for item in follower_contrast_records],
+            [_neighbor_account_sentence(item) for item in following_support_records],
+            [_neighbor_account_sentence(item) for item in following_contrast_records],
+            [_neighbor_account_sentence(item) for item in follower_support_records],
+            [_neighbor_account_sentence(item) for item in follower_contrast_records],
             mismatch_hints,
         ),
         flags,
@@ -4182,6 +4805,15 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         raise ValueError(
             f"Unsupported explain_prompt_style: {explain_prompt_style}. "
             f"Expected one of {EXPLAIN_PROMPT_STYLE_CHOICES}."
+        )
+    if explanation_first and (
+        getattr(args, "selection_embedding_path", None) is not None
+        or getattr(args, "support_selection_embedding_path", None) is not None
+    ):
+        raise ValueError(
+            f"prompt_expert_bundle_{prompt_family_version} is the routed-only evidence path and does not accept "
+            "--selection_embedding_path or --support_selection_embedding_path. "
+            "Use direction-split ranked neighbors from the observed relation graph instead of semantic-KNN prompt selection."
         )
     if explanation_first and policy == "center_induced_relation_aware":
         raise ValueError(
@@ -4524,7 +5156,8 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         semantic_view_mode = "prompt_expert_bundle_v2"
         selection_policy_note = (
             "Direction-split fixed-quota ranking keeps follower and following separate; "
-            "neighbors are ordered by text presence, reciprocity, shared-neighbor activity, structural activity, and usable text length."
+            "neighbors are ordered by text presence, reciprocity, shared-neighbor activity, structural activity, and usable text length. "
+            "No selection_embedding_path or semantic-KNN prompt selection is used in the explanation-first routed-only evidence path."
         )
     elif prompt_family_version == "v3":
         prompt_family = "prompt_expert_bundle_v3"
@@ -4532,8 +5165,9 @@ def _resolve_expert_prompt_bundle(args, records, edge_index, edge_type, target_n
         semantic_view_mode = "prompt_expert_bundle_v3"
         selection_policy_note = (
             "Direction-split fixed-quota ranking keeps follower and following separate; "
-            "LLM generation extracts source-grounded structured evidence cards without final labels, probabilities, "
-            "confidence scores, recommendations, or base-model correction instructions."
+            "LLM generation extracts source-grounded structured evidence cards with a final bot/human judgment derived from the evidence card, "
+            "but without probabilities, confidence scores, recommendations, or base-model correction instructions. "
+            "No selection_embedding_path or semantic-KNN prompt selection is used in the explanation-first routed-only evidence path."
         )
     else:
         prompt_family = "prompt_expert_bundle_center_induced_v1" if policy == "center_induced_relation_aware" else "prompt_expert_bundle_v1"
@@ -4688,6 +5322,21 @@ def _resolve_prompt_bundle(
                 classes,
                 target_node_ids=target_node_ids,
             )
+    elif mode in BOTSAY_KNN_PROMPT_MODES:
+        if policy not in {"center_induced_relation_aware"}:
+            raise ValueError(
+                f"{mode} requires --neighbor_sampling_policy center_induced_relation_aware "
+                "so KNN support accounts are backed by --selection_embedding_path."
+            )
+        bundle = _resolve_botsay_knn_summary_predictor_bundle(
+            args,
+            texts,
+            edge_index,
+            edge_type,
+            classes,
+            target_node_ids=target_node_ids,
+            selection_features=selection_features,
+        )
     elif mode in MHLGC_PROMPT_MODES:
         if policy not in {"center_induced_relation_aware"}:
             raise ValueError(
@@ -4841,20 +5490,29 @@ def _format_chat_prompt(tokenizer, system_prompt, user_prompt):
             {"role": "user", "content": user_prompt},
         ]
         try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
             return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
             pass
     return f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
 
 
+def _effective_explain_model_path(args):
+    explicit_path = str(getattr(args, "explain_model_path", "") or "").strip()
+    return explicit_path or DEFAULT_EXPLAIN_MODEL_PATH
+
+
 def _load_generation_model(args, device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if not args.explain_model_path:
-        raise ValueError(
-            f"Prompt mode {args.prompt_mode} requires --explain_model_path for explanation generation."
-        )
-    model_source = _require_local_pretrained_source(args.explain_model_path, model_role="Explain model")
+    explain_model_path = _effective_explain_model_path(args)
+    model_source = _require_local_pretrained_source(explain_model_path, model_role="Explain model")
     model_source_text = str(model_source).lower()
     is_qwen_generation_model = "qwen" in model_source_text
     tokenizer = AutoTokenizer.from_pretrained(
@@ -4872,27 +5530,74 @@ def _load_generation_model(args, device):
         # the checkpoint dtype for Qwen; keep the old fp16 path for smaller
         # non-Qwen local explainers.
         generation_dtype = "auto" if is_qwen_generation_model else torch.float16
-    model = AutoModelForCausalLM.from_pretrained(
-        model_source,
-        trust_remote_code=bool(args.explain_trust_remote_code),
-        local_files_only=True,
-        torch_dtype=generation_dtype,
-        low_cpu_mem_usage=True,
-    ).to(device)
+
+    load_kwargs = {
+        "trust_remote_code": bool(args.explain_trust_remote_code),
+        "local_files_only": True,
+        "torch_dtype": generation_dtype,
+        "low_cpu_mem_usage": True,
+    }
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
+    except Exception as causal_exc:
+        model_config = {}
+        config_path = Path(model_source) / "config.json"
+        if config_path.exists():
+            try:
+                model_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                model_config = {}
+        model_type = str(model_config.get("model_type", "")).lower()
+        architecture_names = {
+            str(item)
+            for item in model_config.get("architectures", [])
+            if str(item).strip()
+        }
+        is_qwen35_conditional = (
+            model_type == "qwen3_5"
+            or "Qwen3_5ForConditionalGeneration" in architecture_names
+        )
+        if not is_qwen35_conditional:
+            raise
+        fallback_errors = [f"AutoModelForCausalLM: {type(causal_exc).__name__}: {causal_exc}"]
+        model = None
+        try:
+            from transformers import AutoModelForImageTextToText
+
+            model = AutoModelForImageTextToText.from_pretrained(model_source, **load_kwargs)
+        except Exception as image_text_exc:
+            fallback_errors.append(
+                f"AutoModelForImageTextToText: {type(image_text_exc).__name__}: {image_text_exc}"
+            )
+        if model is None:
+            try:
+                from transformers import Qwen3_5ForConditionalGeneration
+
+                model = Qwen3_5ForConditionalGeneration.from_pretrained(model_source, **load_kwargs)
+            except Exception as conditional_exc:
+                fallback_errors.append(
+                    "Qwen3_5ForConditionalGeneration: "
+                    f"{type(conditional_exc).__name__}: {conditional_exc}"
+                )
+        if model is None:
+            raise RuntimeError(
+                "Failed to load qwen3_5 explain model with supported generation classes: "
+                + " | ".join(fallback_errors)
+            ) from causal_exc
+    model = model.to(device)
     model.eval()
     return tokenizer, model
 
 
 def _resolve_generation_runtime(args, device):
-    if not args.explain_model_path:
-        return None
     try:
         tokenizer, model = _load_generation_model(args, device)
     except Exception as exc:
         if bool(getattr(args, "explain_required", False)):
             raise RuntimeError(
                 "Failed to load the required local explain model. "
-                "Pass a valid local HuggingFace causal-LM snapshot via --explain_model_path."
+                "Pass a valid local HuggingFace causal-LM snapshot via --explain_model_path "
+                f"or make sure the default path exists: {DEFAULT_EXPLAIN_MODEL_PATH}"
             ) from exc
         return {"load_error": str(exc)}
     return {"tokenizer": tokenizer, "model": model}
@@ -4910,6 +5615,7 @@ def _generate_component_explanations(
 ):
     component_name = str(component_name or (generation_rows[0].get("component_name", "unknown") if generation_rows else "unknown"))
     quality_gate = bool(getattr(args, "explain_quality_gate", True))
+    explain_model_path = _effective_explain_model_path(args)
     if not generation_rows:
         return [], {
             "generated_count": 0,
@@ -4918,7 +5624,7 @@ def _generate_component_explanations(
             "requested_count": 0,
             "total_count": 0,
             "generation_mode": "skipped_empty",
-            "explain_model_path": str(args.explain_model_path or ""),
+            "explain_model_path": explain_model_path,
             "explain_batch_size": int(args.explain_batch_size),
             "explain_max_input_length": int(args.explain_max_input_length),
             "explain_max_new_tokens": int(args.explain_max_new_tokens),
@@ -4986,49 +5692,6 @@ def _generate_component_explanations(
                 "sidecar_path": str(sidecar_path or ""),
             }
         )
-    if not args.explain_model_path:
-        if bool(getattr(args, "explain_required", False)):
-            raise ValueError(
-                "--explain_required was set but --explain_model_path is empty. "
-                "Provide a local instruct/causal-LM snapshot path for real explanation generation."
-            )
-        pending_explanations = _deterministic_explanations(pending_rows)
-        for position, row, prompt_hash, explanation in zip(pending_positions, pending_rows, pending_hashes, pending_explanations):
-            explanations[position] = explanation
-            if sidecar_path:
-                _append_jsonl(
-                    sidecar_path,
-                    [
-                        {
-                            "node_id": int(row["node_id"]),
-                            "component_name": component_name,
-                            "prompt_role": row.get("prompt_role", ""),
-                            "prompt_hash": prompt_hash,
-                            "explanation": explanation,
-                            "generation_mode": "deterministic_fallback",
-                        }
-                    ],
-                )
-        return explanations, {
-            "generated_count": 0,
-            "fallback_count": len(pending_explanations),
-            "resumed_count": int(resumed_count),
-            "requested_count": int(len(pending_rows)),
-            "total_count": int(len(generation_rows)),
-            "generation_mode": "deterministic_fallback",
-            "fallback_reason": "missing_explain_model_path",
-            "explain_model_path": "",
-            "explain_batch_size": int(args.explain_batch_size),
-            "explain_max_input_length": int(args.explain_max_input_length),
-            "explain_max_new_tokens": int(args.explain_max_new_tokens),
-            "explain_model_load_mode": "not_requested",
-            "explanation_sidecar_path": str(sidecar_path or ""),
-            "explain_quality_gate": bool(quality_gate),
-            "resume_rejected_count": int(resume_rejected_count),
-            "resume_rejected_reasons": dict(resume_rejected_reasons),
-            "quality_rejected_count": 0,
-            "quality_rejected_reasons": {},
-        }
     tokenizer = None
     model = None
     explain_model_load_mode = "inline_reload"
@@ -5060,7 +5723,7 @@ def _generate_component_explanations(
                 "generation_mode": "deterministic_fallback",
                 "fallback_reason": "local_explain_model_unavailable",
                 "explain_model_error": str(generation_runtime.get("load_error")),
-                "explain_model_path": str(args.explain_model_path),
+                "explain_model_path": explain_model_path,
                 "explain_batch_size": int(args.explain_batch_size),
                 "explain_max_input_length": int(args.explain_max_input_length),
                 "explain_max_new_tokens": int(args.explain_max_new_tokens),
@@ -5110,7 +5773,7 @@ def _generate_component_explanations(
                 "generation_mode": "deterministic_fallback",
                 "fallback_reason": "local_explain_model_unavailable",
                 "explain_model_error": str(exc),
-                "explain_model_path": str(args.explain_model_path),
+                "explain_model_path": explain_model_path,
                 "explain_batch_size": int(args.explain_batch_size),
                 "explain_max_input_length": int(args.explain_max_input_length),
                 "explain_max_new_tokens": int(args.explain_max_new_tokens),
@@ -5164,7 +5827,7 @@ def _generate_component_explanations(
             "requested_count": 0,
             "total_count": int(len(generation_rows)),
             "generation_mode": "llm_generation_resumed",
-            "explain_model_path": str(args.explain_model_path),
+            "explain_model_path": explain_model_path,
             "explain_batch_size": int(args.explain_batch_size),
             "effective_explain_batch_size": int(effective_batch_size),
             "explain_max_input_length": int(args.explain_max_input_length),
@@ -5335,7 +5998,7 @@ def _generate_component_explanations(
             "generation_mode": "deterministic_fallback",
             "fallback_reason": "generation_failed",
             "explain_model_error": str(exc),
-            "explain_model_path": str(args.explain_model_path),
+            "explain_model_path": explain_model_path,
             "explain_batch_size": int(args.explain_batch_size),
             "explain_max_input_length": int(args.explain_max_input_length),
             "explain_max_new_tokens": int(args.explain_max_new_tokens),
@@ -5361,7 +6024,7 @@ def _generate_component_explanations(
         "total_count": int(len(generation_rows)),
         "elapsed_seconds": float(time.time() - start_time),
         "generation_mode": "llm_generation",
-        "explain_model_path": str(args.explain_model_path),
+        "explain_model_path": explain_model_path,
         "explain_batch_size": int(args.explain_batch_size),
         "effective_explain_batch_size": int(effective_batch_size),
         "explain_max_input_length": int(args.explain_max_input_length),
@@ -5528,8 +6191,59 @@ def _ultratag_parse_probability(text):
     return float(max(0.0, min(1.0, value)))
 
 
+def _parse_llm_edge_retain_decision(text):
+    lowered = str(text or "").strip().lower()
+    first_line = lowered.splitlines()[0].strip() if lowered else ""
+    if re.search(r"\bkeep\b", first_line) and not re.search(r"\bdrop\b", first_line):
+        return "KEEP"
+    if re.search(r"\bdrop\b", first_line) and not re.search(r"\bkeep\b", first_line):
+        return "DROP"
+    if re.search(r"\bkeep\b", lowered) and not re.search(r"\bdrop\b", lowered):
+        return "KEEP"
+    if re.search(r"\bdrop\b", lowered):
+        return "DROP"
+    return "DROP"
+
+
+def _llm_edge_retain_system():
+    return (
+        "You are an expert social network analyser. Decide whether a retrieved similar account should be "
+        "kept as a reliable high-order message-passing support edge for social bot detection."
+    )
+
+
+def _llm_edge_retain_user_prompt(center_text, candidate_text, rank, relation_text="retrieved by semantic KNN"):
+    center_text = _truncate_chars(_compact_whitespace(center_text), 1400)
+    candidate_text = _truncate_chars(_compact_whitespace(candidate_text), 900)
+    return "\n".join(
+        [
+            "Task:",
+            "A target account is paired with one retrieved account from a target-centered KNN support set.",
+            "Return KEEP only if the retrieved account provides reliable same-side support for high-order aggregation.",
+            "Return DROP if the connection looks noisy, ambiguous, mostly superficial, or likely to propagate misleading evidence.",
+            "",
+            "Decision criteria:",
+            "- KEEP: shared account role, topic, behavior, or social pattern that could support low-frequency/similarity aggregation.",
+            "- DROP: persona mimicry, generic biography similarity, unrelated popularity/celebrity evidence, sparse text, or conflicting social behavior.",
+            "- Do not infer hidden labels. Do not decide whether either account is bot or human.",
+            "",
+            "Target account:",
+            center_text,
+            "",
+            f"Retrieved account rank: {int(rank)}",
+            f"Observed connection: {relation_text}",
+            "Retrieved account:",
+            candidate_text,
+            "",
+            "Answer with exactly one token: KEEP or DROP.",
+        ]
+    )
+
+
 def _ultratag_clean_generation(task_name, text):
     text = str(text or "").strip()
+    if task_name == "edge_retain":
+        return _parse_llm_edge_retain_decision(text)
     if task_name == "soft_label":
         return _ultratag_parse_soft_label(text)
     if task_name == "keywords":
@@ -5551,6 +6265,8 @@ def _ultratag_fallback(task_name, row):
         return "human"
     if task_name == "edge_probability":
         return "0.0000"
+    if task_name == "edge_retain":
+        return "DROP"
     return ""
 
 
@@ -5704,6 +6420,272 @@ def _load_base_embedding_tensor(path: Path, expected_rows: int):
     return loaded
 
 
+def _load_selection_embedding_tensor(path: Path, expected_rows: int):
+    loaded = torch.load(Path(path), map_location="cpu")
+    if isinstance(loaded, dict):
+        for key in ("embeddings", "features", "x", "x_new", "node_repr", "fused_x"):
+            if key in loaded:
+                loaded = loaded[key]
+                break
+    if not torch.is_tensor(loaded):
+        loaded = torch.tensor(loaded)
+    loaded = loaded.float().cpu()
+    if loaded.dim() != 2:
+        raise ValueError(f"Selection embedding tensor must be [num_nodes, dim], got {tuple(loaded.shape)}.")
+    if int(loaded.shape[0]) != int(expected_rows):
+        raise ValueError(
+            f"Selection embedding rows ({int(loaded.shape[0])}) must match graph node count ({int(expected_rows)})."
+        )
+    return F.normalize(torch.nan_to_num(loaded, nan=0.0, posinf=0.0, neginf=0.0), p=2, dim=1, eps=1e-12)
+
+
+def _run_llm_knn_edge_retain_precompute(
+    args,
+    *,
+    dataset_path,
+    texts,
+    resolved_text_path,
+    labels,
+    edge_index,
+    edge_type,
+    graph_data_variant,
+    variant_paths,
+    target_node_bundle,
+    output_path,
+    wandb_run,
+):
+    if not getattr(args, "selection_embedding_path", None):
+        raise ValueError("llm_knn_edge_retain_v1 requires --selection_embedding_path, usually true x_new.")
+    target_node_ids = [int(item) for item in target_node_bundle["target_node_ids"]]
+    if not target_node_ids:
+        raise ValueError("llm_knn_edge_retain_v1 requires at least one target node.")
+    full_node_count = int(len(texts))
+    labeled_node_count = int(labels.shape[0]) if torch.is_tensor(labels) and labels.dim() >= 1 else int(len(labels))
+    selection = _load_selection_embedding_tensor(Path(args.selection_embedding_path), full_node_count)
+    context = _build_graph_context(edge_index, edge_type, full_node_count)
+    routed_path = str(target_node_bundle.get("routed_nodes_path", "") or "")
+    routed_ids = set(target_node_ids)
+    if routed_path:
+        routed_ids = set(int(item) for item in target_node_ids)
+    candidate_limit = full_node_count if str(graph_data_variant).lower() == "full_graph_support" else labeled_node_count
+    candidate_limit = max(0, min(full_node_count, int(candidate_limit)))
+    nonrouted_candidate_ids = torch.tensor(
+        [idx for idx in range(candidate_limit) if idx not in routed_ids],
+        dtype=torch.long,
+    )
+    if int(nonrouted_candidate_ids.numel()) == 0:
+        raise ValueError("llm_knn_edge_retain_v1 found no non-routed candidates to score.")
+
+    neighbor_cap = int(getattr(args, "neighbor_cap", 8) or 8)
+    if neighbor_cap <= 0:
+        raise ValueError("--neighbor_cap must be positive for llm_knn_edge_retain_v1.")
+    max_pairs = int(getattr(args, "ultratag_edge_reconfig_max_pairs", 512) or 512)
+    if max_pairs <= 0:
+        raise ValueError("--ultratag_edge_reconfig_max_pairs must be positive for llm_knn_edge_retain_v1.")
+
+    generation_rows = []
+    candidate_rows = []
+    score_rows = []
+    relation_rows = []
+    for center in target_node_ids:
+        center_vec = selection[int(center)]
+        candidate_scores = torch.mv(selection[nonrouted_candidate_ids], center_vec)
+        topk = min(neighbor_cap, int(nonrouted_candidate_ids.numel()))
+        positions = torch.topk(candidate_scores, k=topk, largest=True).indices
+        selected_candidates = nonrouted_candidate_ids[positions].tolist()
+        selected_scores = candidate_scores[positions].tolist()
+        candidate_rows.append([int(v) for v in selected_candidates])
+        score_rows.append([float(v) for v in selected_scores])
+        center_following = context["following"][int(center)]
+        center_follower = context["follower"][int(center)]
+        current_relations = []
+        for rank, (candidate, score) in enumerate(zip(selected_candidates, selected_scores), start=1):
+            candidate = int(candidate)
+            if candidate in center_following and candidate in center_follower:
+                relation_text = "mutual follow relation"
+            elif candidate in center_following:
+                relation_text = "target account follows the retrieved account"
+            elif candidate in center_follower:
+                relation_text = "retrieved account follows the target account"
+            elif candidate in context["undirected"][int(center)]:
+                relation_text = "observed one-hop social connection"
+            else:
+                relation_text = "retrieved by semantic KNN; no direct social edge observed"
+            current_relations.append(relation_text)
+            prompt_user = _llm_edge_retain_user_prompt(
+                texts[int(center)],
+                texts[int(candidate)],
+                rank=rank,
+                relation_text=relation_text,
+            )
+            generation_rows.append(
+                {
+                    "pair_key": f"{int(center)}-{candidate}",
+                    "center_node_id": int(center),
+                    "candidate_node_id": candidate,
+                    "rank": int(rank),
+                    "similarity": float(score),
+                    "relation_text": relation_text,
+                    "system": _llm_edge_retain_system(),
+                    "user": prompt_user,
+                }
+            )
+        relation_rows.append(current_relations)
+        if len(generation_rows) >= max_pairs:
+            break
+    if len(generation_rows) > max_pairs:
+        generation_rows = generation_rows[:max_pairs]
+
+    device = _device_from_args(str(args.device))
+    generation_runtime = _resolve_generation_runtime(args, device)
+    if generation_runtime is None and bool(getattr(args, "explain_required", False)):
+        raise ValueError(
+            "llm_knn_edge_retain_v1 requires a working local explain model when --explain_required is set. "
+            f"Override --explain_model_path or make sure the default path exists: {DEFAULT_EXPLAIN_MODEL_PATH}"
+        )
+    sidecar_dir = Path(getattr(args, "explain_component_cache_dir", None) or output_path.parent)
+    ensure_dir(sidecar_dir)
+    outputs, generation_summary = _generate_ultratag_text_rows(
+        args,
+        generation_rows,
+        "edge_retain",
+        device,
+        generation_runtime,
+        sidecar_dir / f"{output_path.stem}_edge_retain_generations.jsonl",
+        wandb_run=wandb_run,
+        step_base=5000,
+    )
+    decision_by_pair = {
+        str(row["pair_key"]): str(output).upper()
+        for row, output in zip(generation_rows, outputs)
+    }
+    keep_rows = []
+    decision_sidecar_rows = []
+    for center, candidates, scores, relations in zip(target_node_ids, candidate_rows, score_rows, relation_rows):
+        current_keep = []
+        for rank, (candidate, score, relation_text) in enumerate(zip(candidates, scores, relations), start=1):
+            decision = decision_by_pair.get(f"{int(center)}-{int(candidate)}", "DROP")
+            keep = decision == "KEEP"
+            current_keep.append(bool(keep))
+            decision_sidecar_rows.append(
+                {
+                    "center_node_id": int(center),
+                    "candidate_node_id": int(candidate),
+                    "rank": int(rank),
+                    "similarity": float(score),
+                    "relation_text": relation_text,
+                    "decision": decision,
+                    "keep": bool(keep),
+                }
+            )
+        keep_rows.append(current_keep)
+
+    payload = {
+        "method_family": "llm_knn_edge_retain_v1",
+        "paper_references": {
+            "frequency_filtering": "Beyond Low-frequency Information in Graph Convolutional Networks / FAGCN",
+            "llm_edge_reconfiguration": "UltraTAG-S arXiv:2504.02343",
+        },
+        "center_node_ids": [int(v) for v in target_node_ids[: len(candidate_rows)]],
+        "center_candidate_node_ids": candidate_rows,
+        "center_candidate_keep_mask": keep_rows,
+        "center_candidate_similarity": score_rows,
+        "center_candidate_relation_text": relation_rows,
+        "selection_embedding_path": str(args.selection_embedding_path),
+        "text_path": str(resolved_text_path),
+        "graph_data_variant": str(graph_data_variant),
+        "neighbor_cap": int(neighbor_cap),
+        "retain_threshold": 0.5,
+        "explain_model_path": _effective_explain_model_path(args),
+        "explain_max_input_length": int(getattr(args, "explain_max_input_length", 4096)),
+        "explain_max_new_tokens": int(getattr(args, "explain_max_new_tokens", 128)),
+        "generation_summary": generation_summary,
+        "contract": (
+            "LLM judges whether target-centered non-routed KNN candidates should be retained as high-order "
+            "message-passing support. It is not a bot/human predictor and does not use labels."
+        ),
+    }
+    keep_count = int(sum(sum(1 for item in row if bool(item)) for row in keep_rows))
+    total_count = int(sum(len(row) for row in keep_rows))
+    payload["summary"] = {
+        "center_count": int(len(candidate_rows)),
+        "candidate_count": int(total_count),
+        "keep_count": int(keep_count),
+        "keep_ratio": float(keep_count / float(total_count)) if total_count else 0.0,
+    }
+    write_torch(output_path, payload)
+    decision_sidecar_path = output_path.with_name(f"{output_path.stem}_decisions.jsonl")
+    prompt_sidecar_path = output_path.with_name(f"{output_path.stem}_prompts.jsonl")
+    _write_jsonl(decision_sidecar_path, decision_sidecar_rows)
+    _write_jsonl(
+        prompt_sidecar_path,
+        [
+            {
+                "pair_key": row["pair_key"],
+                "center_node_id": int(row["center_node_id"]),
+                "candidate_node_id": int(row["candidate_node_id"]),
+                "rank": int(row["rank"]),
+                "system": row["system"],
+                "user": row["user"],
+            }
+            for row in generation_rows
+        ],
+    )
+    manifest = {
+        "status": "completed",
+        "dataset": str(args.dataset),
+        "dataset_path": str(dataset_path),
+        "method_family": "llm_knn_edge_retain_v1",
+        "prompt_mode": str(args.prompt_mode),
+        "paper_reference": "UltraTAG-S edge reconfiguration plus FAGCN low/high-pass motivation",
+        "research_boundary": (
+            "Offline LLM edge-retention cache for non-routed KNN support. This is an UltraTAG-S-inspired "
+            "edge reliability adaptation, not a full UltraTAG-S reproduction."
+        ),
+        "output_path": str(output_path),
+        "decision_sidecar_path": str(decision_sidecar_path),
+        "prompt_sidecar_path": str(prompt_sidecar_path),
+        "selection_embedding_path": str(args.selection_embedding_path),
+        "neighbor_cap": int(neighbor_cap),
+        "explain_model_path": _effective_explain_model_path(args),
+        "explain_max_input_length": int(getattr(args, "explain_max_input_length", 4096)),
+        "explain_max_new_tokens": int(getattr(args, "explain_max_new_tokens", 128)),
+        "graph_data_variant": str(graph_data_variant),
+        "edge_index_path": str(variant_paths["edge_index_path"]),
+        "edge_type_path": str(variant_paths["edge_type_path"]),
+        "text_path": str(resolved_text_path),
+        "target_node_source": str(target_node_bundle.get("target_node_source", "")),
+        "target_node_scope": str(target_node_bundle.get("target_node_scope", "")),
+        "routed_nodes_path": str(target_node_bundle.get("routed_nodes_path", "")),
+        "summary": payload["summary"],
+        "generation_summary": generation_summary,
+    }
+    manifest_path = output_path.with_suffix(".manifest.json")
+    write_json(manifest_path, manifest)
+    _wandb_log(
+        wandb_run,
+        {
+            "precompute/status": 1,
+            "precompute/stage_code": 1,
+            "precompute/llm_edge_retain/keep_ratio": float(payload["summary"]["keep_ratio"]),
+            "precompute/llm_edge_retain/candidate_count": int(total_count),
+        },
+        step=9999,
+    )
+    if generation_runtime is not None:
+        generation_runtime["model"] = None
+        generation_runtime["tokenizer"] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    _finish_precompute_wandb(wandb_run, exit_code=0)
+    return {
+        "output_path": str(output_path),
+        "manifest_path": str(manifest_path),
+        "summary": payload["summary"],
+    }
+
+
 def _edge_set_from_tensors(edge_index, edge_type):
     edge_index = edge_index.detach().cpu().long()
     edge_type = edge_type.detach().cpu().long().view(-1)
@@ -5829,7 +6811,10 @@ def _run_ultratag_s_subgraph_precompute(
     device = _device_from_args(str(args.device))
     generation_runtime = _resolve_generation_runtime(args, device)
     if generation_runtime is None and bool(getattr(args, "explain_required", False)):
-        raise ValueError("UltraTAG-S generation requires --explain_model_path when --explain_required is set.")
+        raise ValueError(
+            "UltraTAG-S generation requires a working local explain model when --explain_required is set. "
+            f"Override --explain_model_path or make sure the default path exists: {DEFAULT_EXPLAIN_MODEL_PATH}"
+        )
     sidecar_dir = Path(getattr(args, "explain_component_cache_dir", None) or output_path.parent)
     ensure_dir(sidecar_dir)
     generation_summaries = {}
@@ -6124,7 +7109,7 @@ def _run_ultratag_s_subgraph_precompute(
         "embedding_pooling_mode": embedding_pooling_mode,
         "finetuned_roberta_checkpoint_path": str((simteg_checkpoint_summary or {}).get("checkpoint_path", "")),
         "finetuned_roberta_checkpoint_load": dict(simteg_checkpoint_summary or {}),
-        "explain_model_path": str(getattr(args, "explain_model_path", "") or ""),
+        "explain_model_path": _effective_explain_model_path(args),
         "neighbor_quota": int(neighbor_quota),
         "virtual_edge_policy": virtual_edge_policy,
         "tau1": float(tau1),
@@ -6346,7 +7331,7 @@ def build_parser():
         default=None,
         help=(
             "Node-aligned semantic feature tensor used by center_induced_relation_aware prompt selection "
-            "and by mhlgc_llm_guide to construct the HyperScan-style KNN hypergraph view."
+            "and by mhlgc_llm_guide / llm_knn_edge_retain_v1 to construct the HyperScan-style KNN view."
         ),
     )
     parser.add_argument("--support_selection_embedding_path", type=Path, default=None)
@@ -6366,7 +7351,15 @@ def build_parser():
     parser.add_argument("--save_dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--explain_model_path", type=str, default=None)
+    parser.add_argument(
+        "--explain_model_path",
+        type=str,
+        default=None,
+        help=(
+            "Local causal-LM snapshot for explanation generation. "
+            f"When omitted, generation-based prompt modes default to {DEFAULT_EXPLAIN_MODEL_PATH}."
+        ),
+    )
     parser.add_argument("--explain_trust_remote_code", action="store_true")
     parser.add_argument(
         "--explain_required",
@@ -6446,11 +7439,14 @@ def run(args):
         and str(getattr(args, "prompt_mode", "")) not in ULTRATAG_PROMPT_MODES
         and str(getattr(args, "prompt_mode", "")) not in RESIDUAL_AUDIT_PROMPT_MODES
         and str(getattr(args, "prompt_mode", "")) not in DGP_PROMPT_MODES
+        and str(getattr(args, "prompt_mode", "")) not in BOTSAY_KNN_PROMPT_MODES
+        and str(getattr(args, "prompt_mode", "")) not in LLM_EDGE_RETAIN_PROMPT_MODES
         and str(getattr(args, "prompt_mode", "")) not in MHLGC_PROMPT_MODES
     ):
         raise ValueError(
             "--routed_nodes_path is only supported for expert_* prompt modes, ultratag_s_subgraph_v1, "
-            "residual_audit_v1, dgp_predictor_v1, and mhlgc_llm_guide."
+            "residual_audit_v1, dgp_predictor_v1/v2, botsay_knn_summary_predictor_v1, "
+            "llm_knn_edge_retain_v1, and mhlgc_llm_guide."
         )
     dataset_path = resolve_dataset_path(args.dataset)
     _wandb_log(
@@ -6497,6 +7493,8 @@ def run(args):
             raise ValueError("No node texts found for Qwen prompt precompute.")
         graph_data_variant = variant_paths["variant"]
         full_node_count = int(len(texts))
+        edge_index = torch.load(variant_paths["edge_index_path"], map_location="cpu")
+        edge_type = torch.load(variant_paths["edge_type_path"], map_location="cpu")
         target_node_bundle = _resolve_target_node_ids(
             args,
             labeled_node_count=labeled_node_count,
@@ -6513,6 +7511,39 @@ def run(args):
         classes = ["human", "bot"] if class_count == 2 else [f"class_{idx}" for idx in range(class_count)]
     else:
         classes = sorted(int(x) for x in torch.unique(torch.as_tensor(labels)).tolist())
+
+    if str(getattr(args, "prompt_mode", "")) in LLM_EDGE_RETAIN_PROMPT_MODES:
+        if is_ultratag_mode:
+            raise ValueError("llm_knn_edge_retain_v1 must not be combined with UltraTAG output/context split mode.")
+        output_path = (
+            Path(args.output_path)
+            if args.output_path
+            else _default_output_path(
+                dataset_path,
+                str(args.prompt_mode),
+                prompt_family_version=prompt_family_version,
+                embedding_encoder_tag="qwen3",
+                residual_prompt_variant=str(getattr(args, "residual_prompt_variant", "base_as_hypothesis")),
+                dgp_prompt_variant=str(getattr(args, "dgp_prompt_variant", "target_fine_neighbor_coarse")),
+            )
+        )
+        if output_path.exists() and not bool(args.overwrite):
+            raise FileExistsError(f"Output already exists: {output_path}. Use --overwrite or a different --output_path.")
+        ensure_dir(output_path.parent)
+        return _run_llm_knn_edge_retain_precompute(
+            args,
+            dataset_path=dataset_path,
+            texts=texts,
+            resolved_text_path=resolved_text_path,
+            labels=labels,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            graph_data_variant=graph_data_variant,
+            variant_paths=variant_paths,
+            target_node_bundle=target_node_bundle,
+            output_path=output_path,
+            wandb_run=wandb_run,
+        )
 
     if is_ultratag_mode:
         output_edge_index = torch.load(output_variant_paths["edge_index_path"], map_location="cpu")
@@ -6558,8 +7589,6 @@ def run(args):
             embedding_encoder_tag=embedding_encoder_tag,
             wandb_run=wandb_run,
         )
-    edge_index = torch.load(variant_paths["edge_index_path"], map_location="cpu")
-    edge_type = torch.load(variant_paths["edge_type_path"], map_location="cpu")
     selection_feature_bundle = None
     if str(args.neighbor_sampling_policy).lower() == "center_induced_relation_aware":
         selection_feature_bundle = resolve_selection_feature_bundle(
@@ -6667,12 +7696,14 @@ def run(args):
             )
         else:
             tweet_source_mode_effective = "norm_user_text"
-        generation_runtime = _resolve_generation_runtime(args, device)
+        generation_runtime = None
         initial_generation_order = ["ego", "graph_following", "graph_follower", "tweet"]
         for component_name in initial_generation_order:
             generation_rows = list(prompt_bundle.get("generation_rows_by_component", {}).get(component_name, []))
             if not generation_rows:
                 continue
+            if generation_runtime is None:
+                generation_runtime = _resolve_generation_runtime(args, device)
             component_sidecar_path = (
                 explanation_cache_dir / f"{output_path.stem}_{component_name}_explanations.jsonl"
             )
@@ -6715,6 +7746,8 @@ def run(args):
             prompt_bundle = _prepare_explanation_first_conflict_generation_rows(prompt_bundle)
         conflict_rows = list(prompt_bundle.get("generation_rows_by_component", {}).get("conflict", []))
         if conflict_rows:
+            if generation_runtime is None:
+                generation_runtime = _resolve_generation_runtime(args, device)
             component_sidecar_path = (
                 explanation_cache_dir / f"{output_path.stem}_conflict_explanations.jsonl"
             )
@@ -6811,6 +7844,60 @@ def run(args):
                 }
                 for row, explanation in zip(generation_rows, explanations)
             )
+        if generation_runtime is not None:
+            generation_runtime["model"] = None
+            generation_runtime["tokenizer"] = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    if str(args.prompt_mode) == "botsay_knn_summary_predictor_v1" and bool(
+        prompt_bundle.get("needs_botsay_knn_summary_generation")
+    ):
+        generation_runtime = _resolve_generation_runtime(args, device)
+        component_name = "botsay_knn_neighbor_summary"
+        generation_rows = list(prompt_bundle.get("generation_rows_by_component", {}).get(component_name, []))
+        component_sidecar_path = explanation_cache_dir / f"{output_path.stem}_{component_name}_explanations.jsonl"
+        component_explain_sidecar_paths[component_name] = str(component_sidecar_path)
+        explanations, component_summary = _generate_component_explanations(
+            args,
+            generation_rows,
+            device,
+            generation_runtime=generation_runtime,
+            component_name=component_name,
+            sidecar_path=component_sidecar_path,
+            wandb_run=wandb_run,
+            wandb_step_base=9000 + 1000 * len(explain_summary_by_component),
+        )
+        explain_summary_by_component[component_name] = component_summary
+        prompt_bundle = _attach_botsay_knn_neighbor_summaries(prompt_bundle, explanations)
+        _wandb_log(
+            wandb_run,
+            {
+                "precompute/botsay_knn_component_done": 1,
+                f"precompute/botsay_knn/{component_name}/rows": int(len(generation_rows)),
+                f"precompute/botsay_knn/{component_name}/generated_count": int(component_summary.get("generated_count", 0)),
+                f"precompute/botsay_knn/{component_name}/fallback_count": int(component_summary.get("fallback_count", 0)),
+                f"precompute/botsay_knn/{component_name}/generation_mode_code": 1
+                if str(component_summary.get("generation_mode", "")) == "llm_generation"
+                else 0,
+            },
+            step=40 + len(explain_summary_by_component),
+        )
+        explain_rows_for_sidecar.extend(
+            {
+                "node_id": int(row["node_id"]),
+                "component_name": component_name,
+                "prompt_role": row.get("prompt_role", ""),
+                "neighbor_node_id": int(row.get("neighbor_node_id", -1)),
+                "neighbor_rank": int(row.get("neighbor_rank", 0)),
+                "semantic_similarity": float(row.get("semantic_similarity", 0.0)),
+                "relation_to_target": list(row.get("relation_to_target", [])),
+                "relation_description": str(row.get("relation_description", "")),
+                "explanation": explanation,
+            }
+            for row, explanation in zip(generation_rows, explanations)
+        )
         if generation_runtime is not None:
             generation_runtime["model"] = None
             generation_runtime["tokenizer"] = None
@@ -6944,7 +8031,14 @@ def run(args):
         "dgp_v2_directions": list(prompt_bundle.get("dgp_v2_directions", [])),
         "dgp_v2_summary_language": str(prompt_bundle.get("dgp_v2_summary_language", "")),
         "dgp_v2_empty_context_policy": str(prompt_bundle.get("dgp_v2_empty_context_policy", "")),
+        "botsay_knn_support_k": int(prompt_bundle.get("botsay_knn_support_k", 0) or 0),
     }
+    if prompt_bundle.get("routed_multiview_rows"):
+        payload["routed_multiview_rows"] = _scatter_selected_python_rows_to_full_graph(
+            prompt_bundle.get("routed_multiview_rows", []),
+            target_index_tensor,
+            full_node_count,
+        )
     for component_name, component_tensor in encoded.items():
         payload[component_name] = _scatter_selected_tensor_to_full_graph(
             component_tensor.to(save_dtype).contiguous(),
@@ -7014,7 +8108,10 @@ def run(args):
     _write_jsonl(prompt_sidecar_path, prompt_bundle.get("prompt_rows", []))
     explain_sidecar_path = None
     if explain_rows_for_sidecar:
-        if prompt_family_version in {"v2", "v3"} or prompt_bundle["prompt_family"] in {"dgp_predictor_v2"}:
+        if (
+            prompt_family_version in {"v2", "v3"}
+            or prompt_bundle["prompt_family"] in {"dgp_predictor_v2", "botsay_knn_summary_predictor_v1"}
+        ):
             explain_sidecar_path = output_path.with_name(f"{output_path.stem}_explanations.jsonl")
         else:
             explain_sidecar_path = output_path.with_name("glance_prompt_expert_ego_explain.jsonl")
@@ -7064,6 +8161,7 @@ def run(args):
         "dgp_v2_directions": list(prompt_bundle.get("dgp_v2_directions", [])),
         "dgp_v2_summary_language": str(prompt_bundle.get("dgp_v2_summary_language", "")),
         "dgp_v2_empty_context_policy": str(prompt_bundle.get("dgp_v2_empty_context_policy", "")),
+        "botsay_knn_support_k": int(prompt_bundle.get("botsay_knn_support_k", 0) or 0),
         "residual_base_outputs_path": str(prompt_bundle.get("base_outputs_path", "")),
         "residual_base_outputs_row_count": int(prompt_bundle.get("base_outputs_row_count", 0) or 0),
         "residual_base_output_keys": list(prompt_bundle.get("base_output_keys", [])),
@@ -7194,7 +8292,7 @@ def run(args):
             "target evidence and coarse ranked following/follower neighbor context for Qwen PEFT predictor "
             "and Qwen-embedding-plus-MLP comparisons. "
             "v1 preserves the older mixed embedding/explanation behavior, while v2 upgrades expert prompts to an explanation-first pipeline with encoder-aware naming and pooling. "
-            "v3 keeps the v2 explanation-first component contract but asks the explain model for source-grounded structured evidence cards without final labels, probabilities, confidence scores, recommendations, or model-correction instructions. "
+            "v3 keeps the v2 explanation-first component contract but asks the explain model for source-grounded structured evidence cards plus a final bot/human judgment derived from those cards, without probabilities, confidence scores, recommendations, or model-correction instructions. "
             "Explanation generation stays offline-first: it reuses a local explain-model snapshot when available and otherwise falls back to deterministic summaries instead of blocking on HuggingFace downloads."
         ),
     }

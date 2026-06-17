@@ -201,7 +201,12 @@ def normalize_args(args, raw_args=None):
     second_view_fusion = str(getattr(args, "graph_second_view_fusion", "residual") or "residual").strip().lower()
     if "--hyperscan_detector_style" in raw_flags:
         legacy_style = str(getattr(args, "hyperscan_detector_style", "residual") or "residual").strip().lower()
-        legacy_fusion = "multiattn" if legacy_style in {"original_cross_attention", "multiattn"} else legacy_style
+        if legacy_style in {"original_cross_attention", "multiattn"}:
+            legacy_fusion = "multiattn"
+        elif legacy_style in {"original_cross_attention_adaptive", "multiattn_adaptive"}:
+            legacy_fusion = "multiattn_adaptive"
+        else:
+            legacy_fusion = legacy_style
         if "--graph_second_view_fusion" in raw_flags and legacy_fusion != second_view_fusion:
             raise ValueError(
                 "--graph_second_view_fusion conflicts with explicit --hyperscan_detector_style: "
@@ -209,7 +214,12 @@ def normalize_args(args, raw_args=None):
             )
         second_view_fusion = legacy_fusion
     args.graph_second_view_fusion = second_view_fusion
-    args.hyperscan_detector_style = "original_cross_attention" if second_view_fusion == "multiattn" else "residual"
+    if second_view_fusion == "multiattn":
+        args.hyperscan_detector_style = "original_cross_attention"
+    elif second_view_fusion == "multiattn_adaptive":
+        args.hyperscan_detector_style = "original_cross_attention_adaptive"
+    else:
+        args.hyperscan_detector_style = "residual"
 
     args.conformal_knn_config_source = "explicit_cli_or_router_defaults"
     args.conformal_knn_inherited_from_second_view = False
@@ -247,6 +257,42 @@ def normalize_args(args, raw_args=None):
         if inherited_fields:
             args.conformal_knn_inherited_from_second_view = True
             args.conformal_knn_config_source = "parser_graph_second_view_defaults:" + ",".join(inherited_fields)
+        if graph_mode in hyper_knn_modes and str(getattr(args, "conformal_knn_repr_source", "")).strip().lower() == "node_repr":
+            raise ValueError(
+                "HyperScan-aligned KNN router/support flows must use --conformal_knn_repr_source x_new. "
+                "`node_repr` is the final detector hidden space and can echo base predictions; keep it only for legacy "
+                "or explicit non-HyperScan control ablations."
+            )
+
+    graph_mode = str(getattr(args, "graph_refine_mode", "none") or "none").strip().lower()
+    simple_knn_control_modes = {
+        "hyperscan_knn_hypergraph_proxy_augment",
+        "relation_overlap_knn_proxy_augment",
+        "relation_overlap_knn_repr_prefit_augment",
+    }
+    second_view_mainline_modes = {
+        "routed_dynamic_hyperscan_branch",
+        "hyperscan_neighborloader_batch_local_branch",
+    }
+    if graph_mode in simple_knn_control_modes:
+        args.graph_refine_positioning = "diagnostic_control"
+        args.graph_refine_control_only = True
+    elif graph_mode in second_view_mainline_modes:
+        args.graph_refine_positioning = "second_view_mainline"
+        args.graph_refine_control_only = False
+    else:
+        args.graph_refine_positioning = "none"
+        args.graph_refine_control_only = False
+
+    if args.experiment_task == "graph_detector_prepare":
+        if graph_mode in second_view_mainline_modes and "--graph_second_view_fusion" not in raw_flags and "--hyperscan_detector_style" not in raw_flags:
+            args.graph_second_view_fusion = "multiattn"
+            args.hyperscan_detector_style = "original_cross_attention"
+        if graph_mode in simple_knn_control_modes and str(getattr(args, "graph_second_view_fusion", "residual") or "residual").strip().lower() != "residual":
+            raise ValueError(
+                "Simple KNN augment control modes must keep --graph_second_view_fusion residual. "
+                "Use a HyperScan second-view mode for cross-attention or adaptive low/high fusion."
+            )
 
     args.text_encoder = getattr(args, "text_encoder", None)
     args.LM_model = args.text_encoder
@@ -262,6 +308,36 @@ def normalize_args(args, raw_args=None):
         args.risk_budgets = args.router_budgets
     if getattr(args, "router_budgets", None) is None and getattr(args, "risk_budgets", None) is not None:
         args.router_budgets = args.risk_budgets
+
+    if args.experiment_task == "graph_detector_prepare":
+        routed_contrast_family = str(getattr(args, "routed_contrast_family", "none") or "none").strip().lower()
+        routed_contrast_enabled = routed_contrast_family != "none"
+        routed_highpass_mode = str(getattr(args, "routed_highpass_mode", "off") or "off").strip().lower()
+        routed_highpass_enabled = routed_highpass_mode != "off"
+        if bool(getattr(args, "mhlgc_enable", False)) and routed_contrast_enabled:
+            raise ValueError("--mhlgc_enable and --routed_contrast_family cannot be enabled together.")
+        if bool(getattr(args, "mhlgc_enable", False)) and routed_highpass_enabled:
+            raise ValueError("--mhlgc_enable and --routed_highpass_mode cannot be enabled together.")
+        if routed_contrast_enabled and routed_highpass_enabled:
+            raise ValueError("--routed_contrast_family and --routed_highpass_mode cannot be enabled together.")
+        if routed_contrast_enabled:
+            loader_mode = str(getattr(args, "graph_training_loader_mode", "full_batch") or "full_batch").strip().lower()
+            if loader_mode != "full_batch":
+                raise ValueError("--routed_contrast_family requires --graph_training_loader_mode full_batch.")
+            if not str(getattr(args, "routed_nodes_path", "") or "").strip():
+                raise ValueError("--routed_contrast_family requires --routed_nodes_path.")
+            gate = str(getattr(args, "routed_contrast_gate", "heuristic_reliable") or "heuristic_reliable").strip().lower()
+            if gate == "heuristic_reliable" and not str(getattr(args, "mhlgc_semantic_embedding_path", "") or "").strip():
+                raise ValueError(
+                    "--routed_contrast_gate heuristic_reliable currently requires "
+                    "--mhlgc_semantic_embedding_path carrying routed multiview rows."
+                )
+        if routed_highpass_enabled:
+            loader_mode = str(getattr(args, "graph_training_loader_mode", "full_batch") or "full_batch").strip().lower()
+            if loader_mode != "full_batch":
+                raise ValueError("--routed_highpass_mode requires --graph_training_loader_mode full_batch.")
+            if not str(getattr(args, "routed_nodes_path", "") or "").strip():
+                raise ValueError("--routed_highpass_mode requires --routed_nodes_path.")
 
     args.reset_split = str(args.reset_split).strip()
     args.deprecated_cli_flags = _deprecated_cli_flags(args, raw_args)
@@ -660,18 +736,116 @@ def parser_args(argv=None):
             "`auto` preserves --graph_refine_mode; `none` disables the second view; "
             "`labeled_prefix` maps to a labeled-prefix dynamic branch; "
             "`routed_nodes` maps to routed_dynamic_hyperscan_branch and requires --routed_nodes_path; "
-            "`neighborloader_batch` maps to hyperscan_neighborloader_batch_local_branch."
+            "`neighborloader_batch` maps to hyperscan_neighborloader_batch_local_branch. "
+            "All HyperScan-style second-view grouping uses x_new=cat(x_low,input) as the KNN construction space; "
+            "do not use final node_repr for this flow."
         ),
     )
     parser.add_argument(
         "--graph_second_view_candidate_scope",
         type=str,
         default="auto",
-        choices=["auto", "undirected_relation_1hop", "labeled_relation_1hop"],
+        choices=["auto", "undirected_relation_1hop", "labeled_relation_1hop", "labeled_full", "hyperscan_full"],
         help=(
             "Canonical KNN candidate-scope switch for relation-local second-view grouping. "
-            "`auto` preserves --graph_refine_candidate_scope."
+            "`auto` preserves --graph_refine_candidate_scope. "
+            "`labeled_full` uses all labeled nodes as candidate support; "
+            "`hyperscan_full` uses all graph nodes as candidate support."
         ),
+    )
+    parser.add_argument(
+        "--graph_second_view_candidate_policy",
+        type=str,
+        default="default",
+        choices=["default", "exclude_routed", "post_topk_exclude_routed", "stable_quota", "mixed_quota", "llm_retain", "router_support_transfer"],
+        help=(
+            "Ablation policy for selecting dynamic second-view KNN members after candidate retrieval. "
+            "`default` keeps ordinary x_new top-k. `exclude_routed` removes routed/high-risk candidates. "
+            "`post_topk_exclude_routed` retrieves ordinary top-k first, then drops routed/high-risk candidates "
+            "without refilling. `stable_quota` reserves part of each hyperedge for low-risk non-routed support. "
+            "`mixed_quota` reserves hard/stable/counterfactual buckets before filling by x_new similarity. "
+            "`llm_retain` consumes an offline Qwen edge-retention cache and keeps only LLM-retained candidates. "
+            "`router_support_transfer` directly reuses the conformal router's exported support neighborhood as the "
+            "second-view candidate row for each center."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_router_support_path",
+        type=str,
+        default="",
+        help=(
+            "Optional conformal-router support payload JSON/PT whose center_candidate_node_ids are reused directly "
+            "as dynamic second-view candidates when --graph_second_view_candidate_policy router_support_transfer is used."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_candidate_routed_nodes_path",
+        type=str,
+        default="",
+        help=(
+            "Optional routed-node JSON/PT used only to mark high-risk second-view candidate members for "
+            "`exclude_routed` or `post_topk_exclude_routed`. This decouples member filtering from "
+            "`--routed_nodes_path`, which still selects routed centers when `--graph_second_view_scope routed_nodes`."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_candidate_risk_path",
+        type=str,
+        default="",
+        help=(
+            "Optional full-graph router/risk vector used only to tag second-view candidates as stable support. "
+            "This is error-risk evidence, not bot probability, and must not be derived from test labels."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_candidate_pred_path",
+        type=str,
+        default="",
+        help=(
+            "Optional full-graph base prediction payload used only to tag mixed-quota counterfactual support "
+            "where candidate prediction differs from the center prediction."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_llm_edge_retain_path",
+        type=str,
+        default="",
+        help=(
+            "Optional offline Qwen edge-retention cache produced by "
+            "precompute.py --prompt_mode llm_knn_edge_retain_v1. Required when "
+            "--graph_second_view_candidate_policy llm_retain is used. The cache filters KNN "
+            "members before x_high/HGNN construction and is not a bot/human prediction cache."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_stable_quantile",
+        type=float,
+        default=0.50,
+        help="Risk quantile among non-routed candidates used as the stable-support cutoff for quota policies.",
+    )
+    parser.add_argument(
+        "--graph_second_view_stable_quota",
+        type=int,
+        default=0,
+        help="Stable-support quota for stable_quota. 0 means max(1, floor(K/2)).",
+    )
+    parser.add_argument(
+        "--graph_second_view_mixed_hard_quota",
+        type=int,
+        default=2,
+        help="Hard routed-candidate quota for mixed_quota second-view KNN selection.",
+    )
+    parser.add_argument(
+        "--graph_second_view_mixed_stable_quota",
+        type=int,
+        default=4,
+        help="Stable non-routed candidate quota for mixed_quota second-view KNN selection.",
+    )
+    parser.add_argument(
+        "--graph_second_view_mixed_counterfactual_quota",
+        type=int,
+        default=2,
+        help="Low-risk opposite-prediction support quota for mixed_quota second-view KNN selection.",
     )
     parser.add_argument(
         "--graph_second_view_training_geometry",
@@ -698,25 +872,30 @@ def parser_args(argv=None):
         "--graph_second_view_fusion",
         type=str,
         default="residual",
-        choices=["residual", "multiattn"],
+        choices=["residual", "multiattn", "multiattn_adaptive"],
         help=(
             "Second-view fusion realization for rgcn_hyperscan* backbones. "
             "`residual` uses x_low plus an incident-gated delta; `multiattn` uses the "
-            "HyperScan-style bidirectional MultiAttn concat detector."
+            "HyperScan-style bidirectional MultiAttn concat detector; "
+            "`multiattn_adaptive` keeps the same cross-attention tokens but applies "
+            "a FAGCN-style node-wise adaptive low/high mix before the final classifier."
         ),
     )
     parser.add_argument(
         "--hyperscan_detector_style",
         type=str,
         default="residual",
-        choices=["residual", "original_cross_attention", "multiattn"],
+        choices=["residual", "original_cross_attention", "multiattn", "original_cross_attention_adaptive", "multiattn_adaptive"],
         help=(
             "Legacy detector/fusion head for HyperScan-style graph backbones. "
             "Prefer --graph_second_view_fusion for new experiments. "
             "`residual` keeps the current lightweight residual fusion head; "
             "`original_cross_attention`/`multiattn` swaps in the paper-style bidirectional "
             "cross-attention, concat, LeakyReLU, and linear detector while leaving "
-            "the relation and hypergraph branches unchanged."
+            "the relation and hypergraph branches unchanged; "
+            "`original_cross_attention_adaptive`/`multiattn_adaptive` adds an optional "
+            "FAGCN-style node-wise adaptive low/high fusion on top of the same "
+            "cross-attended detector tokens."
         ),
     )
     parser.add_argument("--SimpleHGN_att_res", type=float, default=0.2)
@@ -763,12 +942,15 @@ def parser_args(argv=None):
         choices=[
             "undirected_relation_1hop",
             "labeled_relation_1hop",
+            "labeled_full",
+            "hyperscan_full",
         ],
         help=(
             "Candidate pool for local KNN grouping inside relation_overlap_* and "
             "routed_dynamic_hyperscan_branch. "
             "`undirected_relation_1hop` uses all relation-1hop neighbors; "
-            "`labeled_relation_1hop` filters those neighbors to the labeled prefix only."
+            "`labeled_relation_1hop` filters those neighbors to the labeled prefix only; "
+            "`labeled_full` uses all labeled nodes; `hyperscan_full` uses all graph nodes."
         ),
     )
     parser.add_argument(
@@ -808,8 +990,9 @@ def parser_args(argv=None):
         "--mhlgc_enable",
         action="store_true",
         help=(
-            "Enable MH-LGC-style LLM-guided contrastive learning for graph_detector_prepare. "
-            "Requires --mhlgc_semantic_embedding_path and adds an auxiliary hard-negative InfoNCE loss."
+            "Enable the legacy MH-LGC-style LLM-guided contrastive branch for graph_detector_prepare. "
+            "Requires --mhlgc_semantic_embedding_path and adds an auxiliary hard-negative InfoNCE loss. "
+            "This is a comparison/diagnostic branch, not the current routed-only evidence/classifier mainline."
         ),
     )
     parser.add_argument(
@@ -887,6 +1070,174 @@ def parser_args(argv=None):
         type=int,
         default=1,
         help="Positive/fraud/bot class index for selecting MH-LGC borderline anchors. TwiBot labels use 1 for bot.",
+    )
+    parser.add_argument(
+        "--mhlgc_contrast_space",
+        type=str,
+        default="fused_x",
+        choices=["fused_x", "node_repr", "x_new", "low_high_concat", "low_high", "semantic"],
+        help=(
+            "Representation space optimized by the MH-LGC auxiliary contrast. "
+            "`fused_x` is the preferred explicit final detector hidden space, "
+            "`node_repr` is the legacy alias for that same final hidden, "
+            "`x_new` uses the HyperScan-style construction space when the backbone exposes it, and "
+            "`low_high_concat` uses the pre-detector HyperScan view pair cat(x_low, x_high), and "
+            "`semantic` is a diagnostic semantic-space contrast over the loaded guide tensor."
+        ),
+    )
+    parser.add_argument(
+        "--mhlgc_anchor_source",
+        type=str,
+        default="semantic_nonzero_positive",
+        choices=["semantic_nonzero_positive", "routed_target_mask", "positive_label"],
+        help=(
+            "Anchor-candidate source for MH-LGC. "
+            "`semantic_nonzero_positive` keeps the legacy behavior, "
+            "`routed_target_mask` restricts anchors to routed/guide target nodes, and "
+            "`positive_label` uses all positive-label supervised nodes. "
+            "This anchor selection is only for the MH-LGC auxiliary branch."
+        ),
+    )
+    parser.add_argument(
+        "--mhlgc_pair_mode",
+        type=str,
+        default="augmentation",
+        choices=["augmentation", "repair_aware"],
+        help=(
+            "Positive-pair construction mode for MH-LGC. "
+            "`augmentation` keeps the existing masked-view pair, while "
+            "`repair_aware` contrasts a non-guided view against a guide-conditioned repaired view. "
+            "This setting belongs to the legacy MH-LGC comparison branch."
+        ),
+    )
+    parser.add_argument(
+        "--mhlgc_semantic_projector",
+        type=str,
+        default="auto",
+        choices=["auto", "none"],
+        help=(
+            "How to reconcile guide embedding dimensionality with the selected MH-LGC contrast space. "
+            "`auto` learns a train-time linear projector when dimensions differ; `none` requires matching dims."
+        ),
+    )
+    parser.add_argument(
+        "--routed_contrast_family",
+        type=str,
+        default="none",
+        choices=["none", "low_high", "three_view_control", "supcon_class", "hybrid", "bot_edge_mask_human"],
+        help=(
+            "Optional routed-node-only contrastive ablation for graph_detector_prepare. "
+            "`low_high` aligns routed x_low/x_high pairs, `three_view_control` adds a frozen->x_low teacher control, "
+            "`supcon_class` is a BotSCL-style same-class positive / different-class negative control on fused_x, "
+            "`hybrid` combines low/high same-node contrast with class-aware supervised contrast, and "
+            "`bot_edge_mask_human` anchors routed bot nodes, uses edge-masked same-node fused_x as positives, "
+            "and routed human fused_x as negatives. "
+            "This branch is separate from legacy MH-LGC and is full-batch only."
+        ),
+    )
+    parser.add_argument(
+        "--routed_contrast_gate",
+        type=str,
+        default="heuristic_reliable",
+        choices=["none", "heuristic_reliable"],
+        help=(
+            "Eligibility gate for routed contrast. "
+            "`heuristic_reliable` keeps only routed train nodes with populated support, reciprocal/common-neighbor evidence, "
+            "and above-median mean semantic similarity; `none` uses all routed train nodes."
+        ),
+    )
+    parser.add_argument(
+        "--routed_contrast_weight",
+        type=float,
+        default=0.0,
+        help="Loss weight for routed-node contrastive ablations. Default 0 keeps CE-only behavior.",
+    )
+    parser.add_argument(
+        "--routed_contrast_temperature",
+        type=float,
+        default=0.2,
+        help="Temperature used by routed-node contrastive ablations.",
+    )
+    parser.add_argument(
+        "--routed_contrast_frozen_path",
+        type=str,
+        default="",
+        help=(
+            "Optional frozen semantic embedding tensor aligned to graph rows for routed contrast. "
+            "When omitted, graph_detector_prepare falls back to the resolved base embedding tensor. "
+            "three_view_control uses this only as a stop-grad teacher."
+        ),
+    )
+    parser.add_argument(
+        "--routed_highpass_mode",
+        type=str,
+        default="off",
+        choices=["off", "low_only", "high_only", "adaptive"],
+        help=(
+            "Enable routed-only high-pass correction. "
+            "`low_only` uses supportive low-pass aggregation, `high_only` uses residual high-pass aggregation, "
+            "and `adaptive` learns a self/low/high gate. This is full-batch only and requires --routed_nodes_path."
+        ),
+    )
+    parser.add_argument(
+        "--routed_highpass_target",
+        type=str,
+        default="logits",
+        choices=["logits", "x_high"],
+        help=(
+            "Representation target for routed high-pass correction. `logits` preserves the legacy post-detector "
+            "delta-logit correction; `x_high` repairs the HyperScan high-order branch before cross-attention."
+        ),
+    )
+    parser.add_argument(
+        "--routed_highpass_candidate_scope",
+        type=str,
+        default="relation_1hop",
+        choices=["relation_1hop", "relation_1hop_plus_xnew_knn"],
+        help=(
+            "Candidate neighbor source for routed high-pass correction. "
+            "`relation_1hop` uses relation-supported one-hop neighbors; "
+            "`relation_1hop_plus_xnew_knn` ranks relation one-hop candidates by forward-native x_new similarity."
+        ),
+    )
+    parser.add_argument(
+        "--routed_highpass_max_neighbors",
+        type=int,
+        default=32,
+        help="Maximum candidates retained per routed node for high-pass correction.",
+    )
+    parser.add_argument(
+        "--routed_highpass_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for routed-node supervised CE in high-pass correction.",
+    )
+    parser.add_argument(
+        "--routed_highpass_preserve_weight",
+        type=float,
+        default=0.2,
+        help="KL preservation weight that keeps non-routed train nodes close to base logits.",
+    )
+    parser.add_argument(
+        "--routed_highpass_risk_gate_weight",
+        type=float,
+        default=0.5,
+        help="BCE weight for conformal-risk/routed-mask supervision on the high-pass gate.",
+    )
+    parser.add_argument(
+        "--routed_highpass_edge_role_weight",
+        type=float,
+        default=0.1,
+        help="Weight for labeled-labeled edge-role supervision: same-label -> low-pass, different-label -> high-pass.",
+    )
+    parser.add_argument(
+        "--routed_highpass_risk_path",
+        type=str,
+        default="",
+        help=(
+            "Optional full-graph risk vector payload containing risk_score/router_score/abstain_risk. "
+            "Risk supervises correction/high-pass utility, not bot probability."
+        ),
     )
     parser.add_argument(
         "--local_conf_disable_degree_guard",
@@ -1357,6 +1708,9 @@ def parser_args(argv=None):
         help=(
             "Optional refiner-only semantic override for joint_router_refinement. "
             "Keeps graph_detector_prepare backbone features unchanged and only replaces the joint refiner semantic source. "
+            "This is the public routed-node evidence upgrade surface: under "
+            "--joint_routing_protocol frozen_router_reuse it keeps router-side node selection fixed "
+            "and does not change KNN or router-side routing decisions. "
             "Accepts either a plain [num_nodes, d] tensor, a prompt-cache payload with ego/hop1/hop2 tensors, "
             "or a prompt-expert bundle payload with ego/graph_following/graph_follower/tweet/conflict/metadata_structured components."
         ),
@@ -1369,7 +1723,8 @@ def parser_args(argv=None):
         help=(
             "Routing protocol for joint_router_refinement. "
             "'joint_train' keeps the current jointly trained router+refiner path; "
-            "'frozen_router_reuse' freezes the router and reuses a prior joint_router_refinement routing artifact."
+            "'frozen_router_reuse' freezes the router and reuses a prior joint_router_refinement routing artifact, "
+            "and is the preferred fixed-router path when comparing routed-node LLM evidence/classifier upgrades."
         ),
     )
     parser.add_argument(
@@ -1521,25 +1876,32 @@ def parser_args(argv=None):
     parser.add_argument(
         "--conformal_knn_repr_source",
         type=str,
-        default="node_repr",
-        choices=["node_repr", "x_low", "x_new"],
+        default="x_new",
+        choices=["fused_x", "node_repr", "x_low", "x_new", "x_high"],
         help=(
             "Representation space used by --estimator_mode conformal_knn_risk_router. "
-            "`node_repr` keeps the frozen GNN output; `x_low` treats that relation-view output as "
-            "the HyperScan low view; `x_new` concatenates x_low with the frozen G0 input features."
+            "`fused_x` is the preferred explicit final detector hidden space; "
+            "`node_repr` is the legacy alias for that same hidden and is only a non-HyperScan control space; "
+            "`x_low` treats that relation-view output as the HyperScan low view; "
+            "`x_new` consumes exported cat(x_low, input features) and is the default HyperScan-aligned support space; "
+            "`x_high` consumes the exported HGNN high-order branch before detector fusion. "
+            "Older artifacts that do not export x_new must be regenerated or used only in explicit legacy controls."
         ),
     )
     parser.add_argument(
         "--conformal_knn_learning_mode",
         type=str,
         default="fixed",
-        choices=["fixed", "ncp_local"],
+        choices=["fixed", "ncp_local", "learned_logistic"],
         help=(
             "Risk-fusion mode for conformal_knn_risk_router. `fixed` preserves the "
             "validation-selected fixed score families; `ncp_local` uses KNN neighborhood "
             "calibration samples with exp(-distance/lambda_L) weights to compute local "
             "conformal features, then selects among nonparametric NCP-local score families "
-            "on the tune split by AUPRC-error first, without fitting a logistic head."
+            "on the tune split by AUPRC-error first, without fitting a logistic head; "
+            "`learned_logistic` fits a balanced logistic residual-risk scorer over the "
+            "structured target+KNN feature bundle on train labels and uses it only for "
+            "target-node risk ranking."
         ),
     )
     parser.add_argument(

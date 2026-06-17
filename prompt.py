@@ -70,51 +70,70 @@ def _summary_generation_system(prompt_style="default"):
             "Do not invent missing evidence."
         )
     return (
-        "You are an analyst for social-media bot detection. "
+        "You are analyzing one evidence view for social-media bot detection. "
         "Use only the provided evidence from the current view. "
-        "Fill the requested schema with source-grounded cues. "
-        "Do not give a final account-level label, score, or recommendation."
+        "Write the response with the requested analytic template. "
+        "After summarizing the evidence, give a final view-level bot/human judgment supported by that explanation only. "
+        "Do not give a score or recommendation."
     )
 
 
 def _evidence_card_generation_system():
     return (
         "You extract source-grounded evidence cards for social-media bot detection. "
-        "Separate suspicious cues, organic cues, ambiguity, and benign explanations. "
-        "Do not output a final account-level label, probability, confidence score, or recommendation."
+        "Separate bot-like evidence, human-like evidence, ambiguity, and benign explanations. "
+        "After completing the evidence card, give a final view-level bot/human judgment. "
+        "Do not output probabilities, confidence scores, or recommendations."
     )
 
 
 def _summary_prompt_rules():
     return [
-        "Return only the requested fields in the given order.",
-        "Use short bullet phrases under the evidence fields; if a field has no evidence, write '- None observed'.",
-        "Assess only this view and do not output a final account-level label, score, or recommendation.",
+        "Return only the requested sections in the given order.",
+        "Use short evidence-grounded bullet phrases; if a section has no evidence, write '- None observed'.",
+        "Assess only this view, then give a final view-level bot/human judgment from the completed explanation.",
         "Make uncertainty explicit when the evidence is sparse, mixed, or explainable by benign behavior.",
-        "Set LOCAL_LEANING to exactly one of: bot_like | human_like | inconclusive.",
-        "Write RATIONALE as 1-2 short evidence-grounded sentences about this view only.",
+        "Set View Leaning to exactly one of: bot-like | human-like | inconclusive.",
+        "Write Rationale as 1-2 short evidence-grounded sentences about this view only.",
+        "Judgement must be exactly one of: bot | human.",
     ]
 
 
 def _summary_output_fields():
     return [
-        "OUTPUT_FIELDS:",
-        "OBSERVED_SUSPICIOUS_CUES:",
-        "OBSERVED_ORGANIC_OR_BENIGN_CUES:",
-        "AMBIGUITY_OR_MISSING_EVIDENCE:",
-        "LOCAL_LEANING: bot_like | human_like | inconclusive",
-        "RATIONALE:",
+        "Response Template:",
+        "Bot-like Evidence:",
+        "Human-like Evidence:",
+        "Uncertainty:",
+        "View Leaning: bot-like | human-like | inconclusive",
+        "Rationale:",
+        "Judgement: bot | human",
     ]
 
 
 def _evidence_card_prompt_rules():
     return [
-        "Return only the requested evidence-card fields.",
+        "Return only the requested evidence-card sections.",
         "Use short bullet phrases grounded in the provided profile, tweets, and directed neighbors.",
-        "Do not output a final account-level label, probability, confidence score, recommendation, or model-correction instruction.",
+        "Do not output probabilities, confidence scores, recommendations, or model-correction instructions.",
         "Do not mention false positives, false negatives, base models, or whether a downstream model should change its prediction.",
-        "Separate observed bot-like cues, human-like cues, relation ambiguity, possible benign explanations, evidence coverage, evidence consistency, and source support.",
+        "Separate bot-like evidence, human-like evidence, relational ambiguity, benign explanations, evidence coverage, evidence consistency, and source support.",
         "If evidence is sparse, noisy, ambiguous, or explainable by benign social behavior, state that explicitly.",
+        "Judgement must be exactly one of: bot | human.",
+    ]
+
+
+def _evidence_card_output_fields():
+    return [
+        "Response Template:",
+        "Bot-like Evidence:",
+        "Human-like Evidence:",
+        "Relational Ambiguity:",
+        "Benign Explanation:",
+        "Evidence Coverage: rich | partial | sparse",
+        "Evidence Consistency: consistent | mixed | conflicting",
+        "Source Support: strong | partial | weak",
+        "Judgement: bot | human",
     ]
 
 
@@ -140,6 +159,10 @@ def _mhlgc_llm_guide_prompt(
     node_id,
     original_view,
     hypergraph_view,
+    following_view=None,
+    follower_view=None,
+    mutual_view=None,
+    semantic_knn_view=None,
     target_text="",
     role="borderline_anchor",
 ):
@@ -159,6 +182,10 @@ def _mhlgc_llm_guide_prompt(
         "target_text": _compact_whitespace(target_text),
         "original_relation_view": original_view if original_view is not None else {},
         "hypergraph_view": hypergraph_view if hypergraph_view is not None else {},
+        "following_view": following_view if following_view is not None else {},
+        "follower_view": follower_view if follower_view is not None else {},
+        "mutual_view": mutual_view if mutual_view is not None else {},
+        "semantic_knn_view": semantic_knn_view if semantic_knn_view is not None else {},
     }
     system = "Instruction"
     user = "\n".join(
@@ -191,11 +218,25 @@ def _mhlgc_llm_guide_prompt(
     }
 
 
-def _mhlgc_semantic_embedding_prompt(node_id, original_view, hypergraph_view, target_text="", role="borderline_anchor"):
+def _mhlgc_semantic_embedding_prompt(
+    node_id,
+    original_view,
+    hypergraph_view,
+    following_view=None,
+    follower_view=None,
+    mutual_view=None,
+    semantic_knn_view=None,
+    target_text="",
+    role="borderline_anchor",
+):
     prompt = _mhlgc_llm_guide_prompt(
         node_id=node_id,
         original_view=original_view,
         hypergraph_view=hypergraph_view,
+        following_view=following_view,
+        follower_view=follower_view,
+        mutual_view=mutual_view,
+        semantic_knn_view=semantic_knn_view,
         target_text=target_text,
         role=role,
     )
@@ -204,6 +245,30 @@ def _mhlgc_semantic_embedding_prompt(node_id, original_view, hypergraph_view, ta
 
 def _glance_bot_detection_header():
     return "Instruct: Predict the node's category for social bot detection from the provided context. Possible categories: human, bot."
+
+
+def _as_prompt_items(items):
+    return list(items) if items else ["- none available"]
+
+
+def _lowercase_section_block(text, replacements=None):
+    if not isinstance(text, str):
+        return ""
+    replacements = replacements or {}
+    lines = []
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        lines.append(replacements.get(stripped, line))
+    return "\n".join(lines).strip()
+
+
+def _tweet_samples_for_embedding(tweet_samples_block):
+    return _lowercase_section_block(
+        tweet_samples_block,
+        replacements={
+            "TWEET_SAMPLES:": "sample tweets:",
+        },
+    )
 
 
 def _botsay_label_explanation_fields():
@@ -254,16 +319,7 @@ def _tweet_explain_generation_prompt(
                     *(_botsay_label_explanation_fields() if botsay else _summary_output_fields()),
                 ]
                 if not structured
-                else [
-                    "OUTPUT_FIELDS:",
-                    "OBSERVED_BOT_LIKE_CUES:",
-                    "OBSERVED_HUMAN_LIKE_CUES:",
-                    "RELATION_AMBIGUITY:",
-                    "POSSIBLE_BENIGN_EXPLANATION:",
-                    "EVIDENCE_COVERAGE: rich | partial | sparse",
-                    "EVIDENCE_CONSISTENCY: consistent | mixed | conflicting",
-                    "SUPPORTED_BY_SOURCE: yes | partly | weak",
-                ]
+                else _evidence_card_output_fields()
             ),
         ]
     )
@@ -339,16 +395,7 @@ def _graph_explain_generation_prompt(
                     *(_botsay_label_explanation_fields() if botsay else _summary_output_fields()),
                 ]
                 if not structured
-                else [
-                    "OUTPUT_FIELDS:",
-                    "OBSERVED_BOT_LIKE_CUES:",
-                    "OBSERVED_HUMAN_LIKE_CUES:",
-                    "RELATION_AMBIGUITY:",
-                    "POSSIBLE_BENIGN_EXPLANATION:",
-                    "EVIDENCE_COVERAGE: rich | partial | sparse",
-                    "EVIDENCE_CONSISTENCY: consistent | mixed | conflicting",
-                    "SUPPORTED_BY_SOURCE: yes | partly | weak",
-                ]
+                else _evidence_card_output_fields()
             ),
         ]
     )
@@ -407,16 +454,7 @@ def _conflict_explain_generation_prompt(
                     *(_botsay_label_explanation_fields() if botsay else _summary_output_fields()),
                 ]
                 if not structured
-                else [
-                    "OUTPUT_FIELDS:",
-                    "OBSERVED_BOT_LIKE_CUES:",
-                    "OBSERVED_HUMAN_LIKE_CUES:",
-                    "RELATION_AMBIGUITY:",
-                    "POSSIBLE_BENIGN_EXPLANATION:",
-                    "EVIDENCE_COVERAGE: rich | partial | sparse",
-                    "EVIDENCE_CONSISTENCY: consistent | mixed | conflicting",
-                    "SUPPORTED_BY_SOURCE: yes | partly | weak",
-                ]
+                else _evidence_card_output_fields()
             ),
         ]
     )
@@ -458,16 +496,7 @@ def _ego_explain_generation_prompt(profile_card, evidence_schema="summary", prom
                     *(_botsay_label_explanation_fields() if botsay else _summary_output_fields()),
                 ]
                 if not structured
-                else [
-                    "OUTPUT_FIELDS:",
-                    "OBSERVED_BOT_LIKE_CUES:",
-                    "OBSERVED_HUMAN_LIKE_CUES:",
-                    "RELATION_AMBIGUITY:",
-                    "POSSIBLE_BENIGN_EXPLANATION:",
-                    "EVIDENCE_COVERAGE: rich | partial | sparse",
-                    "EVIDENCE_CONSISTENCY: consistent | mixed | conflicting",
-                    "SUPPORTED_BY_SOURCE: yes | partly | weak",
-                ]
+                else _evidence_card_output_fields()
             ),
         ]
     )
@@ -479,19 +508,30 @@ def _ego_explain_generation_prompt(profile_card, evidence_schema="summary", prom
 
 
 def _graph_prompt(direction_name, ego_profile_brief, neighbor_cards, total_count, reciprocal_count):
-    header = _glance_bot_detection_header()
-    hop_label = "HOP1_FOLLOWING" if direction_name == "following" else "HOP1_FOLLOWER"
+    if direction_name == "following":
+        instruct = (
+            "Instruct: create an embedding of the accounts this target account follows for social bot detection. "
+            "Focus on social role, topical affinity, coordination, promotion, and benign uncertainty."
+        )
+        neighbor_heading = "accounts followed by the target account:"
+    else:
+        instruct = (
+            "Instruct: create an embedding of the accounts that follow this target account for social bot detection. "
+            "Focus on audience type, credibility, amplification patterns, and benign uncertainty."
+        )
+        neighbor_heading = "accounts following the target account:"
     query = "\n".join(
         [
             "Query:",
-            "EGO:",
+            "target account:",
             ego_profile_brief,
-            f"{hop_label}:",
-            *(neighbor_cards or ["- None"]),
-            "Category? </END>",
+            neighbor_heading,
+            *_as_prompt_items(neighbor_cards),
+            "Use this view to encode the social-neighborhood evidence, not to output a label.",
+            "</END>",
         ]
     )
-    return f"{header}\n{query}"
+    return f"{instruct}\n{query}"
 
 
 def _graph_prompt_partitioned(
@@ -507,38 +547,32 @@ def _graph_prompt_partitioned(
     mean_sim_contrast,
     reciprocal_ratio_selected,
 ):
-    heading_prefix = "FOLLOWING" if direction_name == "following" else "FOLLOWER"
     if direction_name == "following":
         instruct = (
-            "Instruct: Encode who this account chooses to follow, separating supportive neighbors from contrasting "
-            "neighbors to capture social role, coordination, fandom, promotion, or organic behavior."
+            "Instruct: create an embedding of the followee-side social evidence for social bot detection. "
+            "Focus on who the target account chooses to follow, whether those accounts look topically aligned or contrasting, "
+            "and whether the pattern suggests organic interest, promotion, coordination, or ambiguity."
         )
+        support_heading = "similar accounts followed by the target account:"
+        contrast_heading = "contrasting accounts followed by the target account:"
     else:
         instruct = (
-            "Instruct: Encode who follows this account, separating supportive neighbors from contrasting neighbors "
-            "to capture audience type, credibility, coordination, or suspicious amplification."
+            "Instruct: create an embedding of the follower-side audience evidence for social bot detection. "
+            "Focus on the target account, the accounts that follow it, and whether the audience looks organic, coordinated, "
+            "promotional, or ambiguous."
         )
-    social_hints = [
-        f"count_{direction_name}: {int(total_count)}",
-        f"candidate_count_{direction_name}: {int(candidate_count)}",
-        f"selected_count_{direction_name}: {int(selected_count)}",
-        f"has_{direction_name}: {_format_bool(total_count > 0)}",
-        f"reciprocal_{direction_name}_count: {int(reciprocal_count)}",
-        f"mean_sim_{direction_name}_support: {float(mean_sim_support):.4f}",
-        f"mean_sim_{direction_name}_contrast: {float(mean_sim_contrast):.4f}",
-        f"reciprocal_ratio_{direction_name}_selected: {float(reciprocal_ratio_selected):.4f}",
-    ]
+        support_heading = "similar accounts following the target account:"
+        contrast_heading = "contrasting accounts following the target account:"
     query = "\n".join(
         [
             "Query:",
-            "EGO_PROFILE_BRIEF:",
+            "target account:",
             ego_profile_brief,
-            f"{heading_prefix}_SUPPORT:",
-            *(support_cards or ["- None"]),
-            f"{heading_prefix}_CONTRAST:",
-            *(contrast_cards or ["- None"]),
-            "SOCIAL_HINTS:",
-            *social_hints,
+            support_heading,
+            *_as_prompt_items(support_cards),
+            contrast_heading,
+            *_as_prompt_items(contrast_cards),
+            "Use this view to encode social context, relation-aware similarity, contrast, and uncertainty.",
             "</END>",
         ]
     )
@@ -546,16 +580,19 @@ def _graph_prompt_partitioned(
 
 
 def _tweet_prompt(profile_brief, tweet_behavior_summary, tweet_samples_block):
-    instruct = "Instruct: Encode the posting behavior of the account for downstream bot detection."
+    instruct = (
+        "Instruct: create an embedding of the target account's posting behavior for social bot detection. "
+        "Focus on topic consistency, conversationality, repetition, promotion, automation cues, and benign uncertainty."
+    )
     query = "\n".join(
         [
             "Query:",
-            "PROFILE_BRIEF:",
+            "target account:",
             profile_brief,
-            "TWEET_BEHAVIOR_SUMMARY:",
+            "posting behavior:",
             tweet_behavior_summary,
-            tweet_samples_block,
-            "Focus on topical consistency, conversationality, promotion intensity, repetition, and automation cues.",
+            _tweet_samples_for_embedding(tweet_samples_block),
+            "Use this view to encode posting style and content evidence, not to output a label.",
             "</END>",
         ]
     )
@@ -587,22 +624,25 @@ def _ego_botsay_tweet_metadata_prompt(profile_card, tweet_behavior_summary, twee
 
 
 def _conflict_prompt(profile_card, tweet_card_summary, tweet_samples_block, following_cards, follower_cards, mismatch_hints):
-    instruct = "Instruct: Encode cross-view consistency and inconsistency cues for bot detection."
+    instruct = (
+        "Instruct: create an embedding of cross-view consistency for social bot detection. "
+        "Compare the target account profile, posting behavior, accounts it follows, and accounts following it."
+    )
     query = "\n".join(
         [
             "Query:",
-            "PROFILE_CARD:",
+            "target account:",
             profile_card,
-            "TWEET_CARD:",
+            "posting behavior:",
             tweet_card_summary,
-            tweet_samples_block,
-            "GRAPH_CARD_FOLLOWING:",
-            *(following_cards or ["- None"]),
-            "GRAPH_CARD_FOLLOWER:",
-            *(follower_cards or ["- None"]),
-            "MISMATCH_HINTS:",
-            *(mismatch_hints or ["- None"]),
-            "Focus on whether the profile, posting behavior, and social neighborhood support or contradict each other.",
+            _tweet_samples_for_embedding(tweet_samples_block),
+            "accounts followed by the target account:",
+            *_as_prompt_items(following_cards),
+            "accounts following the target account:",
+            *_as_prompt_items(follower_cards),
+            "cross-view consistency notes:",
+            *_as_prompt_items(mismatch_hints),
+            "Use this view to encode whether the profile, posts, and social neighborhood support or contradict each other.",
             "</END>",
         ]
     )
@@ -619,26 +659,29 @@ def _conflict_prompt_partitioned(
     follower_contrast_cards,
     mismatch_hints,
 ):
-    instruct = "Instruct: Encode cross-view consistency and inconsistency cues for bot detection."
+    instruct = (
+        "Instruct: create an embedding of cross-view consistency for social bot detection. "
+        "Compare the target account profile, posting behavior, followee evidence, follower evidence, and relation-aware contrasts."
+    )
     query = "\n".join(
         [
             "Query:",
-            "PROFILE_CARD:",
+            "target account:",
             profile_card,
-            "TWEET_CARD:",
+            "posting behavior:",
             tweet_card_summary,
-            tweet_samples_block,
-            "FOLLOWING_SUPPORT:",
-            *(following_support_cards or ["- None"]),
-            "FOLLOWING_CONTRAST:",
-            *(following_contrast_cards or ["- None"]),
-            "FOLLOWER_SUPPORT:",
-            *(follower_support_cards or ["- None"]),
-            "FOLLOWER_CONTRAST:",
-            *(follower_contrast_cards or ["- None"]),
-            "MISMATCH_HINTS:",
-            *(mismatch_hints or ["- None"]),
-            "Focus on whether the profile, posting behavior, and relation-aware support/contrast neighborhoods support or contradict each other.",
+            _tweet_samples_for_embedding(tweet_samples_block),
+            "similar accounts followed by the target account:",
+            *_as_prompt_items(following_support_cards),
+            "contrasting accounts followed by the target account:",
+            *_as_prompt_items(following_contrast_cards),
+            "similar accounts following the target account:",
+            *_as_prompt_items(follower_support_cards),
+            "contrasting accounts following the target account:",
+            *_as_prompt_items(follower_contrast_cards),
+            "cross-view consistency notes:",
+            *_as_prompt_items(mismatch_hints),
+            "Use this view to encode consistency, contradiction, and uncertainty across profile, posts, and social context.",
             "</END>",
         ]
     )

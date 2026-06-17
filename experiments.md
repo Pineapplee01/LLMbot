@@ -57,6 +57,270 @@ Do not create a second timestamped clone for reruns.
 
 ## Experiment Registry
 
+### botsay_knn_nodeidless_test_20260614
+
+- Status: completed on server.
+- Scope:
+  routed-test-only two-stage diagnostic for
+  `botsay_knn_summary_predictor_v1` after removing graph-global `Node id` from
+  the visible final prediction prompt.
+- Boundary:
+  - this is a routed-node LLM-as-predictor diagnostic, not a graph detector
+    training run
+  - routed target nodes are fixed before any LLM call; the LLM does not choose
+    routed nodes or KNN support accounts
+  - support accounts are fixed by target-centered KNN over frozen SimTeG
+    `iter_-1` full-graph `node_repr`
+  - final visible prompts contain no `Node id:` field; graph-global node ids are
+    retained only in sidecar rows for auditing
+  - prompt quality check passed: `296` final prompts, `0` `Node id:` hits,
+    `0` `<think>` / `Thinking Process` hits, and `0`
+    `Account summary: Account summary:` duplicates
+  - the first full `precompute.py` run completed all support-account summaries
+    but OOMed while encoding the final predictor prompt cache with Qwen3.5 on
+    GPU0; the final prediction prompts were therefore rebuilt from the completed
+    summary sidecar by replaying the same KNN support selection and
+    `_attach_botsay_knn_neighbor_summaries` prompt-construction logic
+- Code / prompt contract:
+  - `precompute.py --prompt_mode botsay_knn_summary_predictor_v1`
+  - support summary prompt:
+    label-free account summary over `norm_user_text_new` plus relation and
+    semantic-similarity metadata
+  - final predictor prompt:
+    target `norm_user_text_new` plus support summaries ordered by KNN
+    similarity from highest to lowest; output is exactly one token,
+    `Yes` for bot or `No` for human
+- Input artifacts:
+  - routed nodes:
+    `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_fullgraph_iterm1_budget_seed1_20260531_test_only.json`
+    (`test=296`)
+  - selection embedding:
+    `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_node_repr_seed1.pt`
+  - text:
+    `/root/workspace/LMbot/datasets/TwiBot-20/norm_user_text_new.json`
+  - graph:
+    `/root/workspace/LMbot/datasets/TwiBot-20/edge_index_new.pt`
+    and `/root/workspace/LMbot/datasets/TwiBot-20/edge_type_new.pt`
+  - labels:
+    `/root/workspace/LMbot/datasets/TwiBot-20/labels.pt`
+- Model / environment:
+  - `/root/workspace/LMbot/hf_models/Qwen3.5-9B`
+  - `Qwen` conda environment
+  - `PYTHONPATH=/root/workspace/LMbot/transformers_qwen35_src`
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614`
+- Artifacts:
+  - support summaries:
+    `botsay_knn_summary_predictor_v1_nodeidless_test_qwen35_botsay_knn_neighbor_summary_explanations.jsonl`
+    (`1480` rows)
+  - recovered support metadata:
+    `botsay_knn_summary_predictor_v1_nodeidless_test_qwen35_botsay_knn_neighbor_summary_recovered_metadata.jsonl`
+    (`1480` rows)
+  - final prompts:
+    `botsay_knn_summary_predictor_v1_nodeidless_test_qwen35_prompts.jsonl`
+    (`296` rows)
+  - final predictions:
+    `stage2_qwen35_predictions.jsonl` (`296` rows)
+  - final metrics:
+    `stage2_qwen35_metrics.json`
+- Stage-1 command:
+
+```bash
+cd /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614
+PYTHONPATH=/root/workspace/LMbot/transformers_qwen35_src:$PYTHONPATH \
+python precompute.py \
+  --dataset TwiBot-20 \
+  --prompt_mode botsay_knn_summary_predictor_v1 \
+  --neighbor_sampling_policy center_induced_relation_aware \
+  --context_graph_variant full_graph_support \
+  --selection_embedding_path /root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_node_repr_seed1.pt \
+  --neighbor_cap 5 \
+  --routed_nodes_path /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_fullgraph_iterm1_budget_seed1_20260531_test_only.json \
+  --routed_nodes_split test \
+  --explain_model_path /root/workspace/LMbot/hf_models/Qwen3.5-9B \
+  --model_path /root/workspace/LMbot/hf_models/Qwen3.5-9B \
+  --embedding_model_class causal_lm \
+  --embedding_pooling_mode causal_last_hidden_last_token \
+  --max_length_hop 4096 \
+  --explain_batch_size 2 \
+  --explain_max_new_tokens 64 \
+  --explain_required \
+  --explain_trust_remote_code \
+  --trust_remote_code \
+  --overwrite \
+  --device cuda:0 \
+  --disable_wandb \
+  --output_path /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614/botsay_knn_summary_predictor_v1_nodeidless_test_qwen35.pt
+```
+
+- Recovery command after prompt-cache OOM:
+
+```bash
+python /root/workspace/LMbot/build_botsay_knn_prompts_from_summaries.py \
+  --repo_root /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614 \
+  --summary_jsonl /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614/botsay_knn_summary_predictor_v1_nodeidless_test_qwen35_botsay_knn_neighbor_summary_explanations.jsonl \
+  --routed_nodes_json /root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_fullgraph_iterm1_budget_seed1_20260531_test_only.json \
+  --norm_user_text_json /root/workspace/LMbot/datasets/TwiBot-20/norm_user_text_new.json \
+  --edge_index_path /root/workspace/LMbot/datasets/TwiBot-20/edge_index_new.pt \
+  --edge_type_path /root/workspace/LMbot/datasets/TwiBot-20/edge_type_new.pt \
+  --selection_embedding_path /root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_node_repr_seed1.pt \
+  --output_prompts_jsonl /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614/botsay_knn_summary_predictor_v1_nodeidless_test_qwen35_prompts.jsonl \
+  --output_metadata_jsonl /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614/botsay_knn_summary_predictor_v1_nodeidless_test_qwen35_botsay_knn_neighbor_summary_recovered_metadata.jsonl \
+  --neighbor_cap 5
+```
+
+- Stage-2 command:
+
+```bash
+PYTHONPATH=/root/workspace/LMbot/transformers_qwen35_src:$PYTHONPATH \
+python /root/workspace/LMbot/run_botsay_knn_stage2_predict.py \
+  --prompts_jsonl /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614/botsay_knn_summary_predictor_v1_nodeidless_test_qwen35_prompts.jsonl \
+  --labels_path /root/workspace/LMbot/datasets/TwiBot-20/labels.pt \
+  --model_path /root/workspace/LMbot/hf_models/Qwen3.5-9B \
+  --output_jsonl /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614/stage2_qwen35_predictions.jsonl \
+  --metrics_json /root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_nodeidless_test_20260614/stage2_qwen35_metrics.json \
+  --device cuda:1 \
+  --max_input_length 4096 \
+  --max_new_tokens 8 \
+  --trust_remote_code
+```
+
+- Metrics on the fixed routed test nodes:
+
+| count | parse ok | Acc | Macro-F1 | Human-F1 | Bot-F1 | TN | FP | FN | TP |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 296 | 296 | `0.4864864865` | `0.4856411194` | `0.5064935065` | `0.4647887324` | 78 | 40 | 112 | 66 |
+
+- Interpretation boundary:
+  The two-stage KNN-summary plus direct Qwen3.5 Yes/No predictor is fully
+  runnable and parser-stable after removing visible node ids, but it performs
+  poorly on this fixed routed-test set and strongly under-recovers bot nodes
+  (`FN=112`). This is negative evidence for using unfine-tuned Qwen3.5 as a
+  direct routed-node classifier over frozen-SimTeG KNN support summaries. It
+  does not invalidate the prompt as an evidence-generation surface, but it
+  argues against treating this zero-shot LLM predictor as a competitive
+  downstream detector without calibration, answer-token finetuning, or a
+  selective/defer mechanism.
+
+### twibot22_sampled__roberta_rgcn__seed1_smoke
+
+- Status: pending launch.
+- Scope: bounded smoke for the prepared `TwiBot-22-sampled` dataset through the
+  current `LLMbot` mainline, before the first full baseline run.
+- Boundary:
+  - reuses the prepared dataset contract only; no raw `TwiBot-22` codepath is
+    introduced into `LLMbot`
+  - dataset root:
+    `/root/workspace/LMbot/datasets/TwiBot-22-sampled`
+  - prepared manifest:
+    `/root/workspace/LMbot/datasets/TwiBot-22-sampled/prepare_manifest.json`
+  - sampled scale:
+    `11826` users with split `train=8278 / val=2365 / test=1183`
+  - stage 1 uses `semantic_encoder_finetune --semantic_encoder roberta`
+  - stage 2 uses `graph_detector_prepare --graph_backbone rgcn`
+  - no method/code change is required if the prepared dataset is readable
+  - runtime split by environment:
+    - semantic stage in `Qwen` because that env has working
+      `torch + transformers + roberta-base`
+    - graph stage in `lmbot` because that env owns the graph runtime
+  - this is an operator/runtime validation run, not a research claim run
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/twibot22_sampled__roberta_rgcn__seed1_smoke`
+- Planned logs:
+  - semantic:
+    `/root/workspace/LMbot/LLMbot/server_logs/twibot22_sampled__roberta_rgcn__seed1_smoke__semantic.log`
+  - graph:
+    `/root/workspace/LMbot/LLMbot/server_logs/twibot22_sampled__roberta_rgcn__seed1_smoke__graph.log`
+- Planned commands:
+  1. `semantic_encoder_finetune` with
+     `--lm_batch_size 8 --semantic_train_limit 256 --semantic_max_steps 10`
+  2. `graph_detector_prepare` with
+     `--embedding_path <semantic_stage>/embeddings.pt --graph_detector_epochs 1`
+
+### twibot22_sampled__roberta_rgcn__seed1
+
+- Status: pending launch.
+- Scope: first full baseline on the sampled `TwiBot-22` prepared dataset.
+- Boundary:
+  - reuses the same prepared dataset contract as the smoke run:
+    `/root/workspace/LMbot/datasets/TwiBot-22-sampled`
+  - current `LLMbot` loader already resolves this dataset directly; no dataset
+    mainline patch is required for the first run
+  - stage order is explicit:
+    1. `semantic_encoder_finetune --semantic_encoder roberta`
+    2. `graph_detector_prepare --graph_backbone rgcn --embedding_path <stage1 embeddings.pt>`
+  - semantic stage runs in `Qwen`; graph stage runs in `lmbot`
+  - this is the initial sampled-dataset baseline, not yet a comparison claim
+    against `TwiBot-20` or prior papers
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/twibot22_sampled__roberta_rgcn__seed1`
+- Planned stage roots:
+  - semantic:
+    `/root/workspace/LMbot/LLMbot/experiments/twibot22_sampled__roberta_rgcn__seed1/seed_1/preparation/semantic_encoder`
+  - graph:
+    `/root/workspace/LMbot/LLMbot/experiments/twibot22_sampled__roberta_rgcn__seed1/seed_1/preparation/graph_detector`
+- Planned logs:
+  - semantic:
+    `/root/workspace/LMbot/LLMbot/server_logs/twibot22_sampled__roberta_rgcn__seed1__semantic.log`
+  - graph:
+    `/root/workspace/LMbot/LLMbot/server_logs/twibot22_sampled__roberta_rgcn__seed1__graph.log`
+- Planned comparable settings:
+  - dataset: `TwiBot-22-sampled`
+  - seed: `1`
+  - semantic encoder: `roberta`
+  - graph backbone: `rgcn`
+  - `--disable_wandb`
+  - explicit `--embedding_path` from the completed semantic stage
+  - keep the sampled split fixed to the prepared manifest
+
+### twibot22_robust_v1__roberta_rgcn__seed1
+
+- Status: launched on server.
+- Scope: first full baseline on the `TwiBot-22-sampled-robust-v1` prepared
+  dataset through the current `LLMbot` mainline.
+- Boundary:
+  - canonical server dataset path remains:
+    `/root/workspace/LMbot/datasets/TwiBot-22-sampled`
+  - as of `2026-06-14`, that canonical path is a symlink to:
+    `/root/workspace/LMbot/datasets/TwiBot-22-sampled-robust-v1`
+  - the pre-robust dataset directory was preserved at:
+    `/root/workspace/LMbot/datasets/TwiBot-22-sampled_pre_robust_v1_backup_20260614`
+  - prepared manifest:
+    `/root/workspace/LMbot/datasets/TwiBot-22-sampled/prepare_manifest.json`
+  - protocol:
+    `twibot22_sampled_robust_v1_to_llmbot_prepared_v1`
+  - sampled scale:
+    `11826` users with split `train=8278 / val=2365 / test=1183`
+  - label counts:
+    `human=10171 / bot=1655`
+  - stage order is explicit:
+    1. `semantic_encoder_finetune --semantic_encoder roberta`
+    2. `graph_detector_prepare --graph_backbone rgcn --embedding_path <stage1 embeddings.pt>`
+  - semantic stage runs in `Qwen`; graph stage runs in `lmbot`
+  - this is the robust-v1 baseline run, not yet a paper-facing comparison claim
+    against `TwiBot-20` or prior papers
+- Artifact root:
+  `/root/workspace/LMbot/LLMbot/experiments/twibot22_robust_v1__roberta_rgcn__seed1`
+- Stage roots:
+  - semantic:
+    `/root/workspace/LMbot/LLMbot/experiments/twibot22_robust_v1__roberta_rgcn__seed1/seed_1/preparation/semantic_encoder`
+  - graph:
+    `/root/workspace/LMbot/LLMbot/experiments/twibot22_robust_v1__roberta_rgcn__seed1/seed_1/preparation/graph_detector`
+- Logs:
+  - master:
+    `/root/workspace/LMbot/LLMbot/server_logs/twibot22_robust_v1__roberta_rgcn__seed1.master.log`
+  - semantic:
+    `/root/workspace/LMbot/LLMbot/server_logs/twibot22_robust_v1__roberta_rgcn__seed1__semantic.log`
+  - graph:
+    `/root/workspace/LMbot/LLMbot/server_logs/twibot22_robust_v1__roberta_rgcn__seed1__graph.log`
+- Command contract:
+  - dataset: `TwiBot-22-sampled`
+  - seed: `1`
+  - semantic encoder: `roberta`
+  - graph backbone: `rgcn`
+  - `--disable_wandb`
+  - graph stage consumes the completed semantic `embeddings.pt`
+
 ### dgp__v2_strict_answer_token__highbase_routed_ctxfull__seed1
 
 - Status: pending launch.
@@ -4125,3 +4389,1228 @@ CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python main.py \
   residual dynamic branch and the no-dynamic NeighborLoader control. This
   supports testing the paper detector in longer/multi-seed HyperScan-style
   runs, but does not by itself establish a claim-grade reproduction.
+
+
+### mhlgc__diag_budget050_ncp_local_xnew__seed1
+
+- Status: pending server launch.
+- Scope: diagnostic-only MH-LGC matrix on the clean `iter_-1` semantic regime with
+  routed hard nodes from the current `x_new + NCP-local` selector.
+- Boundary:
+  - this is not a main-result or claim-grade line
+  - routed nodes come from the latest local-conformal `x_new` risk selector at
+    5% budget, not from the older high-base routed set
+  - guide generation uses `precompute.py --prompt_mode mhlgc_llm_guide` in the
+    `Qwen` environment
+  - the initial full-cache attempt with `--embedding_model_class causal_lm
+    --embedding_pooling_mode causal_last_hidden_last_token` OOMed on the server
+  - the relaunched full-cache path uses `--embedding_model_class auto_model
+    --embedding_pooling_mode last_token --batch_size 1`, which matched the
+    existing limit-2 causal-LM smoke cache exactly on the overlapping rows
+    while using less VRAM
+  - graph training stays in the `lmbot` environment
+  - this matrix is intended to diagnose where the guide should act:
+    `node_repr` vs `x_new`, `augmentation` vs `repair_aware`, and implicit vs
+    explicit routed anchors
+- Routed hard-node file:
+  `/root/workspace/LMbot/LLMbot/experiments/mhlgc_diag__routed_budget050__ncp_local_xnew__seed1.json`
+  - counts: `train=413`, `valid=118`, `test=59`, `all=590`
+- Clean semantic input:
+  `/root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt`
+- Explain / guide model:
+  `/root/workspace/LMbot/hf_models/Qwen2.5-7B-Instruct`
+- Planned full routed-guide cache:
+  `/root/workspace/LMbot/datasets/TwiBot-20/mhlgc_diag_qwen25_automodel_lasttoken_budget050_seed1.pt`
+- Smoke cache (completed):
+  `/root/workspace/LMbot/datasets/TwiBot-20/mhlgc_diag_qwen25_causallast_budget050_limit2_seed1.pt`
+- Equivalence smoke cache (completed):
+  `/root/workspace/LMbot/datasets/TwiBot-20/mhlgc_diag_qwen25_automodel_lasttoken_budget050_limit2_seed1.pt`
+- Planned artifact roots:
+  - `/root/workspace/LMbot/LLMbot/experiments/mhlgc__diag_node_repr_aug_nonzero__budget050_ncpxnew__seed1`
+  - `/root/workspace/LMbot/LLMbot/experiments/mhlgc__diag_node_repr_aug_routedmask__budget050_ncpxnew__seed1`
+  - `/root/workspace/LMbot/LLMbot/experiments/mhlgc__diag_xnew_aug_routedmask__budget050_ncpxnew__seed1`
+  - `/root/workspace/LMbot/LLMbot/experiments/mhlgc__diag_node_repr_repair_routedmask__budget050_ncpxnew__seed1`
+  - `/root/workspace/LMbot/LLMbot/experiments/mhlgc__diag_xnew_repair_routedmask__budget050_ncpxnew__seed1`
+  - optional semantic-space diagnostic:
+    `/root/workspace/LMbot/LLMbot/experiments/mhlgc__diag_semantic_aug_routedmask__budget050_ncpxnew__seed1`
+- Training contract:
+  - clean `iter_-1` regime only
+  - bounded single-seed diagnostics only
+  - not for claim tables until a stable detector contract is chosen and rerun
+    under matched protocol
+
+
+### botsay_knn_xnew_test_20260615
+
+- Status: completed on server.
+- Scope: diagnostic-only validation of the strict
+  `true x_new -> KNN support accounts -> BotSay-KNN summary-predict` chain.
+  This run is a KNN construction-space diagnostic and must not be reported as a
+  method main claim.
+- Clean protocol:
+  - no `finetuned_roberta iter_2`
+  - no legacy `node_repr` substitution for HyperScan `x_new`
+  - `x_new` is the forward-native `cat(x_low, x_in)` exported by
+    `RGCNHyperScanNodeInputProxy`
+- Clean node-input tensor:
+  `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_tweet_num_cat_seed1.pt`
+  - manifest:
+    `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_tweet_num_cat_seed1.manifest.json`
+  - shape: `[229580, 776]`
+  - definition: frozen iter_-1 tweet embedding `768` plus official numeric
+    metadata `5` plus categorical metadata `3`
+- Clean G0 export:
+  `/root/workspace/LMbot/LLMbot/experiments/xnew_export__hyperscan_nodeinput_fullgraph_iterm1_clean__seed1/seed_1/preparation/graph_detector/outputs.pt`
+  - keys verified: `x_low`, `x_new`, `node_repr`
+  - shapes verified: `x_low=[229580,128]`, `x_new=[229580,256]`,
+    `node_repr=[229580,128]`
+  - `fused_x` is not present in this server export and is not used for this
+    diagnostic
+- Standalone x_new artifact:
+  `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_x_new_seed1.pt`
+  - manifest:
+    `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_x_new_seed1.manifest.json`
+  - verified shape: `[229580, 256]`
+  - contract:
+    `exported_forward_native_x_new_for_knn_selection`
+- Router check:
+  `/root/workspace/LMbot/LLMbot/experiments/router_check__exported_xnew_clean_iterm1_v2__seed1/seed_1/stages/estimator_ablation/risk_manifest.json`
+  - `calibration_metadata.conformal_knn_config.repr_metadata.effective_repr_source = x_new`
+  - `calibration_metadata.conformal_knn_config.repr_metadata.repr_resolution = exported_x_new`
+  - `calibration_metadata.conformal_knn_config.repr_metadata.x_new_source = frozen_g0.x_new`
+  - `legacy_node_repr_proxy` does not appear in the manifest
+- Routed nodes:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_xnew_exported_clean_iterm1_budget_seed1_20260615_test_only.json`
+  - 5% test-only budget contains `59` test routed nodes
+- KNN/prompt preview:
+  `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/xnew_knn_support_preview.json`
+  - `selection_embedding_path` points to
+    `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_x_new_seed1.pt`
+  - `selection_embedding_shape = [229580,256]`
+  - support accounts are selected by cosine top-k over this `x_new` tensor, with
+    the center node skipped
+  - prompt display contract: visible node IDs and numeric similarity values are
+    omitted from predictor prompts; support accounts are ordered from most
+    similar to less similar
+- First full `precompute.py` attempt:
+  `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/precompute_xnew_qwen35.log`
+  - command used
+    `--selection_embedding_path /root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_x_new_seed1.pt`
+  - failed during Qwen3.5 model load with CUDA OOM; this is a GPU-resource
+    failure, not an x_new path or prompt-construction failure
+- Aborted two-stage `max_new_tokens=160` attempt:
+  `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/aborted_maxnew160_summary_quality.json`
+  - stopped before stage2 because support summaries frequently ended with
+    incomplete sentence tails
+  - partial generated rows: `262 / 295`
+  - quality issue ratio at 256 generated rows: about `31.6%`
+  - typical bad tails ended with unfinished tokens such as `to`, `retrieved`,
+    `maintains`, `between`, or `in`
+- Completed two-stage `max_new_tokens=256` runner:
+  `/root/workspace/LMbot/run_botsay_knn_xnew_wait_then_predict_20260615.sh`
+  - status:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/wait_then_predict_maxnew256.status.jsonl`
+  - log:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/wait_then_predict_maxnew256.log`
+  - execution contract:
+    `run_botsay_knn_batched_summary_then_prompts.py` builds x_new KNN support
+    rows, generates label-free support summaries, and writes predictor prompts;
+    `run_botsay_knn_stage2_predict.py` then runs Qwen3.5 Yes/No prediction and
+    writes metrics
+  - the runner waits until a GPU has at least `22000 MiB` free before loading
+    Qwen3.5, so it does not displace existing long-running baseline jobs
+  - completed at `2026-06-15T06:07:14+0000`
+  - Qwen model:
+    `/root/workspace/LMbot/hf_models/Qwen3.5-9B`
+  - summary artifact:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/botsay_knn_summary_predictor_v1_xnew_test_qwen35_maxnew256_botsay_knn_neighbor_summary_explanations.jsonl`
+    - rows: `295`
+  - generation rows:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/botsay_knn_summary_predictor_v1_xnew_test_qwen35_maxnew256_generation_rows.jsonl`
+    - rows: `295`
+  - predictor prompts:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/botsay_knn_summary_predictor_v1_xnew_test_qwen35_maxnew256_prompts.jsonl`
+    - rows: `59`
+  - summary metadata:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/botsay_knn_summary_predictor_v1_xnew_test_qwen35_maxnew256_botsay_knn_neighbor_summary_recovered_metadata.jsonl`
+    - rows: `295`
+  - manifest:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/botsay_knn_summary_predictor_v1_xnew_test_qwen35_maxnew256_manifest.json`
+  - predictions:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/stage2_qwen35_xnew_maxnew256_predictions.jsonl`
+    - rows: `59`
+  - metrics:
+    `/root/workspace/LMbot/LLMbot_botsay_knn_nodeidless_20260614/experiments/botsay_knn_xnew_test_20260615/stage2_qwen35_xnew_maxnew256_metrics.json`
+- Prompt and summary QA:
+  - all `295` summary-generation prompts include the `Task`, `Output`, and
+    final `Account summary:` instruction block
+  - no summary-generation prompt lost the task instruction due to input
+    truncation
+  - full `max_new_tokens=256` summary QA found `0` empty summaries, `0` short
+    summaries, and `0` outputs without terminal punctuation
+  - generated summary length range: min `390`, median `765`, max `1115`
+  - the one heuristic suspicious-tail hit was manually checked and was a false
+    positive: the summary ended with the complete phrase
+    `low duplicate ratio of 0.04.`
+  - therefore this version does not show the abnormal truncation pattern seen
+    in the aborted `max_new_tokens=160` run
+- Stage2 Qwen3.5 Yes/No diagnostic result on the `59` routed test nodes:
+
+| metric scope | count | accuracy | macro-F1 | human-F1 | bot-F1 | tn | fp | fn | tp |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| parsed only | 59 | `0.4915254237` | `0.4913793103` | `0.4827586207` | `0.5` | 14 | 8 | 22 | 15 |
+| invalid as wrong | 59 | `0.4915254237` | `0.4913793103` | `0.4827586207` | `0.5` | 14 | 8 | 22 | 15 |
+
+  - parse OK: `59 / 59`
+  - invalid parses: `0`
+  - visible node-id hits: `0`
+  - thinking prompt hits: `0`
+  - prediction distribution: `No=36`, `Yes=23`
+  - true label distribution: human `22`, bot `37`
+  - boundary:
+    this verifies the strict `x_new` KNN construction and summary-predict
+    plumbing, but the zero-shot Qwen3.5 classifier itself is weak on the routed
+    hard-node subset and should not be used as positive method evidence.
+- Diagnostic control boundary:
+  the older
+  `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_node_repr_seed1.pt`
+  BotSay-KNN run is only a node_repr-space diagnostic control. It is not a
+  HyperScan-aligned x_new experiment.
+
+### 2026-06-15 - True x_new routed-node KNN propagation suitability diagnostic
+
+- Motivation:
+  four representative routed bot nodes (`11079`, `11420`, `11265`, `10927`)
+  were missed both by the strict true `x_new` G0 detector and by the
+  Qwen3.5 x_new-KNN summary-predict path, while the older high-base frozen
+  SimTeG protocol classified all four correctly. This suggests the selected
+  high-risk nodes may not be suitable for naive x_new-KNN hypergraph
+  propagation.
+- Diagnostic artifact:
+  `/root/workspace/LMbot/LLMbot/experiments/xnew_router_budget_knn_propagation_diagnostic_20260615.json`
+- Inputs:
+  - routed-node file:
+    `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_xnew_exported_clean_iterm1_budget_seed1_20260615.json`
+  - true x_new tensor:
+    `/root/workspace/LMbot/datasets/TwiBot-20/fullgraph_iter_minus1_x_new_seed1.pt`
+  - strict G0 outputs:
+    `/root/workspace/LMbot/LLMbot/experiments/xnew_export__hyperscan_nodeinput_fullgraph_iterm1_clean__seed1/seed_1/preparation/graph_detector/outputs.pt`
+  - old high-base frozen SimTeG reference:
+    `/root/workspace/LMbot/LLMbot/server_prompt_expert_v2_clean_routed_classifier_qwen3_20260601/base_outputs_for_routed_classifier.pt`
+- KNN contract:
+  cosine KNN over labeled true `x_new`, `K=8`; neighbors are support evidence
+  only, not routed outputs.
+
+| routed test budget | count | clean x_new G0 acc | high-base acc | x_new KNN same-label mean | oracle KNN-majority acc | relation-supported pair rate |
+|---|---:|---:|---:|---:|---:|---:|
+| 5% | 59 | `0.4915` | `0.6102` | `0.5064` | `0.5116` | `0.00424` |
+| 10% | 118 | `0.5678` | `0.6102` | `0.5148` | `0.5529` | `0.00212` |
+| 15% | 177 | `0.5819` | `0.6215` | `0.5268` | `0.5662` | `0.00282` |
+| 20% | 236 | `0.6102` | `0.6356` | `0.5387` | `0.6032` | `0.00318` |
+
+Budget-ring view, computed from the cumulative budgets:
+
+| risk band | count | clean x_new G0 acc | high-base acc | x_new KNN same-label mean | oracle KNN-majority acc | relation-supported pair rate |
+|---|---:|---:|---:|---:|---:|---:|
+| 0-5% | 59 | `0.4915` | `0.6102` | `0.5064` | `0.5116` | `0.00424` |
+| 5-10% | 59 | `0.6441` | `0.6102` | `0.5233` | `0.5952` | `0.00000` |
+| 10-15% | 59 | `0.6102` | `0.6441` | `0.5508` | `0.5882` | `0.00424` |
+| 15-20% | 59 | `0.6949` | `0.6780` | `0.5742` | `0.6981` | `0.00424` |
+
+- Existing 5-seed clean x_new refiner evidence is consistent with this
+  diagnosis:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/raw_knn_refiner_clean_xnew_5seed_20260615/metrics_summary_raw_knn_clean_xnew_5seed.json`
+  - best-by-delta-macro-F1 deltas by budget:
+    - 5%: `-0.0016`
+    - 10%: `-0.0191`
+    - 15%: `-0.0145`
+    - 20%: `-0.0012`
+  - even the best local KNN refiner modes do not provide stable macro-F1
+    improvement under the clean true x_new protocol.
+- LLM-KNN refiner comparison at 5% also does not rescue the issue:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/llm_knn_refiner_clean_xnew_5seed_budget050_20260615/metrics_summary_llm_vs_raw_clean_xnew_5seed_budget050.json`
+  - raw clean x_new 5% best delta macro-F1: `-0.0016`
+  - LLM clean x_new 5% best delta macro-F1: `-0.0193`
+- Interpretation boundary:
+  this is evidence against treating top-ranked conformal-router nodes as
+  ordinary x_new-KNN hypergraph propagation anchors or members. It is not
+  evidence that the router is useless. The router still identifies hard,
+  error-enriched nodes; the problem is that their true x_new KNN support is
+  mixed and almost never relation-supported.
+- Current method implication:
+  keep the original detector backbone and relation graph intact; use routed
+  nodes for selective correction, abstention, or label-aware/lightly supervised
+  routed-only classification. Use x_new KNN neighbors as diagnostic/support
+  evidence only unless a quality gate passes.
+
+### 2026-06-15 - Routed nodes original-neighbor learning diagnostic
+
+- Question:
+  whether routed hard nodes can be handled by learning directly from their
+  original TwiBot-20 relation-graph neighbors, instead of using true x_new KNN
+  neighbors.
+- Neighbor definition:
+  original 1-hop relation graph from
+  `/root/workspace/LMbot/datasets/TwiBot-20/edge_index.pt` and
+  `/root/workspace/LMbot/datasets/TwiBot-20/edge_type.pt`.
+  The strict graph has `16,908` edges. The denser
+  `edge_index_new.pt`/`edge_type_new.pt` graph has `227,979` edges, but for
+  these labeled routed test nodes it produced the same labeled-neighbor
+  coverage statistics in this diagnostic.
+- Coverage/statistics artifact:
+  `/root/workspace/LMbot/LLMbot/experiments/routed_original_neighbor_learning_diagnostic_20260615.json`
+- Leak-free lightweight LR artifact:
+  `/root/workspace/LMbot/LLMbot/experiments/routed_original_neighbor_feature_lr_leakfree_diagnostic_20260615.json`
+
+Original-neighbor coverage on cumulative routed test budgets:
+
+| routed test budget | count | train-neighbor mean | train-neighbor zero frac | train-neighbor same-label mean | train-neighbor oracle majority acc | labeled-neighbor mean | labeled-neighbor oracle majority acc |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 5% | 59 | `1.71` | `0.220` | `0.4677` | `0.4762` | `2.34` | `0.4792` |
+| 10% | 118 | `1.94` | `0.229` | `0.4913` | `0.4878` | `2.59` | `0.4896` |
+| 15% | 177 | `2.06` | `0.232` | `0.5110` | `0.5124` | `2.88` | `0.5141` |
+| 20% | 236 | `1.92` | `0.225` | `0.5288` | `0.5305` | `2.64` | `0.5236` |
+
+Budget-ring view:
+
+| risk band | count | train-neighbor mean | train-neighbor zero frac | train-neighbor same-label mean | train-neighbor oracle majority acc | labeled-neighbor mean | labeled-neighbor oracle majority acc |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0-5% | 59 | `1.71` | `0.220` | `0.4677` | `0.4762` | `2.34` | `0.4792` |
+| 5-10% | 59 | `2.17` | `0.237` | `0.5155` | `0.5000` | `2.85` | `0.5000` |
+| 10-15% | 59 | `2.29` | `0.237` | `0.5509` | `0.5641` | `3.44` | `0.5652` |
+| 15-20% | 59 | `1.49` | `0.203` | `0.5804` | `0.5814` | `1.95` | `0.5510` |
+
+Leak-free routed-only LR diagnostic:
+
+| routed test budget | method | Acc | Macro-F1 | Bot-F1 | TN | FP | FN | TP |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 5% | strict x_new G0 self | `0.4915` | `0.4732` | `0.5714` | 9 | 13 | 17 | 20 |
+| 5% | old high-base frozen SimTeG reference | `0.6102` | `0.5869` | `0.6849` | 11 | 11 | 12 | 25 |
+| 5% | train-neighbor label majority else G0 | `0.4746` | `0.4746` | `0.4746` | 14 | 8 | 23 | 14 |
+| 5% | LR self + original-neighbor features | `0.5085` | `0.4993` | `0.5672` | 11 | 11 | 18 | 19 |
+| 5% | LR original-neighbor features only | `0.4407` | `0.4407` | `0.4407` | 13 | 9 | 24 | 13 |
+| 10% | strict x_new G0 self | `0.5678` | `0.5439` | `0.6483` | 20 | 27 | 24 | 47 |
+| 10% | old high-base frozen SimTeG reference | `0.6102` | `0.5869` | `0.6849` | 22 | 25 | 21 | 50 |
+| 10% | train-neighbor label majority else G0 | `0.5169` | `0.5161` | `0.5366` | 28 | 19 | 38 | 33 |
+| 10% | LR self + original-neighbor features | `0.5847` | `0.5737` | `0.6423` | 25 | 22 | 27 | 44 |
+| 10% | LR original-neighbor features only | `0.4746` | `0.4740` | `0.4561` | 30 | 17 | 45 | 26 |
+| 15% | strict x_new G0 self | `0.5819` | `0.5606` | `0.6574` | 32 | 42 | 32 | 71 |
+| 15% | old high-base frozen SimTeG reference | `0.6215` | `0.6087` | `0.6794` | 39 | 35 | 32 | 71 |
+| 15% | train-neighbor label majority else G0 | `0.5367` | `0.5355` | `0.5591` | 43 | 31 | 51 | 52 |
+| 15% | LR self + original-neighbor features | `0.5706` | `0.5604` | `0.6275` | 37 | 37 | 39 | 64 |
+| 15% | LR original-neighbor features only | `0.5028` | `0.4970` | `0.5510` | 35 | 39 | 49 | 54 |
+| 20% | strict x_new G0 self | `0.6102` | `0.5933` | `0.6761` | 48 | 55 | 37 | 96 |
+| 20% | old high-base frozen SimTeG reference | `0.6356` | `0.6259` | `0.6861` | 56 | 47 | 39 | 94 |
+| 20% | train-neighbor label majority else G0 | `0.5593` | `0.5585` | `0.5772` | 61 | 42 | 62 | 71 |
+| 20% | LR self + original-neighbor features | `0.6059` | `0.5999` | `0.6491` | 57 | 46 | 47 | 86 |
+| 20% | LR original-neighbor features only | `0.5000` | `0.4894` | `0.5630` | 42 | 61 | 57 | 76 |
+
+- Interpretation boundary:
+  original relation neighbors are useful as small routed-only diagnostic
+  features, but their coverage is too sparse and their homophily/oracle-majority
+  signal is too weak to support direct propagation or a standalone strong
+  routed-node classifier. The best leak-free LR variant only slightly improves
+  over strict x_new G0 on the 10% budget and remains below the old high-base
+  frozen SimTeG reference on all budgets.
+- Method implication:
+  direct original-neighbor learning should be treated as an auxiliary feature
+  or gate for routed-only correction, not as a replacement for the base
+  detector. If propagated, original-neighbor messages still need
+  heterophily-aware low/high/self gating; plain neighbor label majority and
+  plain neighbor-only LR both increase bot misses on the hardest routed slice.
+
+### 2026-06-15 - Routed-only self/low/high gated original-neighbor diagnostic
+
+- Question:
+  whether BotSCL/heterophily-inspired `self + low-pass + high-pass` aggregation
+  over original relation-graph neighbors improves routed hard-node
+  classification.
+- Diagnostic script:
+  `/tmp/routed_self_low_high_gate_diag.py` on the server.
+- Result artifact:
+  `/root/workspace/LMbot/LLMbot/experiments/routed_self_low_high_gated_original_neighbor_diagnostic_20260615.json`
+- Contract:
+  - routed-only diagnostic, not a full-graph propagation experiment
+  - original 1-hop relation graph only:
+    `/root/workspace/LMbot/datasets/TwiBot-20/edge_index.pt`
+  - train on routed train nodes, early-select by routed valid macro-F1, report
+    routed test metrics
+  - no test tuning
+  - features:
+    - `self`: center representation
+    - `low`: mean original-neighbor representation
+    - `high`: center minus mean original-neighbor representation
+    - scalar support: neighbor counts, train-neighbor label mean/std, G0
+      neighbor probability summaries, relation-type counts
+  - trained five random seeds for each budget and module
+  - checked both `x_low` and `node_repr`; in this strict G0 export they are
+    identical (`maxabs=0.0`, `meanabs=0.0`), so the two result blocks are the
+    same.
+
+Mean routed-test results over five seeds:
+
+| budget | method | Acc | Macro-F1 | Bot-F1 | Macro-F1 std |
+|---|---|---:|---:|---:|---:|
+| 5% | strict x_new G0 self | `0.4915` | `0.4732` | `0.5714` | - |
+| 5% | old high-base frozen SimTeG reference | `0.6102` | `0.5869` | `0.6849` | - |
+| 5% | self-only MLP | `0.4881` | `0.4766` | `0.5518` | `0.0287` |
+| 5% | low-pass original-neighbor MLP | `0.4915` | `0.4815` | `0.5400` | `0.0487` |
+| 5% | high-pass original-neighbor MLP | `0.4780` | `0.4708` | `0.5301` | `0.0135` |
+| 5% | concat self/low/high MLP | `0.5051` | `0.4988` | `0.5508` | `0.0309` |
+| 5% | gated self/low/high MLP | `0.5254` | `0.5215` | `0.5587` | `0.0502` |
+| 10% | strict x_new G0 self | `0.5678` | `0.5439` | `0.6483` | - |
+| 10% | old high-base frozen SimTeG reference | `0.6102` | `0.5869` | `0.6849` | - |
+| 10% | self-only MLP | `0.5661` | `0.5548` | `0.6243` | `0.0130` |
+| 10% | low-pass original-neighbor MLP | `0.5678` | `0.5534` | `0.6326` | `0.0298` |
+| 10% | high-pass original-neighbor MLP | `0.5661` | `0.5531` | `0.6247` | `0.0196` |
+| 10% | concat self/low/high MLP | `0.5814` | `0.5692` | `0.6401` | `0.0065` |
+| 10% | gated self/low/high MLP | `0.5797` | `0.5730` | `0.6249` | `0.0164` |
+| 15% | strict x_new G0 self | `0.5819` | `0.5606` | `0.6574` | - |
+| 15% | old high-base frozen SimTeG reference | `0.6215` | `0.6087` | `0.6794` | - |
+| 15% | self-only MLP | `0.5819` | `0.5698` | `0.6387` | `0.0200` |
+| 15% | low-pass original-neighbor MLP | `0.5842` | `0.5764` | `0.6334` | `0.0167` |
+| 15% | high-pass original-neighbor MLP | `0.5797` | `0.5704` | `0.6331` | `0.0186` |
+| 15% | concat self/low/high MLP | `0.5910` | `0.5806` | `0.6464` | `0.0085` |
+| 15% | gated self/low/high MLP | `0.5785` | `0.5710` | `0.6239` | `0.0230` |
+| 20% | strict x_new G0 self | `0.6102` | `0.5933` | `0.6761` | - |
+| 20% | old high-base frozen SimTeG reference | `0.6356` | `0.6259` | `0.6861` | - |
+| 20% | self-only MLP | `0.5932` | `0.5878` | `0.6339` | `0.0043` |
+| 20% | low-pass original-neighbor MLP | `0.6144` | `0.6089` | `0.6550` | `0.0057` |
+| 20% | high-pass original-neighbor MLP | `0.6127` | `0.6058` | `0.6576` | `0.0097` |
+| 20% | concat self/low/high MLP | `0.6169` | `0.6093` | `0.6637` | `0.0058` |
+| 20% | gated self/low/high MLP | `0.6008` | `0.5956` | `0.6405` | `0.0160` |
+
+Gate means for the `gated` model over `[self, low, high]`:
+
+| budget | gate mean |
+|---|---|
+| 5% | `[0.358, 0.333, 0.310]` |
+| 10% | `[0.346, 0.321, 0.333]` |
+| 15% | `[0.361, 0.307, 0.332]` |
+| 20% | `[0.364, 0.305, 0.331]` |
+
+- Interpretation boundary:
+  self/low/high decomposition has a real diagnostic signal on routed hard nodes:
+  it improves over strict x_new G0 on 5% and 10%, and concat/low/high features
+  are useful on broader budgets. However, the gated variant does not stably
+  dominate concat or low-pass, and all variants remain below the old high-base
+  frozen SimTeG reference. This is not yet a main-method positive result.
+- Method implication:
+  BotSCL-style high-pass information is worth keeping as an auxiliary routed
+  correction feature, especially for the hardest 5-10% routed nodes. But the
+  current small gate is under-trained/under-constrained and mostly learns a
+  near-uniform mixture rather than a decisive heterophily router. A stronger
+  version should be trained inside the graph detector with supervised
+  contrastive or utility targets, not as a standalone routed-only MLP.
+
+### 2026-06-15 - Routed-only self/low/high utility and SupCon gate diagnostic
+
+- Question:
+  whether the weak near-uniform gate above can be improved by adding explicit
+  utility supervision and/or supervised contrastive learning over the routed
+  `self + low-pass + high-pass` branches.
+- Diagnostic script:
+  `/tmp/routed_self_low_high_gate_next_diag.py` on the server.
+- Result artifact:
+  `/root/workspace/LMbot/LLMbot/experiments/routed_self_low_high_utility_supcon_gate_diagnostic_20260615.json`
+- Contract:
+  - routed-only diagnostic, not a full-graph propagation experiment
+  - train on routed train nodes, early-select by routed valid macro-F1, report
+    routed test metrics
+  - five seeds: `1,2,3,4,5`
+  - no test tuning
+  - representation:
+    strict true-x_new G0 export `outputs["x_low"]`; in this export
+    `node_repr` is identical to `x_low`
+  - original 1-hop relation graph:
+    `/root/workspace/LMbot/datasets/TwiBot-20/edge_index.pt`
+  - modes:
+    `moe_ce`, `moe_utility`, `moe_utility_sparse`, `moe_supcon`,
+    `moe_utility_supcon`
+
+Best routed-test result by macro-F1 for each budget:
+
+| budget | strict x_new G0 Macro/Bot-F1 | old high-base frozen SimTeG Macro/Bot-F1 | best MoE mode | Acc | Macro-F1 | Bot-F1 | gate mean `[self, low, high]` | gate entropy |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| 5% | `0.4732 / 0.5714` | `0.5869 / 0.6849` | `moe_utility_supcon` | `0.5119` | `0.5056` | `0.5610` | `[0.407, 0.295, 0.298]` | `1.055` |
+| 10% | `0.5439 / 0.6483` | `0.5869 / 0.6849` | `moe_supcon` | `0.5915` | `0.5827` | `0.6428` | `[0.462, 0.270, 0.267]` | `1.006` |
+| 15% | `0.5606 / 0.6574` | `0.6087 / 0.6794` | `moe_supcon` | `0.5944` | `0.5845` | `0.6475` | `[0.464, 0.270, 0.266]` | `1.004` |
+| 20% | `0.5933 / 0.6761` | `0.6259 / 0.6861` | `moe_supcon` | `0.6212` | `0.6117` | `0.6693` | `[0.450, 0.279, 0.271]` | `1.013` |
+
+All modes, mean over five seeds:
+
+| budget | mode | Acc | Macro-F1 | Bot-F1 | gate mean `[self, low, high]` | gate entropy |
+|---|---|---:|---:|---:|---:|---:|
+| 5% | `moe_ce` | `0.4712` | `0.4596` | `0.5345` | `[0.438, 0.288, 0.274]` | `0.984` |
+| 5% | `moe_utility` | `0.4915` | `0.4850` | `0.5427` | `[0.402, 0.296, 0.302]` | `1.061` |
+| 5% | `moe_utility_sparse` | `0.4915` | `0.4850` | `0.5427` | `[0.402, 0.297, 0.301]` | `1.062` |
+| 5% | `moe_supcon` | `0.4915` | `0.4841` | `0.5409` | `[0.454, 0.271, 0.275]` | `1.003` |
+| 5% | `moe_utility_supcon` | `0.5119` | `0.5056` | `0.5610` | `[0.407, 0.295, 0.298]` | `1.055` |
+| 10% | `moe_ce` | `0.5881` | `0.5789` | `0.6410` | `[0.446, 0.290, 0.265]` | `1.011` |
+| 10% | `moe_utility` | `0.5780` | `0.5715` | `0.6231` | `[0.368, 0.323, 0.308]` | `1.088` |
+| 10% | `moe_utility_sparse` | `0.5780` | `0.5711` | `0.6242` | `[0.368, 0.326, 0.305]` | `1.087` |
+| 10% | `moe_supcon` | `0.5915` | `0.5827` | `0.6428` | `[0.462, 0.270, 0.267]` | `1.006` |
+| 10% | `moe_utility_supcon` | `0.5780` | `0.5708` | `0.6257` | `[0.371, 0.320, 0.309]` | `1.087` |
+| 15% | `moe_ce` | `0.5864` | `0.5779` | `0.6376` | `[0.474, 0.264, 0.262]` | `0.966` |
+| 15% | `moe_utility` | `0.5864` | `0.5755` | `0.6425` | `[0.393, 0.306, 0.301]` | `1.075` |
+| 15% | `moe_utility_sparse` | `0.5831` | `0.5725` | `0.6384` | `[0.393, 0.306, 0.301]` | `1.076` |
+| 15% | `moe_supcon` | `0.5944` | `0.5845` | `0.6475` | `[0.464, 0.270, 0.266]` | `1.004` |
+| 15% | `moe_utility_supcon` | `0.5864` | `0.5755` | `0.6422` | `[0.398, 0.301, 0.300]` | `1.074` |
+| 20% | `moe_ce` | `0.6136` | `0.6073` | `0.6553` | `[0.460, 0.271, 0.269]` | `0.989` |
+| 20% | `moe_utility` | `0.6119` | `0.6043` | `0.6579` | `[0.418, 0.289, 0.293]` | `1.069` |
+| 20% | `moe_utility_sparse` | `0.6119` | `0.6043` | `0.6579` | `[0.420, 0.288, 0.292]` | `1.069` |
+| 20% | `moe_supcon` | `0.6212` | `0.6117` | `0.6693` | `[0.450, 0.279, 0.271]` | `1.013` |
+| 20% | `moe_utility_supcon` | `0.6076` | `0.5997` | `0.6549` | `[0.410, 0.293, 0.297]` | `1.072` |
+
+- Interpretation boundary:
+  explicit utility/SupCon supervision confirms that the routed original-neighbor
+  decomposition contains recoverable signal. Compared with strict x_new G0, the
+  best MoE variant improves macro-F1 on all routed budgets, especially the
+  hardest 5% slice (`0.4732 -> 0.5056`) and the 10% slice
+  (`0.5439 -> 0.5827`). However, it still does not exceed the old high-base
+  frozen SimTeG reference on any budget, and bot-F1 remains below the reference.
+- Method implication:
+  this is stronger evidence for a routed auxiliary correction head than for
+  naive hypergraph propagation. The best gates are still self-heavy and not a
+  decisive heterophily router: gate entropy remains around `1.0`, close to the
+  uniform three-expert entropy `log(3)=1.099`. Therefore, the next method step
+  should not be a detached routed-only classifier claim. A cleaner mainline
+  would integrate the `self/low/high` branch into the graph detector as a
+  routed-only auxiliary correction or abstention module, with SupCon/utility
+  loss applied only on routed hard nodes.
+
+### 2026-06-15 - MH-LGC contrast-space rerun on `fused_x` and `cat(x_low,x_high)`
+
+- Question:
+  whether the previous negative MH-LGC/GCL result was caused by optimizing the
+  HyperScan construction space `x_new` instead of the detector representation
+  space.
+- Status:
+  completed on server, single-seed diagnostic only.
+- Server workspace:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612`
+- Launcher:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/server_logs/launch_mhlgc_fused_lowhigh_20260615.sh`
+- Code synchronization note:
+  local `GNNs.py`, `parser_args.py`, and `trainer_preparation.py` were synced
+  to the server workspace after backing up the previous remote copies under
+  `server_logs/code_backup_20260615_170728`.
+- Common protocol:
+  - dataset: TwiBot-20, canonical split `--reset_split -1`
+  - clean input regime: `iter_-1` LM embedding only, no `iter_2`
+  - graph data variant: `labeled`
+  - backbone: `rgcn_hyperscan`
+  - node input family: `hyperscan_meta_tweet_proxy`
+  - second view: `neighborloader_batch`, PyG hypergraph backend, `k=8`
+  - detector fusion: `multiattn` / `original_cross_attention`
+  - training cap: `--graph_training_max_steps 200`
+  - guide cache:
+    `/root/workspace/LMbot/datasets/TwiBot-20/mhlgc_diag_qwen25_automodel_lasttoken_budget050_seed1.pt`
+    with `590` routed target rows and full labeled-graph alignment
+  - anchor source for GCL runs: `routed_target_mask`
+  - contrast settings: `anchors_per_batch=1`, `negative_count=3`,
+    `loss_weight=0.1`, `beta=1.0`, `gamma=0.5`
+- Mechanism check:
+  - manifests record `feature_manifest.node_input_family =
+    hyperscan_meta_tweet_proxy`
+  - manifests record `detector.graph_second_view_fusion = multiattn`
+  - graph refine stats record
+    `feature_source = x_low_plus_x_in_dynamic_forward`
+  - graph refine stats record `fusion = multiattn`,
+    `training_loader_mode = neighbor_subgraph`, `hypergraph_backend = pyg`
+  - MH-LGC manifests record the intended `contrast_space` and `pair_mode`
+
+Results on labeled scope:
+
+| run | MH-LGC | contrast space | pair mode | Acc | Macro-F1 | Human-F1 | Bot-F1 | Δ Macro-F1 vs control |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| `mhlgc_fused_lowhigh_control_multiattn_hyperscanpre_seed1_20260615` | off | `fused_x` manifest default | augmentation | `0.8596` | `0.8573` | `0.8366` | `0.8750` | `0.0000` |
+| `mhlgc_fused_lowhigh_aug_fusedx_multiattn_hyperscanpre_seed1_20260615` | on | `fused_x` | augmentation | `0.7569` | `0.7335` | `0.6679` | `0.8186` | `-0.1238` |
+| `mhlgc_fused_lowhigh_aug_lowhigh_multiattn_hyperscanpre_seed1_20260615` | on | `low_high_concat` | augmentation | `0.8368` | `0.8304` | `0.7974` | `0.8648` | `-0.0269` |
+| `mhlgc_fused_lowhigh_repair_fusedx_multiattn_hyperscanpre_seed1_20260615` | on | `fused_x` | repair-aware | `0.7653` | `0.7470` | `0.6908` | `0.8197` | `-0.1102` |
+| `mhlgc_fused_lowhigh_repair_lowhigh_multiattn_hyperscanpre_seed1_20260615` | on | `low_high_concat` | repair-aware | `0.8148` | `0.8016` | `0.7602` | `0.8584` | `-0.0556` |
+
+Confusion matrices on labeled scope:
+
+| run | TN | FP | FN | TP |
+|---|---:|---:|---:|---:|
+| control | `4289` | `948` | `727` | `5862` |
+| augmentation @ `fused_x` | `2791` | `2446` | `329` | `6260` |
+| augmentation @ `low_high_concat` | `3774` | `1463` | `455` | `6134` |
+| repair-aware @ `fused_x` | `3009` | `2228` | `466` | `6123` |
+| repair-aware @ `low_high_concat` | `3338` | `1899` | `207` | `6382` |
+
+- Interpretation boundary:
+  this is a same-protocol single-seed diagnostic, not a claim-grade result.
+  It shows that simply moving the current MH-LGC objective from `x_new` to
+  `fused_x` or `cat(x_low,x_high)` does not recover a gain. The post-attention
+  `fused_x` contrast is the most damaging. The pre-detector
+  `low_high_concat` contrast is less damaging, especially under augmentation,
+  but still remains below the no-MH-LGC cross-attention detector.
+- Error-shape note:
+  the main degradation comes from a large increase in false positives. For
+  example, augmentation on `fused_x` reduces FN (`727 -> 329`) but increases FP
+  far more (`948 -> 2446`), so bot recall is purchased by breaking many human
+  accounts. This is not a useful correction mechanism under the current loss.
+- Method implication:
+  the negative result is now less likely to be just a construction-space
+  mismatch. The current single-positive-anchor MH-LGC objective is misaligned
+  with bot/human correction in this strong SimTeG/HyperScan-style detector
+  regime. Future GCL work should change the objective or routing target, not
+  only the representation space.
+- Artifact caveat:
+  the completed runs used `low_high_concat` inside the training forward path,
+  but the saved `outputs.pt` whitelist in that server snapshot did not include
+  `x_high`. The code has since been patched so future `outputs.pt` manifests can
+  persist `x_high` for audit. The completed manifests and graph refine stats are
+  still sufficient to verify the run protocol and requested contrast spaces.
+
+### 2026-06-15 - Official HyperScan preprocessing control for MH-LGC/GCL
+
+- Question:
+  whether the negative MH-LGC/GCL result above was caused by using the
+  frozen-SimTeG `iter_-1` embedding as the detector input instead of the
+  official HyperScan tweet/num/cat preprocessing tensor.
+- Status:
+  completed on server, single-seed diagnostic only.
+- Server workspace:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612`
+- Launcher:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/server_logs/launch_mhlgc_officialpre_fused_lowhigh_20260615.sh`
+- Nohup log:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/server_logs/launch_mhlgc_officialpre_fused_lowhigh_20260615.nohup.log`
+- Metrics summary:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/server_logs/mhlgc_officialpre_fused_lowhigh_20260615_metrics_summary.json`
+- Official input:
+  - source tensor:
+    `/root/workspace/LMbot/repro_baselines_20260527/datasets_botbr_twibot20/TwiBot-20/official_hyperscan_x_tweet_num_cat.pt`
+    with shape `[229580, 776]`
+  - labeled-prefix tensor produced for this run:
+    `/root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt`
+    with shape `[11826, 776]`
+  - labeled-prefix manifest:
+    `/root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.manifest.json`
+  - manifest definition:
+    `official HyperScan tweet/num/cat preprocessing tensor restricted to the
+    LMBot labeled prefix`
+  - `uses_frozen_simteg_embedding = false`
+- Common protocol:
+  - dataset: TwiBot-20, canonical split `--reset_split -1`
+  - graph data variant: `labeled`
+  - backbone: `rgcn_hyperscan_nodeinput`
+  - node input family: `hyperscan_meta_tweet_proxy`
+  - input: official HyperScan tweet/num/cat tensor, not `iter_-1` or `iter_2`
+    RoBERTa embedding
+  - second view: `neighborloader_batch`, PyG hypergraph backend, `k=8`
+  - detector fusion: `multiattn` / original-style cross-attention
+  - training cap: `--graph_training_max_steps 200`
+  - guide cache:
+    `/root/workspace/LMbot/datasets/TwiBot-20/mhlgc_diag_qwen25_automodel_lasttoken_budget050_seed1.pt`
+  - anchor source for GCL runs: `routed_target_mask`
+  - contrast settings: `anchors_per_batch=1`, `negative_count=3`,
+    `loss_weight=0.1`, `beta=1.0`, `gamma=0.5`
+- Engineering checks:
+  - smoke run completed with status `0`
+  - full queue completed with status `0` for control and all four MH-LGC
+    variants
+  - model printout confirmed `RGCNHyperScanNodeInputProxy` with tweet/num/cat
+    branches, HypergraphConv high-order branch, and `multiattn` detector
+  - saved `outputs.pt` contains `x_low`, `x_new`, `fused_x`, `node_repr`,
+    `logits`, `prob`, `pred`, and `labels`
+  - saved `outputs.pt` still does not include `x_high` in this server snapshot,
+    so `low_high_concat` is verified through the forward-path command and run
+    manifests rather than post-hoc tensor inspection
+
+Validation-selected metrics:
+
+| run | MH-LGC | contrast space | pair mode | Val Acc | Val Macro-F1 | selected epoch | Delta Val Macro-F1 vs control |
+|---|---|---|---|---:|---:|---:|---:|
+| `mhlgc_officialpre_control_multiattn_hyperscanpre_seed1_20260615` | off | - | - | `0.8626` | `0.8589` | `21` | `0.0000` |
+| `mhlgc_officialpre_aug_fusedx_multiattn_hyperscanpre_seed1_20260615` | on | `fused_x` | augmentation | `0.7459` | `0.7225` | `21` | `-0.1363` |
+| `mhlgc_officialpre_aug_lowhigh_multiattn_hyperscanpre_seed1_20260615` | on | `low_high_concat` | augmentation | `0.7890` | `0.7691` | `22` | `-0.0897` |
+| `mhlgc_officialpre_repair_fusedx_multiattn_hyperscanpre_seed1_20260615` | on | `fused_x` | repair-aware | `0.7201` | `0.6902` | `20` | `-0.1687` |
+| `mhlgc_officialpre_repair_lowhigh_multiattn_hyperscanpre_seed1_20260615` | on | `low_high_concat` | repair-aware | `0.7860` | `0.7668` | `22` | `-0.0920` |
+
+Canonical test split metrics recomputed from `outputs.pt`:
+
+| run | Test Acc | Test Macro-F1 | Human-F1 | Bot-F1 | TN | FP | FN | TP | Delta Test Macro-F1 vs control |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| control | `0.8639` | `0.8616` | `0.8435` | `0.8796` | `434` | `109` | `52` | `588` | `0.0000` |
+| augmentation @ `fused_x` | `0.7549` | `0.7364` | `0.6667` | `0.8061` | `290` | `253` | `37` | `603` | `-0.1252` |
+| augmentation @ `low_high_concat` | `0.8056` | `0.7915` | `0.7374` | `0.8456` | `323` | `220` | `10` | `630` | `-0.0700` |
+| repair-aware @ `fused_x` | `0.7168` | `0.6936` | `0.6091` | `0.7780` | `261` | `282` | `53` | `587` | `-0.1680` |
+| repair-aware @ `low_high_concat` | `0.8115` | `0.7987` | `0.7480` | `0.8494` | `331` | `212` | `11` | `629` | `-0.0628` |
+
+- Interpretation boundary:
+  this is a same-seed diagnostic control, not a claim-grade multi-seed result.
+  It answers a narrow protocol question: replacing the frozen-SimTeG `iter_-1`
+  detector input with the official HyperScan preprocessing tensor does not
+  recover a positive MH-LGC/GCL gain.
+- Error-shape note:
+  the official-pre control is strong on the canonical test split
+  (`Macro-F1 = 0.8616`). All MH-LGC variants reduce false negatives but increase
+  false positives much more. For example, augmentation on `low_high_concat`
+  reduces FN from `52` to `10`, but FP rises from `109` to `220`.
+- Method implication:
+  the negative GCL result is not primarily caused by frozen-SimTeG input
+  mismatch. The current routed-anchor MH-LGC objective is still too
+  bot-leaning/aggressive under official HyperScan preprocessing. Future work
+  should treat this as an objective/risk-control problem, not only as an input
+  preprocessing or contrast-space problem.
+
+## 2026-06-16 - Routed High-Pass Correction On `x_high` Before Cross-Attention
+
+Motivation:
+
+- H2GCN motivates separating ego and neighbor channels plus higher-order
+  representations under heterophily.
+- FAGCN motivates adaptive low-pass / high-pass mixing instead of only using
+  smoothing-style low-frequency propagation.
+- ACM-GNN motivates node-wise mixing of identity, aggregation, and
+  diversification channels.
+- BotSCL gives the social-bot-specific risk: bot-human heterophilic links can
+  mix representations and increase hard false negatives.
+
+Implementation change:
+
+- Added `--routed_highpass_target {logits,x_high}`.
+- `target=logits` preserves the previous detector-space delta-logit
+  correction after `fused_x/logits`.
+- `target=x_high` applies the same self / low-pass / high-pass routed
+  correction to the HGNN high-order branch after
+  `x_new -> dynamic hypergraph -> HGNN -> x_high_base`, and before the
+  HyperScan-style original cross-attention detector.
+- Saved tensors now include `x_high` and `x_high_base`, so the routed
+  high-order-branch delta is directly auditable.
+
+Clean protocol:
+
+- dataset: TwiBot-20, canonical labeled split
+- seed: `1`
+- input feature path:
+  `/root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt`
+- no `finetuned_roberta iter_2`
+- graph data variant: `labeled`
+- routed nodes:
+  `/root/workspace/LMbot/datasets/TwiBot-20/routed_nodes_xnew_exported_clean_iterm1_budget_seed1_20260615.json`
+- routed budget used here: `5%`
+- candidate scope: `relation_1hop`
+- max neighbors: `32`
+- training contract: `stage0_base_ce_then_frozen_routed_correction`
+- detector: HyperScan-style dynamic branch and original cross-attention
+  detector
+
+Run roots:
+
+- previous detector-space correction:
+  `/root/workspace/LMbot/LLMbot/experiments/highpass_ablation_relation1hop_xnew_budget050_e100_seed1_20260615`
+- new `target=x_high` low/high/gate0 group:
+  `/root/workspace/LMbot/LLMbot/experiments/highpass_xhigh_target_relation1hop_xnew_budget050_e100_seed1_20260616_full`
+- new `target=x_high` adaptive rerun with saved `x_high` tensors:
+  `/root/workspace/LMbot/LLMbot/experiments/highpass_xhigh_target_relation1hop_xnew_budget050_e100_seed1_20260616_rerun1`
+
+Canonical test metrics recomputed from `outputs.pt`:
+
+| run | target | Val Macro-F1 | Test Acc | Test Macro-F1 | Human-F1 | Bot-F1 | Routed 5% Macro-F1 | Routed Bot-F1 | Non-routed Macro-F1 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| off baseline | none | `0.8567` | `0.8597` | `0.8575` | `0.8401` | `0.8750` | `0.5725` | `0.6667` | `0.8719` |
+| low_only | logits | `0.8563` | `0.8571` | `0.8555` | `0.8398` | `0.8711` | `0.5592` | `0.5667` | `0.8711` |
+| high_only | logits | `0.8550` | `0.8563` | `0.8545` | `0.8381` | `0.8708` | `0.5220` | `0.5625` | `0.8720` |
+| adaptive | logits | `0.8554` | `0.8563` | `0.8546` | `0.8390` | `0.8702` | `0.5079` | `0.4912` | `0.8729` |
+| adaptive gate0 | logits | `0.8550` | `0.8529` | `0.8513` | `0.8358` | `0.8668` | `0.5242` | `0.5000` | `0.8685` |
+| low_only | `x_high` | `0.8577` | `0.8588` | `0.8571` | `0.8414` | `0.8728` | `0.5763` | `0.5763` | `0.8720` |
+| high_only | `x_high` | `0.8576` | `0.8555` | `0.8537` | `0.8379` | `0.8696` | `0.5253` | `0.5333` | `0.8711` |
+| adaptive gate0 | `x_high` | `0.8591` | `0.8580` | `0.8563` | `0.8406` | `0.8720` | `0.5424` | `0.5424` | `0.8729` |
+| adaptive | `x_high` | `0.8595` | `0.8588` | `0.8572` | `0.8417` | `0.8726` | `0.5592` | `0.5517` | `0.8729` |
+
+Artifact checks:
+
+- `target=x_high` manifests record `routed_highpass.target = x_high`.
+- `outputs.pt` contains `x_low`, `x_high_base`, `x_high`, `x_new`,
+  `fused_x/node_repr`, `logits`, `prob`, `pred`, and `labels`.
+- For `x_high_adaptive`, `x_high - x_high_base` has nonzero rows only on the
+  590 routed nodes. Delta norm mean is about `0.1217`, max about `3.9737`;
+  routed-test delta norm mean is about `2.4335`.
+
+Interpretation boundary:
+
+- Moving correction from post-detector logits to the HGNN high-order branch is
+  better aligned with the heterophily literature and improves validation
+  Macro-F1 modestly (`0.8567 -> 0.8595` for adaptive).
+- The clean test gain is not established: adaptive `target=x_high` is
+  essentially tied with the off baseline on test Macro-F1
+  (`0.8575 -> 0.8572`).
+- Routed hard-node repair is still not solved. The off baseline has the best
+  routed Bot-F1 in this table (`0.6667`), while routed `target=x_high`
+  variants reduce routed Bot-F1.
+- This is a useful implementation/diagnostic result, not a claim-grade method
+  result. The next optimization should focus on better edge-role supervision
+  and high-order candidate construction inside the HGNN branch, not on another
+  post-hoc classifier correction.
+
+## 2026-06-16 - Post-TopK Routed-Member Filtering In HyperScan-Style `x_new` Hyperedges
+
+Question:
+
+- After diagnosing that routed/high-risk nodes often appear as unstable
+  high-order KNN neighbors, test whether HyperScan-style high-order hyperedges
+  benefit from removing routed members.
+- This run tests strict post-K pruning, not re-retrieval from an easy
+  non-routed prototype pool.
+
+Protocol:
+
+- dataset: TwiBot-20, canonical labeled split
+- seed: `1`
+- input feature path:
+  `/root/workspace/LMbot/repro_baselines_20260527/datasets_botbr_twibot20/TwiBot-20/official_hyperscan_x_tweet_num_cat.pt`
+- no `finetuned_roberta iter_2`
+- graph backbone: `rgcn_hyperscan`
+- node input family: `hyperscan_meta_tweet_proxy`
+- graph data variant: `full_graph_support`
+- second-view centers: `labeled_prefix` (`11826` centers)
+- second-view candidates: `labeled_full`
+- high-order construction space: dynamic forward `x_new = [x_low; x_in]`
+- KNN: `K=8`, cosine, dynamic full-batch construction
+- hypergraph backend: `pyg`
+- detector: HyperScan-style `x_low / x_high` multi-attention fusion
+- max training steps: `200`
+- routed-member mask:
+  `experiments/raw_knn_refiner_clean_xnew_5seed_20260615/seed1_budget_050_routed_nodes.json`
+  (`590` routed/high-risk nodes, 5% budget)
+
+Compared runs:
+
+| run | candidate policy | Val Acc | Val Macro-F1 | best epoch | mean selected members | incidence count |
+|---|---|---:|---:|---:|---:|---:|
+| `official_nodeinput_labeled_full_default_seed1` | `default` | `0.8753` | `0.8716` | `120` | `8.0000` | `106434` |
+| `official_nodeinput_labeled_full_post_topk_exclude_routed_seed1` | `post_topk_exclude_routed` | `0.8757` | `0.8722` | `115` | `7.6205` | `101946` |
+
+Canonical test metrics recomputed from `outputs.pt` plus the canonical
+`load_raw_data("TwiBot-20", graph_data_variant="full_graph_support")` split:
+
+| run | Test Acc | Test Macro-F1 | Human-F1 | Bot-F1 | TN | FP | FN | TP |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `default` | `0.8605` | `0.8578` | `0.8381` | `0.8775` | `427` | `116` | `49` | `591` |
+| `post_topk_exclude_routed` | `0.8605` | `0.8580` | `0.8390` | `0.8770` | `430` | `113` | `52` | `588` |
+
+Routed-test and non-routed-test slice metrics under the same split:
+
+| run | slice | n | Acc | Macro-F1 | Human-F1 | Bot-F1 | TN | FP | FN | TP |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `default` | routed 5% test | `59` | `0.6780` | `0.6260` | `0.4865` | `0.7654` | `9` | `17` | `2` | `31` |
+| `post_topk_exclude_routed` | routed 5% test | `59` | `0.6780` | `0.6362` | `0.5128` | `0.7595` | `10` | `16` | `3` | `30` |
+| `default` | non-routed test | `1124` | `0.8701` | `0.8680` | `0.8513` | `0.8847` | `418` | `99` | `47` | `560` |
+| `post_topk_exclude_routed` | non-routed test | `1124` | `0.8701` | `0.8681` | `0.8519` | `0.8843` | `420` | `97` | `49` | `558` |
+
+Artifact roots:
+
+- `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/post_topk_member_filter_20260616/official_nodeinput_labeled_full_default_seed1`
+- `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/post_topk_member_filter_20260616/official_nodeinput_labeled_full_post_topk_exclude_routed_seed1`
+
+Implementation contract:
+
+- `default` keeps ordinary `x_new` top-K members.
+- `post_topk_exclude_routed` first retrieves ordinary top-K members, then drops
+  members whose role is routed/high-risk (`role == 1`) without refilling.
+- The center node is not replaced. The policy only removes unreliable retrieved
+  hyperedge members.
+- This is distinct from `exclude_routed`, which removes routed/high-risk
+  candidates before top-K selection and then fills top-K from the remaining
+  candidate pool.
+
+Current-run member diagnostic:
+
+- diagnostic path:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/post_topk_member_filter_20260616/post_topk_member_diagnostic_current_run.json`
+- labeled centers: `11826`
+- routed mask size: `590`
+- centers with at least one routed member in ordinary top-8: `2712`
+- centers with all top-8 members filtered: `0`
+- routed member incidence removed from ordinary top-8: `4488 / 94608`
+- kept neighbor incidence after post-filtering: `90120`
+- mean kept members per center: `7.6205`
+- kept-count distribution:
+  `{2: 6, 3: 26, 4: 108, 5: 296, 6: 726, 7: 1550, 8: 9114}`
+
+Interpretation boundary:
+
+- The validation gain is small but positive in this single-seed ablation
+  (`Val Macro-F1 0.8716 -> 0.8722`).
+- The canonical test change is near-tie: `Test Macro-F1 0.8578 -> 0.8580`.
+  The filter trades three fewer false positives for three more false negatives,
+  so the small Macro-F1 gain comes from human-side improvement rather than a
+  stronger bot detector.
+- On routed test nodes, Macro-F1 improves (`0.6260 -> 0.6362`) because Human-F1
+  improves, while routed Bot-F1 drops (`0.7654 -> 0.7595`).
+- The mechanism is mild pruning, not wholesale hyperedge replacement. Most
+  centers (`9114 / 11826`) keep all eight ordinary KNN members; affected centers
+  remove only routed/high-risk members already present in the original top-K.
+- This supports the narrower hypothesis that routed/high-risk nodes can be
+  unreliable high-order hyperedge members. It does not prove that all routed
+  nodes should be avoided, nor that replacing hard-hard neighborhoods with
+  stable non-routed prototypes is generally beneficial.
+- `selection_metrics.json` is the best validation checkpoint metric. The saved
+  `outputs.pt` does not include split masks, so test metrics above were
+  recomputed by reloading the canonical dataset split, not read directly from
+  the artifact.
+
+## 2026-06-16 - Capacity-Aligned NeighborLoader Batch-Local KNN Routed-Member Filtering
+
+Question:
+
+- The previous post-TopK member-filtering run used full-batch/global
+  labeled-prefix KNN. This diagnostic asks whether the conclusion changes when
+  the training geometry is closer to the original HyperScan implementation:
+  NeighborLoader sampled subgraphs, with a fresh `x_new` KNN hypergraph built
+  inside each batch.
+- It also aligns model capacity with the official HyperScan code by setting
+  `hidden_dim = 788`, instead of the earlier 128-level node-input proxy.
+
+Protocol:
+
+- dataset: TwiBot-20, canonical labeled split
+- seed: `1`
+- input feature path:
+  `/root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt`
+- input feature definition:
+  official HyperScan tweet/num/cat tensor restricted to the labeled prefix
+- graph data variant: `labeled`
+- graph backbone: `rgcn_hyperscan_nodeinput`
+- node input family: `hyperscan_meta_tweet_proxy`
+- hidden dimension: `788`
+- training geometry: `neighbor_subgraph`
+- second-view scope: `neighborloader_batch`
+- NeighborLoader fanout: `64`
+- KNN: batch-local `x_new = [x_low; x_in]`, cosine, `K=8`
+- KNN backend: `torch_cdist_topk_cuda`
+- hypergraph backend: `pyg`
+- detector: HyperScan-style original cross-attention / `multiattn`
+- max training steps: `200`
+- routed-member mask:
+  `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/raw_knn_refiner_clean_xnew_5seed_20260615/seed1_budget_050_routed_nodes.json`
+  (`590` routed/high-risk nodes, 5% budget)
+
+Compared runs:
+
+| run | candidate policy | Val Acc | Val Macro-F1 | best epoch | mean selected members | removed routed members |
+|---|---|---:|---:|---:|---:|---:|
+| `default_seed1` | `default` | `0.8668` | `0.8620` | `15` | `7.0000` | `0.0000` |
+| `post_topk_exclude_routed_seed1` | `post_topk_exclude_routed` | `0.8668` | `0.8640` | `15` | `6.6096` | `702.9535` |
+
+Canonical test metrics recomputed from `outputs.pt` plus
+`labels.pt/train_idx.pt/valid_idx.pt/test_idx.pt`:
+
+| run | Test Acc | Test Macro-F1 | Human-F1 | Bot-F1 | TN | FP | FN | TP |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `default` | `0.8588` | `0.8556` | `0.8338` | `0.8773` | `419` | `124` | `43` | `597` |
+| `post_topk_exclude_routed` | `0.8529` | `0.8511` | `0.8346` | `0.8676` | `439` | `104` | `70` | `570` |
+
+Routed-test and non-routed-test slice metrics:
+
+| run | slice | n | Acc | Macro-F1 | Human-F1 | Bot-F1 | TN | FP | FN | TP |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `default` | routed 5% test | `59` | `0.6780` | `0.6362` | `0.5128` | `0.7595` | `10` | `16` | `3` | `30` |
+| `post_topk_exclude_routed` | routed 5% test | `59` | `0.6441` | `0.6374` | `0.5882` | `0.6866` | `15` | `11` | `10` | `23` |
+| `default` | non-routed test | `1124` | `0.8683` | `0.8657` | `0.8468` | `0.8846` | `409` | `108` | `40` | `567` |
+| `post_topk_exclude_routed` | non-routed test | `1124` | `0.8639` | `0.8622` | `0.8472` | `0.8773` | `424` | `93` | `60` | `547` |
+
+Artifact roots:
+
+- `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/neighborloader_hid788_policy_compare_step200_gpu_20260616/default_seed1`
+- `/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/neighborloader_hid788_policy_compare_step200_gpu_20260616/post_topk_exclude_routed_seed1`
+
+Artifact checks:
+
+- `checkpoint.pt["model_config"]["hidden_dim"] = 788`.
+- `manifest.json["graph_refine"]["training_geometry"] = neighbor_subgraph`.
+- `manifest.json["graph_refine"]["second_view_scope"] = neighborloader_batch`.
+- `manifest.json["graph_refine"]["feature_source"] = x_low_plus_x_in_dynamic_forward`.
+- `manifest.json["graph_refine"]["fusion"] = multiattn`.
+- `outputs.pt` contains `x_low=[11826,788]`,
+  `x_new=[11826,1576]`, `fused_x=[11826,1576]`,
+  `node_repr=[11826,1576]`, and `prob=[11826,2]`.
+
+Interpretation boundary:
+
+- "Training geometry is different" means the hypergraph construction scope and
+  optimization minibatch contract differ. It is not simply that training was
+  changed to routed nodes. In this NeighborLoader geometry, the sampled subgraph
+  is the local universe for each forward pass, and the KNN hypergraph is rebuilt
+  from batch-local `x_new` features.
+- Capacity alignment and batch-local KNN improve fidelity to the original
+  HyperScan training contract, but they do not make routed-member filtering
+  beneficial in this step-200 diagnostic.
+- `post_topk_exclude_routed` reduces false positives, but increases false
+  negatives much more (`43 -> 70` on the full test split), lowering Test
+  Macro-F1 (`0.8556 -> 0.8511`) and Bot-F1 (`0.8773 -> 0.8676`).
+- On routed test nodes, Macro-F1 is essentially tied, but Bot-F1 drops sharply
+  (`0.7595 -> 0.6866`). This supports the earlier warning that hard-hard
+  high-order neighborhoods contain useful boundary evidence and should not be
+  blindly removed.
+- This is a single-seed, 200-step diagnostic. It is sufficient negative
+  evidence against the simple "drop routed KNN members" policy, but not a
+  claim-grade reproduction of HyperScan or a final multi-seed method result.
+
+## 2026-06-17 - Strict Same-Protocol Detector Consumption Comparison (`iter_-1`, frozen SimTeG, seed 1)
+
+Question:
+
+- Under one clean bounded protocol, does explicit second-view consumption help
+  the current frozen semantic regime, and does `multiattn_adaptive` add real
+  value beyond `multiattn`?
+- This block is a detector-consumption diagnostic only. It is not an official
+  HyperScan reproduction claim, and it does not mix router retraining,
+  MH-LGC, routed correction, official HyperScan raw-data preprocessing, or
+  `iter_2`.
+
+Protocol:
+
+- dataset: TwiBot-20 canonical split
+- seed: `1`
+- embedding regime: frozen SimTeG `iter_-1`
+- embedding path:
+  `/root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt`
+- graph data variant: `labeled`
+- graph backbone: `rgcn_hyperscan_routed`
+- neighbor fanout: `64`
+- graph batch size: `1024`
+- max training steps: `200`
+- fixed routed-slice source for all detector runs:
+  `LLMbot/experiments/fullgraph_conformal_knn_risk_k8_labeledfull_labeledcenters_xnew_seed1/seed_1/stages/estimator_ablation/risk_manifest.json`
+  with test counts:
+  - `budget_050`: `59`
+  - `budget_100`: `118`
+  - `budget_150`: `177`
+  - `budget_200`: `236`
+- remote execution root:
+  `/root/workspace/LMbot/LLMbot_strict_proto_20260617`
+- code provenance note:
+  the existing remote `/root/workspace/LMbot/LLMbot` checkout was stale
+  relative to the local active mainline, so this run used a fresh synced copy.
+  The synced remote hashes matched local current mainline for:
+  - `main.py`: `476bb97550cd09c1b062614db7e405266eb2d371e7217eb62cb936b096ab9c56`
+  - `parser_args.py`: `aef6e77710c5c36c49a872ffb2f835d930cc2e972f89311c3125716e490510f8`
+  - `GNNs.py`: `d244416b79b411d85ad99be5abd939eddce197f08ccd5dcb38675872a1c57d4d`
+
+Execution note:
+
+- For second-view runs, current parser semantics require
+  `--graph_second_view_scope neighborloader_batch` to keep the intended
+  NeighborLoader batch-local second-view geometry. Without this flag, the
+  parser may normalize second-view training back to `full_batch`. This is an
+  execution correction to preserve the planned same-protocol geometry, not a
+  method change.
+
+Commands:
+
+```bash
+cd /root/workspace/LMbot/LLMbot_strict_proto_20260617
+
+# semantic-only RGCN
+CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_routed \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --disable_wandb \
+  --experiment_name experiments/strict_proto_semantic_only_neighborloader_step200_iterm1_seed1_20260617 \
+  --graph_training_loader_mode neighbor_subgraph
+
+# second-view + residual
+CUDA_VISIBLE_DEVICES=1 /root/mambaforge/envs/lmbot/bin/python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_routed \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --disable_wandb \
+  --experiment_name experiments/strict_proto_secondview_residual_neighborloader_step200_iterm1_seed1_20260617 \
+  --graph_refine_mode hyperscan_neighborloader_batch_local_branch \
+  --graph_refine_knn_k 8 \
+  --graph_second_view_fusion residual \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_training_loader_mode neighbor_subgraph
+
+# second-view + multiattn
+CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_routed \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --disable_wandb \
+  --experiment_name experiments/strict_proto_secondview_multiattn_neighborloader_step200_iterm1_seed1_20260617 \
+  --graph_refine_mode hyperscan_neighborloader_batch_local_branch \
+  --graph_refine_knn_k 8 \
+  --graph_second_view_fusion multiattn \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_training_loader_mode neighbor_subgraph
+
+# second-view + multiattn_adaptive
+CUDA_VISIBLE_DEVICES=1 /root/mambaforge/envs/lmbot/bin/python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_routed \
+  --embedding_path /root/workspace/LMbot/TwiBot-20_seed_1/intermediate/LM/embeddings_iter_-1.pt \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --disable_wandb \
+  --experiment_name experiments/strict_proto_secondview_multiattn_adaptive_neighborloader_step200_iterm1_seed1_20260617 \
+  --graph_refine_mode hyperscan_neighborloader_batch_local_branch \
+  --graph_refine_knn_k 8 \
+  --graph_second_view_fusion multiattn_adaptive \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_training_loader_mode neighbor_subgraph
+```
+
+Artifact roots:
+
+- `/root/workspace/LMbot/LLMbot_strict_proto_20260617/experiments/strict_proto_semantic_only_neighborloader_step200_iterm1_seed1_20260617`
+- `/root/workspace/LMbot/LLMbot_strict_proto_20260617/experiments/strict_proto_secondview_residual_neighborloader_step200_iterm1_seed1_20260617`
+- `/root/workspace/LMbot/LLMbot_strict_proto_20260617/experiments/strict_proto_secondview_multiattn_neighborloader_step200_iterm1_seed1_20260617`
+- `/root/workspace/LMbot/LLMbot_strict_proto_20260617/experiments/strict_proto_secondview_multiattn_adaptive_neighborloader_step200_iterm1_seed1_20260617`
+
+Completed artifacts per run:
+
+- `manifest.json`
+- `selection_metrics.json`
+- `outputs.pt`
+- `checkpoint.pt`
+- `slice_metrics.json`
+- `slice_metrics.csv`
+- second-view runs additionally include `graph_refine_stats.json`
+
+Manifest checks:
+
+- `semantic_only`
+  - `graph_refine` inactive: no active second-view branch recorded
+  - `detector.positioning = lightweight_residual_consumer`
+  - `detector.graph_second_view_fusion = residual`
+- `residual`
+  - `graph_refine.positioning = second_view_mainline`
+  - `graph_refine.control_only = false`
+  - `detector.positioning = lightweight_residual_consumer`
+  - `detector.graph_second_view_fusion = residual`
+- `multiattn`
+  - `graph_refine.positioning = second_view_mainline`
+  - `graph_refine.control_only = false`
+  - `detector.positioning = strong_graph_consumer`
+  - `detector.graph_second_view_fusion = multiattn`
+- `adaptive`
+  - `graph_refine.positioning = second_view_mainline`
+  - `graph_refine.control_only = false`
+  - `detector.positioning = strong_graph_consumer`
+  - `detector.graph_second_view_fusion = multiattn_adaptive`
+- all four runs record the same representation-role contract:
+  - `z_sem = semantic_input_space`
+  - `z_construct = x_new_high_order_construction_space`
+  - `z_pred = fused_x_final_detector_space`
+
+Metric computation note:
+
+- full/routed/non-routed test metrics were recomputed from each run's
+  `outputs.pt` plus canonical `test_idx.pt` and the fixed router manifest above.
+- In these artifacts `labels` is stored as one-hot `[N,2]`, so metric
+  recomputation uses `argmax(labels, dim=1)` before scoring.
+
+Full-test metrics:
+
+| variant | Test Acc | Test Macro-F1 | Bot-F1 | Human-F1 |
+|---|---:|---:|---:|---:|
+| `semantic_only` | `0.8555` | `0.8542` | `0.8675` | `0.8409` |
+| `residual` | `0.8597` | `0.8588` | `0.8701` | `0.8474` |
+| `multiattn` | `0.8555` | `0.8549` | `0.8640` | `0.8458` |
+| `adaptive` | `0.8555` | `0.8537` | `0.8698` | `0.8376` |
+
+Routed-test slice metrics:
+
+| variant | budget | n | Acc | Macro-F1 | Human-F1 | Bot-F1 |
+|---|---|---:|---:|---:|---:|---:|
+| `semantic_only` | `5%` | `59` | `0.4068` | `0.3597` | `0.5333` | `0.1860` |
+| `residual` | `5%` | `59` | `0.4407` | `0.3833` | `0.5714` | `0.1951` |
+| `multiattn` | `5%` | `59` | `0.5424` | `0.4516` | `0.6747` | `0.2286` |
+| `adaptive` | `5%` | `59` | `0.3390` | `0.3382` | `0.3607` | `0.3158` |
+| `semantic_only` | `10%` | `118` | `0.5339` | `0.5282` | `0.5802` | `0.4762` |
+| `residual` | `10%` | `118` | `0.5169` | `0.5011` | `0.5899` | `0.4124` |
+| `multiattn` | `10%` | `118` | `0.5339` | `0.4889` | `0.6405` | `0.3373` |
+| `adaptive` | `10%` | `118` | `0.4746` | `0.4740` | `0.4561` | `0.4918` |
+| `semantic_only` | `15%` | `177` | `0.5198` | `0.5198` | `0.5198` | `0.5198` |
+| `residual` | `15%` | `177` | `0.5424` | `0.5403` | `0.5714` | `0.5091` |
+| `multiattn` | `15%` | `177` | `0.5254` | `0.5123` | `0.5922` | `0.4324` |
+| `adaptive` | `15%` | `177` | `0.5198` | `0.5136` | `0.4586` | `0.5685` |
+| `semantic_only` | `20%` | `236` | `0.5763` | `0.5752` | `0.5536` | `0.5968` |
+| `residual` | `20%` | `236` | `0.6017` | `0.6017` | `0.6017` | `0.6017` |
+| `multiattn` | `20%` | `236` | `0.5763` | `0.5732` | `0.6094` | `0.5370` |
+| `adaptive` | `20%` | `236` | `0.5805` | `0.5721` | `0.5123` | `0.6320` |
+
+Non-routed-test slice metrics:
+
+| variant | budget | n | Acc | Macro-F1 | Human-F1 | Bot-F1 |
+|---|---|---:|---:|---:|---:|---:|
+| `semantic_only` | `5%` | `1124` | `0.8790` | `0.8775` | `0.8640` | `0.8910` |
+| `residual` | `5%` | `1124` | `0.8817` | `0.8805` | `0.8684` | `0.8925` |
+| `multiattn` | `5%` | `1124` | `0.8719` | `0.8709` | `0.8596` | `0.8822` |
+| `adaptive` | `5%` | `1124` | `0.8826` | `0.8809` | `0.8669` | `0.8949` |
+| `semantic_only` | `10%` | `1065` | `0.8911` | `0.8897` | `0.8771` | `0.9022` |
+| `residual` | `10%` | `1065` | `0.8977` | `0.8964` | `0.8851` | `0.9077` |
+| `multiattn` | `10%` | `1065` | `0.8911` | `0.8899` | `0.8787` | `0.9012` |
+| `adaptive` | `10%` | `1065` | `0.8977` | `0.8962` | `0.8839` | `0.9085` |
+| `semantic_only` | `15%` | `1006` | `0.9145` | `0.9135` | `0.9042` | `0.9228` |
+| `residual` | `15%` | `1006` | `0.9155` | `0.9145` | `0.9055` | `0.9236` |
+| `multiattn` | `15%` | `1006` | `0.9135` | `0.9126` | `0.9037` | `0.9216` |
+| `adaptive` | `15%` | `1006` | `0.9145` | `0.9135` | `0.9040` | `0.9229` |
+| `semantic_only` | `20%` | `947` | `0.9250` | `0.9242` | `0.9166` | `0.9319` |
+| `residual` | `20%` | `947` | `0.9240` | `0.9232` | `0.9155` | `0.9309` |
+| `multiattn` | `20%` | `947` | `0.9250` | `0.9243` | `0.9168` | `0.9318` |
+| `adaptive` | `20%` | `947` | `0.9240` | `0.9232` | `0.9153` | `0.9310` |
+
+Decision-gate outcome:
+
+- `multiattn` does not beat both `semantic_only` and `residual` on full-test
+  Macro-F1. It is only `+0.0006` over `semantic_only`
+  (`0.8542 -> 0.8549`) and `-0.0039` below `residual`
+  (`0.8588 - 0.8549 = 0.0039`).
+- `multiattn_adaptive` does not clear the promotion threshold over
+  `multiattn`:
+  - full-test Macro-F1 delta: `0.8537 - 0.8549 = -0.0012`
+  - routed `5%` Macro-F1 delta: `0.3382 - 0.4516 = -0.1134`
+  - non-routed `5%` Macro-F1 delta: `0.8809 - 0.8709 = +0.0100`
+- Therefore `multiattn_adaptive` is a negative result under this bounded clean
+  protocol and should not be expanded to multi-seed on the basis of this block.
+
+Interpretation boundary:
+
+- Under this strict same-protocol seed-1 diagnostic, the strongest full-test
+  detector consumer is `second-view + residual`, not `multiattn`.
+- `multiattn` does improve routed `5%` Macro-F1 relative to both
+  `semantic_only` and `residual`, but that routed gain does not survive as a
+  better full-test detector in this bounded protocol because non-routed quality
+  falls relative to `residual`.
+- `adaptive` shifts some non-routed budgets slightly upward, but the routed
+  slice degrades sharply at the most important `5%` budget, so the adaptive
+  low/high fusion claim is not supported here.
+- This block answers one narrow question only: under the current frozen
+  semantic regime and fixed 200-step NeighborLoader contract, explicit
+  cross-attention consumption and adaptive low/high fusion do not provide a
+  stable full-test gain over the lighter residual second-view consumer.

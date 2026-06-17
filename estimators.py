@@ -2278,6 +2278,8 @@ def _conformal_knn_scalar_risk_features(
     same_hyperedge_calibration_fallback_to_global = np.ones(num_nodes, dtype=np.float64)
     same_hyperedge_calibration_shrink_weight = np.zeros(num_nodes, dtype=np.float64)
     same_hyperedge_calibration_shrunk_tail_risk = risk.copy().astype(np.float64)
+    support_candidate_rows = [[] for _ in range(center_limit)]
+    support_similarity_rows = [[] for _ in range(center_limit)]
 
     high_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.80)) if labeled_limit else 1.0
     low_threshold = float(np.quantile(risk[:labeled_limit].astype(np.float64), 0.35)) if labeled_limit else 0.0
@@ -2465,6 +2467,9 @@ def _conformal_knn_scalar_risk_features(
         support_count = float(selected.size)
         support_neighbor_count[center] = support_count
         hyperedge_member_count[center] = float(member_count) if member_count is not None else support_count
+        if 0 <= int(center) < int(center_limit):
+            support_candidate_rows[int(center)] = [int(item) for item in selected.astype(np.int64).tolist()]
+            support_similarity_rows[int(center)] = [float(item) for item in sims.astype(np.float32).tolist()]
         if selected.size == 0:
             return
         selected_hubness = hubness_counts[selected] if hubness_counts.size else np.zeros(selected.size, dtype=np.float64)
@@ -2863,6 +2868,23 @@ def _conformal_knn_scalar_risk_features(
         "same_hyperedge_calibration_shrunk_tail_risk": np.clip(same_hyperedge_calibration_shrunk_tail_risk, 0.0, 1.0).astype(np.float32),
         "knn_has_candidates": has_candidates,
     }
+    features["_support_payload"] = {
+        "contract": "conformal_knn_router_support_group_v1",
+        "source": "conformal_knn_risk_router",
+        "candidate_scope": str(scope),
+        "backend": str(backend),
+        "neighbor_mode": str(neighbor_mode_value),
+        "knn_k": int(k),
+        "adaptive_max_k": int(adaptive_k),
+        "min_support": int(min_support_count),
+        "local_calibration_scope": str(local_calibration_scope_value),
+        "center_count": int(center_limit),
+        "center_node_ids": [int(idx) for idx in range(center_limit)],
+        "center_candidate_node_ids": support_candidate_rows,
+        "center_candidate_similarity": support_similarity_rows,
+        "center_support_neighbor_count": support_neighbor_count[:center_limit].astype(np.int64).tolist(),
+        "center_hyperedge_member_count": hyperedge_member_count[:center_limit].astype(np.int64).tolist(),
+    }
     features["_metadata"] = {
         "knn_k": int(k),
         "knn_support_k": int(support_k),
@@ -3102,6 +3124,7 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
         self.selected_score_family_metrics = {}
         self.local_risk_features_ = {}
         self.local_risk_feature_metadata_ = {}
+        self.local_support_payload_ = {}
         self.candidate_score_family_metrics = {}
         self.split_selection_metadata = {}
         self.score_family_override = "auto"
@@ -3152,6 +3175,7 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             **kwargs,
         )
         self.local_risk_feature_metadata_ = dict(local_features.pop("_metadata", {}))
+        self.local_support_payload_ = dict(local_features.pop("_support_payload", {}) or {})
         self.local_risk_features_ = {name: values.astype(np.float32) for name, values in local_features.items()}
         override = (
             str(kwargs.get("conformal_knn_score_family_override", "auto") or "auto").strip()
@@ -3261,6 +3285,7 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             **kwargs,
         )
         local_metadata = dict(local_features.pop("_metadata", {}))
+        support_payload = dict(local_features.pop("_support_payload", {}) or {})
         risk_score = self._score_from_local_risk_features(base_risk, local_features)
         preds = posterior.argmax(axis=1)
         preds_labeled = preds[:labeled_count]
@@ -3288,6 +3313,7 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             "risk_object_smoothed": True,
             "embedding_context_used": node_repr is not None,
             "node_repr_used": node_repr is not None,
+            "support_group_payload_available": bool(support_payload),
             "local_calibration_router_metadata": dict(getattr(self, "local_calibration_router_metadata_", {}) or {}),
             "learned_router_metadata": dict(getattr(self, "learned_router_metadata_", {}) or {}),
         }
@@ -3325,6 +3351,7 @@ class CalibratedLocalRiskRouter(PostHocCalibratedRanker):
             "selected_nodes_by_budget": selected_nodes,
             "target_selection_contract": "rank_target_nodes_by_target_plus_optional_support_evidence_v1",
             "support_group_contract": "knn_neighbors_are_evidence_only_not_routed_outputs",
+            "support_group_payload": support_payload,
             "top_ranked_targets": {
                 "test": _top_target_rows(
                     risk_score,
@@ -3472,6 +3499,74 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
         self.local_calibration_idx_ = np.empty(0, dtype=np.int64)
         self.local_calibration_scope_ = "independent_knn"
         self.nonparametric_family_pool_name_ = "ncp_local"
+        self.learned_router_scaler_ = None
+        self.learned_router_classifier_ = None
+        self.learned_router_feature_names_ = []
+        self.learned_router_metrics_ = {}
+
+    def _learned_feature_names(self, local_features):
+        preferred = [
+            "knn_mean_risk",
+            "knn_max_risk",
+            "knn_risk_std",
+            "knn_prediction_disagreement",
+            "knn_high_risk_mass",
+            "knn_safe_support_mass",
+            "knn_similarity_mean",
+            "knn_similarity_gap",
+            "knn_effective_neighbor_count",
+            "knn_support_neighbor_count",
+            "knn_hyperedge_member_count",
+            "ncp_weighted_mean_risk",
+            "ncp_shrunk_weighted_mean_risk",
+            "ncp_weighted_risk_q80",
+            "ncp_weighted_prediction_disagreement",
+            "ncp_weighted_high_risk_mass",
+            "ncp_effective_sample_size",
+            "ncp_local_abstain_risk",
+            "ncp_local_threshold",
+            "ncp_local_threshold_delta",
+            "ncp_local_set_size",
+            "ncp_local_margin_risk",
+            "ncp_local_calibration_neighbor_count",
+            "ncp_local_effective_calibration_sample_size",
+            "same_hyperedge_selected_tail_risk",
+            "same_hyperedge_global_tail_risk",
+            "same_hyperedge_calibration_tail_risk",
+            "same_hyperedge_calibration_shrunk_tail_risk",
+            "same_hyperedge_selected_effective_sample_size",
+            "same_hyperedge_calibration_effective_sample_size",
+        ]
+        return [name for name in preferred if name in local_features]
+
+    def _learned_feature_matrix(self, base_risk, local_features):
+        feature_map = {"base_abstain_risk": np.asarray(base_risk, dtype=np.float32).reshape(-1)}
+        feature_names = ["base_abstain_risk"]
+        for name in self._learned_feature_names(local_features):
+            values = np.asarray(local_features.get(name), dtype=np.float32).reshape(-1)
+            feature_map[name] = values
+            feature_names.append(name)
+        matrix = _feature_matrix_from_map(feature_map, feature_names, int(feature_map["base_abstain_risk"].shape[0]))
+        return matrix, feature_names
+
+    def _fit_learned_router(self, feature_matrix, target_labels):
+        if feature_matrix.shape[0] == 0 or feature_matrix.shape[1] == 0:
+            return False
+        labels = np.asarray(target_labels, dtype=np.int64).reshape(-1)
+        if np.unique(labels).size < 2:
+            return False
+        self.learned_router_scaler_ = StandardScaler()
+        scaled = self.learned_router_scaler_.fit_transform(feature_matrix)
+        clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+        clf.fit(scaled, labels)
+        self.learned_router_classifier_ = clf
+        return True
+
+    def _learned_router_score(self, feature_matrix):
+        if self.learned_router_scaler_ is None or self.learned_router_classifier_ is None:
+            return None
+        scaled = self.learned_router_scaler_.transform(feature_matrix)
+        return self.learned_router_classifier_.predict_proba(scaled)[:, 1].astype(np.float32)
 
     def _local_calibration_kwargs(self, kwargs):
         payload = dict(kwargs)
@@ -3485,8 +3580,8 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
 
     def fit(self, logits, probs, labels, train_idx, val_idx, edge_index=None, edge_type=None, node_repr=None, **kwargs):
         self.learning_mode = str(kwargs.get("conformal_knn_learning_mode", "fixed") or "fixed").strip().lower()
-        if self.learning_mode not in {"fixed", "ncp_local"}:
-            raise ValueError("--conformal_knn_learning_mode must be one of {fixed, ncp_local}.")
+        if self.learning_mode not in {"fixed", "ncp_local", "learned_logistic"}:
+            raise ValueError("--conformal_knn_learning_mode must be one of {fixed, ncp_local, learned_logistic}.")
         requested_override = str(kwargs.get("conformal_knn_score_family_override", "auto") or "auto").strip()
         requested_override_key = requested_override.lower()
         self.local_calibration_scope_ = str(
@@ -3536,13 +3631,19 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
         self.local_calibration_router_metadata_ = {
             "learning_mode": self.learning_mode,
             "local_calibration_router_active": bool(self.learning_mode == "ncp_local"),
-            "router_model": "none",
-            "uses_logistic": False,
+            "router_model": "logistic_regression" if self.learning_mode == "learned_logistic" else "none",
+            "uses_logistic": bool(self.learning_mode == "learned_logistic"),
             "calibration_split": "cal_idx",
             "calibration_count": int(self.local_calibration_idx_.size),
-            "score_semantics": "validation_selected_nonparametric_ncp_local_risk_family"
-            if self.learning_mode == "ncp_local"
-            else "fixed_validation_selected_knn_risk_family",
+            "score_semantics": (
+                "validation_selected_nonparametric_ncp_local_risk_family"
+                if self.learning_mode == "ncp_local"
+                else (
+                    "train_fit_logistic_residual_risk_scorer_over_structured_knn_features"
+                    if self.learning_mode == "learned_logistic"
+                    else "fixed_validation_selected_knn_risk_family"
+                )
+            ),
             "official_ncp_alignment": (
                 "Uses NCP-style KNN neighborhood localization weights with no learned logistic risk head. "
                 "Under independent_knn it keeps calibration-only local conformal thresholds; under same_hyperedge "
@@ -3570,6 +3671,55 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
                 if key in local_metadata
             },
         }
+        if self.learning_mode == "learned_logistic":
+            fit_idx_np = _valid_index_array(kwargs.get("train_idx", train_idx), int(labels_np.shape[0]))
+            feature_matrix, feature_names = self._learned_feature_matrix(self.local_risk_features_.get("base_risk", r0), self.local_risk_features_)
+            self.learned_router_feature_names_ = list(feature_names)
+            router_available = self._fit_learned_router(feature_matrix[fit_idx_np], wrong[fit_idx_np]) if fit_idx_np.size else False
+            learned_score = self._learned_router_score(feature_matrix) if router_available else None
+            val_idx_np = _valid_index_array(val_idx, int(labels_np.shape[0]))
+            train_metrics = (
+                residual_risk_metrics(wrong[fit_idx_np], learned_score[fit_idx_np], budgets=(0.15,))
+                if router_available and fit_idx_np.size
+                else {}
+            )
+            valid_metrics = (
+                residual_risk_metrics(wrong[val_idx_np], learned_score[val_idx_np], budgets=(0.15,))
+                if router_available and val_idx_np.size
+                else {}
+            )
+            self.learned_router_metrics_ = {
+                "router_available": bool(router_available),
+                "fit_count": int(fit_idx_np.size),
+                "fit_positive_count": int(wrong[fit_idx_np].sum()) if fit_idx_np.size else 0,
+                "train_metrics": train_metrics,
+                "valid_metrics": valid_metrics,
+            }
+            self.local_calibration_router_metadata_.update(
+                {
+                    "learned_router_feature_names": list(feature_names),
+                    "learned_router_router_available": bool(router_available),
+                    "learned_router_fit_scope": "train_split_residual_error_labels_only",
+                    "learned_router_target_semantics": "predict_base_detector_error_probability",
+                    "learned_router_train_metrics": dict(train_metrics),
+                    "learned_router_valid_metrics": dict(valid_metrics),
+                }
+            )
+            self.selected_score_family = "learned_logistic_residual_router"
+            self.selected_score_family_metrics = dict(valid_metrics)
+            self.candidate_score_family_metrics = {
+                "learned_logistic_residual_router": dict(valid_metrics),
+            }
+            self.fit_summary = {
+                **dict(self.fit_summary),
+                "selected_score_family": self.selected_score_family,
+                "selected_score_family_metrics": dict(self.selected_score_family_metrics),
+                "candidate_score_family_metrics": dict(self.candidate_score_family_metrics),
+                "learned_router_feature_names": list(feature_names),
+                "learned_router_metrics": dict(self.learned_router_metrics_),
+            }
+            self.calibration_metadata = dict(self.fit_summary)
+            return self
         if self.learning_mode == "ncp_local" and requested_override_key != "auto" and requested_override in self.SCORE_FAMILIES:
             self.score_family_override = requested_override
             self.local_calibration_router_metadata_["selected_ncp_local_family"] = self.selected_score_family
@@ -3640,6 +3790,12 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
         return self
 
     def _score_from_local_risk_features(self, r0, local_features):
+        if self.learning_mode == "learned_logistic":
+            feature_matrix, _ = self._learned_feature_matrix(r0, local_features)
+            scores = self._learned_router_score(feature_matrix)
+            if scores is None:
+                return np.asarray(r0, dtype=np.float32).reshape(-1)
+            return np.clip(np.asarray(scores, dtype=np.float32).reshape(-1), 0.0, 1.0).astype(np.float32)
         if self.learning_mode == "ncp_local" and self.selected_score_family in self.NCP_LOCAL_SCORE_FAMILIES:
             scorer = self.NCP_LOCAL_SCORE_FAMILIES[self.selected_score_family]
             values = np.asarray(scorer(r0, local_features), dtype=np.float32).reshape(-1)
@@ -3681,6 +3837,8 @@ class ConformalKNNRiskRouter(CalibratedLocalRiskRouter):
             {
                 "learning_mode": self.learning_mode,
                 "local_calibration_router_metadata": dict(self.local_calibration_router_metadata_),
+                "learned_router_feature_names": list(self.learned_router_feature_names_),
+                "learned_router_metrics": dict(self.learned_router_metrics_),
             }
         )
         return payload

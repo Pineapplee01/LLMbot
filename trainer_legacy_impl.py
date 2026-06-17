@@ -472,15 +472,24 @@ def train_frozen_g0(args, seed, data, experiment_root):
         input_adapter.eval()
     with torch.no_grad():
         x = input_adapter(x_projected, x_raw) if input_adapter is not None else x_projected
-        outputs = model.forward_outputs(x, edge_index, edge_type)
+        raw_outputs = model.forward_outputs(x, edge_index, edge_type)
     outputs = {
-        "logits": outputs["logits"].detach().cpu(),
-        "prob": outputs["prob"].detach().cpu(),
-        "pred": outputs["prob"].argmax(dim=1).detach().cpu(),
+        "logits": raw_outputs["logits"].detach().cpu(),
+        "prob": raw_outputs["prob"].detach().cpu(),
+        "pred": raw_outputs["prob"].argmax(dim=1).detach().cpu(),
         "labels": data["labels"].detach().cpu() if torch.is_tensor(data["labels"]) else torch.tensor(data["labels"]),
-        "node_repr": outputs["node_repr"].detach().cpu(),
-        "aux_features": outputs.get("aux_features", {}),
+        "node_repr": raw_outputs["node_repr"].detach().cpu(),
+        "fused_x": (
+            raw_outputs["fused_x"].detach().cpu()
+            if torch.is_tensor(raw_outputs.get("fused_x"))
+            else raw_outputs["node_repr"].detach().cpu()
+        ),
+        "aux_features": raw_outputs.get("aux_features", {}),
     }
+    if torch.is_tensor(raw_outputs.get("x_low")):
+        outputs["x_low"] = raw_outputs["x_low"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("x_new")):
+        outputs["x_new"] = raw_outputs["x_new"].detach().cpu()
 
     checkpoint = {
         "model": (best_state or {}).get("model")
@@ -602,6 +611,8 @@ def _requested_feature_path(args):
 def _graph_refine_request(args):
     mode = str(getattr(args, "graph_refine_mode", "none") or "none").lower()
     budget = float(getattr(args, "graph_refine_budget", 0.0) or 0.0)
+    graph_refine_positioning = str(getattr(args, "graph_refine_positioning", "none") or "none").strip().lower()
+    graph_refine_control_only = bool(getattr(args, "graph_refine_control_only", False))
     if mode == "none":
         return {
             "mode": "none",
@@ -609,6 +620,8 @@ def _graph_refine_request(args):
             "degree_guard_enabled": False,
             "oracle_uses_labels": False,
             "diagnostic_only": False,
+            "positioning": graph_refine_positioning,
+            "control_only": graph_refine_control_only,
         }
     if mode not in {
         "directional_relation_aware_prune",
@@ -634,6 +647,8 @@ def _graph_refine_request(args):
             "directional_relation_aware_oracle_prune_no_hetero_priority",
         },
         "hetero_priority": mode == "directional_relation_aware_oracle_prune",
+        "positioning": graph_refine_positioning,
+        "control_only": graph_refine_control_only,
     }
 
 
@@ -6646,7 +6661,7 @@ class StageRunner:
             "conformal_knn_score_family_override": str(
                 getattr(self.args, "conformal_knn_score_family_override", "auto") or "auto"
             ),
-            "conformal_knn_repr_source": str(getattr(self.args, "conformal_knn_repr_source", "node_repr") or "node_repr"),
+            "conformal_knn_repr_source": str(getattr(self.args, "conformal_knn_repr_source", "x_new") or "x_new"),
             "conformal_knn_local_calibration_scope": str(
                 getattr(self.args, "conformal_knn_local_calibration_scope", "independent_knn") or "independent_knn"
             ),
@@ -6697,10 +6712,12 @@ class StageRunner:
                 "--conformal_knn_candidate_scope must resolve to one of "
                 "{labeled_full, hyperscan_full, labeled_relation_1hop, undirected_relation_1hop}."
             )
-        if config["conformal_knn_repr_source"] not in {"node_repr", "x_low", "x_new"}:
-            raise ValueError("--conformal_knn_repr_source must resolve to one of {node_repr, x_low, x_new}.")
-        if config["conformal_knn_learning_mode"] not in {"fixed", "ncp_local"}:
-            raise ValueError("--conformal_knn_learning_mode must resolve to one of {fixed, ncp_local}.")
+        if config["conformal_knn_repr_source"] not in {"fused_x", "node_repr", "x_low", "x_new", "x_high"}:
+            raise ValueError(
+                "--conformal_knn_repr_source must resolve to one of {fused_x, node_repr, x_low, x_new, x_high}."
+            )
+        if config["conformal_knn_learning_mode"] not in {"fixed", "ncp_local", "learned_logistic"}:
+            raise ValueError("--conformal_knn_learning_mode must resolve to one of {fixed, ncp_local, learned_logistic}.")
         if config["conformal_knn_local_calibration_scope"] not in {"independent_knn", "same_hyperedge"}:
             raise ValueError(
                 "--conformal_knn_local_calibration_scope must resolve to one of "
@@ -6729,9 +6746,9 @@ class StageRunner:
         node_repr = None if estimator_mode == "posthoc_calibrated_ranker" else gnn_outputs.get("node_repr")
         if estimator_mode != "conformal_knn_risk_router":
             return node_repr, None
-        repr_source = str(repr_source or getattr(self.args, "conformal_knn_repr_source", "node_repr") or "node_repr").strip().lower()
-        if repr_source not in {"node_repr", "x_low", "x_new"}:
-            raise ValueError("--conformal_knn_repr_source must be one of {node_repr, x_low, x_new}.")
+        repr_source = str(repr_source or getattr(self.args, "conformal_knn_repr_source", "x_new") or "x_new").strip().lower()
+        if repr_source not in {"fused_x", "node_repr", "x_low", "x_new", "x_high"}:
+            raise ValueError("--conformal_knn_repr_source must be one of {fused_x, node_repr, x_low, x_new, x_high}.")
 
         def _to_cpu_float_view(value, name):
             if value is None:
@@ -6743,32 +6760,44 @@ class StageRunner:
                 )
             return tensor
 
+        fused_x_export = _to_cpu_float_view(gnn_outputs.get("fused_x"), "fused_x")
         node_repr_tensor = _to_cpu_float_view(node_repr, "node_repr")
         x_low_export = _to_cpu_float_view(gnn_outputs.get("x_low"), "x_low")
         x_new_export = _to_cpu_float_view(gnn_outputs.get("x_new"), "x_new")
+        x_high_export = _to_cpu_float_view(gnn_outputs.get("x_high"), "x_high")
         metadata = {
             "requested_repr_source": repr_source,
             "available_repr_fields": {
+                "fused_x": bool(fused_x_export is not None),
                 "node_repr": bool(node_repr_tensor is not None),
                 "x_low": bool(x_low_export is not None),
                 "x_new": bool(x_new_export is not None),
+                "x_high": bool(x_high_export is not None),
             },
         }
-        if repr_source == "node_repr":
-            if node_repr_tensor is None:
-                raise MissingFrozenArtifactError("conformal_knn_risk_router requires frozen G0 node_repr.")
+        if repr_source in {"fused_x", "node_repr"}:
+            fused_tensor = fused_x_export if fused_x_export is not None else node_repr_tensor
+            if fused_tensor is None:
+                raise MissingFrozenArtifactError(
+                    "conformal_knn_risk_router requires frozen G0 fused_x or legacy node_repr."
+                )
             metadata.update(
                 {
-                    "effective_repr_source": "node_repr",
-                    "repr_resolution": "direct_node_repr",
-                    "repr_shape": [int(node_repr_tensor.shape[0]), int(node_repr_tensor.shape[1])],
+                    "effective_repr_source": "fused_x",
+                    "repr_resolution": (
+                        "direct_fused_x"
+                        if fused_x_export is not None
+                        else "legacy_node_repr_alias_for_fused_x"
+                    ),
+                    "repr_shape": [int(fused_tensor.shape[0]), int(fused_tensor.shape[1])],
                     "hyperscan_alignment_note": (
-                        "Router consumed the detector fused node_repr directly because "
-                        "--conformal_knn_repr_source node_repr was requested."
+                        "Router consumed the explicit detector fused_x hidden."
+                        if fused_x_export is not None
+                        else "Frozen G0 did not export fused_x, so router fell back to legacy node_repr as the fused hidden alias."
                     ),
                 }
             )
-            return node_repr_tensor, metadata
+            return fused_tensor, metadata
 
         x_low = x_low_export
         x_low_source = "frozen_g0.x_low"
@@ -6799,61 +6828,50 @@ class StageRunner:
             )
             return x_low, metadata
 
-        if x_new_export is not None:
-            metadata.update(
-                {
-                    "effective_repr_source": "x_new",
-                    "repr_resolution": "exported_x_new",
-                    "x_new_source": "frozen_g0.x_new",
-                    "repr_shape": [int(x_new_export.shape[0]), int(x_new_export.shape[1])],
-                    "hyperscan_alignment_note": (
-                        "Router consumed the exact HyperScan x_new exported by frozen G0, instead of reconstructing "
-                        "it from node_repr."
-                    ),
-                }
-            )
-            return x_new_export, metadata
+        if repr_source == "x_new":
+            if x_new_export is not None:
+                metadata.update(
+                    {
+                        "effective_repr_source": "x_new",
+                        "repr_resolution": "exported_x_new",
+                        "x_new_source": "frozen_g0.x_new",
+                        "repr_shape": [int(x_new_export.shape[0]), int(x_new_export.shape[1])],
+                        "hyperscan_alignment_note": (
+                            "Router consumed the exact HyperScan x_new exported by frozen G0, instead of reconstructing "
+                            "it from node_repr."
+                        ),
+                    }
+                )
+                return x_new_export, metadata
 
-        x_in = self._strict_glance_backbone_input_features()
-        x_in = x_in.detach().cpu().float() if torch.is_tensor(x_in) else torch.tensor(x_in, dtype=torch.float32)
-        if x_low.dim() != 2 or x_in.dim() != 2:
             raise MissingFrozenArtifactError(
-                f"conformal_knn x_new expects 2-D x_low/x_in tensors, got {tuple(x_low.shape)} and {tuple(x_in.shape)}."
+                "conformal_knn_risk_router with --conformal_knn_repr_source x_new requires frozen G0 outputs['x_new']. "
+                "HyperScan-aligned KNN support must consume the forward-native cat(x_low, x_in) tensor; do not "
+                "approximate it from legacy node_repr. Regenerate graph_detector_prepare with a backbone/export path "
+                "that writes x_new, or run an explicit non-HyperScan control with --conformal_knn_repr_source fused_x/node_repr."
             )
-        if int(x_low.shape[0]) != int(x_in.shape[0]):
+
+        if repr_source == "x_high":
+            if x_high_export is not None:
+                metadata.update(
+                    {
+                        "effective_repr_source": "x_high",
+                        "repr_resolution": "exported_x_high",
+                        "x_high_source": "frozen_g0.x_high",
+                        "repr_shape": [int(x_high_export.shape[0]), int(x_high_export.shape[1])],
+                        "hyperscan_alignment_note": (
+                            "Router consumed the exported HyperScan HGNN high-order branch x_high before detector fusion."
+                        ),
+                    }
+                )
+                return x_high_export, metadata
+
             raise MissingFrozenArtifactError(
-                "conformal_knn x_new requires frozen G0 input features and node_repr to have the same node count."
+                "conformal_knn_risk_router with --conformal_knn_repr_source x_high requires frozen G0 outputs['x_high']. "
+                "Regenerate graph_detector_prepare with a HyperScan-style backbone/export path that writes x_high."
             )
-        x_new = torch.cat([x_low, x_in], dim=1)
-        context = self.ensure_backbone_context()
-        feature_manifest = (
-            context.get("frozen_g0", {})
-            .get("manifest", {})
-            .get("feature_manifest", {})
-            or {}
-        )
-        metadata.update(
-            {
-                "effective_repr_source": "x_new",
-                "repr_resolution": (
-                    "reconstructed_x_new_from_exported_x_low_and_x_in"
-                    if x_low_source == "frozen_g0.x_low"
-                    else "reconstructed_x_new_from_node_repr_and_x_in"
-                ),
-                "x_new_source": "reconstructed_cat_x_low_x_in",
-                "x_in_source": "frozen_g0.input_pipeline.projected_features",
-                "x_in_shape": [int(x_in.shape[0]), int(x_in.shape[1])],
-                "repr_shape": [int(x_new.shape[0]), int(x_new.shape[1])],
-                "feature_manifest_path": str(feature_manifest.get("path", "") or ""),
-                "feature_manifest_projector": str(feature_manifest.get("projector", "") or ""),
-                "feature_manifest_projected_dim": feature_manifest.get("projected_dim"),
-                "hyperscan_alignment_note": (
-                    "Frozen G0 did not export x_new, so router reconstructed cat(x_low, x_in) post-hoc. "
-                    "This is backward-compatible but less exact than consuming exported x_new directly."
-                ),
-            }
-        )
-        return x_new, metadata
+
+        raise ValueError(f"Unsupported conformal KNN representation source after normalization: {repr_source!r}.")
 
     def _build_graph_conformal_estimator_bundle(self, estimator_mode):
         context = self.ensure_backbone_context()
@@ -11440,21 +11458,33 @@ class GNN_Trainer:
                 logits = out['logits'].cpu()
                 prob = out['prob'].cpu()
                 node_repr = out['node_repr'].cpu()
+                fused_x = out.get('fused_x', out['node_repr']).cpu()
+                x_low = out.get('x_low')
+                x_new = out.get('x_new')
                 aux_features = out.get('aux_features', {})
             else:
                 logits = self.model(x, edge_index, edge_type).cpu()
                 prob = torch.softmax(logits, dim=1)
                 node_repr = logits
+                fused_x = logits
+                x_low = None
+                x_new = None
                 aux_features = {}
 
-        return {
+        outputs = {
             'logits': logits,
             'prob': prob,
             'pred': prob.argmax(dim=1),
             'labels': self.hard_labels.cpu(),
             'node_repr': node_repr,
+            'fused_x': fused_x,
             'aux_features': aux_features,
         }
+        if torch.is_tensor(x_low):
+            outputs['x_low'] = x_low.cpu()
+        if torch.is_tensor(x_new):
+            outputs['x_new'] = x_new.cpu()
+        return outputs
 
     def save_results(self, path):
         json.dump(self.results, open(path, 'w'), indent=4)

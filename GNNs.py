@@ -25,6 +25,8 @@ def _cfg(model_config, *names, default=None):
 
 
 class BaseGraphBackbone(nn.Module):
+    export_relation_x_new = False
+
     def __init__(self, model_config):
         super().__init__()
         self.model_config = dict(model_config)
@@ -46,27 +48,95 @@ class BaseGraphBackbone(nn.Module):
             return nn.ELU()
         raise ValueError('Please choose activation function from "leakyrelu", "relu" or "elu".')
 
-    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
+    def forward_outputs(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
         hidden = self.encode(x, edge_index, edge_type)
         logits = self.linear_out(hidden)
-        return {
+        outputs = {
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "fused_x": hidden,
             "aux_features": {},
         }
+        if self.export_relation_x_new:
+            x_new = torch.cat([hidden, x], dim=1)
+            outputs.update(
+                {
+                    "x_low": hidden,
+                    "x_new": x_new,
+                    "x_new_base": x_new,
+                }
+            )
+        return outputs
 
-    def forward(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
         return self.forward_outputs(
             x,
             edge_index,
             edge_type,
             hyperedge_mask_probability=hyperedge_mask_probability,
+            second_view_repair_delta=second_view_repair_delta,
+            second_view_repair_mask=second_view_repair_mask,
+            routed_multiview_bundle=routed_multiview_bundle,
+            routed_highpass_bundle=routed_highpass_bundle,
+            batch_node_ids=batch_node_ids,
         )["logits"]
 
 
 def _as_long_tensor_list(values):
     return [torch.tensor(item, dtype=torch.long) for item in values]
+
+
+def _dynamic_branch_policy_config(branch_cfg):
+    raw_quotas = branch_cfg.get("candidate_policy_quotas", {}) or {}
+    quotas = {}
+    if isinstance(raw_quotas, dict):
+        for key, value in raw_quotas.items():
+            try:
+                quotas[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return {
+        "candidate_policy": str(branch_cfg.get("candidate_policy", "default") or "default"),
+        "candidate_policy_quotas": quotas,
+    }
+
+
+def _as_long_tensor(values):
+    if values is None:
+        return None
+    return values.detach().cpu().long().view(-1) if torch.is_tensor(values) else torch.tensor(values, dtype=torch.long).view(-1)
+
+
+def _dynamic_branch_policy_stats(branch_cfg):
+    config = _dynamic_branch_policy_config(branch_cfg)
+    return {
+        "candidate_policy": config["candidate_policy"],
+        "candidate_policy_quotas": dict(config["candidate_policy_quotas"]),
+        "candidate_role_contract": str(branch_cfg.get("candidate_role_contract", "none") or "none"),
+    }
 
 
 def _cpu_scalar_dict(payload):
@@ -197,6 +267,216 @@ class _MultiAttnModel(nn.Module):
         return f_l, f_h
 
 
+class HyperScanAdaptiveLowHighFusion(nn.Module):
+    """FAGCN-style node-wise adaptive mixing over relation/high-order detector views.
+
+    This module does not reimplement spectral filtering. It keeps HyperScan's
+    relation-view and hypergraph-view branches intact, then learns a node-wise
+    low/high mixture over the cross-attended detector tokens.
+    """
+
+    def __init__(self, model_dim, dropout_rate=0.4):
+        super().__init__()
+        self.model_dim = int(model_dim)
+        context_dim = int(model_dim) * 4
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(context_dim, int(model_dim)),
+            nn.LeakyReLU(),
+            nn.Dropout(float(dropout_rate)),
+            nn.Linear(int(model_dim), 2),
+        )
+        self.mix_norm = nn.LayerNorm(int(model_dim))
+
+    def forward(self, low_hidden, high_hidden):
+        if low_hidden.shape != high_hidden.shape:
+            raise ValueError(
+                "adaptive low/high fusion requires matching detector tokens: "
+                f"got {tuple(low_hidden.shape)} and {tuple(high_hidden.shape)}."
+            )
+        context = torch.cat(
+            [
+                low_hidden,
+                high_hidden,
+                low_hidden - high_hidden,
+                low_hidden * high_hidden,
+            ],
+            dim=-1,
+        )
+        gate = torch.softmax(self.gate_mlp(context), dim=-1)
+        mixed = gate[:, 0:1] * low_hidden + gate[:, 1:2] * high_hidden
+        mixed = self.mix_norm(mixed)
+        return mixed, gate
+
+
+class RoutedHighPassCorrection(nn.Module):
+    """Routed-node low/high-pass correction over a chosen representation space."""
+
+    def __init__(self, model_dim, dropout_rate=0.4):
+        super().__init__()
+        self.model_dim = int(model_dim)
+        context_dim = int(model_dim) * 3 + 6
+        self.self_proj = nn.Linear(int(model_dim), int(model_dim))
+        self.low_proj = nn.Linear(int(model_dim), int(model_dim))
+        self.high_proj = nn.Linear(int(model_dim), int(model_dim))
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(context_dim, int(model_dim)),
+            nn.LeakyReLU(),
+            nn.Dropout(float(dropout_rate)),
+            nn.Linear(int(model_dim), 3),
+        )
+        self.correction_head = nn.Sequential(
+            nn.Linear(int(model_dim), int(model_dim)),
+            nn.LeakyReLU(),
+            nn.Dropout(float(dropout_rate)),
+            nn.Linear(int(model_dim), 2),
+        )
+        self.edge_role_head = nn.Sequential(
+            nn.Linear(int(model_dim) * 3, int(model_dim)),
+            nn.LeakyReLU(),
+            nn.Dropout(float(dropout_rate)),
+            nn.Linear(int(model_dim), 1),
+        )
+
+    def forward(self, hidden, low_agg, high_agg, scalar_features, routed_mask, mode="adaptive"):
+        mode = str(mode or "adaptive").strip().lower()
+        if mode not in {"low_only", "high_only", "adaptive"}:
+            raise ValueError("--routed_highpass_mode must be one of {off, low_only, high_only, adaptive}.")
+        if scalar_features is None:
+            scalar_features = hidden.new_zeros((int(hidden.size(0)), 6))
+        scalar_features = scalar_features.to(device=hidden.device, dtype=hidden.dtype)
+        if scalar_features.dim() != 2 or int(scalar_features.size(0)) != int(hidden.size(0)):
+            raise ValueError("routed_highpass scalar_features must be shaped [num_nodes, feature_dim].")
+        if int(scalar_features.size(1)) < 6:
+            pad = hidden.new_zeros((int(hidden.size(0)), 6 - int(scalar_features.size(1))))
+            scalar_features = torch.cat([scalar_features, pad], dim=1)
+        elif int(scalar_features.size(1)) > 6:
+            scalar_features = scalar_features[:, :6]
+        routed_mask = routed_mask.to(device=hidden.device).bool().view(-1)
+        if int(routed_mask.numel()) != int(hidden.size(0)):
+            raise ValueError("routed_highpass routed_mask must align with hidden rows.")
+
+        context = torch.cat([hidden, low_agg, high_agg, scalar_features], dim=1)
+        learned_gate = torch.softmax(self.gate_mlp(context), dim=1)
+        if mode == "low_only":
+            gate = torch.zeros_like(learned_gate)
+            gate[:, 1] = 1.0
+        elif mode == "high_only":
+            gate = torch.zeros_like(learned_gate)
+            gate[:, 2] = 1.0
+        else:
+            gate = learned_gate
+
+        self_channel = self.self_proj(hidden)
+        low_channel = self.low_proj(low_agg)
+        high_channel = self.high_proj(high_agg)
+        corrected_hidden = (
+            gate[:, 0:1] * self_channel
+            + gate[:, 1:2] * low_channel
+            + gate[:, 2:3] * high_channel
+        )
+        delta_logits = self.correction_head(corrected_hidden)
+        delta_logits = delta_logits * routed_mask.to(dtype=hidden.dtype).unsqueeze(1)
+        return delta_logits, {
+            "gate": gate,
+            "learned_gate": learned_gate,
+            "routed_mask": routed_mask,
+            "delta_logits": delta_logits,
+            "corrected_hidden": corrected_hidden,
+        }
+
+
+class RoutedMultiViewTransformer(nn.Module):
+    """Routed-node multi-view refiner over detector-space tokens.
+
+    The module consumes per-node view tokens already aligned to the detector
+    hidden size, optionally performs bidirectional MultiAttn between relation
+    and semantic halves, then runs a lightweight Transformer encoder over the
+    view sequence and returns a routed-node delta.
+    """
+
+    def __init__(self, model_dim, num_heads, hidden_dim, dropout_rate, num_layers=2, bidirectional_multiattn=True):
+        super().__init__()
+        self.model_dim = int(model_dim)
+        self.bidirectional_multiattn = bool(bidirectional_multiattn)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.view_type_embeddings = nn.Embedding(8, self.model_dim)
+        self.sequence_pos_embeddings = nn.Embedding(8, self.model_dim)
+        if self.bidirectional_multiattn:
+            self.cross_view_multiattn = _MultiAttnModel(
+                num_layers=max(int(num_layers), 1),
+                model_dim=self.model_dim,
+                num_heads=int(num_heads),
+                hidden_dim=int(hidden_dim),
+                dropout_rate=float(dropout_rate),
+            )
+        else:
+            self.cross_view_multiattn = None
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.model_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(hidden_dim),
+            dropout=float(dropout_rate),
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=max(int(num_layers), 1))
+        self.output_norm = nn.LayerNorm(self.model_dim)
+        self.output_projection = nn.Linear(self.model_dim, self.model_dim)
+        self.output_gate = nn.Sequential(
+            nn.Linear(self.model_dim * 2, self.model_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.model_dim, 1),
+        )
+
+    def forward(self, view_tokens, token_mask=None, relation_token_count=4, semantic_token_count=2):
+        if view_tokens.dim() != 3:
+            raise ValueError(f"Expected routed multi-view tokens shaped [batch, tokens, dim], got {tuple(view_tokens.shape)}.")
+        batch_size, token_count, model_dim = view_tokens.shape
+        if int(model_dim) != self.model_dim:
+            raise ValueError(
+                f"RoutedMultiViewTransformer expected token dim {self.model_dim}, got {int(model_dim)}."
+            )
+        device = view_tokens.device
+        relation_token_count = int(max(min(int(relation_token_count), token_count), 0))
+        semantic_token_count = int(max(min(int(semantic_token_count), token_count - relation_token_count), 0))
+        type_ids = torch.arange(token_count, device=device, dtype=torch.long).clamp_max(7).unsqueeze(0).expand(batch_size, -1)
+        pos_ids = torch.arange(token_count, device=device, dtype=torch.long).clamp_max(7).unsqueeze(0).expand(batch_size, -1)
+        tokens = view_tokens + self.view_type_embeddings(type_ids) + self.sequence_pos_embeddings(pos_ids)
+        tokens = self.dropout(tokens)
+        if self.cross_view_multiattn is not None and relation_token_count > 0 and semantic_token_count > 0:
+            relation_tokens = tokens[:, :relation_token_count, :]
+            semantic_tokens = tokens[:, relation_token_count : relation_token_count + semantic_token_count, :]
+            fused_relation, fused_semantic = self.cross_view_multiattn(relation_tokens, semantic_tokens)
+            tokens = torch.cat(
+                [
+                    fused_relation,
+                    fused_semantic,
+                    tokens[:, relation_token_count + semantic_token_count :, :],
+                ],
+                dim=1,
+            )
+        padding_mask = None
+        if token_mask is not None:
+            token_mask = token_mask.to(device=device).bool()
+            if token_mask.shape != (batch_size, token_count):
+                raise ValueError(
+                    "token_mask must align with view_tokens rows: "
+                    f"expected {(batch_size, token_count)}, got {tuple(token_mask.shape)}."
+                )
+            padding_mask = ~token_mask
+            # Ensure self token stays visible if upstream mask is malformed.
+            padding_mask[:, 0] = False
+        encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
+        pooled = encoded[:, 0, :]
+        pooled = self.output_norm(pooled)
+        delta = self.output_projection(pooled)
+        gate = torch.sigmoid(self.output_gate(torch.cat([pooled, view_tokens[:, 0, :]], dim=-1)))
+        return gate * delta, {
+            "token_count": int(token_count),
+            "bidirectional_multiattn": bool(self.bidirectional_multiattn),
+        }
+
+
 def _init_hyperscan_detector(module, model_config, hidden_dim):
     style = str(
         _cfg(
@@ -209,11 +489,19 @@ def _init_hyperscan_detector(module, model_config, hidden_dim):
     ).lower()
     if style == "multiattn":
         style = "original_cross_attention"
-    if style not in {"residual", "original_cross_attention"}:
-        raise ValueError("--graph_second_view_fusion must be one of {residual, multiattn}.")
+    elif style == "multiattn_adaptive":
+        style = "original_cross_attention_adaptive"
+    if style not in {"residual", "original_cross_attention", "original_cross_attention_adaptive"}:
+        raise ValueError("--graph_second_view_fusion must be one of {residual, multiattn, multiattn_adaptive}.")
     module.hyperscan_detector_style = style
-    module.graph_second_view_fusion = "multiattn" if style == "original_cross_attention" else "residual"
     if style == "original_cross_attention":
+        module.graph_second_view_fusion = "multiattn"
+    elif style == "original_cross_attention_adaptive":
+        module.graph_second_view_fusion = "multiattn_adaptive"
+    else:
+        module.graph_second_view_fusion = "residual"
+    module.hyperscan_branch_hidden_dim = int(hidden_dim)
+    if style in {"original_cross_attention", "original_cross_attention_adaptive"}:
         detector_heads = 4
         if int(hidden_dim) % detector_heads != 0:
             raise ValueError("original_cross_attention detector requires hidden_dim to be divisible by 4.")
@@ -224,16 +512,57 @@ def _init_hyperscan_detector(module, model_config, hidden_dim):
             hidden_dim=int(hidden_dim) * 2,
             dropout_rate=float(_cfg(model_config, "dropout", default=0.4)),
         )
+        module.detector_adaptive_lowhigh = (
+            HyperScanAdaptiveLowHighFusion(
+                model_dim=int(hidden_dim),
+                dropout_rate=float(_cfg(model_config, "dropout", default=0.4)),
+            )
+            if style == "original_cross_attention_adaptive"
+            else None
+        )
         module.detector_activation = nn.LeakyReLU()
         module.linear_out = nn.Linear(int(hidden_dim) * 2, 2)
+        module.hyperscan_detector_hidden_dim = int(hidden_dim) * 2
     else:
+        module.detector_adaptive_lowhigh = None
         module.fusion_linear = nn.Linear(int(hidden_dim) * 2, int(hidden_dim))
+        module.hyperscan_detector_hidden_dim = int(hidden_dim)
+
+
+def _init_routed_highpass_correction(module, model_config, hidden_dim):
+    cfg = dict(model_config.get("routed_highpass", {}) or {})
+    mode = str(cfg.get("mode", "off") or "off").strip().lower()
+    target = str(cfg.get("target", "logits") or "logits").strip().lower()
+    module.routed_highpass_mode = mode
+    module.routed_highpass_target = target
+    module.routed_highpass_enabled = mode != "off"
+    if mode not in {"off", "low_only", "high_only", "adaptive"}:
+        raise ValueError("--routed_highpass_mode must be one of {off, low_only, high_only, adaptive}.")
+    if target not in {"logits", "x_high"}:
+        raise ValueError("--routed_highpass_target must be one of {logits, x_high}.")
+    if not module.routed_highpass_enabled:
+        module.routed_highpass_correction = None
+        return
+    detector_hidden_dim = int(getattr(module, "hyperscan_detector_hidden_dim", hidden_dim) or hidden_dim)
+    correction_dim = int(hidden_dim) if target == "x_high" else int(detector_hidden_dim)
+    module.routed_highpass_correction = RoutedHighPassCorrection(
+        model_dim=correction_dim,
+        dropout_rate=float(_cfg(model_config, "dropout", default=0.4)),
+    )
 
 
 def _apply_hyperscan_detector(module, x_low, x_high, incident_scale):
-    if module.hyperscan_detector_style == "original_cross_attention":
+    if module.hyperscan_detector_style in {"original_cross_attention", "original_cross_attention_adaptive"}:
         fused_low, fused_high = module.detector_multiattn(x_low.unsqueeze(1), x_high.unsqueeze(1))
-        hidden = torch.cat((fused_low.squeeze(1), fused_high.squeeze(1)), dim=-1)
+        fused_low = fused_low.squeeze(1)
+        fused_high = fused_high.squeeze(1)
+        if module.hyperscan_detector_style == "original_cross_attention_adaptive":
+            mixed, _ = module.detector_adaptive_lowhigh(fused_low, fused_high)
+            hidden = torch.cat((mixed, fused_high), dim=-1)
+            hidden = module.detector_activation(hidden)
+            logits = module.linear_out(hidden)
+            return hidden, logits
+        hidden = torch.cat((fused_low, fused_high), dim=-1)
         hidden = module.detector_activation(hidden)
         return hidden, module.linear_out(hidden)
 
@@ -242,6 +571,332 @@ def _apply_hyperscan_detector(module, x_low, x_high, incident_scale):
     delta = module.dropout(delta)
     hidden = x_low + delta * incident_scale
     return hidden, module.linear_out(hidden)
+
+
+def _apply_routed_highpass_correction(module, hidden, logits, routed_highpass_bundle):
+    stats = {
+        "enabled": bool(getattr(module, "routed_highpass_enabled", False)),
+        "applied": False,
+        "mode": str(getattr(module, "routed_highpass_mode", "off")),
+        "target": str(getattr(module, "routed_highpass_target", "logits")),
+        "routed_node_count": 0,
+        "gate_self_mean": 0.0,
+        "gate_low_mean": 0.0,
+        "gate_high_mean": 0.0,
+    }
+    if not bool(getattr(module, "routed_highpass_enabled", False)):
+        return hidden, logits, stats, None
+    if str(getattr(module, "routed_highpass_target", "logits")) != "logits":
+        return hidden, logits, stats, None
+    if routed_highpass_bundle is None or module.routed_highpass_correction is None:
+        return hidden, logits, stats, None
+    low_agg = routed_highpass_bundle.get("low_agg")
+    high_agg = routed_highpass_bundle.get("high_agg")
+    routed_mask = routed_highpass_bundle.get("routed_mask")
+    if not torch.is_tensor(low_agg) or not torch.is_tensor(high_agg) or not torch.is_tensor(routed_mask):
+        return hidden, logits, stats, None
+    low_agg = low_agg.to(device=hidden.device, dtype=hidden.dtype)
+    high_agg = high_agg.to(device=hidden.device, dtype=hidden.dtype)
+    scalar_features = routed_highpass_bundle.get("scalar_features")
+    if scalar_features is not None and not torch.is_tensor(scalar_features):
+        scalar_features = torch.as_tensor(scalar_features)
+    if scalar_features is not None:
+        scalar_features = scalar_features.to(device=hidden.device, dtype=hidden.dtype)
+    routed_mask = routed_mask.to(device=hidden.device).bool().view(-1)
+    if low_agg.shape != hidden.shape or high_agg.shape != hidden.shape:
+        raise ValueError(
+            "routed_highpass low_agg/high_agg must match detector hidden shape: "
+            f"expected {tuple(hidden.shape)}, got {tuple(low_agg.shape)} and {tuple(high_agg.shape)}."
+        )
+    delta_logits, aux = module.routed_highpass_correction(
+        hidden=hidden,
+        low_agg=low_agg,
+        high_agg=high_agg,
+        scalar_features=scalar_features,
+        routed_mask=routed_mask,
+        mode=str(getattr(module, "routed_highpass_mode", "adaptive")),
+    )
+    refined_logits = logits + delta_logits
+    gate = aux["gate"]
+    active_count = int(routed_mask.sum().detach().cpu().item())
+    if active_count > 0:
+        active_gate = gate[routed_mask]
+        stats.update(
+            {
+                "applied": True,
+                "routed_node_count": active_count,
+                "gate_self_mean": float(active_gate[:, 0].detach().mean().cpu().item()),
+                "gate_low_mean": float(active_gate[:, 1].detach().mean().cpu().item()),
+                "gate_high_mean": float(active_gate[:, 2].detach().mean().cpu().item()),
+            }
+        )
+    return hidden, refined_logits, stats, aux
+
+
+def _apply_routed_highpass_x_high_correction(module, x_high, routed_highpass_bundle):
+    stats = {
+        "enabled": bool(getattr(module, "routed_highpass_enabled", False)),
+        "applied": False,
+        "mode": str(getattr(module, "routed_highpass_mode", "off")),
+        "target": str(getattr(module, "routed_highpass_target", "logits")),
+        "routed_node_count": 0,
+        "gate_self_mean": 0.0,
+        "gate_low_mean": 0.0,
+        "gate_high_mean": 0.0,
+    }
+    if not bool(getattr(module, "routed_highpass_enabled", False)):
+        return x_high, stats, None
+    if str(getattr(module, "routed_highpass_target", "logits")) != "x_high":
+        return x_high, stats, None
+    if routed_highpass_bundle is None or module.routed_highpass_correction is None:
+        return x_high, stats, None
+    low_agg = routed_highpass_bundle.get("low_agg")
+    high_agg = routed_highpass_bundle.get("high_agg")
+    routed_mask = routed_highpass_bundle.get("routed_mask")
+    if not torch.is_tensor(low_agg) or not torch.is_tensor(high_agg) or not torch.is_tensor(routed_mask):
+        return x_high, stats, None
+    low_agg = low_agg.to(device=x_high.device, dtype=x_high.dtype)
+    high_agg = high_agg.to(device=x_high.device, dtype=x_high.dtype)
+    scalar_features = routed_highpass_bundle.get("scalar_features")
+    if scalar_features is not None and not torch.is_tensor(scalar_features):
+        scalar_features = torch.as_tensor(scalar_features)
+    if scalar_features is not None:
+        scalar_features = scalar_features.to(device=x_high.device, dtype=x_high.dtype)
+    routed_mask = routed_mask.to(device=x_high.device).bool().view(-1)
+    if low_agg.shape != x_high.shape or high_agg.shape != x_high.shape:
+        raise ValueError(
+            "routed_highpass x_high low_agg/high_agg must match x_high shape: "
+            f"expected {tuple(x_high.shape)}, got {tuple(low_agg.shape)} and {tuple(high_agg.shape)}."
+        )
+    _, aux = module.routed_highpass_correction(
+        hidden=x_high,
+        low_agg=low_agg,
+        high_agg=high_agg,
+        scalar_features=scalar_features,
+        routed_mask=routed_mask,
+        mode=str(getattr(module, "routed_highpass_mode", "adaptive")),
+    )
+    corrected_hidden = aux.get("corrected_hidden")
+    if not torch.is_tensor(corrected_hidden):
+        return x_high, stats, aux
+    routed_gate = routed_mask.to(dtype=x_high.dtype).unsqueeze(1)
+    refined_x_high = x_high + routed_gate * (corrected_hidden - x_high)
+    gate = aux["gate"]
+    active_count = int(routed_mask.sum().detach().cpu().item())
+    if active_count > 0:
+        active_gate = gate[routed_mask]
+        stats.update(
+            {
+                "applied": True,
+                "routed_node_count": active_count,
+                "gate_self_mean": float(active_gate[:, 0].detach().mean().cpu().item()),
+                "gate_low_mean": float(active_gate[:, 1].detach().mean().cpu().item()),
+                "gate_high_mean": float(active_gate[:, 2].detach().mean().cpu().item()),
+            }
+        )
+    return refined_x_high, stats, aux
+
+
+def _second_view_feature_source(branch_cfg):
+    feature_source = str(branch_cfg.get("feature_source", "x_low_plus_x_in_dynamic_forward"))
+    if "node_repr" in feature_source:
+        raise ValueError(
+            "HyperScan-style dynamic second-view feature_source must describe x_new=cat(x_low,x_in), "
+            "not final node_repr. Use relation_overlap_knn_repr_prefit_augment for the explicit legacy proxy."
+        )
+    return feature_source
+
+
+def _init_routed_multiview_refiner(module, model_config, hidden_dim):
+    routed_cfg = dict(model_config.get("routed_multiview_refiner", {}) or {})
+    module.routed_multiview_refiner_enabled = bool(routed_cfg.get("enabled", False))
+    module.routed_multiview_relation_token_count = int(routed_cfg.get("relation_token_count", 4))
+    module.routed_multiview_semantic_token_count = int(routed_cfg.get("semantic_token_count", 2))
+    module.routed_multiview_bidirectional = bool(routed_cfg.get("bidirectional_multiattn", True))
+    detector_hidden_dim = int(getattr(module, "hyperscan_detector_hidden_dim", hidden_dim) or hidden_dim)
+    branch_hidden_dim = int(getattr(module, "hyperscan_branch_hidden_dim", hidden_dim) or hidden_dim)
+    semantic_input_dim = int(routed_cfg.get("semantic_input_dim", detector_hidden_dim) or detector_hidden_dim)
+    module.routed_multiview_model_dim = detector_hidden_dim
+    module.routed_multiview_branch_hidden_dim = branch_hidden_dim
+    module.routed_multiview_semantic_input_dim = semantic_input_dim
+    if not module.routed_multiview_refiner_enabled:
+        module.routed_multiview_refiner = None
+        module.routed_multiview_view_proj = None
+        module.routed_multiview_semantic_proj = None
+        return
+    num_heads = int(routed_cfg.get("num_heads", 4))
+    if int(detector_hidden_dim) % max(num_heads, 1) != 0:
+        raise ValueError("routed multi-view refiner requires hidden_dim to be divisible by num_heads.")
+    module.routed_multiview_refiner = RoutedMultiViewTransformer(
+        model_dim=int(detector_hidden_dim),
+        num_heads=num_heads,
+        hidden_dim=int(routed_cfg.get("ff_hidden_dim", int(detector_hidden_dim) * 2)),
+        dropout_rate=float(routed_cfg.get("dropout", _cfg(model_config, "dropout", default=0.4))),
+        num_layers=int(routed_cfg.get("num_layers", 2)),
+        bidirectional_multiattn=module.routed_multiview_bidirectional,
+    )
+    if int(branch_hidden_dim) == int(detector_hidden_dim):
+        module.routed_multiview_view_proj = nn.Identity()
+    else:
+        module.routed_multiview_view_proj = nn.Linear(int(branch_hidden_dim), int(detector_hidden_dim))
+    if int(semantic_input_dim) == int(detector_hidden_dim):
+        module.routed_multiview_semantic_proj = nn.Identity()
+    else:
+        module.routed_multiview_semantic_proj = nn.Linear(int(semantic_input_dim), int(detector_hidden_dim))
+
+
+def _build_detector_space_view_tokens(module, hidden, x_low, x_high, routed_multiview_bundle):
+    rows = routed_multiview_bundle.get("rows") or []
+    if not rows:
+        return None, None, None, None
+    target_node_ids = routed_multiview_bundle.get("target_node_ids")
+    if target_node_ids is None:
+        target_node_ids = [int(item.get("node_id", -1)) for item in rows]
+    semantic_guide = routed_multiview_bundle.get("semantic_embeddings")
+    view_projector = getattr(module, "routed_multiview_view_proj", None)
+    semantic_projector = getattr(module, "routed_multiview_semantic_proj", None)
+    semantic_input_dim = int(getattr(module, "routed_multiview_semantic_input_dim", hidden.size(-1)))
+    token_rows = []
+    token_masks = []
+    valid_node_ids = []
+    max_tokens = 6
+    for node_id, row in zip(target_node_ids, rows):
+        node_id = int(node_id)
+        if node_id < 0 or node_id >= int(hidden.size(0)) or not isinstance(row, dict):
+            continue
+        token_list = [hidden[node_id]]
+        mask_list = [True]
+        has_auxiliary_context = False
+        for key, source_tensor in (
+            ("following_view", x_low),
+            ("follower_view", x_low),
+            ("mutual_view", x_low),
+            ("semantic_knn_view", x_high),
+        ):
+            view = row.get(key) if isinstance(row, dict) else None
+            members = list((view or {}).get("members") or [])
+            member_ids = [int(item.get("node_id", -1)) for item in members if 0 <= int(item.get("node_id", -1)) < int(source_tensor.size(0))]
+            if member_ids:
+                member_tensor = source_tensor[torch.tensor(member_ids, device=source_tensor.device, dtype=torch.long)]
+                member_token = member_tensor.mean(dim=0)
+                if view_projector is not None:
+                    member_token = view_projector(member_token.unsqueeze(0)).squeeze(0)
+                token_list.append(member_token)
+                mask_list.append(True)
+                has_auxiliary_context = True
+            else:
+                token_list.append(torch.zeros_like(hidden[node_id]))
+                mask_list.append(False)
+        if semantic_guide is not None and 0 <= node_id < int(semantic_guide.size(0)):
+            semantic_token = semantic_guide[node_id].to(device=hidden.device, dtype=hidden.dtype)
+            if int(semantic_token.numel()) != int(semantic_input_dim):
+                raise ValueError(
+                    "routed semantic guide dimension mismatch: "
+                    f"expected {int(semantic_input_dim)}, got {int(semantic_token.numel())}."
+                )
+            if semantic_projector is None:
+                semantic_token = semantic_token.view_as(hidden[node_id])
+            else:
+                semantic_token = semantic_projector(semantic_token.unsqueeze(0)).squeeze(0)
+            semantic_nonzero = bool(torch.norm(semantic_token, p=2).item() > 0.0)
+            token_list.append(semantic_token)
+            mask_list.append(semantic_nonzero)
+            has_auxiliary_context = has_auxiliary_context or semantic_nonzero
+        else:
+            token_list.append(torch.zeros_like(hidden[node_id]))
+            mask_list.append(False)
+        if not has_auxiliary_context:
+            continue
+        token_rows.append(torch.stack(token_list[:max_tokens], dim=0))
+        token_masks.append(torch.tensor(mask_list[:max_tokens], device=hidden.device, dtype=torch.bool))
+        valid_node_ids.append(node_id)
+    if not token_rows:
+        return None, None, None, None
+    return (
+        torch.stack(token_rows, dim=0),
+        torch.stack(token_masks, dim=0),
+        torch.tensor(valid_node_ids, device=hidden.device, dtype=torch.long),
+        max_tokens,
+    )
+
+
+def _apply_routed_multiview_refinement(module, hidden, x_low, x_high, logits, routed_multiview_bundle):
+    stats = {
+        "enabled": bool(getattr(module, "routed_multiview_refiner_enabled", False)),
+        "applied": False,
+        "routed_node_count": 0,
+        "token_count": 0,
+    }
+    if not bool(getattr(module, "routed_multiview_refiner_enabled", False)):
+        return hidden, logits, stats
+    if routed_multiview_bundle is None or module.routed_multiview_refiner is None:
+        return hidden, logits, stats
+    token_tensor, token_mask, routed_node_ids, token_count = _build_detector_space_view_tokens(
+        module,
+        hidden,
+        x_low,
+        x_high,
+        routed_multiview_bundle,
+    )
+    if token_tensor is None:
+        return hidden, logits, stats
+    delta, refiner_stats = module.routed_multiview_refiner(
+        token_tensor,
+        token_mask=token_mask,
+        relation_token_count=int(getattr(module, "routed_multiview_relation_token_count", 4)),
+        semantic_token_count=int(getattr(module, "routed_multiview_semantic_token_count", 2)),
+    )
+    refined_hidden = hidden.clone()
+    refined_hidden[routed_node_ids] = refined_hidden[routed_node_ids] + delta
+    refined_logits = module.linear_out(refined_hidden)
+    stats.update(
+        {
+            "applied": True,
+            "routed_node_count": int(routed_node_ids.numel()),
+            "token_count": int(token_count),
+            "bidirectional_multiattn": bool(refiner_stats.get("bidirectional_multiattn", False)),
+        }
+    )
+    return refined_hidden, refined_logits, stats
+
+
+def _apply_second_view_repair(x_new, repair_delta=None, repair_mask=None):
+    if repair_delta is None:
+        return x_new, {
+            "second_view_repair_active": False,
+            "second_view_repair_nodes": 0,
+            "second_view_repair_delta_norm_mean": 0.0,
+        }
+    if not torch.is_tensor(repair_delta):
+        repair_delta = torch.as_tensor(repair_delta, device=x_new.device, dtype=x_new.dtype)
+    repair_delta = repair_delta.to(device=x_new.device, dtype=x_new.dtype)
+    if repair_delta.shape != x_new.shape:
+        raise ValueError(
+            "second_view_repair_delta must match x_new shape: "
+            f"expected {tuple(x_new.shape)}, got {tuple(repair_delta.shape)}."
+        )
+    if repair_mask is None:
+        repair_mask = repair_delta.norm(dim=1) > 0.0
+    else:
+        if not torch.is_tensor(repair_mask):
+            repair_mask = torch.as_tensor(repair_mask, device=x_new.device)
+        repair_mask = repair_mask.to(device=x_new.device).bool().view(-1)
+        if int(repair_mask.numel()) != int(x_new.size(0)):
+            raise ValueError(
+                "second_view_repair_mask must align with x_new rows: "
+                f"expected {int(x_new.size(0))}, got {int(repair_mask.numel())}."
+            )
+    repair_gate = repair_mask.to(dtype=x_new.dtype).unsqueeze(-1)
+    repaired_x_new = x_new + repair_gate * repair_delta
+    active_nodes = int(repair_mask.sum().item())
+    delta_norm_mean = 0.0
+    if active_nodes > 0:
+        delta_norm_mean = float(repair_delta[repair_mask].norm(dim=1).mean().detach().cpu().item())
+    return repaired_x_new, {
+        "second_view_repair_active": bool(active_nodes > 0),
+        "second_view_repair_nodes": active_nodes,
+        "second_view_repair_delta_norm_mean": delta_norm_mean,
+    }
 
 
 def mhlgc_mask_node_features(x, mask_probability=0.0):
@@ -352,6 +1007,7 @@ def mhlgc_llm_guided_contrastive_loss(
     temperature=1.0,
     negative_count=0,
     negative_mask=None,
+    anchor_mask=None,
 ):
     """MH-LGC-style hardness-aware InfoNCE for routed hard-node training.
 
@@ -373,7 +1029,7 @@ def mhlgc_llm_guided_contrastive_loss(
     beta = float(beta or 0.0)
     negative_count = max(int(negative_count or 0), 0)
     semantic_embeddings_clean = None
-    anchor_mask = None
+    semantic_anchor_mask = None
     if semantic_embeddings is not None and gamma > 0.0:
         semantic_embeddings_clean = torch.nan_to_num(
             semantic_embeddings.to(origin_embeddings.device).float(),
@@ -386,7 +1042,15 @@ def mhlgc_llm_guided_contrastive_loss(
             or int(semantic_embeddings_clean.size(0)) != int(origin_embeddings.size(0))
         ):
             raise ValueError("semantic_embeddings must be shaped [batch_nodes, semantic_dim].")
-        anchor_mask = semantic_embeddings_clean.norm(dim=1) > 0.0
+        semantic_anchor_mask = semantic_embeddings_clean.norm(dim=1) > 0.0
+    if anchor_mask is not None:
+        anchor_mask = anchor_mask.to(origin_embeddings.device).bool().view(-1)
+        if int(anchor_mask.numel()) != int(origin_embeddings.size(0)):
+            raise ValueError("anchor_mask must align with origin_embeddings rows.")
+        if semantic_anchor_mask is not None:
+            anchor_mask = anchor_mask & semantic_anchor_mask
+    else:
+        anchor_mask = semantic_anchor_mask
 
     anchors = mhlgc_select_borderline_anchors(
         labels=labels,
@@ -463,6 +1127,165 @@ def mhlgc_llm_guided_contrastive_loss(
         "mhlgc_beta": float(beta),
         "mhlgc_gamma": float(gamma),
         "mhlgc_temperature": float(temperature),
+    }
+
+
+def routed_same_node_contrastive_loss(low_embeddings, high_embeddings, temperature=0.2):
+    """Same-node low/high InfoNCE over routed eligible nodes only."""
+    if low_embeddings.dim() != 2 or high_embeddings.dim() != 2:
+        raise ValueError("low_embeddings and high_embeddings must be 2-D tensors.")
+    if low_embeddings.shape != high_embeddings.shape:
+        raise ValueError("low_embeddings and high_embeddings must have the same shape.")
+    node_count = int(low_embeddings.size(0))
+    temperature = float(temperature or 0.2)
+    zero = low_embeddings.sum() * 0.0
+    if node_count < 2:
+        return zero, {
+            "active": False,
+            "family": "low_high",
+            "eligible_count": int(node_count),
+            "anchor_count": 0,
+            "positive_count": 0,
+            "negative_count": 0,
+        }
+    if temperature <= 0.0:
+        raise ValueError("routed contrast temperature must be > 0.")
+    z_low = F.normalize(low_embeddings, dim=1, eps=1e-12)
+    z_high = F.normalize(high_embeddings, dim=1, eps=1e-12)
+    logits = torch.matmul(z_low, z_high.transpose(0, 1)) / temperature
+    labels = torch.arange(node_count, device=logits.device)
+    loss_lh = F.cross_entropy(logits, labels)
+    loss_hl = F.cross_entropy(logits.transpose(0, 1), labels)
+    loss = 0.5 * (loss_lh + loss_hl)
+    return loss, {
+        "active": True,
+        "family": "low_high",
+        "eligible_count": int(node_count),
+        "anchor_count": int(node_count),
+        "positive_count": int(node_count),
+        "negative_count": int(node_count * max(node_count - 1, 0)),
+    }
+
+
+def routed_frozen_alignment_loss(frozen_embeddings, target_embeddings):
+    """Stop-grad alignment from frozen semantic teacher to routed detector view."""
+    if frozen_embeddings.dim() != 2 or target_embeddings.dim() != 2:
+        raise ValueError("frozen_embeddings and target_embeddings must be 2-D tensors.")
+    if frozen_embeddings.shape != target_embeddings.shape:
+        raise ValueError("frozen_embeddings and target_embeddings must have the same shape.")
+    node_count = int(target_embeddings.size(0))
+    zero = target_embeddings.sum() * 0.0
+    if node_count < 1:
+        return zero, {
+            "active": False,
+            "family": "frozen_control",
+            "eligible_count": 0,
+        }
+    teacher = F.normalize(frozen_embeddings.detach(), dim=1, eps=1e-12)
+    student = F.normalize(target_embeddings, dim=1, eps=1e-12)
+    loss = 1.0 - torch.sum(teacher * student, dim=1).mean()
+    return loss, {
+        "active": True,
+        "family": "frozen_control",
+        "eligible_count": int(node_count),
+    }
+
+
+def routed_supervised_contrastive_loss(embeddings, labels, temperature=0.2):
+    """BotSCL-style same-class positive, different-class negative contrast."""
+    if embeddings.dim() != 2:
+        raise ValueError("embeddings must be 2-D.")
+    labels = labels.view(-1).to(embeddings.device)
+    if int(labels.numel()) != int(embeddings.size(0)):
+        raise ValueError("labels must align with embeddings rows.")
+    node_count = int(embeddings.size(0))
+    temperature = float(temperature or 0.2)
+    zero = embeddings.sum() * 0.0
+    if node_count < 2:
+        return zero, {
+            "active": False,
+            "family": "supcon_class",
+            "eligible_count": int(node_count),
+            "anchor_count": 0,
+            "positive_pair_count": 0,
+            "negative_pair_count": 0,
+        }
+    if temperature <= 0.0:
+        raise ValueError("routed contrast temperature must be > 0.")
+    z = F.normalize(embeddings, dim=1, eps=1e-12)
+    similarity = torch.matmul(z, z.transpose(0, 1)) / temperature
+    diag_mask = torch.eye(node_count, device=similarity.device, dtype=torch.bool)
+    positive_mask = labels.unsqueeze(0).eq(labels.unsqueeze(1)) & (~diag_mask)
+    negative_mask = ~labels.unsqueeze(0).eq(labels.unsqueeze(1))
+    valid_anchor_mask = positive_mask.any(dim=1) & negative_mask.any(dim=1)
+    valid_anchor_idx = torch.nonzero(valid_anchor_mask, as_tuple=False).view(-1)
+    if valid_anchor_idx.numel() == 0:
+        return zero, {
+            "active": False,
+            "family": "supcon_class",
+            "eligible_count": int(node_count),
+            "anchor_count": 0,
+            "positive_pair_count": int(positive_mask.sum().item()),
+            "negative_pair_count": int(negative_mask.sum().item()),
+        }
+    logits = similarity[valid_anchor_idx]
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+    exp_logits = torch.exp(logits) * (~diag_mask[valid_anchor_idx]).to(logits.dtype)
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12))
+    positive_mask_valid = positive_mask[valid_anchor_idx].to(logits.dtype)
+    positive_counts = positive_mask_valid.sum(dim=1)
+    loss = -((positive_mask_valid * log_prob).sum(dim=1) / positive_counts.clamp_min(1.0)).mean()
+    return loss, {
+        "active": True,
+        "family": "supcon_class",
+        "eligible_count": int(node_count),
+        "anchor_count": int(valid_anchor_idx.numel()),
+        "positive_pair_count": int(positive_mask_valid.sum().item()),
+        "negative_pair_count": int(negative_mask[valid_anchor_idx].sum().item()),
+    }
+
+
+def routed_bot_edge_mask_human_contrastive_loss(
+    anchor_embeddings,
+    positive_embeddings,
+    negative_embeddings,
+    temperature=0.2,
+):
+    """Anchor routed bots, use edge-masked same-node positives, and routed humans as negatives."""
+    if anchor_embeddings.dim() != 2 or positive_embeddings.dim() != 2 or negative_embeddings.dim() != 2:
+        raise ValueError("anchor_embeddings, positive_embeddings, and negative_embeddings must be 2-D.")
+    if anchor_embeddings.shape != positive_embeddings.shape:
+        raise ValueError("anchor_embeddings and positive_embeddings must have the same shape.")
+    if int(anchor_embeddings.size(1)) != int(negative_embeddings.size(1)):
+        raise ValueError("negative_embeddings must match anchor embedding width.")
+    anchor_count = int(anchor_embeddings.size(0))
+    negative_count = int(negative_embeddings.size(0))
+    temperature = float(temperature or 0.2)
+    zero = anchor_embeddings.sum() * 0.0
+    if anchor_count < 1 or negative_count < 1:
+        return zero, {
+            "active": False,
+            "family": "bot_edge_mask_human",
+            "anchor_count": int(anchor_count),
+            "positive_count": int(anchor_count),
+            "negative_count": int(negative_count),
+        }
+    if temperature <= 0.0:
+        raise ValueError("routed contrast temperature must be > 0.")
+    z_anchor = F.normalize(anchor_embeddings, dim=1, eps=1e-12)
+    z_positive = F.normalize(positive_embeddings, dim=1, eps=1e-12)
+    z_negative = F.normalize(negative_embeddings, dim=1, eps=1e-12)
+    pos_logits = torch.sum(z_anchor * z_positive, dim=1, keepdim=True) / temperature
+    neg_logits = torch.matmul(z_anchor, z_negative.transpose(0, 1)) / temperature
+    logits = torch.cat([pos_logits, neg_logits], dim=1)
+    targets = torch.zeros(anchor_count, dtype=torch.long, device=logits.device)
+    loss = F.cross_entropy(logits, targets)
+    return loss, {
+        "active": True,
+        "family": "bot_edge_mask_human",
+        "anchor_count": int(anchor_count),
+        "positive_count": int(anchor_count),
+        "negative_count": int(anchor_count * negative_count),
     }
 
 
@@ -543,6 +1366,8 @@ class FACNConv(nn.Module):
 class BotRGCN(BaseGraphBackbone):
     """BotRGCN-style proxy backbone aligned to the current unified LM input surface."""
 
+    export_relation_x_new = True
+
     def __init__(self, model_config):
         super().__init__(model_config)
         input_dim = _cfg(model_config, "lm_input_dim")
@@ -570,6 +1395,8 @@ class BotRGCN(BaseGraphBackbone):
 
 
 class RGCN(BaseGraphBackbone):
+    export_relation_x_new = True
+
     def __init__(self, model_config):
         super().__init__(model_config)
         input_dim = _cfg(model_config, "lm_input_dim")
@@ -606,22 +1433,40 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
         self.hyper_conv1 = HypergraphConv(self.hidden_dim + input_dim, self.hidden_dim, use_attention=False)
         self.hyper_conv2 = HypergraphConv(self.hidden_dim, self.hidden_dim, use_attention=False)
         _init_hyperscan_detector(self, model_config, self.hidden_dim)
+        _init_routed_multiview_refiner(self, model_config, self.hidden_dim)
+        _init_routed_highpass_correction(self, model_config, self.hidden_dim)
 
         self.dynamic_branch_enabled = bool(branch_cfg.get("enabled", False))
         self.dynamic_hyper_k = int(branch_cfg.get("knn_k", 8))
         self.dynamic_candidate_scope = str(branch_cfg.get("candidate_scope", "undirected_relation_1hop"))
         self.dynamic_similarity_metric = str(branch_cfg.get("similarity_metric", "cosine"))
-        self.dynamic_feature_source = str(branch_cfg.get("feature_source", "relation_node_repr_plus_g0_input"))
+        self.dynamic_feature_source = _second_view_feature_source(branch_cfg)
         self.dynamic_center_source = str(branch_cfg.get("center_source", "labeled_prefix"))
         self.dynamic_routed_nodes_path = str(branch_cfg.get("routed_nodes_path", "") or "")
         self.dynamic_routed_nodes_split = str(branch_cfg.get("routed_nodes_split", "all") or "all")
         self.dynamic_batch_local_knn = bool(branch_cfg.get("batch_local_knn", False))
+        self._dynamic_batch_local_routed_node_ids = _as_long_tensor(branch_cfg.get("batch_local_routed_node_ids", []))
         center_node_ids = list(branch_cfg.get("center_node_ids", []) or [])
         center_candidate_node_ids = list(branch_cfg.get("center_candidate_node_ids", []) or [])
         if (not self.dynamic_batch_local_knn) and len(center_node_ids) != len(center_candidate_node_ids):
             raise ValueError("dynamic_similarity_branch center ids and candidate ids must have the same length.")
         self.register_buffer("_dynamic_center_node_ids", torch.tensor(center_node_ids, dtype=torch.long), persistent=False)
         self._dynamic_center_candidate_node_ids = _as_long_tensor_list(center_candidate_node_ids)
+        center_candidate_role_ids = list(branch_cfg.get("center_candidate_role_ids", []) or [])
+        if center_candidate_role_ids and len(center_candidate_role_ids) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate role ids must match candidate ids.")
+        self._dynamic_center_candidate_role_ids = (
+            _as_long_tensor_list(center_candidate_role_ids) if center_candidate_role_ids else None
+        )
+        center_candidate_keep_mask = list(branch_cfg.get("center_candidate_keep_mask", []) or [])
+        if center_candidate_keep_mask and len(center_candidate_keep_mask) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate keep mask must match candidate ids.")
+        self._dynamic_center_candidate_keep_mask = (
+            [torch.tensor(item, dtype=torch.bool) for item in center_candidate_keep_mask]
+            if center_candidate_keep_mask
+            else None
+        )
+        self.dynamic_candidate_policy_config = _dynamic_branch_policy_config(branch_cfg)
         self.dynamic_branch_static_stats = {
             "enabled": self.dynamic_branch_enabled,
             "center_count": int(len(center_node_ids)),
@@ -637,6 +1482,7 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
             "fusion": self.graph_second_view_fusion,
             "centers_with_relation_neighbors": int(branch_cfg.get("centers_with_relation_neighbors", 0)),
             "mean_relation_candidates_per_center": float(branch_cfg.get("mean_relation_candidates_per_center", 0.0)),
+            **_dynamic_branch_policy_stats(branch_cfg),
         }
 
     def _encode_relation_view(self, x, edge_index, edge_type):
@@ -650,13 +1496,16 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
         hidden = self.dropout(hidden)
         return hidden
 
-    def _build_dynamic_hypergraph(self, feature_tensor):
+    def _build_dynamic_hypergraph(self, feature_tensor, batch_node_ids=None):
         if self.dynamic_batch_local_knn:
             return build_batch_local_knn_hypergraph(
                 feature_tensor,
                 branch_enabled=self.dynamic_branch_enabled,
                 knn_k=self.dynamic_hyper_k,
                 static_stats=self.dynamic_branch_static_stats,
+                node_ids=batch_node_ids,
+                routed_node_ids=self._dynamic_batch_local_routed_node_ids,
+                **self.dynamic_candidate_policy_config,
             )
         return build_dynamic_hypergraph(
             feature_tensor,
@@ -665,12 +1514,31 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
             branch_enabled=self.dynamic_branch_enabled,
             knn_k=self.dynamic_hyper_k,
             static_stats=self.dynamic_branch_static_stats,
+            center_candidate_role_ids=self._dynamic_center_candidate_role_ids,
+            center_candidate_keep_mask=self._dynamic_center_candidate_keep_mask,
+            **self.dynamic_candidate_policy_config,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
+    def forward_outputs(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
         x_low = self._encode_relation_view(x, edge_index, edge_type)
-        x_new = torch.cat([x_low, x], dim=1)
-        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
+        x_new_base = torch.cat([x_low, x], dim=1)
+        x_new, repair_stats = _apply_second_view_repair(
+            x_new_base,
+            repair_delta=second_view_repair_delta,
+            repair_mask=second_view_repair_mask,
+        )
+        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new, batch_node_ids=batch_node_ids)
         hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
             hyperedge_index,
             incident_mask=incident_mask,
@@ -679,6 +1547,7 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
         )
         branch_stats = dict(branch_stats or {})
         branch_stats.update(mask_stats)
+        branch_stats.update(repair_stats)
         if hyperedge_index is None or int(hyperedge_index.numel()) == 0:
             x_high = torch.zeros_like(x_low)
             incident_scale = torch.zeros((x_low.size(0), 1), dtype=x_low.dtype, device=x_low.device)
@@ -691,16 +1560,46 @@ class RGCNHyperScanProxy(BaseGraphBackbone):
             x_high = self.dropout(x_high)
             incident_scale = incident_mask.to(dtype=x_low.dtype).unsqueeze(-1)
 
+        x_high_base = x_high
+        x_high, highpass_xhigh_stats, highpass_xhigh_aux = _apply_routed_highpass_x_high_correction(
+            self,
+            x_high,
+            routed_highpass_bundle,
+        )
         hidden, logits = _apply_hyperscan_detector(self, x_low, x_high, incident_scale)
+        hidden, logits, routed_stats = _apply_routed_multiview_refinement(
+            self,
+            hidden,
+            x_low,
+            x_high,
+            logits,
+            routed_multiview_bundle,
+        )
+        hidden, logits, highpass_stats, highpass_aux = _apply_routed_highpass_correction(
+            self,
+            hidden,
+            logits,
+            routed_highpass_bundle,
+        )
+        if highpass_xhigh_aux is not None:
+            highpass_stats = highpass_xhigh_stats
+            highpass_aux = highpass_xhigh_aux
         return {
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "fused_x": hidden,
             "x_low": x_low,
+            "x_high": x_high,
+            "x_high_base": x_high_base,
             "x_new": x_new,
+            "x_new_base": x_new_base,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
+                "routed_multiview_refiner": _cpu_scalar_dict(routed_stats),
+                "routed_highpass": _cpu_scalar_dict(highpass_stats),
             },
+            "routed_highpass_aux": highpass_aux,
         }
 
 
@@ -730,23 +1629,41 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
         self.hyper_conv1 = HypergraphConv(self.hidden_dim * 2, self.hidden_dim, use_attention=False)
         self.hyper_conv2 = HypergraphConv(self.hidden_dim, self.hidden_dim, use_attention=False)
         _init_hyperscan_detector(self, model_config, self.hidden_dim)
+        _init_routed_multiview_refiner(self, model_config, self.hidden_dim)
+        _init_routed_highpass_correction(self, model_config, self.hidden_dim)
 
         self.dynamic_branch_enabled = bool(branch_cfg.get("enabled", False))
         self.dynamic_hyper_k = int(branch_cfg.get("knn_k", 8))
         self.dynamic_batch_local_knn = bool(branch_cfg.get("batch_local_knn", False))
+        self._dynamic_batch_local_routed_node_ids = _as_long_tensor(branch_cfg.get("batch_local_routed_node_ids", []))
         center_node_ids = list(branch_cfg.get("center_node_ids", []) or [])
         center_candidate_node_ids = list(branch_cfg.get("center_candidate_node_ids", []) or [])
         if (not self.dynamic_batch_local_knn) and len(center_node_ids) != len(center_candidate_node_ids):
             raise ValueError("dynamic_similarity_branch center ids and candidate ids must have the same length.")
         self.register_buffer("_dynamic_center_node_ids", torch.tensor(center_node_ids, dtype=torch.long), persistent=False)
         self._dynamic_center_candidate_node_ids = _as_long_tensor_list(center_candidate_node_ids)
+        center_candidate_role_ids = list(branch_cfg.get("center_candidate_role_ids", []) or [])
+        if center_candidate_role_ids and len(center_candidate_role_ids) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate role ids must match candidate ids.")
+        self._dynamic_center_candidate_role_ids = (
+            _as_long_tensor_list(center_candidate_role_ids) if center_candidate_role_ids else None
+        )
+        center_candidate_keep_mask = list(branch_cfg.get("center_candidate_keep_mask", []) or [])
+        if center_candidate_keep_mask and len(center_candidate_keep_mask) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate keep mask must match candidate ids.")
+        self._dynamic_center_candidate_keep_mask = (
+            [torch.tensor(item, dtype=torch.bool) for item in center_candidate_keep_mask]
+            if center_candidate_keep_mask
+            else None
+        )
+        self.dynamic_candidate_policy_config = _dynamic_branch_policy_config(branch_cfg)
         self.dynamic_branch_static_stats = {
             "enabled": self.dynamic_branch_enabled,
             "center_count": int(len(center_node_ids)),
             "knn_k": int(self.dynamic_hyper_k),
             "candidate_scope": str(branch_cfg.get("candidate_scope", "undirected_relation_1hop")),
             "similarity_metric": str(branch_cfg.get("similarity_metric", "cosine")),
-            "feature_source": str(branch_cfg.get("feature_source", "relation_node_repr_plus_node_input_dynamic_forward")),
+            "feature_source": _second_view_feature_source(branch_cfg),
             "center_source": str(branch_cfg.get("center_source", "labeled_prefix")),
             "routed_nodes_path": str(branch_cfg.get("routed_nodes_path", "") or ""),
             "routed_nodes_split": str(branch_cfg.get("routed_nodes_split", "all") or "all"),
@@ -756,6 +1673,7 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
             "centers_with_relation_neighbors": int(branch_cfg.get("centers_with_relation_neighbors", 0)),
             "mean_relation_candidates_per_center": float(branch_cfg.get("mean_relation_candidates_per_center", 0.0)),
             "node_input_family": "hyperscan_meta_tweet_proxy",
+            **_dynamic_branch_policy_stats(branch_cfg),
         }
 
     def _encode_node_input(self, x):
@@ -783,13 +1701,16 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
         hidden = self.dropout(hidden)
         return hidden
 
-    def _build_dynamic_hypergraph(self, feature_tensor):
+    def _build_dynamic_hypergraph(self, feature_tensor, batch_node_ids=None):
         if self.dynamic_batch_local_knn:
             return build_batch_local_knn_hypergraph(
                 feature_tensor,
                 branch_enabled=self.dynamic_branch_enabled,
                 knn_k=self.dynamic_hyper_k,
                 static_stats=self.dynamic_branch_static_stats,
+                node_ids=batch_node_ids,
+                routed_node_ids=self._dynamic_batch_local_routed_node_ids,
+                **self.dynamic_candidate_policy_config,
             )
         return build_dynamic_hypergraph(
             feature_tensor,
@@ -798,13 +1719,32 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
             branch_enabled=self.dynamic_branch_enabled,
             knn_k=self.dynamic_hyper_k,
             static_stats=self.dynamic_branch_static_stats,
+            center_candidate_role_ids=self._dynamic_center_candidate_role_ids,
+            center_candidate_keep_mask=self._dynamic_center_candidate_keep_mask,
+            **self.dynamic_candidate_policy_config,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
+    def forward_outputs(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
         x_in, x_rel = self._encode_node_input(x)
         x_low = self._encode_relation_view(x_rel, edge_index, edge_type)
-        x_new = torch.cat([x_low, x_in], dim=1)
-        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
+        x_new_base = torch.cat([x_low, x_in], dim=1)
+        x_new, repair_stats = _apply_second_view_repair(
+            x_new_base,
+            repair_delta=second_view_repair_delta,
+            repair_mask=second_view_repair_mask,
+        )
+        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new, batch_node_ids=batch_node_ids)
         hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
             hyperedge_index,
             incident_mask=incident_mask,
@@ -813,6 +1753,7 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
         )
         branch_stats = dict(branch_stats or {})
         branch_stats.update(mask_stats)
+        branch_stats.update(repair_stats)
         if hyperedge_index is None or int(hyperedge_index.numel()) == 0:
             x_high = torch.zeros_like(x_low)
             incident_scale = torch.zeros((x_low.size(0), 1), dtype=x_low.dtype, device=x_low.device)
@@ -825,16 +1766,46 @@ class RGCNHyperScanNodeInputProxy(BaseGraphBackbone):
             x_high = self.dropout(x_high)
             incident_scale = incident_mask.to(dtype=x_low.dtype).unsqueeze(-1)
 
+        x_high_base = x_high
+        x_high, highpass_xhigh_stats, highpass_xhigh_aux = _apply_routed_highpass_x_high_correction(
+            self,
+            x_high,
+            routed_highpass_bundle,
+        )
         hidden, logits = _apply_hyperscan_detector(self, x_low, x_high, incident_scale)
+        hidden, logits, routed_stats = _apply_routed_multiview_refinement(
+            self,
+            hidden,
+            x_low,
+            x_high,
+            logits,
+            routed_multiview_bundle,
+        )
+        hidden, logits, highpass_stats, highpass_aux = _apply_routed_highpass_correction(
+            self,
+            hidden,
+            logits,
+            routed_highpass_bundle,
+        )
+        if highpass_xhigh_aux is not None:
+            highpass_stats = highpass_xhigh_stats
+            highpass_aux = highpass_xhigh_aux
         return {
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "fused_x": hidden,
             "x_low": x_low,
+            "x_high": x_high,
+            "x_high_base": x_high_base,
             "x_new": x_new,
+            "x_new_base": x_new_base,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
+                "routed_multiview_refiner": _cpu_scalar_dict(routed_stats),
+                "routed_highpass": _cpu_scalar_dict(highpass_stats),
             },
+            "routed_highpass_aux": highpass_aux,
         }
 
 
@@ -866,23 +1837,41 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
         self.hgnn_layer1 = DHG_HGNNConv(self.hidden_dim * 2, self.hidden_dim, use_bn=False, drop_rate=float(_cfg(model_config, "dropout", default=0.4)))
         self.hgnn_layer2 = DHG_HGNNConv(self.hidden_dim, self.hidden_dim, use_bn=False, is_last=True)
         _init_hyperscan_detector(self, model_config, self.hidden_dim)
+        _init_routed_multiview_refiner(self, model_config, self.hidden_dim)
+        _init_routed_highpass_correction(self, model_config, self.hidden_dim)
 
         self.dynamic_branch_enabled = bool(branch_cfg.get("enabled", False))
         self.dynamic_hyper_k = int(branch_cfg.get("knn_k", 8))
         self.dynamic_batch_local_knn = bool(branch_cfg.get("batch_local_knn", False))
+        self._dynamic_batch_local_routed_node_ids = _as_long_tensor(branch_cfg.get("batch_local_routed_node_ids", []))
         center_node_ids = list(branch_cfg.get("center_node_ids", []) or [])
         center_candidate_node_ids = list(branch_cfg.get("center_candidate_node_ids", []) or [])
         if (not self.dynamic_batch_local_knn) and len(center_node_ids) != len(center_candidate_node_ids):
             raise ValueError("dynamic_similarity_branch center ids and candidate ids must have the same length.")
         self.register_buffer("_dynamic_center_node_ids", torch.tensor(center_node_ids, dtype=torch.long), persistent=False)
         self._dynamic_center_candidate_node_ids = _as_long_tensor_list(center_candidate_node_ids)
+        center_candidate_role_ids = list(branch_cfg.get("center_candidate_role_ids", []) or [])
+        if center_candidate_role_ids and len(center_candidate_role_ids) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate role ids must match candidate ids.")
+        self._dynamic_center_candidate_role_ids = (
+            _as_long_tensor_list(center_candidate_role_ids) if center_candidate_role_ids else None
+        )
+        center_candidate_keep_mask = list(branch_cfg.get("center_candidate_keep_mask", []) or [])
+        if center_candidate_keep_mask and len(center_candidate_keep_mask) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate keep mask must match candidate ids.")
+        self._dynamic_center_candidate_keep_mask = (
+            [torch.tensor(item, dtype=torch.bool) for item in center_candidate_keep_mask]
+            if center_candidate_keep_mask
+            else None
+        )
+        self.dynamic_candidate_policy_config = _dynamic_branch_policy_config(branch_cfg)
         self.dynamic_branch_static_stats = {
             "enabled": self.dynamic_branch_enabled,
             "center_count": int(len(center_node_ids)),
             "knn_k": int(self.dynamic_hyper_k),
             "candidate_scope": str(branch_cfg.get("candidate_scope", "undirected_relation_1hop")),
             "similarity_metric": str(branch_cfg.get("similarity_metric", "cosine")),
-            "feature_source": str(branch_cfg.get("feature_source", "relation_node_repr_plus_node_input_dynamic_forward")),
+            "feature_source": _second_view_feature_source(branch_cfg),
             "center_source": str(branch_cfg.get("center_source", "labeled_prefix")),
             "routed_nodes_path": str(branch_cfg.get("routed_nodes_path", "") or ""),
             "routed_nodes_split": str(branch_cfg.get("routed_nodes_split", "all") or "all"),
@@ -892,6 +1881,7 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
             "centers_with_relation_neighbors": int(branch_cfg.get("centers_with_relation_neighbors", 0)),
             "mean_relation_candidates_per_center": float(branch_cfg.get("mean_relation_candidates_per_center", 0.0)),
             "node_input_family": "hyperscan_meta_tweet_proxy",
+            **_dynamic_branch_policy_stats(branch_cfg),
         }
 
     def _encode_node_input(self, x):
@@ -919,13 +1909,16 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
         hidden = self.dropout(hidden)
         return hidden
 
-    def _build_dynamic_hypergraph(self, feature_tensor):
+    def _build_dynamic_hypergraph(self, feature_tensor, batch_node_ids=None):
         if self.dynamic_batch_local_knn:
             return build_batch_local_knn_hypergraph(
                 feature_tensor,
                 branch_enabled=self.dynamic_branch_enabled,
                 knn_k=self.dynamic_hyper_k,
                 static_stats=self.dynamic_branch_static_stats,
+                node_ids=batch_node_ids,
+                routed_node_ids=self._dynamic_batch_local_routed_node_ids,
+                **self.dynamic_candidate_policy_config,
             )
         return build_dynamic_hypergraph(
             feature_tensor,
@@ -934,13 +1927,32 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
             branch_enabled=self.dynamic_branch_enabled,
             knn_k=self.dynamic_hyper_k,
             static_stats=self.dynamic_branch_static_stats,
+            center_candidate_role_ids=self._dynamic_center_candidate_role_ids,
+            center_candidate_keep_mask=self._dynamic_center_candidate_keep_mask,
+            **self.dynamic_candidate_policy_config,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
+    def forward_outputs(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
         x_in, x_rel = self._encode_node_input(x)
         x_low = self._encode_relation_view(x_rel, edge_index, edge_type)
-        x_new = torch.cat([x_low, x_in], dim=1)
-        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
+        x_new_base = torch.cat([x_low, x_in], dim=1)
+        x_new, repair_stats = _apply_second_view_repair(
+            x_new_base,
+            repair_delta=second_view_repair_delta,
+            repair_mask=second_view_repair_mask,
+        )
+        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new, batch_node_ids=batch_node_ids)
         hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
             hyperedge_index,
             incident_mask=incident_mask,
@@ -949,6 +1961,7 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
         )
         branch_stats = dict(branch_stats or {})
         branch_stats.update(mask_stats)
+        branch_stats.update(repair_stats)
         hg = _dhg_hypergraph_from_incidence(hyperedge_index, x_new.size(0), x_new.device)
         if hg is None:
             x_high = torch.zeros_like(x_low)
@@ -958,16 +1971,46 @@ class RGCNHyperScanNodeInputDHG(BaseGraphBackbone):
         if incident_mask is None:
             incident_mask = torch.zeros(x_low.size(0), dtype=torch.bool, device=x_low.device)
         incident_scale = incident_mask.to(dtype=x_low.dtype).unsqueeze(-1)
+        x_high_base = x_high
+        x_high, highpass_xhigh_stats, highpass_xhigh_aux = _apply_routed_highpass_x_high_correction(
+            self,
+            x_high,
+            routed_highpass_bundle,
+        )
         hidden, logits = _apply_hyperscan_detector(self, x_low, x_high, incident_scale)
+        hidden, logits, routed_stats = _apply_routed_multiview_refinement(
+            self,
+            hidden,
+            x_low,
+            x_high,
+            logits,
+            routed_multiview_bundle,
+        )
+        hidden, logits, highpass_stats, highpass_aux = _apply_routed_highpass_correction(
+            self,
+            hidden,
+            logits,
+            routed_highpass_bundle,
+        )
+        if highpass_xhigh_aux is not None:
+            highpass_stats = highpass_xhigh_stats
+            highpass_aux = highpass_xhigh_aux
         return {
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "fused_x": hidden,
             "x_low": x_low,
+            "x_high": x_high,
+            "x_high_base": x_high_base,
             "x_new": x_new,
+            "x_new_base": x_new_base,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
+                "routed_multiview_refiner": _cpu_scalar_dict(routed_stats),
+                "routed_highpass": _cpu_scalar_dict(highpass_stats),
             },
+            "routed_highpass_aux": highpass_aux,
         }
 
 
@@ -988,23 +2031,41 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
         self.hgnn_layer1 = DHG_HGNNConv(self.hidden_dim + input_dim, self.hidden_dim, use_bn=False, drop_rate=float(_cfg(model_config, "dropout", default=0.4)))
         self.hgnn_layer2 = DHG_HGNNConv(self.hidden_dim, self.hidden_dim, use_bn=False, is_last=True)
         _init_hyperscan_detector(self, model_config, self.hidden_dim)
+        _init_routed_multiview_refiner(self, model_config, self.hidden_dim)
+        _init_routed_highpass_correction(self, model_config, self.hidden_dim)
 
         self.dynamic_branch_enabled = bool(branch_cfg.get("enabled", False))
         self.dynamic_hyper_k = int(branch_cfg.get("knn_k", 8))
         self.dynamic_batch_local_knn = bool(branch_cfg.get("batch_local_knn", False))
+        self._dynamic_batch_local_routed_node_ids = _as_long_tensor(branch_cfg.get("batch_local_routed_node_ids", []))
         center_node_ids = list(branch_cfg.get("center_node_ids", []) or [])
         center_candidate_node_ids = list(branch_cfg.get("center_candidate_node_ids", []) or [])
         if (not self.dynamic_batch_local_knn) and len(center_node_ids) != len(center_candidate_node_ids):
             raise ValueError("dynamic_similarity_branch center ids and candidate ids must have the same length.")
         self.register_buffer("_dynamic_center_node_ids", torch.tensor(center_node_ids, dtype=torch.long), persistent=False)
         self._dynamic_center_candidate_node_ids = _as_long_tensor_list(center_candidate_node_ids)
+        center_candidate_role_ids = list(branch_cfg.get("center_candidate_role_ids", []) or [])
+        if center_candidate_role_ids and len(center_candidate_role_ids) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate role ids must match candidate ids.")
+        self._dynamic_center_candidate_role_ids = (
+            _as_long_tensor_list(center_candidate_role_ids) if center_candidate_role_ids else None
+        )
+        center_candidate_keep_mask = list(branch_cfg.get("center_candidate_keep_mask", []) or [])
+        if center_candidate_keep_mask and len(center_candidate_keep_mask) != len(center_candidate_node_ids):
+            raise ValueError("dynamic_similarity_branch candidate keep mask must match candidate ids.")
+        self._dynamic_center_candidate_keep_mask = (
+            [torch.tensor(item, dtype=torch.bool) for item in center_candidate_keep_mask]
+            if center_candidate_keep_mask
+            else None
+        )
+        self.dynamic_candidate_policy_config = _dynamic_branch_policy_config(branch_cfg)
         self.dynamic_branch_static_stats = {
             "enabled": self.dynamic_branch_enabled,
             "center_count": int(len(center_node_ids)),
             "knn_k": int(self.dynamic_hyper_k),
             "candidate_scope": str(branch_cfg.get("candidate_scope", "undirected_relation_1hop")),
             "similarity_metric": str(branch_cfg.get("similarity_metric", "cosine")),
-            "feature_source": str(branch_cfg.get("feature_source", "relation_node_repr_plus_g0_input_dynamic_forward")),
+            "feature_source": _second_view_feature_source(branch_cfg),
             "center_source": str(branch_cfg.get("center_source", "labeled_prefix")),
             "routed_nodes_path": str(branch_cfg.get("routed_nodes_path", "") or ""),
             "routed_nodes_split": str(branch_cfg.get("routed_nodes_split", "all") or "all"),
@@ -1014,6 +2075,7 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
             "centers_with_relation_neighbors": int(branch_cfg.get("centers_with_relation_neighbors", 0)),
             "mean_relation_candidates_per_center": float(branch_cfg.get("mean_relation_candidates_per_center", 0.0)),
             "node_input_family": "semantic_embedding",
+            **_dynamic_branch_policy_stats(branch_cfg),
         }
 
     def _encode_relation_view(self, x, edge_index, edge_type):
@@ -1027,13 +2089,16 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
         hidden = self.dropout(hidden)
         return hidden
 
-    def _build_dynamic_hypergraph(self, feature_tensor):
+    def _build_dynamic_hypergraph(self, feature_tensor, batch_node_ids=None):
         if self.dynamic_batch_local_knn:
             return build_batch_local_knn_hypergraph(
                 feature_tensor,
                 branch_enabled=self.dynamic_branch_enabled,
                 knn_k=self.dynamic_hyper_k,
                 static_stats=self.dynamic_branch_static_stats,
+                node_ids=batch_node_ids,
+                routed_node_ids=self._dynamic_batch_local_routed_node_ids,
+                **self.dynamic_candidate_policy_config,
             )
         return build_dynamic_hypergraph(
             feature_tensor,
@@ -1042,12 +2107,31 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
             branch_enabled=self.dynamic_branch_enabled,
             knn_k=self.dynamic_hyper_k,
             static_stats=self.dynamic_branch_static_stats,
+            center_candidate_role_ids=self._dynamic_center_candidate_role_ids,
+            center_candidate_keep_mask=self._dynamic_center_candidate_keep_mask,
+            **self.dynamic_candidate_policy_config,
         )
 
-    def forward_outputs(self, x, edge_index, edge_type, hyperedge_mask_probability=0.0):
+    def forward_outputs(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        hyperedge_mask_probability=0.0,
+        second_view_repair_delta=None,
+        second_view_repair_mask=None,
+        routed_multiview_bundle=None,
+        routed_highpass_bundle=None,
+        batch_node_ids=None,
+    ):
         x_low = self._encode_relation_view(x, edge_index, edge_type)
-        x_new = torch.cat([x_low, x], dim=1)
-        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new)
+        x_new_base = torch.cat([x_low, x], dim=1)
+        x_new, repair_stats = _apply_second_view_repair(
+            x_new_base,
+            repair_delta=second_view_repair_delta,
+            repair_mask=second_view_repair_mask,
+        )
+        hyperedge_index, incident_mask, branch_stats = self._build_dynamic_hypergraph(x_new, batch_node_ids=batch_node_ids)
         hyperedge_index, incident_mask, mask_stats = mhlgc_mask_hyperedge_membership(
             hyperedge_index,
             incident_mask=incident_mask,
@@ -1056,6 +2140,7 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
         )
         branch_stats = dict(branch_stats or {})
         branch_stats.update(mask_stats)
+        branch_stats.update(repair_stats)
         hg = _dhg_hypergraph_from_incidence(hyperedge_index, x_new.size(0), x_new.device)
         if hg is None:
             x_high = torch.zeros_like(x_low)
@@ -1065,16 +2150,46 @@ class RGCNHyperScanDHGProxy(BaseGraphBackbone):
         if incident_mask is None:
             incident_mask = torch.zeros(x_low.size(0), dtype=torch.bool, device=x_low.device)
         incident_scale = incident_mask.to(dtype=x_low.dtype).unsqueeze(-1)
+        x_high_base = x_high
+        x_high, highpass_xhigh_stats, highpass_xhigh_aux = _apply_routed_highpass_x_high_correction(
+            self,
+            x_high,
+            routed_highpass_bundle,
+        )
         hidden, logits = _apply_hyperscan_detector(self, x_low, x_high, incident_scale)
+        hidden, logits, routed_stats = _apply_routed_multiview_refinement(
+            self,
+            hidden,
+            x_low,
+            x_high,
+            logits,
+            routed_multiview_bundle,
+        )
+        hidden, logits, highpass_stats, highpass_aux = _apply_routed_highpass_correction(
+            self,
+            hidden,
+            logits,
+            routed_highpass_bundle,
+        )
+        if highpass_xhigh_aux is not None:
+            highpass_stats = highpass_xhigh_stats
+            highpass_aux = highpass_xhigh_aux
         return {
             "logits": logits,
             "prob": torch.softmax(logits, dim=-1),
             "node_repr": hidden,
+            "fused_x": hidden,
             "x_low": x_low,
+            "x_high": x_high,
+            "x_high_base": x_high_base,
             "x_new": x_new,
+            "x_new_base": x_new_base,
             "aux_features": {
                 "dynamic_similarity_branch": _cpu_scalar_dict(branch_stats),
+                "routed_multiview_refiner": _cpu_scalar_dict(routed_stats),
+                "routed_highpass": _cpu_scalar_dict(highpass_stats),
             },
+            "routed_highpass_aux": highpass_aux,
         }
 
 

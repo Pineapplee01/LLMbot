@@ -652,7 +652,121 @@ def select_center_induced_directional_neighbors(
     }
 
 
-def build_dynamic_hypergraph(feature_tensor, center_node_ids, center_candidate_node_ids, branch_enabled=True, knn_k=8, static_stats=None):
+def _select_topk_positions(scores, k):
+    topk = min(int(k), int(scores.numel()))
+    if topk <= 0:
+        return scores.new_empty((0,), dtype=torch.long)
+    return torch.topk(scores, k=topk, largest=True).indices
+
+
+def _append_bucket_positions(selected, used, scores, bucket_mask, quota):
+    if int(quota) <= 0:
+        return 0
+    positions = torch.nonzero(bucket_mask, as_tuple=False).view(-1)
+    if positions.numel() == 0:
+        return 0
+    ordered_local = _select_topk_positions(scores[positions], int(quota))
+    added = 0
+    for pos in positions[ordered_local].tolist():
+        pos = int(pos)
+        if pos in used:
+            continue
+        selected.append(pos)
+        used.add(pos)
+        added += 1
+        if added >= int(quota):
+            break
+    return added
+
+
+def _select_dynamic_neighbors(candidate_ids, scores, roles, knn_k, candidate_policy, candidate_policy_quotas):
+    policy = str(candidate_policy or "default").strip().lower()
+    topk = min(int(knn_k), int(candidate_ids.numel()))
+    if topk <= 0:
+        return candidate_ids.new_empty((0,), dtype=torch.long), roles.new_empty((0,), dtype=torch.long)
+    if policy in {"default", ""} or roles is None:
+        selected_positions = _select_topk_positions(scores, topk)
+        return candidate_ids[selected_positions], roles[selected_positions] if roles is not None else None
+
+    quotas = dict(candidate_policy_quotas or {})
+    selected_positions = []
+    used_positions = set()
+    refill = True
+
+    if policy == "stable_quota":
+        stable_quota = int(quotas.get("stable", max(1, topk // 2)))
+        _append_bucket_positions(
+            selected_positions,
+            used_positions,
+            scores,
+            (roles == 2) | (roles == 3),
+            min(stable_quota, topk),
+        )
+    elif policy == "mixed_quota":
+        for role_name, role_id in (("hard", 1), ("stable", 2), ("counterfactual", 3)):
+            remaining = topk - len(selected_positions)
+            if remaining <= 0:
+                break
+            quota_key = "stable_mixed" if role_name == "stable" and "stable_mixed" in quotas else role_name
+            quota = int(quotas.get(quota_key, 0))
+            _append_bucket_positions(
+                selected_positions,
+                used_positions,
+                scores,
+                roles == int(role_id),
+                min(quota, remaining),
+            )
+    elif policy == "post_topk_exclude_routed":
+        top_positions = _select_topk_positions(scores, topk)
+        keep_mask = roles[top_positions] != 1
+        selected_positions = [int(pos) for pos in top_positions[keep_mask].tolist()]
+        used_positions = set(selected_positions)
+        refill = False
+    elif policy in {"exclude_routed", "llm_retain"}:
+        keep_mask = roles != 1
+        kept_positions = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+        if kept_positions.numel() == 0:
+            return candidate_ids.new_empty((0,), dtype=torch.long), roles.new_empty((0,), dtype=torch.long)
+        ordered_local = _select_topk_positions(scores[kept_positions], topk)
+        selected_positions = [int(pos) for pos in kept_positions[ordered_local].tolist()]
+        used_positions = set(selected_positions)
+    else:
+        selected_positions = []
+        used_positions = set()
+
+    remaining = (topk - len(selected_positions)) if refill else 0
+    if remaining > 0:
+        all_positions = _select_topk_positions(scores, int(scores.numel()))
+        for pos in all_positions.tolist():
+            pos = int(pos)
+            if pos in used_positions:
+                continue
+            if policy in {"exclude_routed", "post_topk_exclude_routed", "llm_retain"} and int(roles[pos].item()) == 1:
+                continue
+            selected_positions.append(pos)
+            used_positions.add(pos)
+            remaining -= 1
+            if remaining <= 0:
+                break
+
+    if not selected_positions:
+        return candidate_ids.new_empty((0,), dtype=torch.long), roles.new_empty((0,), dtype=torch.long)
+    selected_position_tensor = torch.tensor(selected_positions, dtype=torch.long, device=candidate_ids.device)
+    return candidate_ids[selected_position_tensor], roles[selected_position_tensor]
+
+
+def build_dynamic_hypergraph(
+    feature_tensor,
+    center_node_ids,
+    center_candidate_node_ids,
+    branch_enabled=True,
+    knn_k=8,
+    static_stats=None,
+    center_candidate_role_ids=None,
+    center_candidate_keep_mask=None,
+    candidate_policy="default",
+    candidate_policy_quotas=None,
+):
     stats = {
         **dict(static_stats or {}),
         "hypergraph_branch_active": bool(branch_enabled),
@@ -661,6 +775,12 @@ def build_dynamic_hypergraph(feature_tensor, center_node_ids, center_candidate_n
         "center_count_with_members": 0,
         "mean_selected_neighbors_per_center": 0.0,
         "incident_node_count": 0,
+        "selected_role_hard": 0,
+        "selected_role_stable": 0,
+        "selected_role_counterfactual": 0,
+        "selected_role_generic": 0,
+        "llm_retain_candidate_count": 0,
+        "llm_retain_dropped_count": 0,
     }
     center_ids_tensor = center_node_ids.detach().cpu().long().view(-1) if torch.is_tensor(center_node_ids) else torch.tensor(center_node_ids, dtype=torch.long).view(-1)
     if not branch_enabled or center_ids_tensor.numel() == 0:
@@ -678,19 +798,54 @@ def build_dynamic_hypergraph(feature_tensor, center_node_ids, center_candidate_n
     incident_mask = torch.zeros(feature_tensor.size(0), dtype=torch.bool, device=device)
     total_selected_neighbors = 0
     valid_hyperedges = 0
+    role_rows = list(center_candidate_role_ids) if center_candidate_role_ids is not None else None
+    keep_rows = list(center_candidate_keep_mask) if center_candidate_keep_mask is not None else None
 
     hyperedge_id = 0
-    for center_id, candidate_ids_raw in zip(center_ids_tensor.tolist(), list(center_candidate_node_ids)):
+    for row_idx, (center_id, candidate_ids_raw) in enumerate(zip(center_ids_tensor.tolist(), list(center_candidate_node_ids))):
         center = int(center_id)
         if center < 0 or center >= int(feature_view.size(0)):
             continue
         candidate_ids = candidate_ids_raw.to(device=device) if torch.is_tensor(candidate_ids_raw) else torch.tensor(candidate_ids_raw, dtype=torch.long, device=device)
-        candidate_ids = candidate_ids[(candidate_ids >= 0) & (candidate_ids < int(feature_view.size(0)))]
+        valid_mask = (candidate_ids >= 0) & (candidate_ids < int(feature_view.size(0)))
+        if role_rows is not None:
+            roles_raw = role_rows[int(row_idx)]
+            roles = roles_raw.to(device=device) if torch.is_tensor(roles_raw) else torch.tensor(roles_raw, dtype=torch.long, device=device)
+            if int(roles.numel()) != int(candidate_ids.numel()):
+                raise ValueError("dynamic_similarity_branch candidate role ids must align with candidate ids.")
+            roles = roles[valid_mask].long()
+        else:
+            roles = None
+        candidate_ids = candidate_ids[valid_mask]
+        if keep_rows is not None:
+            keep_raw = keep_rows[int(row_idx)]
+            keep_mask = keep_raw.to(device=device) if torch.is_tensor(keep_raw) else torch.tensor(keep_raw, dtype=torch.bool, device=device)
+            if int(keep_mask.numel()) != int(valid_mask.numel()):
+                raise ValueError("dynamic_similarity_branch candidate keep mask must align with candidate ids.")
+            keep_mask = keep_mask[valid_mask].bool()
+            stats["llm_retain_candidate_count"] += int(keep_mask.numel())
+            stats["llm_retain_dropped_count"] += int((~keep_mask).sum().item())
+            candidate_ids = candidate_ids[keep_mask]
+            if roles is not None:
+                roles = roles[keep_mask]
         if candidate_ids.numel() == 0:
             continue
         scores = torch.mv(feature_view[candidate_ids], feature_view[center])
-        topk = min(int(knn_k), int(candidate_ids.numel()))
-        selected = candidate_ids[torch.topk(scores, k=topk, largest=True).indices] if topk > 0 else candidate_ids.new_empty((0,), dtype=torch.long)
+        selected, selected_roles = _select_dynamic_neighbors(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            roles=roles,
+            knn_k=knn_k,
+            candidate_policy=candidate_policy,
+            candidate_policy_quotas=candidate_policy_quotas,
+        )
+        if selected.numel() == 0:
+            continue
+        if selected_roles is not None and selected_roles.numel() > 0:
+            stats["selected_role_hard"] += int((selected_roles == 1).sum().item())
+            stats["selected_role_stable"] += int((selected_roles == 2).sum().item())
+            stats["selected_role_counterfactual"] += int((selected_roles == 3).sum().item())
+            stats["selected_role_generic"] += int((selected_roles == 0).sum().item())
         members = torch.cat(
             [
                 torch.tensor([center], dtype=torch.long, device=device),
@@ -726,7 +881,60 @@ def build_dynamic_hypergraph(feature_tensor, center_node_ids, center_candidate_n
     return hyperedge_index, incident_mask, stats
 
 
-def build_batch_local_knn_hypergraph(feature_tensor, branch_enabled=True, knn_k=8, static_stats=None):
+def _batch_local_routed_roles(node_ids, routed_node_ids, num_nodes, device):
+    if node_ids is None or routed_node_ids is None:
+        return None
+    node_ids_t = node_ids.to(device=device).long().view(-1) if torch.is_tensor(node_ids) else torch.tensor(node_ids, dtype=torch.long, device=device).view(-1)
+    if int(node_ids_t.numel()) != int(num_nodes):
+        raise ValueError(
+            "batch-local routed member filtering requires node_ids to align with feature_tensor rows: "
+            f"expected {int(num_nodes)}, got {int(node_ids_t.numel())}."
+        )
+    routed_ids_t = (
+        routed_node_ids.to(device=device).long().view(-1)
+        if torch.is_tensor(routed_node_ids)
+        else torch.tensor(routed_node_ids, dtype=torch.long, device=device).view(-1)
+    )
+    if int(routed_ids_t.numel()) == 0:
+        return torch.zeros((int(num_nodes),), dtype=torch.bool, device=device)
+    return torch.isin(node_ids_t, routed_ids_t)
+
+
+def _batch_local_feature_k_nearest_neighbor_query(feature_tensor, k):
+    feature = torch.nan_to_num(
+        feature_tensor.detach().float(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).contiguous()
+    num_nodes = int(feature.size(0))
+    if num_nodes == 0:
+        return torch.empty((0, 0), dtype=torch.long, device=feature_tensor.device), "empty"
+    k_effective = min(int(k), num_nodes)
+    if k_effective <= 0:
+        raise ValueError("k must be positive for batch-local KNN hypergraph construction.")
+    with torch.no_grad():
+        distances = torch.cdist(feature, feature, p=2)
+        neighbors = torch.topk(distances, k=k_effective, largest=False, dim=1).indices.long()
+    return neighbors, f"torch_cdist_topk_{feature.device.type}"
+
+
+def build_batch_local_knn_hypergraph(
+    feature_tensor,
+    branch_enabled=True,
+    knn_k=8,
+    static_stats=None,
+    node_ids=None,
+    routed_node_ids=None,
+    candidate_policy="default",
+    candidate_policy_quotas=None,
+):
+    policy = str(candidate_policy or "default").strip().lower()
+    if policy in {"stable_quota", "mixed_quota"}:
+        raise ValueError(
+            "batch-local KNN currently supports only default, exclude_routed, "
+            "or post_topk_exclude_routed candidate policies."
+        )
     stats = {
         **dict(static_stats or {}),
         "hypergraph_branch_active": bool(branch_enabled),
@@ -735,25 +943,69 @@ def build_batch_local_knn_hypergraph(feature_tensor, branch_enabled=True, knn_k=
         "center_count_with_members": 0,
         "mean_selected_neighbors_per_center": 0.0,
         "incident_node_count": 0,
+        "candidate_policy": policy,
+        "candidate_role_contract": "batch_local_global_routed_mask" if policy != "default" else "none",
+        "selected_role_hard": 0,
+        "selected_role_stable": 0,
+        "selected_role_counterfactual": 0,
+        "selected_role_generic": 0,
+        "removed_role_hard": 0,
+        "batch_local_routed_candidate_count": 0,
     }
     if not branch_enabled or feature_tensor.size(0) == 0:
         return None, None, stats
 
-    neighbors, _distances, backend = feature_k_nearest_neighbor_query(feature_tensor, knn_k)
-    if neighbors.size == 0:
+    device = feature_tensor.device
+    routed_roles = _batch_local_routed_roles(
+        node_ids=node_ids,
+        routed_node_ids=routed_node_ids,
+        num_nodes=int(feature_tensor.size(0)),
+        device=device,
+    )
+    if routed_roles is not None:
+        stats["batch_local_routed_candidate_count"] = int(routed_roles.sum().item())
+    query_k = int(knn_k)
+    if policy == "exclude_routed" and routed_roles is not None:
+        query_k = min(int(feature_tensor.size(0)), int(knn_k) + int(routed_roles.sum().item()))
+    neighbors, backend = _batch_local_feature_k_nearest_neighbor_query(feature_tensor, query_k)
+    if int(neighbors.numel()) == 0:
         stats["backend"] = backend
         return None, torch.zeros(feature_tensor.size(0), dtype=torch.bool, device=feature_tensor.device), stats
 
-    device = feature_tensor.device
     node_members = []
     hyperedge_members = []
     incident_mask = torch.zeros(feature_tensor.size(0), dtype=torch.bool, device=device)
     total_selected_neighbors = 0
 
-    for hyperedge_id, member_row in enumerate(neighbors.tolist()):
-        members = torch.tensor(sorted({int(item) for item in member_row if 0 <= int(item) < int(feature_tensor.size(0))}), dtype=torch.long, device=device)
+    for hyperedge_id, member_row in enumerate(neighbors.detach().cpu().tolist()):
+        selected = []
+        removed_hard = 0
+        for raw_item in member_row:
+            item = int(raw_item)
+            if item < 0 or item >= int(feature_tensor.size(0)):
+                continue
+            is_center = item == int(hyperedge_id)
+            is_routed_member = bool(routed_roles[item].item()) if routed_roles is not None else False
+            if policy == "post_topk_exclude_routed" and is_routed_member and not is_center:
+                removed_hard += 1
+                continue
+            if policy == "exclude_routed" and is_routed_member and not is_center:
+                removed_hard += 1
+                continue
+            selected.append(item)
+            if policy == "exclude_routed" and len(selected) >= int(knn_k):
+                break
+        members = torch.tensor(sorted(set(selected)), dtype=torch.long, device=device)
         if members.numel() == 0:
             continue
+        non_center_members = members[members != int(hyperedge_id)]
+        if routed_roles is not None and int(non_center_members.numel()) > 0:
+            selected_hard = int(routed_roles[non_center_members].sum().item())
+            stats["selected_role_hard"] += selected_hard
+            stats["selected_role_generic"] += int(non_center_members.numel()) - selected_hard
+        else:
+            stats["selected_role_generic"] += int(non_center_members.numel())
+        stats["removed_role_hard"] += int(removed_hard)
         incident_mask[members] = True
         node_members.append(members)
         hyperedge_members.append(torch.full((members.numel(),), int(hyperedge_id), dtype=torch.long, device=device))
