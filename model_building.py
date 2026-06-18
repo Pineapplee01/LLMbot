@@ -909,7 +909,7 @@ def build_GNN_model(model_config):
         construct_dim = int(model_config.get("construct_input_dim", 0) or 0)
         if construct_dim <= 0:
             raise ValueError(
-                "dualspace hyperscan backbones require a clean construct tensor; missing construct_input_dim."
+                "construct-complete dualspace hyperscan backbones require a construct-side graph input tensor; missing construct_input_dim."
             )
         construct_manifest = dict(model_config.get("construct_feature_manifest", {}) or {})
         construct_path = str(model_config.get("graph_construct_embedding_path", "") or construct_manifest.get("path", "") or "")
@@ -919,7 +919,7 @@ def build_GNN_model(model_config):
             token in lowered_path for token in ["iter_-1", "iter_minus1", "node_repr"]
         ):
             raise ValueError(
-                "dualspace hyperscan construct space must not use iter_-1 decision embeddings or final node_repr artifacts."
+                "construct-complete dualspace hyperscan graph input must not use iter_-1 decision embeddings or final node_repr artifacts."
             )
 
     gnn_model = builder(model_config).to(model_config["device"])

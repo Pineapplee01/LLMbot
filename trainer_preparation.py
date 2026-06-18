@@ -287,6 +287,42 @@ def _score_repeated_neighborloader_logits(logits_cpu, labels_cpu):
     }
 
 
+def _accumulate_aux_feature_groups(accumulator, aux_features, weight):
+    if not isinstance(aux_features, dict):
+        return
+    for group_name, group_stats in aux_features.items():
+        if not isinstance(group_stats, dict):
+            accumulator.setdefault(group_name, group_stats)
+            continue
+        group_acc = accumulator.setdefault(group_name, {})
+        for key, value in group_stats.items():
+            if isinstance(value, bool):
+                group_acc.setdefault(key, 0.0)
+                group_acc[key] += (1.0 if value else 0.0) * weight
+            elif isinstance(value, (int, float)):
+                group_acc.setdefault(key, 0.0)
+                group_acc[key] += float(value) * weight
+            else:
+                group_acc.setdefault(key, value)
+
+
+def _finalize_aux_feature_groups(accumulator, aux_weight):
+    finalized = {}
+    non_avg_keys = {"backend", "candidate_scope", "center_source", "feature_source"}
+    for group_name, group_stats in accumulator.items():
+        if not isinstance(group_stats, dict):
+            finalized[group_name] = group_stats
+            continue
+        finalized_group = {}
+        for key, value in group_stats.items():
+            if isinstance(value, float) and aux_weight > 0.0 and key not in non_avg_keys:
+                finalized_group[key] = value / aux_weight
+            else:
+                finalized_group[key] = value
+        finalized[group_name] = finalized_group
+    return finalized
+
+
 def _model_config(args, features, device):
     return {
         "GNN_model": getattr(args, "GNN_model", "rgcn"),
@@ -305,7 +341,11 @@ def _model_config(args, features, device):
         "att_heads": getattr(args, "att_heads", 8),
         "hyperscan_detector_style": getattr(args, "hyperscan_detector_style", "residual"),
         "graph_second_view_hypergraph_backend": getattr(args, "graph_second_view_hypergraph_backend", "pyg"),
+        "graph_second_view_use_bn": bool(getattr(args, "graph_second_view_use_bn", False)),
         "graph_second_view_fusion": getattr(args, "graph_second_view_fusion", "residual"),
+        "graph_second_view_consumer_scope": getattr(args, "graph_second_view_consumer_scope", "all_nodes"),
+        "graph_second_view_nonconsumer_fallback": getattr(args, "graph_second_view_nonconsumer_fallback", "low_only"),
+        "graph_second_view_risk_gate_mode": getattr(args, "graph_second_view_risk_gate_mode", "linear_sigmoid"),
         "routed_multiview_refiner": {
             "enabled": bool(getattr(args, "mhlgc_enable", False) and getattr(args, "mhlgc_anchor_source", "semantic_nonzero_positive") == "routed_target_mask"),
             "num_heads": 4,
@@ -1295,6 +1335,7 @@ def _train_graph_backbone_once(
     routed_highpass_node_ids=None,
     routed_highpass_risk_scores=None,
     routed_highpass_candidate_rows=None,
+    second_view_risk_scores=None,
 ):
     device = config["device"]
     config = dict(config)
@@ -1303,6 +1344,8 @@ def _train_graph_backbone_once(
         routed_refiner_cfg["semantic_input_dim"] = int(mhlgc_semantic_embeddings.shape[1])
         config["routed_multiview_refiner"] = routed_refiner_cfg
     model = build_GNN_model(config).to(device)
+    if second_view_risk_scores is not None:
+        model.second_view_risk_scores = second_view_risk_scores.to(device=device, dtype=torch.float32).view(-1)
     input_adapter = None
     if peft_enabled:
         if raw_feature_dim is None:
@@ -2401,21 +2444,23 @@ def _train_graph_backbone_once(
         aux_accumulator = {}
         aux_weight = 0.0
         extra_tensor_keys = [
-            "x_ego_dec",
-            "x_rel_low1_dec",
-            "x_rel_high1_dec",
-            "x_rel_state1_dec",
-            "x_rel_low2_dec",
-            "x_rel_high2_dec",
-            "x_rel_state2_dec",
-            "x_clean_base",
-            "x_new_clean",
-            "x_high_low1_clean",
-            "x_high_high1_clean",
-            "x_high_state1_clean",
-            "x_high_low2_clean",
-            "x_high_high2_clean",
-            "x_high_clean",
+            "x_in_construct",
+            "x_low_construct",
+            "x_ego_construct",
+            "x_rel_low1_construct",
+            "x_rel_high1_construct",
+            "x_rel_state1_construct",
+            "x_rel_low2_construct",
+            "x_rel_high2_construct",
+            "x_rel_state2_construct",
+            "x_new_construct",
+            "x_hg_base",
+            "x_high_low1_construct",
+            "x_high_high1_construct",
+            "x_high_state1_construct",
+            "x_high_low2_construct",
+            "x_high_high2_construct",
+            "x_high_construct",
             "x_high",
         ]
         repeated_test_logits = []
@@ -2464,6 +2509,41 @@ def _train_graph_backbone_once(
                     batch_x_new = batch_x_new[:seed_count].detach().cpu()
                 else:
                     batch_x_new = None
+                batch_consumer_mask = batch_outputs.get("highorder_consumer_mask")
+                if torch.is_tensor(batch_consumer_mask):
+                    batch_consumer_mask = batch_consumer_mask[:seed_count].detach().cpu().bool()
+                else:
+                    batch_consumer_mask = None
+                batch_consumer_gate = batch_outputs.get("highorder_consumer_gate")
+                if torch.is_tensor(batch_consumer_gate):
+                    batch_consumer_gate = batch_consumer_gate[:seed_count].detach().cpu().view(-1)
+                else:
+                    batch_consumer_gate = None
+                batch_consumer_risk = batch_outputs.get("highorder_risk_score")
+                if torch.is_tensor(batch_consumer_risk):
+                    batch_consumer_risk = batch_consumer_risk[:seed_count].detach().cpu().view(-1)
+                else:
+                    batch_consumer_risk = None
+                batch_logits_hnn = batch_outputs.get("logits_hnn")
+                if torch.is_tensor(batch_logits_hnn):
+                    batch_logits_hnn = batch_logits_hnn[:seed_count].detach().cpu()
+                else:
+                    batch_logits_hnn = None
+                batch_logits_lowonly = batch_outputs.get("logits_lowonly")
+                if torch.is_tensor(batch_logits_lowonly):
+                    batch_logits_lowonly = batch_logits_lowonly[:seed_count].detach().cpu()
+                else:
+                    batch_logits_lowonly = None
+                batch_fused_x_hnn = batch_outputs.get("fused_x_hnn")
+                if torch.is_tensor(batch_fused_x_hnn):
+                    batch_fused_x_hnn = batch_fused_x_hnn[:seed_count].detach().cpu()
+                else:
+                    batch_fused_x_hnn = None
+                batch_fused_x_lowonly = batch_outputs.get("fused_x_lowonly")
+                if torch.is_tensor(batch_fused_x_lowonly):
+                    batch_fused_x_lowonly = batch_fused_x_lowonly[:seed_count].detach().cpu()
+                else:
+                    batch_fused_x_lowonly = None
                 batch_extra_tensors = {}
                 for key in extra_tensor_keys:
                     value = batch_outputs.get(key)
@@ -2478,6 +2558,41 @@ def _train_graph_backbone_once(
                     x_low_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_x_low.shape[1])), dtype=batch_x_low.dtype)
                 if batch_x_new is not None and x_new_full is None:
                     x_new_full = torch.zeros((int(x_projected_cpu.shape[0]), int(batch_x_new.shape[1])), dtype=batch_x_new.dtype)
+                if batch_consumer_mask is not None and "highorder_consumer_mask" not in extra_full_tensors:
+                    extra_full_tensors["highorder_consumer_mask"] = torch.zeros(
+                        (int(x_projected_cpu.shape[0]),),
+                        dtype=torch.bool,
+                    )
+                if batch_consumer_gate is not None and "highorder_consumer_gate" not in extra_full_tensors:
+                    extra_full_tensors["highorder_consumer_gate"] = torch.zeros(
+                        (int(x_projected_cpu.shape[0]),),
+                        dtype=batch_consumer_gate.dtype,
+                    )
+                if batch_consumer_risk is not None and "highorder_risk_score" not in extra_full_tensors:
+                    extra_full_tensors["highorder_risk_score"] = torch.zeros(
+                        (int(x_projected_cpu.shape[0]),),
+                        dtype=batch_consumer_risk.dtype,
+                    )
+                if batch_logits_hnn is not None and "logits_hnn" not in extra_full_tensors:
+                    extra_full_tensors["logits_hnn"] = torch.zeros(
+                        (int(x_projected_cpu.shape[0]), int(batch_logits_hnn.shape[1])),
+                        dtype=batch_logits_hnn.dtype,
+                    )
+                if batch_logits_lowonly is not None and "logits_lowonly" not in extra_full_tensors:
+                    extra_full_tensors["logits_lowonly"] = torch.zeros(
+                        (int(x_projected_cpu.shape[0]), int(batch_logits_lowonly.shape[1])),
+                        dtype=batch_logits_lowonly.dtype,
+                    )
+                if batch_fused_x_hnn is not None and "fused_x_hnn" not in extra_full_tensors:
+                    extra_full_tensors["fused_x_hnn"] = torch.zeros(
+                        (int(x_projected_cpu.shape[0]), int(batch_fused_x_hnn.shape[1])),
+                        dtype=batch_fused_x_hnn.dtype,
+                    )
+                if batch_fused_x_lowonly is not None and "fused_x_lowonly" not in extra_full_tensors:
+                    extra_full_tensors["fused_x_lowonly"] = torch.zeros(
+                        (int(x_projected_cpu.shape[0]), int(batch_fused_x_lowonly.shape[1])),
+                        dtype=batch_fused_x_lowonly.dtype,
+                    )
                 logits_full[global_ids] = batch_logits
                 prob_full[global_ids] = batch_prob
                 repr_full[global_ids] = batch_repr
@@ -2486,6 +2601,20 @@ def _train_graph_backbone_once(
                     x_low_full[global_ids] = batch_x_low
                 if batch_x_new is not None and x_new_full is not None:
                     x_new_full[global_ids] = batch_x_new
+                if batch_consumer_mask is not None:
+                    extra_full_tensors["highorder_consumer_mask"][global_ids] = batch_consumer_mask
+                if batch_consumer_gate is not None:
+                    extra_full_tensors["highorder_consumer_gate"][global_ids] = batch_consumer_gate
+                if batch_consumer_risk is not None:
+                    extra_full_tensors["highorder_risk_score"][global_ids] = batch_consumer_risk
+                if batch_logits_hnn is not None:
+                    extra_full_tensors["logits_hnn"][global_ids] = batch_logits_hnn
+                if batch_logits_lowonly is not None:
+                    extra_full_tensors["logits_lowonly"][global_ids] = batch_logits_lowonly
+                if batch_fused_x_hnn is not None:
+                    extra_full_tensors["fused_x_hnn"][global_ids] = batch_fused_x_hnn
+                if batch_fused_x_lowonly is not None:
+                    extra_full_tensors["fused_x_lowonly"][global_ids] = batch_fused_x_lowonly
                 for key, value in batch_extra_tensors.items():
                     if key not in extra_full_tensors:
                         extra_full_tensors[key] = torch.zeros(
@@ -2493,25 +2622,12 @@ def _train_graph_backbone_once(
                             dtype=value.dtype,
                         )
                     extra_full_tensors[key][global_ids] = value
-                branch_stats = batch_outputs.get("aux_features", {}).get("dynamic_similarity_branch", {})
-                if isinstance(branch_stats, dict):
+                batch_aux_features = batch_outputs.get("aux_features", {})
+                if isinstance(batch_aux_features, dict) and batch_aux_features:
                     weight = float(seed_count)
                     aux_weight += weight
-                    for key, value in branch_stats.items():
-                        if isinstance(value, bool):
-                            aux_accumulator.setdefault(key, 0.0)
-                            aux_accumulator[key] += (1.0 if value else 0.0) * weight
-                        elif isinstance(value, (int, float)):
-                            aux_accumulator.setdefault(key, 0.0)
-                            aux_accumulator[key] += float(value) * weight
-                        else:
-                            aux_accumulator.setdefault(key, value)
-        aggregated_aux = {}
-        for key, value in aux_accumulator.items():
-            if isinstance(value, float) and aux_weight > 0.0 and key not in {"backend", "candidate_scope", "center_source", "feature_source"}:
-                aggregated_aux[key] = value / aux_weight
-            else:
-                aggregated_aux[key] = value
+                    _accumulate_aux_feature_groups(aux_accumulator, batch_aux_features, weight)
+        aggregated_aux = _finalize_aux_feature_groups(aux_accumulator, aux_weight)
         if neighborloader_contract == "hyperscan_sampled_subgraph":
             if not repeated_test_logits:
                 raise RuntimeError("NeighborLoader test/infer pass did not produce any sampled-subgraph logits.")
@@ -2524,9 +2640,7 @@ def _train_graph_backbone_once(
             "prob": prob_full if prob_full is not None else torch.empty((0, 2), dtype=torch.float32),
             "node_repr": repr_full if repr_full is not None else torch.empty((0, config["hidden_dim"]), dtype=torch.float32),
             "fused_x": fused_x_full if fused_x_full is not None else torch.empty((0, config["hidden_dim"]), dtype=torch.float32),
-            "aux_features": {
-                "dynamic_similarity_branch": aggregated_aux,
-            },
+            "aux_features": aggregated_aux,
         }
         if x_low_full is not None:
             outputs["x_low"] = x_low_full
@@ -2822,13 +2936,26 @@ def train_frozen_g0(args, seed, data, experiment_root):
             )
         candidate_policy = str(refine_request.get("candidate_policy", "default") or "default").strip().lower()
         candidate_routed_nodes_path = str(refine_request.get("candidate_routed_nodes_path", "") or "").strip()
+        consumer_scope = str(
+            getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes"
+        ).strip().lower()
         batch_local_routed_node_ids = []
+        if consumer_scope == "routed_only":
+            routed_nodes_path = str(refine_request.get("routed_nodes_path", "") or "").strip()
+            if routed_nodes_path:
+                batch_local_routed_node_ids.extend(
+                    int(item)
+                    for item in _load_routed_center_node_ids(Path(routed_nodes_path), split_name="all")
+                    if 0 <= int(item) < int(graph_node_count)
+                )
         if candidate_policy in {"exclude_routed", "post_topk_exclude_routed"}:
-            batch_local_routed_node_ids = [
+            batch_local_routed_node_ids.extend(
                 int(item)
                 for item in _load_routed_center_node_ids(Path(candidate_routed_nodes_path), split_name="all")
                 if 0 <= int(item) < int(graph_node_count)
-            ]
+            )
+        if batch_local_routed_node_ids:
+            batch_local_routed_node_ids = sorted({int(item) for item in batch_local_routed_node_ids})
         dynamic_similarity_branch = {
             "center_node_ids": [],
             "center_candidate_node_ids": [],
@@ -2857,6 +2984,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 else "none"
             ),
             "candidate_routed_nodes_path": candidate_routed_nodes_path,
+            "consumer_scope": consumer_scope,
             "candidate_policy_routed_count": int(len(batch_local_routed_node_ids)),
             "knn_k": int(refine_request.get("knn_k", 8)),
             "candidate_scope": "batch_local_subgraph_knn",
@@ -3015,6 +3143,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
     routed_highpass_train_node_ids = None
     routed_highpass_risk_scores = None
     routed_highpass_candidate_rows = None
+    second_view_risk_scores = None
     if routed_contrast_enabled:
         routed_contrast_frozen_path = str(
             getattr(args, "routed_contrast_frozen_path", "") or getattr(args, "embedding_path", "") or ""
@@ -3063,6 +3192,21 @@ def train_frozen_g0(args, seed, data, experiment_root):
         )
     else:
         routed_highpass_candidate_stats = {}
+    if str(getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes").strip().lower() == "risk_gated_all_nodes":
+        second_view_risk_scores = _load_optional_fullgraph_vector(
+            str(getattr(args, "graph_second_view_risk_path", "") or ""),
+            expected_rows=graph_node_count,
+            allowed_keys=("risk_score", "router_score", "abstain_risk", "scores"),
+            dtype=torch.float32,
+            value_name="--graph_second_view_risk_path",
+        )
+        if second_view_risk_scores is None:
+            raise ValueError(
+                "--graph_second_view_consumer_scope risk_gated_all_nodes requires a valid --graph_second_view_risk_path payload."
+            )
+        second_view_risk_scores = torch.nan_to_num(
+            second_view_risk_scores.float(), nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0).contiguous()
     training_result = _train_graph_backbone_once(
         config=config,
         x_projected=x_projected,
@@ -3138,6 +3282,7 @@ def train_frozen_g0(args, seed, data, experiment_root):
         routed_highpass_node_ids=routed_highpass_node_ids,
         routed_highpass_risk_scores=routed_highpass_risk_scores,
         routed_highpass_candidate_rows=routed_highpass_candidate_rows,
+        second_view_risk_scores=second_view_risk_scores,
     )
     model = training_result["model"]
     input_adapter = training_result["input_adapter"]
@@ -3169,22 +3314,38 @@ def train_frozen_g0(args, seed, data, experiment_root):
         outputs["x_high_base"] = raw_outputs["x_high_base"].detach().cpu()
     if torch.is_tensor(raw_outputs.get("x_new")):
         outputs["x_new"] = raw_outputs["x_new"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("highorder_consumer_mask")):
+        outputs["highorder_consumer_mask"] = raw_outputs["highorder_consumer_mask"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("highorder_consumer_gate")):
+        outputs["highorder_consumer_gate"] = raw_outputs["highorder_consumer_gate"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("highorder_risk_score")):
+        outputs["highorder_risk_score"] = raw_outputs["highorder_risk_score"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("logits_hnn")):
+        outputs["logits_hnn"] = raw_outputs["logits_hnn"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("logits_lowonly")):
+        outputs["logits_lowonly"] = raw_outputs["logits_lowonly"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("fused_x_hnn")):
+        outputs["fused_x_hnn"] = raw_outputs["fused_x_hnn"].detach().cpu()
+    if torch.is_tensor(raw_outputs.get("fused_x_lowonly")):
+        outputs["fused_x_lowonly"] = raw_outputs["fused_x_lowonly"].detach().cpu()
     extra_tensor_keys = [
-        "x_ego_dec",
-        "x_rel_low1_dec",
-        "x_rel_high1_dec",
-        "x_rel_state1_dec",
-        "x_rel_low2_dec",
-        "x_rel_high2_dec",
-        "x_rel_state2_dec",
-        "x_clean_base",
-        "x_new_clean",
-        "x_high_low1_clean",
-        "x_high_high1_clean",
-        "x_high_state1_clean",
-        "x_high_low2_clean",
-        "x_high_high2_clean",
-        "x_high_clean",
+        "x_in_construct",
+        "x_low_construct",
+        "x_ego_construct",
+        "x_rel_low1_construct",
+        "x_rel_high1_construct",
+        "x_rel_state1_construct",
+        "x_rel_low2_construct",
+        "x_rel_high2_construct",
+        "x_rel_state2_construct",
+        "x_new_construct",
+        "x_hg_base",
+        "x_high_low1_construct",
+        "x_high_high1_construct",
+        "x_high_state1_construct",
+        "x_high_low2_construct",
+        "x_high_high2_construct",
+        "x_high_construct",
     ]
     for key in extra_tensor_keys:
         if torch.is_tensor(raw_outputs.get(key)):
@@ -3245,16 +3406,22 @@ def train_frozen_g0(args, seed, data, experiment_root):
             },
             "seed": int(seed),
             "backbone": getattr(args, "GNN_model", "rgcn"),
+            "backbone_contract_version": (
+                "construct_complete_v2"
+                if "rgcn_h2fag_dualspace" in str(getattr(args, "GNN_model", "rgcn") or "rgcn").lower()
+                else "legacy_or_non_dualspace"
+            ),
             "detector": {
                 "hyperscan_detector_style": str(getattr(args, "hyperscan_detector_style", "residual") or "residual"),
                 "graph_second_view_fusion": str(getattr(args, "graph_second_view_fusion", "residual") or "residual"),
                 "graph_second_view_hypergraph_backend": str(
                     getattr(args, "graph_second_view_hypergraph_backend", "pyg") or "pyg"
                 ),
+                "graph_second_view_use_bn": bool(getattr(args, "graph_second_view_use_bn", False)),
                 "positioning": (
                     "strong_graph_consumer"
                     if str(getattr(args, "graph_second_view_fusion", "residual") or "residual").strip().lower()
-                    in {"multiattn", "multiattn_adaptive"}
+                    in {"multiattn", "multiattn_adaptive", "construct_acm"}
                     else "lightweight_residual_consumer"
                 ),
             },
@@ -3277,7 +3444,39 @@ def train_frozen_g0(args, seed, data, experiment_root):
                     )
                 ),
                 "hypergraph_backend": str(getattr(args, "graph_second_view_hypergraph_backend", "pyg") or "pyg"),
+                "hypergraph_use_bn": bool(getattr(args, "graph_second_view_use_bn", False)),
                 "fusion": str(getattr(args, "graph_second_view_fusion", "residual") or "residual"),
+                "consumer_scope": str(getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes"),
+                "nonconsumer_fallback": str(
+                    getattr(args, "graph_second_view_nonconsumer_fallback", "low_only") or "low_only"
+                ),
+                "consumer_mask_source": (
+                    str(getattr(args, "routed_nodes_path", "") or "")
+                    if str(getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes").strip().lower()
+                    == "routed_only"
+                    else ""
+                ),
+                "consumer_risk_path": (
+                    str(getattr(args, "graph_second_view_risk_path", "") or "")
+                    if str(getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes").strip().lower()
+                    == "risk_gated_all_nodes"
+                    else ""
+                ),
+                "consumer_risk_source": (
+                    "conformal_knn_risk_router_x_new"
+                    if str(getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes").strip().lower()
+                    == "risk_gated_all_nodes"
+                    else ""
+                ),
+                "consumer_gate_mode": (
+                    str(getattr(args, "graph_second_view_risk_gate_mode", "linear_sigmoid") or "linear_sigmoid")
+                    if str(getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes").strip().lower()
+                    == "risk_gated_all_nodes"
+                    else ""
+                ),
+                "membership_scope": "all_nodes_batch_local_knn",
+                "membership_policy": "default_topk_x_new",
+                "membership_risk_aware": False,
                 "positioning": str(refine_request.get("positioning", "none") or "none"),
                 "control_only": bool(refine_request.get("control_only", False)),
             },
@@ -3297,15 +3496,26 @@ def train_frozen_g0(args, seed, data, experiment_root):
                 else "disabled"
             ),
             "representation_roles": {
-            "z_sem": "semantic_input_space",
-            "z_construct": (
-                "hyperscan_clean_representation"
-                if construct_bundle is not None
-                else "x_new_high_order_construction_space"
-            ),
-            "z_decision": "iter_minus1",
-            "z_pred": "fused_x_final_detector_space",
-        },
+                **(
+                    {
+                        "z_graph_input": "construct_representation",
+                        "z_construct": "construct_representation",
+                        "z_semantic": "control_only_or_unused",
+                        "z_pred": "fused_x_final_detector_space",
+                    }
+                    if "rgcn_h2fag_dualspace" in str(getattr(args, "GNN_model", "rgcn") or "rgcn").lower()
+                    else {
+                        "z_sem": "semantic_input_space",
+                        "z_construct": (
+                            "hyperscan_clean_representation"
+                            if construct_bundle is not None
+                            else "x_new_high_order_construction_space"
+                        ),
+                        "z_decision": "iter_minus1",
+                        "z_pred": "fused_x_final_detector_space",
+                    }
+                )
+            },
             "pseudo_label_policy": "disabled_by_default",
             "checkpoint_selection": {
                 "primary": str(
@@ -3702,8 +3912,8 @@ def _graph_refine_request(args):
         )
     if hypergraph_backend not in {"pyg", "dhg"}:
         raise ValueError("--graph_second_view_hypergraph_backend must be one of {pyg, dhg}.")
-    if fusion not in {"residual", "multiattn", "multiattn_adaptive"}:
-        raise ValueError("--graph_second_view_fusion must be one of {residual, multiattn, multiattn_adaptive}.")
+    if fusion not in {"residual", "multiattn", "multiattn_adaptive", "construct_acm"}:
+        raise ValueError("--graph_second_view_fusion must be one of {residual, multiattn, multiattn_adaptive, construct_acm}.")
     if training_geometry not in {"full_batch", "neighbor_subgraph"}:
         raise ValueError("--graph_training_loader_mode must be one of {full_batch, neighbor_subgraph}.")
     if mode == "none":
@@ -4357,6 +4567,12 @@ def _detector_manifest_matches_request(args, manifest):
     ).lower()
     if existing_backend != requested_backend:
         return False
+    requested_use_bn = bool(getattr(args, "graph_second_view_use_bn", False))
+    existing_use_bn = bool(
+        existing_detector.get("graph_second_view_use_bn", existing_second_view.get("hypergraph_use_bn", False))
+    )
+    if existing_use_bn != requested_use_bn:
+        return False
     requested_fusion = str(getattr(args, "graph_second_view_fusion", "residual") or "residual").lower()
     existing_fusion = str(
         existing_detector.get("graph_second_view_fusion", "")
@@ -4378,16 +4594,53 @@ def _neighborloader_contract_manifest_matches_request(args, manifest):
     return existing_contract == requested_contract
 
 
+def _second_view_consumer_manifest_matches_request(args, manifest):
+    requested_scope = str(getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes").strip().lower()
+    requested_fallback = str(
+        getattr(args, "graph_second_view_nonconsumer_fallback", "low_only") or "low_only"
+    ).strip().lower()
+    requested_risk_path = str(getattr(args, "graph_second_view_risk_path", "") or "").strip()
+    requested_gate_mode = str(
+        getattr(args, "graph_second_view_risk_gate_mode", "linear_sigmoid") or "linear_sigmoid"
+    ).strip().lower()
+    second_view = manifest.get("second_view", {})
+    if not isinstance(second_view, dict):
+        second_view = {}
+    existing_scope = str(second_view.get("consumer_scope", "all_nodes") or "all_nodes").strip().lower()
+    existing_fallback = str(second_view.get("nonconsumer_fallback", "low_only") or "low_only").strip().lower()
+    existing_source = str(second_view.get("consumer_mask_source", "") or "").strip()
+    existing_risk_path = str(second_view.get("consumer_risk_path", "") or "").strip()
+    existing_gate_mode = str(second_view.get("consumer_gate_mode", "") or "").strip().lower()
+    requested_source = (
+        str(getattr(args, "routed_nodes_path", "") or "").strip()
+        if requested_scope == "routed_only"
+        else ""
+    )
+    return (
+        existing_scope == requested_scope
+        and existing_fallback == requested_fallback
+        and existing_source == requested_source
+        and existing_risk_path == (requested_risk_path if requested_scope == "risk_gated_all_nodes" else "")
+        and existing_gate_mode == (requested_gate_mode if requested_scope == "risk_gated_all_nodes" else "")
+    )
+
+
 def _existing_g0_matches_request(args, manifest):
     if manifest.get("contract") != FROZEN_G0_CONTRACT:
         return False
-    if manifest.get("backbone", "").lower() != str(getattr(args, "GNN_model", "rgcn")).lower():
+    requested_backbone = str(getattr(args, "GNN_model", "rgcn")).lower()
+    if manifest.get("backbone", "").lower() != requested_backbone:
         return False
+    if "rgcn_h2fag_dualspace" in requested_backbone:
+        if str(manifest.get("backbone_contract_version", "") or "").strip().lower() != "construct_complete_v2":
+            return False
     if not _mhlgc_manifest_matches_request(args, manifest):
         return False
     if not _routed_contrast_manifest_matches_request(args, manifest):
         return False
     if not _neighborloader_contract_manifest_matches_request(args, manifest):
+        return False
+    if not _second_view_consumer_manifest_matches_request(args, manifest):
         return False
 
     requested_graph_override = _graph_override_manifest_request(args)
@@ -4416,7 +4669,6 @@ def _existing_g0_matches_request(args, manifest):
         if str(Path(existing_construct_path)) != str(Path(requested_construct_path)):
             return False
     elif existing_construct_path and str(existing_construct_manifest.get("dualspace_role", "") or "").strip().lower() == "hyperscan_clean_representation":
-        requested_backbone = str(getattr(args, "GNN_model", getattr(args, "graph_backbone", "rgcn")) or "rgcn").lower()
         if "rgcn_h2fag_dualspace_hyperscan" in requested_backbone:
             return False
     projected_dim = feature_manifest.get("projected_dim")

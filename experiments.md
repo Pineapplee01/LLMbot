@@ -5907,6 +5907,65 @@ Contract-difference interpretation boundary:
   `outputs.pt + canonical test_idx.pt`, not the repeated sampled-subgraph
   sidecar.
 
+## 2026-06-17 - Routed-selective HNN detector (implementation note / pending run block)
+
+Question:
+
+- Can we unify the current faithful HNN detector into a routed-selective
+  consumption contract, where the sampled-subgraph high-order branch is still
+  built globally but only routed/high-risk rows consume it?
+
+Implementation boundary:
+
+- This block is about **detector consumption** only.
+- It does **not** change:
+  - conformal router scoring
+  - second-view member policy
+  - KNN construction space (`x_new` remains the same)
+- It does add two public flags:
+  - `--graph_second_view_consumer_scope {all_nodes,routed_only}`
+  - `--graph_second_view_nonconsumer_fallback {low_only}`
+
+Contract:
+
+- v1 is intentionally narrow and parser-validated:
+  - `graph_backbone = rgcn_hyperscan_dhg_nodeinput`
+  - `graph_node_input_family = hyperscan_meta_tweet_proxy`
+  - `graph_second_view_scope = neighborloader_batch`
+  - `graph_neighborloader_contract = hyperscan_sampled_subgraph`
+  - `graph_second_view_fusion = multiattn`
+  - `routed_nodes_path` required when `consumer_scope = routed_only`
+
+Expected artifacts:
+
+- `outputs.pt` remains one-node-one-row and now additionally records:
+  - `highorder_consumer_mask`
+  - `fused_x_hnn`
+  - `fused_x_lowonly`
+  - `logits_hnn`
+  - `logits_lowonly`
+- `manifest.json.second_view` additionally records:
+  - `consumer_scope`
+  - `nonconsumer_fallback`
+  - `consumer_mask_source`
+  - `membership_scope = all_nodes_batch_local_knn`
+
+Planned comparison matrix:
+
+1. `RGCN/control + hyperscan_sampled_subgraph`
+2. `DHG HGNN + multiattn + all_nodes`
+3. `DHG HGNN + multiattn + routed_only @ 5%`
+4. `DHG HGNN + multiattn + routed_only @ 10%`
+5. `DHG HGNN + multiattn + routed_only @ 20%`
+
+Interpretation boundary:
+
+- If routed-only improves routed slices while preserving canonical full-test
+  performance, it supports a detector-consumption unification view.
+- If it only reproduces the old all-node result or harms routed slices, this
+  block should be kept as engineering unification rather than upgraded into a
+  paper-level method claim.
+
 Local conclusion from this 4-run matrix:
 
 - Under identical official nodeinput-788 backbone / geometry, switching from
@@ -5923,3 +5982,298 @@ Local conclusion from this 4-run matrix:
 - This block should be read as a contract audit and same-geometry detector
   comparison only. It does not by itself justify mixing repeated sampled-row
   faithful metrics into the repo's default full-test comparison tables.
+
+## 2026-06-18 - Residual global consumer matrix (faithful nodeinput-788)
+
+Question:
+
+- Under one native, auditable faithful NeighborLoader contract, how do
+  `all_nodes`, `routed_only`, and `risk_gated_all_nodes` compare inside the
+  **residual** second-view consumer family on TwiBot-20?
+
+Boundary:
+
+- This is a **same-backbone / same-geometry / same-contract** consumer-scope
+  comparison.
+- It compares only detector consumption:
+  - `all_nodes`
+  - `routed_only`
+  - `risk_gated_all_nodes`
+- It does **not** change:
+  - conformal router scoring
+  - second-view member policy
+  - `x_new` KNN construction space
+- This line should be described as a **HyperScan-style residual second-view
+  consumer**, not as an official HyperScan reproduction.
+
+Native contract:
+
+- `experiment_task = graph_detector_prepare`
+- `dataset = TwiBot-20`
+- `reset_split = -1`
+- `graph_data_variant = labeled`
+- `graph_backbone = rgcn_hyperscan_dhg_nodeinput`
+- `graph_node_input_family = hyperscan_meta_tweet_proxy`
+- `embedding_path = /root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt`
+- `hidden_dim = 788`
+- `graph_training_loader_mode = neighbor_subgraph`
+- `graph_second_view_scope = neighborloader_batch`
+- `graph_neighborloader_contract = hyperscan_sampled_subgraph`
+- `graph_second_view_hypergraph_backend = dhg`
+- `graph_second_view_fusion = residual`
+- `graph_refine_mode = hyperscan_neighborloader_batch_local_branch`
+- `graph_refine_knn_k = 8`
+- `graph_neighbor_num_neighbors = 64`
+- `gnn_batch_size = 1024`
+- `graph_training_max_steps = 200`
+- `seeds = 1`
+
+Parser / contract note:
+
+- `routed_only` is now a native supported combination for this narrow contract:
+  - `graph_second_view_consumer_scope = routed_only`
+  - `graph_second_view_fusion in {multiattn, residual}`
+  - `graph_backbone = rgcn_hyperscan_dhg_nodeinput`
+  - `graph_second_view_scope = neighborloader_batch`
+  - `graph_neighborloader_contract = hyperscan_sampled_subgraph`
+  - `routed_nodes_path` required
+- Under `graph_second_view_fusion = residual`, non-consumer rows use the
+  explicit `low_only` fallback.
+- `risk_gated_all_nodes` remains residual-only and requires a frozen full-graph
+  `x_new` conformal risk payload plus
+  `graph_second_view_risk_gate_mode = linear_sigmoid`.
+
+Run matrix:
+
+1. `all_nodes + residual`
+2. `risk_gated_all_nodes + residual`
+3. `routed_only + residual @ 5%`
+4. `routed_only + residual @ 10%`
+5. `routed_only + residual @ 20%`
+
+Shared input payloads:
+
+- risk payload:
+  - `/root/workspace/LMbot/LLMbot/experiments/risk_gated_global_residual_inputs_20260617/risk_manifest_xnew_seed1.json`
+- routed payloads:
+  - `/root/workspace/LMbot/LLMbot/experiments/risk_gated_global_residual_inputs_20260617/routed_nodes_xnew_budget050_seed1.json`
+  - `/root/workspace/LMbot/LLMbot/experiments/risk_gated_global_residual_inputs_20260617/routed_nodes_xnew_budget100_seed1.json`
+  - `/root/workspace/LMbot/LLMbot/experiments/risk_gated_global_residual_inputs_20260617/routed_nodes_xnew_budget200_seed1.json`
+
+Artifact root:
+
+- `/root/workspace/LMbot/LLMbot_risk_gated_global_residual_20260618/experiments/`
+
+Canonical command skeleton:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --graph_data_variant labeled \
+  --use_GNN \
+  --graph_backbone rgcn_hyperscan_dhg_nodeinput \
+  --graph_node_input_family hyperscan_meta_tweet_proxy \
+  --embedding_path /root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt \
+  --hidden_dim 788 \
+  --graph_training_loader_mode neighbor_subgraph \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_neighborloader_contract hyperscan_sampled_subgraph \
+  --graph_second_view_hypergraph_backend dhg \
+  --graph_second_view_fusion residual \
+  --graph_refine_mode hyperscan_neighborloader_batch_local_branch \
+  --graph_refine_knn_k 8 \
+  --graph_neighbor_num_neighbors 64 \
+  --gnn_batch_size 1024 \
+  --graph_training_max_steps 200 \
+  --seeds 1 \
+  --disable_wandb \
+  --force_retrain_backbone
+```
+
+Per-run additions:
+
+- `all_nodes`:
+  - `--graph_second_view_consumer_scope all_nodes`
+- `risk_gated_all_nodes`:
+  - `--graph_second_view_consumer_scope risk_gated_all_nodes`
+
+## 2026-06-18 - HyperScan-faithful two-channel vs dual-space three-channel (plan / execution block)
+
+Question:
+
+- Under one shared faithful NeighborLoader contract, does the official-style
+  two-channel HyperScan detector remain stronger than a dual-space
+  three-channel extension, or does explicit `identity/low/high` consumption
+  add value?
+
+Boundary:
+
+- The **faithful mainline** in this block is:
+  `rgcn_hyperscan_dhg_nodeinput + multiattn`
+  with official nodeinput-788, NeighborLoader sampled-subgraph supervision,
+  `x_new = [x_low; x_in]`, `k=8`, DHG HGNN, and two-channel low/high detector
+  consumption.
+- The **extension line** in this block is:
+  `rgcn_h2fag_dualspace_hyperscan_nodeinput + construct_acm`
+  under the rewritten `construct_complete_v2` contract.
+- This block does **not** mix in:
+  - the semantic `finetuned RoBERTa -> RGCN` transfer family
+  - routed-only or risk-gated consumer variants
+  - member-policy changes
+- `second-view + residual` remains a **HyperScan-style residual consumer**
+  ablation and is not part of the faithful mainline claim.
+
+Shared contract:
+
+- `dataset = TwiBot-20`
+- canonical `train_idx.pt / valid_idx.pt / test_idx.pt`
+- `graph_data_variant = labeled`
+- `graph_training_loader_mode = neighbor_subgraph`
+- `graph_second_view_scope = neighborloader_batch`
+- `graph_neighborloader_contract = hyperscan_sampled_subgraph`
+- `graph_neighbor_num_neighbors = 64`
+- `graph_refine_knn_k = 8`
+- `hidden_dim = 788`
+- primary result surface:
+  canonical deduplicated full-test recompute from `outputs.pt + canonical test_idx.pt`
+- faithful repeated sampled-subgraph sidecar metrics are audit-only
+
+Run matrix:
+
+1. `RGCN/control faithful`
+   - backbone: `rgcn_hyperscan_dhg_nodeinput`
+   - geometry: same faithful NeighborLoader contract
+   - no active second-view detector branch
+2. `HyperScan-faithful two-channel`
+   - backbone: `rgcn_hyperscan_dhg_nodeinput`
+   - fusion: `multiattn`
+3. `Dual-space three-channel extension`
+   - backbone: `rgcn_h2fag_dualspace_hyperscan_nodeinput`
+   - fusion: `construct_acm`
+   - requires `graph_construct_embedding_path` pointing to the clean
+     official `tweet|num|cat` construct tensor
+
+Execution order:
+
+- first run `graph_training_max_steps=5~20` smoke commands and verify:
+  - `manifest.json`
+  - `selection_metrics.json`
+  - `neighborloader_contract_metrics.json`
+  - `outputs.pt`
+- faithful two-channel smoke must export:
+  - `x_low`
+  - `x_new`
+  - `x_high`
+  - `fused_x`
+- dual-space three-channel smoke must additionally export:
+  - `x_in_construct`
+  - `x_low_construct`
+  - `x_new_construct`
+  - `x_high_construct`
+  - `aux_features.construct_acm_detector`
+- then run seed `1` full TwiBot-20
+- only if the three-channel extension is non-inferior on canonical full-test
+  or meaningfully stronger on routed hard-node slices without exceeding a
+  `0.003` full-test Macro-F1 drop should it be expanded to seeds `1,2,3`
+
+Artifact roots:
+
+- `faithful_control`:
+  `/root/workspace/LMbot/LLMbot_protocol_align_20260618/faithful_control_seed1`
+- `faithful_two_channel`:
+  `/root/workspace/LMbot/LLMbot_protocol_align_20260618/faithful_two_channel_seed1`
+- `dualspace_three_channel`:
+  `/root/workspace/LMbot/LLMbot_protocol_align_20260618/dualspace_three_channel_seed1`
+
+Smoke / contract checks:
+
+- faithful two-channel smoke:
+  - `backbone = rgcn_hyperscan_dhg_nodeinput`
+  - `detector.graph_second_view_fusion = multiattn`
+  - `detector.graph_second_view_hypergraph_backend = dhg`
+  - `training_loader.neighborloader_contract = hyperscan_sampled_subgraph`
+  - `outputs.pt` contains `x_low`, `x_new`, `x_high`, `fused_x`
+- dual-space three-channel smoke:
+  - `backbone = rgcn_h2fag_dualspace_hyperscan_nodeinput`
+  - `backbone_contract_version = construct_complete_v2`
+  - `detector.graph_second_view_fusion = construct_acm`
+  - `outputs.pt` contains
+    `x_in_construct`, `x_low_construct`, `x_new_construct`, `x_high_construct`
+  - `outputs.pt["aux_features"]` now also retains
+    `construct_relation_encoder`, `construct_highorder_encoder`, and
+    `construct_acm_detector` under the NeighborLoader export path
+
+Canonical deduplicated full-test metrics (seed 1):
+
+| run | Test Acc | Test Macro-F1 | Bot-F1 | Human-F1 |
+|---|---:|---:|---:|---:|
+| `faithful_control` | `0.8757` | `0.8742` | `0.8882` | `0.8601` |
+| `faithful_two_channel` | `0.8597` | `0.8568` | `0.8770` | `0.8366` |
+| `dualspace_three_channel` | `0.8681` | `0.8661` | `0.8827` | `0.8494` |
+
+Routed / non-routed slices from the fixed risk manifest (seed 1):
+
+| run | budget | routed Macro-F1 | routed Bot-F1 | routed Human-F1 | non-routed Macro-F1 |
+|---|---|---:|---:|---:|---:|
+| `faithful_control` | `5%` | `0.7281` | `0.7143` | `0.7419` | `0.8817` |
+| `faithful_control` | `10%` | `0.6997` | `0.7328` | `0.6667` | `0.8935` |
+| `faithful_control` | `20%` | `0.6867` | `0.7491` | `0.6243` | `0.9191` |
+| `faithful_two_channel` | `5%` | `0.6586` | `0.6875` | `0.6296` | `0.8674` |
+| `faithful_two_channel` | `10%` | `0.6185` | `0.6993` | `0.5376` | `0.8824` |
+| `faithful_two_channel` | `20%` | `0.6154` | `0.7279` | `0.5030` | `0.9114` |
+| `dualspace_three_channel` | `5%` | `0.5758` | `0.5614` | `0.5902` | `0.8814` |
+| `dualspace_three_channel` | `10%` | `0.5811` | `0.6202` | `0.5421` | `0.8979` |
+| `dualspace_three_channel` | `20%` | `0.6311` | `0.7108` | `0.5514` | `0.9221` |
+
+Current seed-1 interpretation boundary:
+
+- Under this faithful DHG nodeinput-788 contract, the official-style
+  two-channel `multiattn` detector does **not** beat the low-order faithful
+  control on canonical full-test or routed hard-node slices.
+- The dual-space three-channel extension recovers part of that drop relative to
+  faithful two-channel, but still trails the faithful control on both canonical
+  full-test and routed 5/10/20 slices.
+- Therefore this seed-1 block currently supports a protocol-alignment claim
+  boundary, not a promotion of the three-channel extension into the paper
+  mainline.
+  - `--graph_second_view_risk_path <risk_manifest_xnew_seed1.json>`
+  - `--graph_second_view_risk_gate_mode linear_sigmoid`
+- `routed_only @ {5,10,20}%`:
+  - `--graph_second_view_consumer_scope routed_only`
+  - `--graph_second_view_nonconsumer_fallback low_only`
+  - `--routed_nodes_path <budget manifest>`
+
+Expected manifest / artifact checks:
+
+- `manifest.json`
+  - `training_loader.neighborloader_contract = hyperscan_sampled_subgraph`
+  - `second_view.consumer_scope`
+  - `second_view.nonconsumer_fallback`
+  - `second_view.consumer_mask_source` for `routed_only`
+  - `second_view.consumer_risk_path` for `risk_gated_all_nodes`
+- `outputs.pt`
+  - `x_low`
+  - `x_new`
+  - `x_high`
+  - `fused_x`
+  - `highorder_consumer_mask`
+  - `highorder_consumer_gate`
+  - `highorder_risk_score` for `risk_gated_all_nodes`
+- `neighborloader_contract_metrics.json`
+  - faithful repeated-row validation / test sidecar
+
+Metric interpretation rule:
+
+- Main comparison uses canonical deduplicated full-test recompute from
+  `outputs.pt + canonical test_idx.pt`.
+- The faithful sidecar remains contract-native repeated sampled-subgraph
+  reporting only; it should not be mixed directly with canonical full-test
+  tables.
+
+Status:
+
+- Local parser / contract validation is complete.
+- Remote sync, smoke, and full-matrix launch are the next execution step for
+  this block.

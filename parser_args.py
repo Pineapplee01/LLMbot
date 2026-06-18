@@ -215,6 +215,59 @@ def normalize_args(args, raw_args=None):
                 "--graph_data_variant labeled."
             )
 
+    graph_second_view_consumer_scope = str(
+        getattr(args, "graph_second_view_consumer_scope", "all_nodes") or "all_nodes"
+    ).strip().lower()
+    if graph_second_view_consumer_scope not in {"all_nodes", "routed_only", "risk_gated_all_nodes"}:
+        raise ValueError(
+            "--graph_second_view_consumer_scope must be one of {all_nodes, routed_only, risk_gated_all_nodes}."
+        )
+    graph_second_view_nonconsumer_fallback = str(
+        getattr(args, "graph_second_view_nonconsumer_fallback", "low_only") or "low_only"
+    ).strip().lower()
+    if graph_second_view_nonconsumer_fallback not in {"low_only"}:
+        raise ValueError("--graph_second_view_nonconsumer_fallback must be low_only in v1.")
+    if graph_second_view_consumer_scope == "routed_only":
+        routed_nodes_path = str(getattr(args, "routed_nodes_path", "") or "").strip()
+        if not routed_nodes_path:
+            raise ValueError("--graph_second_view_consumer_scope routed_only requires --routed_nodes_path.")
+        requested_backbone = str(getattr(args, "graph_backbone", "") or "").strip().lower()
+        if requested_backbone != "rgcn_hyperscan_dhg_nodeinput":
+            raise ValueError(
+                "--graph_second_view_consumer_scope routed_only currently requires "
+                "--graph_backbone rgcn_hyperscan_dhg_nodeinput."
+            )
+        if second_view_scope != "neighborloader_batch":
+            raise ValueError(
+                "--graph_second_view_consumer_scope routed_only currently requires "
+                "--graph_second_view_scope neighborloader_batch."
+            )
+        if graph_neighborloader_contract != "hyperscan_sampled_subgraph":
+            raise ValueError(
+                "--graph_second_view_consumer_scope routed_only currently requires "
+                "--graph_neighborloader_contract hyperscan_sampled_subgraph."
+            )
+    if graph_second_view_consumer_scope == "risk_gated_all_nodes":
+        requested_risk_path = str(getattr(args, "graph_second_view_risk_path", "") or "").strip()
+        if not requested_risk_path:
+            raise ValueError(
+                "--graph_second_view_consumer_scope risk_gated_all_nodes requires --graph_second_view_risk_path."
+            )
+        requested_gate_mode = str(
+            getattr(args, "graph_second_view_risk_gate_mode", "linear_sigmoid") or "linear_sigmoid"
+        ).strip().lower()
+        if requested_gate_mode != "linear_sigmoid":
+            raise ValueError(
+                "--graph_second_view_consumer_scope risk_gated_all_nodes currently requires "
+                "--graph_second_view_risk_gate_mode linear_sigmoid."
+            )
+        if second_view_scope == "none":
+            raise ValueError(
+                "--graph_second_view_consumer_scope risk_gated_all_nodes requires an active "
+                "HyperScan-style second view; set --graph_second_view_scope to labeled_prefix, "
+                "routed_nodes, or neighborloader_batch."
+            )
+
     legacy_dhg_backbones = {"rgcn_hyperscan_dhg", "rgcn_hyperscan_dhg_nodeinput"}
     legacy_pyg_backbones = {"rgcn_hyperscan_routed", "rgcn_hyperscan_nodeinput"}
     if "--graph_second_view_hypergraph_backend" not in raw_flags:
@@ -243,8 +296,20 @@ def normalize_args(args, raw_args=None):
         args.hyperscan_detector_style = "original_cross_attention"
     elif second_view_fusion == "multiattn_adaptive":
         args.hyperscan_detector_style = "original_cross_attention_adaptive"
+    elif second_view_fusion == "construct_acm":
+        args.hyperscan_detector_style = "construct_acm"
     else:
         args.hyperscan_detector_style = "residual"
+    if graph_second_view_consumer_scope == "routed_only" and second_view_fusion not in {"multiattn", "residual"}:
+        raise ValueError(
+            "--graph_second_view_consumer_scope routed_only currently requires "
+            "--graph_second_view_fusion multiattn or residual."
+        )
+    if graph_second_view_consumer_scope == "risk_gated_all_nodes" and second_view_fusion != "residual":
+        raise ValueError(
+            "--graph_second_view_consumer_scope risk_gated_all_nodes currently requires "
+            "--graph_second_view_fusion residual."
+        )
 
     args.conformal_knn_config_source = "explicit_cli_or_router_defaults"
     args.conformal_knn_inherited_from_second_view = False
@@ -902,16 +967,26 @@ def parser_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--graph_second_view_use_bn",
+        action="store_true",
+        help=(
+            "Enable HGNN batch normalization on DHG-backed second-view encoders. "
+            "This is mainly for closer alignment to the released HyperScan TwiBot20 contract; "
+            "PyG HypergraphConv backends ignore it."
+        ),
+    )
+    parser.add_argument(
         "--graph_second_view_fusion",
         type=str,
         default="residual",
-        choices=["residual", "multiattn", "multiattn_adaptive"],
+        choices=["residual", "multiattn", "multiattn_adaptive", "construct_acm"],
         help=(
             "Second-view fusion realization for rgcn_hyperscan* backbones. "
             "`residual` uses x_low plus an incident-gated delta; `multiattn` uses the "
             "HyperScan-style bidirectional MultiAttn concat detector; "
             "`multiattn_adaptive` keeps the same cross-attention tokens but applies "
-            "a FAGCN-style node-wise adaptive low/high mix before the final classifier."
+            "a FAGCN-style node-wise adaptive low/high mix before the final classifier; "
+            "`construct_acm` uses construct-space identity/low/high adaptive channel mixing."
         ),
     )
     parser.add_argument(
@@ -929,6 +1004,51 @@ def parser_args(argv=None):
             "`original_cross_attention_adaptive`/`multiattn_adaptive` adds an optional "
             "FAGCN-style node-wise adaptive low/high fusion on top of the same "
             "cross-attended detector tokens."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_consumer_scope",
+        type=str,
+        default="all_nodes",
+        choices=["all_nodes", "routed_only", "risk_gated_all_nodes"],
+        help=(
+            "Which nodes consume the second-view high-order detector branch. "
+            "`all_nodes` keeps the current behavior. "
+            "`routed_only` keeps x_new->KNN->x_high construction shared but only routed/high-risk nodes "
+            "consume the high-order detector path; non-routed nodes use the configured low-order fallback. "
+            "`risk_gated_all_nodes` keeps all-node construction/consumption but replaces the binary consumer "
+            "switch with a conformal-risk-driven residual gate read from --graph_second_view_risk_path. "
+            "v1 is restricted to residual fusion and does not change KNN member selection."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_risk_path",
+        type=str,
+        default="",
+        help=(
+            "Optional full-graph frozen risk payload for second-view consumer gating. "
+            "When --graph_second_view_consumer_scope risk_gated_all_nodes is used, this path is required and "
+            "must contain a node-aligned risk_score/router_score/abstain_risk vector derived from x_new."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_risk_gate_mode",
+        type=str,
+        default="linear_sigmoid",
+        choices=["linear_sigmoid"],
+        help=(
+            "Node-wise second-view consumer gate mapping for risk_gated_all_nodes. "
+            "`linear_sigmoid` learns alpha=sigmoid(a*risk+b) and applies it to the residual high-order branch."
+        ),
+    )
+    parser.add_argument(
+        "--graph_second_view_nonconsumer_fallback",
+        type=str,
+        default="low_only",
+        choices=["low_only"],
+        help=(
+            "Detector path used by nodes that do not consume the second-view branch. "
+            "v1 supports only `low_only`, which treats non-consumer nodes as the explicit low-order special case."
         ),
     )
     parser.add_argument("--SimpleHGN_att_res", type=float, default=0.2)

@@ -125,13 +125,43 @@ First-round full-graph support:
     batches, repeated nodes across batches are counted repeatedly, and checkpoint
     selection uses validation accuracy
   - `--graph_second_view_hypergraph_backend {pyg,dhg}` and
-    `--graph_second_view_fusion {residual,multiattn,multiattn_adaptive}` split
-    second-view realization into two parser axes. `dhg` now consumes the same
-    dynamic incidence specification as `pyg`; `multiattn` swaps the residual
-    detector for the HyperScan-style bidirectional MultiAttn concat detector;
+    `--graph_second_view_fusion {residual,multiattn,multiattn_adaptive,construct_acm}`
+    split second-view realization into two parser axes. `dhg` now consumes the
+    same dynamic incidence specification as `pyg`; `multiattn` is the
+    HyperScan-faithful two-channel detector over `x_low` and `x_high`;
     `multiattn_adaptive` keeps the same cross-attention detector tokens but
     adds a FAGCN-style node-wise adaptive low/high mix before the final linear
-    classifier.
+    classifier; `construct_acm` is a dual-space extension that adaptively mixes
+    `x_in_construct`, `x_low_construct`, and `x_high_construct`.
+  - `--graph_second_view_consumer_scope {all_nodes,routed_only,risk_gated_all_nodes}` controls who
+    actually consumes the high-order detector branch after `x_high` is built.
+    `all_nodes` preserves the current behavior. `routed_only` keeps
+    `x_low -> x_new -> batch-local KNN -> x_high` shared for the whole sampled
+    subgraph, but only routed/high-risk nodes consume the HNN detector path;
+    non-routed nodes fall back to the configured low-order detector path.
+    `risk_gated_all_nodes` keeps all-node `x_low -> x_new -> x_high`
+    construction/consumption but replaces the binary switch with a continuous
+    conformal-risk gate over the residual branch.
+  - `--graph_second_view_risk_path` supplies the required frozen full-graph
+    `x_new` conformal risk vector for `risk_gated_all_nodes`.
+  - `--graph_second_view_risk_gate_mode {linear_sigmoid}` is the current v1
+    gate family for that mode and learns `alpha=sigmoid(a*risk+b)`.
+  - `--graph_second_view_nonconsumer_fallback {low_only}` defines the current
+    v1 fallback for non-consumer nodes. Under `routed_only`, non-routed rows are
+    treated as the explicit low-order special case rather than as zeroed
+    high-order consumers.
+  - v1 risk-gated consumption is intentionally narrow: it currently requires an
+    active HyperScan-style second view, `--graph_second_view_fusion residual`,
+    and a valid `--graph_second_view_risk_path`. It does not change KNN member
+    selection.
+  - v1 routed-selective consumption is intentionally narrow: it currently
+    requires `--graph_backbone rgcn_hyperscan_dhg_nodeinput`,
+    `--graph_second_view_scope neighborloader_batch`,
+    `--graph_neighborloader_contract hyperscan_sampled_subgraph`,
+    `--graph_second_view_fusion {multiattn,residual}`, and
+    `--routed_nodes_path`.
+    Under `residual`, non-consumer rows use the explicit `low_only`
+    fallback rather than a zeroed high-order path.
   - active mainline runs should prefer `multiattn` or `multiattn_adaptive`
     when the goal is to test whether high-order KNN information is useful
     after explicit low/high view separation rather than as a simple RGCN-side
@@ -140,18 +170,25 @@ First-round full-graph support:
   HyperScan-style node input from the labeled graph:
   current tweet embedding stays as the tweet channel, while numeric and
   categorical metadata proxies are parsed from `norm_user_text.json`
-- `--graph_construct_embedding_path` is the dual-space construct/high-order
-  input for `rgcn_h2fag_dualspace_hyperscan*`. It defines the clean Hyperscan
-  representation used for `x_new`, KNN, and hypergraph construction, while
-  `--embedding_path` continues to define the iter_-1 decision-space detector
-  input. It must not point to iter_-1 decision embeddings or exported final
-  `node_repr`.
-  In the current dual-space implementation, the clean branch first encodes this
-  tensor into `x_clean_base -> x_new_clean`, and dynamic KNN / hypergraph
-  construction consumes `x_new_clean` rather than the raw construct tensor.
+- `--graph_construct_embedding_path` is the construct-side graph input for
+  `rgcn_h2fag_dualspace_hyperscan*`. In the rewritten
+  `construct_complete_v2` contract, the graph branch is fully self-consistent:
+  `construct_x -> x_in_construct -> x_low_construct -> x_new_construct ->
+  x_high_construct`.
+  This construct-complete family is a dual-space three-channel extension rather
+  than an official HyperScan reproduction: the official-faithful mainline in
+  this repo remains the two-channel `rgcn_hyperscan_dhg_nodeinput +
+  multiattn` detector over `x_low` and `x_high`.
+  Dynamic KNN / hypergraph construction is built directly from
+  `x_new_construct = cat(x_low_construct, x_in_construct)`, not from a
+  separate semantic decision branch and not from exported final `node_repr`.
+  `--graph_second_view_hypergraph_backend {pyg,dhg}` selects whether that
+  construct-side high-order encoder uses PyG `HypergraphConv` or DHG
+  `HGNNConv`; `--graph_second_view_use_bn` turns on DHG batch normalization for
+  closer alignment to the released HyperScan TwiBot20 training code.
   For `rgcn_h2fag_dualspace_hyperscan_nodeinput`, `--graph_node_input_family
-  hyperscan_meta_tweet_proxy` applies only to that construct-side clean branch;
-  it does not replace the iter_-1 decision input from `--embedding_path`.
+  hyperscan_meta_tweet_proxy` defines the construct-side nodeinput preprocessing
+  that produces `x_in_construct`.
   Legacy `rgcn_hyperscan_nodeinput` backbones still read their tweet/num/cat
   dimensions from the ordinary `feature_manifest`, while dual-space nodeinput
   backbones read them from `construct_feature_manifest`.
@@ -171,6 +208,14 @@ First-round full-graph support:
     full-graph one-row-per-node artifact; the repeated sampled-subgraph
     validation/test metrics are written separately to
     `neighborloader_contract_metrics.json`
+  - routed-selective HNN runs additionally export:
+    `highorder_consumer_mask`, `fused_x_hnn`, `fused_x_lowonly`,
+    `logits_hnn`, and `logits_lowonly`. `fused_x` remains the actual
+    classifier-consumed hidden state after routed/non-routed mixing.
+  - risk-gated residual runs additionally export
+    `highorder_consumer_gate` and `highorder_risk_score`. The gate is the
+    actual per-node residual strength used by the detector; the risk score is
+    the frozen external `x_new` conformal signal that drives that gate.
   - `--graph_second_view_candidate_scope labeled_relation_1hop` restricts
     relation-local KNN candidates to the labeled prefix instead of allowing
     support nodes from the full graph
@@ -312,10 +357,13 @@ First-round full-graph support:
     - do not reuse the same task-shaped semantic tensor as construction space,
       final detector space, and contrast space without marking it as an
       explicit control
-  - dual-space H2GCN/FAGCN backbones extend this contract by separating:
-    - clean Hyperscan construct space for `x_new` / KNN / `x_high`
-    - iter_-1 decision space for low-order relation propagation
+  - rewritten dual-space H2GCN/FAGCN backbones now keep the graph branch fully
+    inside construct space:
+    - `z_graph_input = construct_representation`
+    - `x_in_construct -> x_low_construct -> x_new_construct -> x_high_construct`
     - `fused_x` as the only final detector space
+    - `iter_-1` remains a separate semantic control line through non-dualspace
+      baselines such as `rgcn`
   - v1 keeps this family as a clean detector-consumption line only: it does not
     mix in `--mhlgc_enable`, `--routed_contrast_family`, or
     `--routed_highpass_mode`
@@ -413,6 +461,33 @@ python main.py \
   --graph_neighbor_num_neighbors 64 \
   --graph_refine_knn_k 8 \
   --gnn_batch_size 1024 \
+  --seeds 1 \
+  --disable_wandb
+```
+
+Example routed-selective HNN detector on the same faithful NeighborLoader line:
+
+```bash
+python main.py \
+  --experiment_task graph_detector_prepare \
+  --dataset TwiBot-20 \
+  --graph_data_variant labeled \
+  --graph_backbone rgcn_h2fag_dualspace_hyperscan_nodeinput \
+  --graph_node_input_family hyperscan_meta_tweet_proxy \
+  --embedding_path /root/workspace/LMbot/datasets/TwiBot-20/embeddings_iter_-1_seed_1.pt \
+  --graph_construct_embedding_path /root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt \
+  --graph_second_view_scope neighborloader_batch \
+  --graph_neighborloader_contract hyperscan_sampled_subgraph \
+  --graph_second_view_hypergraph_backend dhg \
+  --graph_second_view_use_bn \
+  --graph_second_view_fusion construct_acm \
+  --graph_neighbor_num_neighbors 64 \
+  --graph_refine_knn_k 8 \
+  --hidden_dim 788 \
+  --gnn_dropout 0.5 \
+  --gnn_learning_rate 0.001 \
+  --gnn_weight_decay 1e-5 \
+  --GNN_epochs_per_iter 200 \
   --seeds 1 \
   --disable_wandb
 ```
@@ -1628,8 +1703,9 @@ python main.py \
 # For a clean same-protocol SimTeG fused_x vs HyperScan fused_x comparison,
 # explicitly set --conformal_knn_repr_source fused_x and
 # --mhlgc_contrast_space fused_x. For HyperScan's cross-attention fused hidden,
-# pair this with --graph_second_view_fusion multiattn or
-# --graph_second_view_fusion multiattn_adaptive.
+# pair this with --graph_second_view_fusion multiattn,
+# --graph_second_view_fusion multiattn_adaptive, or
+# --graph_second_view_fusion construct_acm.
 # Explicit --conformal_knn_* flags still override the inherited defaults, and
 # the effective source is written to risk_manifest.calibration_metadata.
 # Only labeled centers are risk-updated and routed; support nodes keep their
