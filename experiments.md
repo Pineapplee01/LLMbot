@@ -6277,3 +6277,323 @@ Status:
 - Local parser / contract validation is complete.
 - Remote sync, smoke, and full-matrix launch are the next execution step for
   this block.
+
+## 2026-06-18 - Local routed residual gate and K ablation (seed 1)
+
+Question:
+
+- Under the routed residual family, does a conformal-risk gate or the KNN
+  hyperedge size improve the low/high residual consumer?
+
+Scope and comparability boundary:
+
+- This is a **local seed-1 exploratory ablation**, not a server official tensor
+  result.
+- The local machine did not have
+  `official_hyperscan_x_tweet_num_cat_labeled_prefix.pt`, so this run used:
+  - `datasets/TwiBot-20/embeddings_iter_-1_seed_1.pt`
+  - `graph_node_input_family = hyperscan_meta_tweet_proxy`
+  - metadata proxy rebuilt from local TwiBot-20 files
+- Do not mix these numbers with the server official-nodeinput-788 result table
+  without rerunning the same settings on the server official tensor.
+- Main metric below is the canonical deduplicated full-test recompute from
+  `outputs.pt + test_idx.pt`. Repeated sampled-subgraph sidecar metrics are
+  audit-only.
+
+Shared contract:
+
+- `graph_backbone = rgcn_hyperscan_dhg_nodeinput`
+- `graph_training_loader_mode = neighbor_subgraph`
+- `graph_second_view_scope = neighborloader_batch`
+- `graph_neighborloader_contract = hyperscan_sampled_subgraph`
+- `graph_second_view_hypergraph_backend = dhg`
+- `graph_second_view_fusion = residual`
+- `graph_training_max_steps = 200`
+- `gnn_batch_size = 512`
+- `hidden_dim = 788`
+- `seed = 1`
+
+Evidence paths:
+
+- Core ablation root:
+  `LLMbot/experiments/local_twibot20_routed_residual_20260618_core_seed1_step200_seed1/`
+- Hyperparameter root:
+  `LLMbot/experiments/local_twibot20_routed_residual_20260618_hparam_seed1_step200_seed1/`
+- Routed/risk payloads:
+  `LLMbot/experiments/local_twibot20_routed_residual_20260618_inputs/`
+- Router source:
+  `LLMbot/experiments/local_twibot20_routed_residual_20260618_router_from_smoke_seed1/seed_1/stages/estimator_ablation/risk_manifest.json`
+- Summary:
+  `LLMbot/experiments/local_twibot20_routed_residual_20260618_reports/summary_seed1.csv`
+
+Core gate / consumer ablation:
+
+| setting | Full Acc | Full Macro-F1 | Routed 10% Macro-F1 | Non-routed 10% Macro-F1 |
+|---|---:|---:|---:|---:|
+| `A0 low_only` | `0.8766` | `0.8741` | `0.7340` | `0.8834` |
+| `A1 all_nodes residual` | `0.8757` | `0.8732` | `0.7340` | `0.8824` |
+| `A2 routed_only residual @5%` | `0.8707` | `0.8678` | `0.7425` | `0.8756` |
+| `A3 routed_only residual @10%` | `0.8715` | `0.8684` | `0.7627` | `0.8753` |
+| `A4 routed_only residual @20%` | `0.8715` | `0.8703` | `0.7427` | `0.8794` |
+| `A5 risk_gated_all_nodes residual` | `0.8783` | `0.8761` | `0.7485` | `0.8845` |
+| `A6 shuffled routed_only residual @10%` | `0.8757` | `0.8745` | `0.7771` | `0.8813` |
+
+Gate diagnostics for `A5 risk_gated_all_nodes residual`:
+
+| diagnostic | value |
+|---|---:|
+| Spearman(`risk`, `gate`) | `~1.0000` |
+| gate mean | `0.6361` |
+| gate min / max | `0.5128 / 0.7289` |
+| bottom-risk-decile gate mean | `0.5408` |
+| top-risk-decile gate mean | `0.7220` |
+| fraction gate `<0.1` / `>0.9` | `0.0000 / 0.0000` |
+
+K / fanout ablation at routed-only 10%:
+
+| setting | Full Acc | Full Macro-F1 | Routed 10% Macro-F1 | Non-routed 10% Macro-F1 |
+|---|---:|---:|---:|---:|
+| `K=4, fanout=64` | `0.8757` | `0.8742` | `0.7917` | `0.8809` |
+| `K=8, fanout=64` | `0.8715` | `0.8684` | `0.7627` | `0.8753` |
+| `K=16, fanout=64` | `0.8800` | `0.8782` | `0.7726` | `0.8856` |
+| `K=8, fanout=32` | `0.8757` | `0.8732` | `0.7485` | `0.8815` |
+| `K=8, fanout=128` | `0.8833` | `0.8817` | `0.7943` | `0.8875` |
+
+Interpretation boundary for paper writing:
+
+- The local result favors a **continuous all-node risk gate** over binary
+  `routed_only` in full-test Macro-F1 under this local input contract:
+  `0.8761` vs `0.8684` for routed-only 10%.
+- Binary `routed_only @10%` improves the routed 10% slice relative to low-only
+  (`0.7627` vs `0.7340`) but lowers full-test Macro-F1.
+- The shuffled routed-only 10% control is strong (`0.8745` full Macro-F1 and
+  `0.7771` routed 10% Macro-F1), so this seed-1 local run does **not** prove
+  that conformal selected nodes are better residual consumers than arbitrary
+  same-budget nodes.
+- The best local seed-1 hyperparameter setting is `K=8, fanout=128`, with
+  `0.8817` full Macro-F1 and `0.7943` routed 10% Macro-F1.
+- Before any paper-level claim, rerun the promising settings on the official
+  server nodeinput tensor and expand to at least seeds 1/2/3.
+
+## 2026-06-19 - Local routed residual multi-seed extension (seeds 1/2/3)
+
+Question:
+
+- Does the local seed-1 routed residual observation hold after expanding the
+  same local contract to seeds `1,2,3`?
+
+Scope and comparability boundary:
+
+- This is a **local exploratory multi-seed extension**, not the server official
+  HyperScan nodeinput-788 result.
+- Seed 1 reuses the completed 2026-06-18 artifacts. Seeds 2/3 were newly run
+  on 2026-06-19.
+- The local run uses:
+  - `datasets/TwiBot-20/embeddings_iter_-1_seed_{1,2,3}.pt`
+  - `graph_node_input_family = hyperscan_meta_tweet_proxy`
+  - canonical TwiBot-20 `train_idx.pt / valid_idx.pt / test_idx.pt`
+  - canonical deduplicated full-test recompute from `outputs.pt + test_idx.pt`
+- It does **not** use:
+  - `/root/workspace/LMbot/datasets/TwiBot-20/official_hyperscan_x_tweet_num_cat_labeled_prefix.pt`
+  - server official nodeinput-788
+- Remote server note: SSH to `172.31.106.108:10011` was unavailable during this
+  run (`banner exchange` timeout / TCP port test failed), so the official
+  server multi-seed expansion remains pending.
+
+Shared local contract:
+
+- `graph_backbone = rgcn_hyperscan_dhg_nodeinput`
+- `graph_training_loader_mode = neighbor_subgraph`
+- `graph_second_view_scope = neighborloader_batch`
+- `graph_neighborloader_contract = hyperscan_sampled_subgraph`
+- `graph_second_view_hypergraph_backend = dhg`
+- `graph_second_view_fusion = residual`
+- `graph_training_max_steps = 200`
+- `gnn_batch_size = 512`
+- `hidden_dim = 788`
+
+Evidence paths:
+
+- Multi-seed root:
+  `LLMbot/experiments/local_twibot20_routed_residual_multiseed_20260619/`
+- Summary by seed:
+  `LLMbot/experiments/local_twibot20_routed_residual_multiseed_20260619/reports/summary_by_seed.csv`
+- Summary by variant:
+  `LLMbot/experiments/local_twibot20_routed_residual_multiseed_20260619/reports/summary_by_variant.csv`
+- Seed2/3 routed/risk payloads:
+  `LLMbot/experiments/local_twibot20_routed_residual_multiseed_20260619/inputs/`
+- Seed2/3 router source:
+  `LLMbot/experiments/local_twibot20_routed_residual_multiseed_20260619/router_from_smoke_seed{2,3}/seed_{2,3}/stages/estimator_ablation/risk_manifest.json`
+
+Run completion:
+
+- Completed A0-A6 for seeds `1,2,3`.
+- Completed the seed-1 best hyperparameter extension
+  `routed_only@10%, K=8, fanout=128` for seeds `1,2,3`.
+- Artifact count check: `20` manifest files under the multi-seed root,
+  including smoke/router support runs and detector runs.
+
+Aggregate canonical test results:
+
+| setting | n | Full Macro-F1 mean | Full Macro-F1 std | Routed 10% Macro-F1 mean | Routed 10% Macro-F1 std | Non-routed 10% Macro-F1 mean |
+|---|---:|---:|---:|---:|---:|---:|
+| `A0 low_only` | `3` | `0.8746` | `0.0019` | `0.8341` | `0.0895` | `0.8753` |
+| `A1 all_nodes residual` | `3` | `0.8740` | `0.0034` | `0.8477` | `0.0985` | `0.8733` |
+| `A2 routed_only residual @5%` | `3` | `0.8709` | `0.0031` | `0.8485` | `0.0920` | `0.8698` |
+| `A3 routed_only residual @10%` | `3` | `0.8678` | `0.0048` | `0.8449` | `0.0722` | `0.8670` |
+| `A4 routed_only residual @20%` | `3` | `0.8707` | `0.0036` | `0.8420` | `0.0862` | `0.8705` |
+| `A5 risk_gated_all_nodes residual` | `3` | `0.8728` | `0.0035` | `0.8429` | `0.0834` | `0.8724` |
+| `A6 shuffled routed_only residual @10%` | `3` | `0.8722` | `0.0031` | `0.8928` | `0.0083` | `0.8683` |
+| `H4 routed_only @10%, K=8, fanout=128` | `3` | `0.8757` | `0.0055` | `0.8501` | `0.0486` | `0.8757` |
+
+Gate diagnostics:
+
+| setting | gate mean | gate min | gate max | risk mean |
+|---|---:|---:|---:|---:|
+| `A5 risk_gated_all_nodes residual` | `0.6158 +/- 0.0307` | `0.5270 +/- 0.0153` | `0.7282 +/- 0.0010` | `0.4904 +/- 0.1359` |
+
+Interpretation boundary:
+
+- The local multi-seed expansion **does not support** promoting
+  `risk_gated_all_nodes` as a finished performance improvement: its mean full
+  Macro-F1 is `0.8728`, below `low_only` (`0.8746`) and below `all_nodes
+  residual` only within noise but not better.
+- Binary `routed_only` budgets do not improve full Macro-F1 in this local
+  contract; all 5/10/20% budgets trail low-only on full-test Macro-F1.
+- `fanout=128` is the strongest local multi-seed setting among this block:
+  `0.8757 +/- 0.0055` full Macro-F1 and `0.8501 +/- 0.0486` routed 10%
+  Macro-F1.
+- The shuffled routed-only control remains strong on the routed 10% slice
+  (`0.8928 +/- 0.0083`), so this block still does **not** prove that conformal
+  selected routed nodes are better residual consumers than arbitrary same-budget
+  nodes.
+- Paper-safe claim from this block: high-order residual performance is sensitive
+  to NeighborLoader fanout, and larger low-order sampling context can stabilize
+  the residual branch. The conformal-risk gate / routed-only selector remains a
+  hypothesis needing official tensor and stronger controls.
+
+## 2026-06-19 - TwiBot-20 seed1 component ablation and hyperparameter sensitivity
+
+Question:
+
+- For the paper route `risk router -> routed nodes -> residual connection`, what
+  happens when we remove the supervised LM embedding, router, or residual
+  consumption?
+- Separately, how sensitive is the same method to `K`, NeighborLoader fanout,
+  and routed budget?
+
+Scope and comparability boundary:
+
+- This block is a **TwiBot-20 seed-1 local same-contract** rerun for the
+  finetuned-RoBERTa routed residual family.
+- Main metric is the canonical deduplicated full-test recompute from
+  `outputs.pt + test_idx.pt`. In the tables below, `Acc` is full-test
+  accuracy and `F1` is full-test Macro-F1.
+- Component ablation and hyperparameter sensitivity are separated. `K`,
+  `fanout`, and `budget` are **not** component ablations.
+- The `w/o LM supervised fine-tuning` raw `roberta-base` item is not filled in
+  here because the local HuggingFace cache contains tokenizer/config files but
+  no `pytorch_model.bin` or `model.safetensors`. The older server-side raw
+  RoBERTa result is a different contract and is intentionally not mixed into
+  this table.
+
+Shared completed-run contract:
+
+- `graph_backbone = rgcn_hyperscan_dhg_nodeinput`
+- `graph_node_input_family = hyperscan_meta_tweet_proxy`
+- `embedding_path = datasets/TwiBot-20/finetuned_roberta_embeddings_iter_2_seed1.pt`
+  except the explicit Frozen SimTeG replacement row
+- `graph_training_loader_mode = neighbor_subgraph`
+- `graph_second_view_scope = neighborloader_batch`
+- `graph_neighborloader_contract = hyperscan_sampled_subgraph`
+- `graph_second_view_hypergraph_backend = dhg`
+- `graph_second_view_fusion = residual`
+- `graph_training_max_steps = 200`
+- `gnn_batch_size = 512`
+- `hidden_dim = 788`
+- default full-method setting: `K=8`, `fanout=64`, `budget=10%`
+
+Evidence paths:
+
+- Component / hparam reports:
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619_reports/`
+- Component run root:
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619/`
+- Hyperparameter run root:
+  `LLMbot/experiments/twibot20_seed1_hparam_sensitivity_20260619/`
+- Finetuned x_new router source:
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619/router_finetuned_xnew_from_all_nodes/seed_1/stages/estimator_ablation/risk_manifest.json`
+- Finetuned routed payloads:
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619_inputs/`
+- Manifest / artifact audit:
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619_reports/manifest_contract_checks_seed1.json`
+- Hyperparameter figure:
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619_reports/twibot20_seed1_hparam_sensitivity.pdf`
+  and `.png`, generated by
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619_reports/gen_hparam_sensitivity_figure.py`
+
+Component ablation:
+
+| Variant | Removed / changed component | Status | Acc | F1 |
+|---|---|---|---:|---:|
+| Full method | none: finetuned RoBERTa + conformal x_new router + routed-only residual @10% | completed | `0.8893` | `0.8878` |
+| w/o router | all nodes consume residual | completed | `0.8850` | `0.8835` |
+| w/o residual | empty routed mask, so every row takes `low_only` fallback | completed | `0.8774` | `0.8755` |
+| w/o LM supervised fine-tuning | raw pretrained `roberta-base` embedding | missing local raw embedding |  |  |
+| Frozen SimTeG -> RGCN/graph detector | replace finetuned embedding with `embeddings_iter_-1_seed_1.pt` | completed | `0.8715` | `0.8684` |
+| Random routed residual | shuffled same-budget 10% routed mask | completed | `0.8698` | `0.8677` |
+
+Implementation notes:
+
+- `w/o residual` uses the existing `routed_only + low_only fallback` path with
+  an empty routed-node payload. The KNN/HGNN branch is still constructible under
+  the same NeighborLoader contract, but no node consumes the residual output.
+- `w/o router` is `all_nodes + residual`.
+- `Random routed residual` preserves the 10% split counts but replaces the
+  conformal selected mask with a shuffled mask.
+- The Frozen SimTeG row is an explicit embedding replacement row from the
+  existing 2026-06-18 same local contract; it uses the iter_-1 routed mask and
+  should not be read as a finetuned-router run.
+- This table is the current seed-1 component ablation record. The next paper
+  update should replace or extend it with multi-seed mean/std once the same
+  component matrix is completed for additional seeds.
+
+Hyperparameter sensitivity:
+
+| Hyperparameter | Setting | Acc | F1 |
+|---|---:|---:|---:|
+| K | `4` | `0.8859` | `0.8842` |
+| K | `8` | `0.8893` | `0.8878` |
+| K | `16` | `0.8791` | `0.8771` |
+| fanout | `32` | `0.8884` | `0.8863` |
+| fanout | `64` | `0.8893` | `0.8878` |
+| fanout | `128` | `0.8757` | `0.8742` |
+| budget | `5%` | `0.8850` | `0.8834` |
+| budget | `10%` | `0.8893` | `0.8878` |
+| budget | `20%` | `0.8791` | `0.8774` |
+
+Validation:
+
+- All completed runs produced `manifest.json`, `outputs.pt`,
+  `selection_metrics.json`, and `neighborloader_contract_metrics.json`.
+- Completed runs share `training_loader.neighborloader_contract =
+  hyperscan_sampled_subgraph`, `training_loader.mode = neighbor_subgraph`,
+  `fusion = residual`, and `hypergraph_backend = dhg`.
+- Consumer mask means match the intended settings:
+  - full / default 10%: `0.0999`
+  - all-nodes residual: `1.0000`
+  - w/o residual empty mask: `0.0000`
+  - budget 5% / 20%: `0.0499 / 0.1999`
+
+Interpretation boundary:
+
+- In this finetuned-RoBERTa seed-1 contract, the full method is stronger than
+  `w/o router`, `w/o residual`, Frozen SimTeG replacement, and random routed
+  residual on full-test F1.
+- The raw RoBERTa ablation remains incomplete locally and must be rerun from a
+  real raw `roberta-base` embedding artifact before the component table is
+  complete enough for a final paper table.
+- The hyperparameter figure follows the HyperScan plotting convention:
+  F1-Score and Accuracy are plotted against each varied setting. It is used as
+  the paper's TwiBot-20 seed-1 hyperparameter sensitivity analysis and does not
+  require multi-seed expansion.
