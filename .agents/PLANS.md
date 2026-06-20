@@ -6,6 +6,8 @@ Use a written execution plan before code changes when any condition below is tru
 - The task changes a CLI, config schema, manifest, artifact path, or public output format.
 - The task changes evaluation logic, metrics, split handling, or research-claim boundaries.
 - The task adds or removes dependencies.
+- The task changes `NLPCC/` manuscript structure, artifact inventory, evidence mapping, or paper-task boundaries.
+- The task changes the boundary between `NLPCC/` paper claims and `LLMbot/` experiment/code evidence.
 - The task touches `LLMbot/baseline/`, `LLMbot/code/`, `botbr/`, `HyperScan/`, or `SEBot/`.
 - The task requires implementation, experiment execution, analysis, and review handoffs.
 - The task could invalidate previous experiment evidence or paper-facing conclusions.
@@ -34,7 +36,8 @@ A valid plan must state:
 
 ## Current Active Mainline Governance
 
-- `LLMbot/` is the only active implementation mainline.
+- `LLMbot/` is the active implementation mainline.
+- `NLPCC/` is the active NLPCC paper/task line.
 - `LLMbot/baseline/` and `LLMbot/code/` are deprecated legacy surfaces scheduled for deletion.
 - New plans must not use `LLMbot/baseline/core` as an edit zone unless the task explicitly asks for migration, deletion, archival cleanup, or forensic comparison.
 - Routine validation should prefer CLI-argument checks, smoke commands, manifest inspection, artifact existence checks, and governance drift checks over new test-code creation.

@@ -9,8 +9,11 @@ This file is a routing index for the active project standards. It is no longer t
 - [docs/guides/codex.md](guides/codex.md) — Codex/OMX orchestration adapter under the repo protocols
 
 ## Current Defaults
-- The current default execution surface lives in `LLMbot/`.
+- The current active code mainline lives in `LLMbot/`.
+- The current active NLPCC paper/task line lives in `NLPCC/`.
 - Repo-local implementation guidance lives in [../LLMbot/AGENTS.md](../LLMbot/AGENTS.md) and [../LLMbot/README.md](../LLMbot/README.md).
+- NLPCC paper/task guidance lives in [../NLPCC/AGENTS.md](../NLPCC/AGENTS.md) and [../NLPCC/README.md](../NLPCC/README.md).
+- Large or generated NLPCC artifacts are recorded in [../NLPCC/docs/artifact_inventory.md](../NLPCC/docs/artifact_inventory.md), not tracked as source.
 - `LLMbot/baseline/` and `LLMbot/code/` are deprecated legacy/reference surfaces scheduled for deletion.
 - `LMBot/` remains a legacy/reference implementation line.
 - `docs/wiki/` is the only project-level memory layer.
@@ -22,6 +25,9 @@ This file is a routing index for the active project standards. It is no longer t
 - Need the project entrypoint: [../AGENTS.md](../AGENTS.md)
 - Need the current implementation details: [../LLMbot/AGENTS.md](../LLMbot/AGENTS.md)
 - Need the current repo-local guide: [../LLMbot/README.md](../LLMbot/README.md)
+- Need the active NLPCC paper/task rules: [../NLPCC/AGENTS.md](../NLPCC/AGENTS.md)
+- Need the active NLPCC guide: [../NLPCC/README.md](../NLPCC/README.md)
+- Need NLPCC artifact boundaries: [../NLPCC/docs/artifact_inventory.md](../NLPCC/docs/artifact_inventory.md)
 - Need baseline comparison rules: [protocols/baseline_comparability.md](protocols/baseline_comparability.md)
 - Need Codex/OMX workflow guidance: [guides/codex.md](guides/codex.md)
 - Need research phase naming: [research/project_phase_taxonomy.md](research/project_phase_taxonomy.md)

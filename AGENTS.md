@@ -8,18 +8,26 @@ Read this first. It is the top-level operating contract for agents and future se
 2. [docs/protocols/agent-coding-guideline.md](docs/protocols/agent-coding-guideline.md)
 3. [docs/protocols/baseline_comparability.md](docs/protocols/baseline_comparability.md) for formal comparison work
 4. [docs/wiki/README.md](docs/wiki/README.md) for durable project memory
-5. Repo-local implementation docs such as [LLMbot/AGENTS.md](LLMbot/AGENTS.md) and [LLMbot/README.md](LLMbot/README.md)
+5. Repo-local surface docs such as [LLMbot/AGENTS.md](LLMbot/AGENTS.md), [LLMbot/README.md](LLMbot/README.md), [NLPCC/AGENTS.md](NLPCC/AGENTS.md), and [NLPCC/README.md](NLPCC/README.md)
 
 Direct user instructions outrank this file. Deeper `AGENTS.md` files govern their subtrees when they are more specific.
 
-## Current Default Implementation
+## Current Active Surfaces
 
-`LLMbot/` is the only active mainline for future bot-detection pipeline work.
+`LLMbot/` is the active code mainline for future bot-detection pipeline work.
+`NLPCC/` is the active NLPCC paper/task line for lightweight manuscript
+source, paper-task documentation, and artifact inventories.
 
-Start with:
+For code work, start with:
 
 - [LLMbot/AGENTS.md](LLMbot/AGENTS.md)
 - [LLMbot/README.md](LLMbot/README.md)
+
+For NLPCC paper work, start with:
+
+- [NLPCC/AGENTS.md](NLPCC/AGENTS.md)
+- [NLPCC/README.md](NLPCC/README.md)
+- [NLPCC/docs/artifact_inventory.md](NLPCC/docs/artifact_inventory.md)
 
 `LLMbot/baseline/` and `LLMbot/code/` are deprecated legacy surfaces scheduled for deletion. Do not add implementation, tests, or documentation there unless the user explicitly asks for migration, deletion, archival cleanup, or forensic comparison.
 
@@ -44,6 +52,9 @@ OMX runtime state under `.omx/` is local execution state. Durable project decisi
 
 - Active implementation: [LLMbot/AGENTS.md](LLMbot/AGENTS.md)
 - Active mainline guide: [LLMbot/README.md](LLMbot/README.md)
+- Active NLPCC paper line: [NLPCC/AGENTS.md](NLPCC/AGENTS.md)
+- Active NLPCC guide: [NLPCC/README.md](NLPCC/README.md)
+- NLPCC artifact inventory: [NLPCC/docs/artifact_inventory.md](NLPCC/docs/artifact_inventory.md)
 - Project docs hub: [docs/README.md](docs/README.md)
 - Current project memory: [docs/wiki/query_pack.md](docs/wiki/query_pack.md)
 - Formal comparison protocol: [docs/protocols/baseline_comparability.md](docs/protocols/baseline_comparability.md)
@@ -53,7 +64,8 @@ OMX runtime state under `.omx/` is local execution state. Durable project decisi
 ## Working Agreements
 
 - Ground decisions in repo evidence, manifests, traces, metrics, tests, or explicit user direction.
-- Prefer `LLMbot/` for new implementation. Treat deprecated directories as read-only unless the task explicitly names a migration or archival action.
+- Prefer `LLMbot/` for new implementation and `NLPCC/` for NLPCC paper/task work. Treat deprecated directories as read-only unless the task explicitly names a migration or archival action.
+- Record large or generated NLPCC artifacts in [NLPCC/docs/artifact_inventory.md](NLPCC/docs/artifact_inventory.md) instead of tracking or manually editing them.
 - Keep design, implementation, validation, experiment execution, analysis writing, and review as separate jobs.
 - Make the smallest task-scoped change; avoid drive-by cleanup and speculative abstractions.
 - Do not create new source files unless the user requested them or an approved design names the path and explains why existing files are insufficient.
@@ -62,7 +74,7 @@ OMX runtime state under `.omx/` is local execution state. Durable project decisi
 
 ## Edit Zones
 
-- Default research-wide zones: `LLMbot/`, `LMBot/`, `rewrite_pipeline/`, `docs/`, `scripts/`, `.agents/`, `tools/`, plus root governance docs.
+- Default research-wide zones: `LLMbot/`, `NLPCC/`, `LMBot/`, `rewrite_pipeline/`, `docs/`, `scripts/`, `.agents/`, `tools/`, plus root governance docs.
 - Deprecated default-read-only zones: `LLMbot/baseline/` and `LLMbot/code/`; edit only for explicit migration, deletion, archival cleanup, or forensic comparison.
 - Comparison-only zones: `botbr/`, `HyperScan/`, and `SEBot/`; edit only for explicit baseline-comparison work.
 - Evidence zones are read/verify by default, not manual-edit targets: `datasets/`, `results/`, `LLMbot/saved_artifacts/`, `LLMbot/checkpoints/`, and `LMBot/results_*`.

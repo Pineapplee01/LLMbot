@@ -1,3 +1,11 @@
+# Code And Structure Risk Register
+
+Current active code mainline: `LLMbot/`.
+Current active NLPCC paper/task line: `NLPCC/`.
+
+The older `LLMbot/baseline/` audit below is historical risk context and does
+not redefine the current default code mainline.
+
 # LLMbot/baseline 代码风险审计
 
 审计日期：2026-05-07

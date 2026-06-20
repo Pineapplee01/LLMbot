@@ -1,10 +1,23 @@
-# Architecture - LLMbot Root Mainline
+# Architecture - BotDetection Workspace
 
-> High-level codebase map for the current LLMbot onboarding surface.
+> High-level workspace map for active code, paper, documentation, and evidence surfaces.
+
+## Workspace Surfaces
+
+| Path | Role |
+| --- | --- |
+| `LLMbot/` | Active code mainline and nested repository boundary |
+| `NLPCC/` | Active NLPCC paper/task line with lightweight manuscript source |
+| `docs/` | Workspace protocols, architecture, guides, and durable memory |
+| `datasets/` | Dataset metadata and ignored raw data zone |
+| `results/` | Ignored generated evidence zone |
+| `LMBot/`, `botbr/`, `HyperScan/`, `SEBot/` | Comparison/reference lines |
 
 ## System Overview
 
-The default pipeline inside `LLMbot/` is now the root mainline.
+The active code pipeline inside `LLMbot/` is the root mainline. This runtime
+flow describes only `LLMbot/`; `NLPCC/` consumes documented evidence and stores
+paper/task source rather than executable training pipeline code.
 
 - Primary entrypoint: `LLMbot/main.py`
 - Primary onboarding stage: `--stage legacy_distill`
@@ -79,7 +92,7 @@ Use [research/project_phase_taxonomy.md](research/project_phase_taxonomy.md) for
 
 ## Historical and Experimental Surface
 
-`LLMbot/baseline/` and `LLMbot/code/` contain legacy/reference implementation lines. Keep them available for migration, deletion planning, archival cleanup, or forensic comparison, but do not use them as the default onboarding pipeline.
+`LLMbot/baseline/` and `LLMbot/code/` contain legacy/reference implementation lines. Keep them available for migration, deletion planning, archival cleanup, or forensic comparison, but do not route routine onboarding or new implementation there.
 
 ## Dataset Expectations
 
