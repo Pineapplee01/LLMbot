@@ -104,3 +104,19 @@ LMBot/datasets/**
 *.zip
 *.7z
 *.rar
+
+# NLPCC generated artifacts and local build state
+NLPCC/**/*.pdf
+NLPCC/**/*.png
+NLPCC/**/*.log
+NLPCC/**/*.aux
+NLPCC/**/*.bbl
+NLPCC/**/*.blg
+NLPCC/**/*.fls
+NLPCC/**/*.fdb_latexmk
+NLPCC/**/.texenv/
+NLPCC/**/_preview*/
+NLPCC/**/rendered_pages/
+NLPCC/**/__pycache__/
+NLPCC/**/*.pyc
+NLPCC/**/*.xlsx
