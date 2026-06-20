@@ -1,0 +1,16 @@
+\begin{table}[t]
+\caption{Risk-quality diagnostics on TwiBot-20 (seed-1). Higher AUROC-error and AUPRC-error are better; lower AURC is better.}
+\label{tab:risk-quality}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
+\toprule
+Risk score & AUROC-error & AUPRC-error & AURC \\
+\midrule
+Target-only risk & 0.8580 & 0.4057 & 0.0322 \\
+Fixed KNN on $x_{\mathrm{new}}$ & 0.8631 & 0.4304 & 0.0313 \\
+Learned KNN on $x_{\mathrm{new}}$ & \textbf{0.8674} & \textbf{0.4562} & \textbf{0.0307} \\
+\bottomrule
+\end{tabular}
+\end{table}

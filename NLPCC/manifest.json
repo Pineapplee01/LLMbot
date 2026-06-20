@@ -1,0 +1,32 @@
+{
+  "name": "botdetection-nlpcc",
+  "created": "2026-06-20",
+  "role": "active_nlpcc_paper_task_line",
+  "source_origin": "G:\\Research\\BotDetection\\paper\\NLPCC",
+  "tracked_roots": [
+    "NLPCC/AGENTS.md",
+    "NLPCC/README.md",
+    "NLPCC/docs/",
+    "NLPCC/paper/main.tex",
+    "NLPCC/paper/sections/",
+    "NLPCC/paper/references.bib",
+    "NLPCC/paper/figures/"
+  ],
+  "excluded_artifact_classes": [
+    "compiled_pdf",
+    "tex_build_logs",
+    "tex_auxiliary_files",
+    "preview_images",
+    "rendered_pages",
+    "portable_tex_runtime",
+    "datasets",
+    "checkpoints",
+    "model_caches",
+    "experiment_outputs"
+  ],
+  "code_boundary": {
+    "active_code_mainline": "LLMbot/",
+    "parent_tracking_mode": "gitlink",
+    "code_changes_policy": "commit in nested LLMbot repository before parent gitlink updates"
+  }
+}

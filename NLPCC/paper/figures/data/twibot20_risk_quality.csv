@@ -1,0 +1,4 @@
+Risk score,AUROC-error,AUPRC-error,AURC
+Target-only risk,0.8580,0.4057,0.0322
+Fixed KNN on x_new,0.8631,0.4304,0.0313
+Learned KNN on x_new,0.8674,0.4562,0.0307

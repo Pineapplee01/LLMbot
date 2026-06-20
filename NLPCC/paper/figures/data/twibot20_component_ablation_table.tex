@@ -1,0 +1,17 @@
+\begin{table}[t]
+\caption{Ablation study on TwiBot-20. The full model uses $K=8$, fanout 64, and a routing budget of 10\%.}
+\label{tab:component-ablation}
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+Variant & Accuracy & F1-score \\
+\midrule
+Full model & \textbf{0.8893} & \textbf{0.8878} \\
+w/o Reliability-Guided Routing & 0.8850 & 0.8835 \\
+w/o Residual Correction & 0.8774 & 0.8755 \\
+w/o Hypergraph Correction & 0.8715 & 0.8684 \\
+w/o Random Routing & 0.8698 & 0.8677 \\
+\bottomrule
+\end{tabular}
+\end{table}

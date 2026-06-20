@@ -1,0 +1,6 @@
+variant_id,variant,figure_label,acc,f1,is_full,reported,notes
+full,Full model,Full,0.8893,0.8878,yes,yes,"Full model: K=8; fanout=64; budget=10%."
+wo_router,w/o Router,w/o Router,0.8850,0.8835,no,yes,"Remove the calibrated routing decision."
+wo_residual,w/o Residual Branch,w/o Residual,0.8774,0.8755,no,yes,"Remove the residual hypergraph correction branch."
+finetuned_roberta_rgcn,w/o Selective Hypergraph,w/o Selective Hypergraph,0.8715,0.8684,no,yes,"Replace the selective correction design with a fine-tuned RoBERTa + RGCN variant."
+random_routed,w/o Risk-based Routing,w/o Risk-based Routing,0.8698,0.8677,no,yes,"Use a random routed set under the same correction budget."

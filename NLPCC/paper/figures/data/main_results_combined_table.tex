@@ -1,0 +1,32 @@
+\begin{table}[t]
+\caption{Main results on TwiBot-20 and sampled TwiBot-22. Values are reported as percentages. Bold and underlined values indicate the best and second-best results, respectively. A dash denotes unavailable compatible results.}
+\label{tab:main-results}
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{m{2.2cm}|cccccc}
+\toprule
+Method & \multicolumn{3}{c}{TwiBot-20} & \multicolumn{3}{c}{TwiBot-22} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & Accuracy & Precision & F1-score & Accuracy & Precision & F1-score \\
+\midrule
+BotHunter~\cite{bot_hunter2018} & 75.28 $\pm$ 0.42 & 76.34 $\pm$ 0.51 & 74.39 $\pm$ 0.42 & 77.31 $\pm$ 0.19 & \textbf{78.56 $\pm$ 1.19} & 63.23 $\pm$ 0.31 \\
+FriendBot~\cite{friendbot2020} & 77.19 $\pm$ 0.46 & 77.71 $\pm$ 0.46 & 76.63 $\pm$ 0.48 & -- & -- & -- \\
+\midrule
+BotRGCN~\cite{feng2021botrgcn} & 85.68 $\pm$ 0.57 & 85.88 $\pm$ 0.69 & 85.49 $\pm$ 0.55 & 72.21 $\pm$ 2.29 & 66.50 $\pm$ 4.57 & 60.55 $\pm$ 2.10 \\
+RGT~\cite{feng2022rgt} & 86.39 $\pm$ 0.25 & 86.63 $\pm$ 0.26 & 86.20 $\pm$ 0.26 & 72.24 $\pm$ 2.38 & 64.40 $\pm$ 5.58 & 56.73 $\pm$ 6.91 \\
+BIC~\cite{lei2023bic} & 85.55 $\pm$ 0.50 & 85.78 $\pm$ 0.53 & 85.34 $\pm$ 0.51 & \underline{78.56 $\pm$ 0.97} & \underline{74.33 $\pm$ 1.40} & \textbf{73.42 $\pm$ 0.95} \\
+BotMoE~\cite{liu2023botmoe} & 86.12 $\pm$ 0.50 & 86.38 $\pm$ 0.66 & 85.92 $\pm$ 0.47 & 64.99 $\pm$ 1.60 & 65.62 $\pm$ 0.92 & 63.64 $\pm$ 1.36 \\
+SEBot~\cite{yang2024sebot} & 86.29 $\pm$ 0.33 & 86.52 $\pm$ 0.31 & 86.10 $\pm$ 0.35 & -- & -- & -- \\
+\midrule
+BotBR~\cite{lin2025botbr} & \underline{86.91 $\pm$ 0.20} & 87.19 $\pm$ 0.21 & \underline{86.72 $\pm$ 0.21} & 76.09 $\pm$ 3.99 & 68.94 $\pm$ 17.60 & 60.34 $\pm$ 12.20 \\
+\midrule
+LMBot-GNN~\cite{cai2024lmbot} & 85.11 $\pm$ 0.39 & 86.44 $\pm$ 0.73 & 84.65 $\pm$ 0.39 & 74.98 $\pm$ 1.46 & 69.19 $\pm$ 2.42 & 64.29 $\pm$ 3.80 \\
+LMBot-LM~\cite{cai2024lmbot} & 85.41 $\pm$ 0.10 & \underline{87.47 $\pm$ 0.57} & 84.87 $\pm$ 0.21 & 74.72 $\pm$ 1.27 & 69.46 $\pm$ 2.80 & 62.90 $\pm$ 2.25 \\
+\midrule
+\textbf{BotRHG} & \textbf{88.93 $\pm$ 0.53} & \textbf{89.18 $\pm$ 0.43} & \textbf{88.78 $\pm$ 0.48} & \textbf{82.41 $\pm$ 1.40} & 73.14 $\pm$ 1.34 & \underline{71.31 $\pm$ 1.04} \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

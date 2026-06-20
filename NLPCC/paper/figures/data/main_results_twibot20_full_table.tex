@@ -1,0 +1,30 @@
+\begin{table}[t]
+\caption{Detailed main results on TwiBot-20. Values are reported as percentages. Bold and underlined values indicate the best and second-best results, respectively.}
+\label{tab:main-results-twibot20-full}
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{m{2.2cm}|ccccc}
+\toprule
+Method & Accuracy & F1-score & Bot-F1 & Bot-Precision & Bot-Recall \\
+\midrule
+BotHunter~\cite{bot_hunter2018} & 75.28 $\pm$ 0.42 & 74.39 $\pm$ 0.42 & 79.18 $\pm$ 0.39 & 72.74 $\pm$ 0.32 & 86.88 $\pm$ 0.70 \\
+FriendBot~\cite{friendbot2020} & 77.19 $\pm$ 0.46 & 76.63 $\pm$ 0.48 & 80.26 $\pm$ 0.38 & 75.46 $\pm$ 0.43 & 85.72 $\pm$ 0.38 \\
+\midrule
+BotRGCN~\cite{feng2021botrgcn} & 85.68 $\pm$ 0.57 & 85.49 $\pm$ 0.55 & 87.14 $\pm$ 0.63 & \textbf{89.75 $\pm$ 1.63} & 84.71 $\pm$ 0.61 \\
+RGT~\cite{feng2022rgt} & 86.39 $\pm$ 0.25 & 86.20 $\pm$ 0.26 & \underline{87.82 $\pm$ 0.23} & 85.11 $\pm$ 0.44 & 90.72 $\pm$ 0.58 \\
+BIC~\cite{lei2023bic} & 85.55 $\pm$ 0.50 & 85.34 $\pm$ 0.51 & 87.07 $\pm$ 0.47 & 84.39 $\pm$ 0.82 & 89.94 $\pm$ 1.24 \\
+BotMoE~\cite{liu2023botmoe} & 86.12 $\pm$ 0.50 & 85.92 $\pm$ 0.47 & 87.59 $\pm$ 0.56 & 84.82 $\pm$ 0.23 & 90.56 $\pm$ 1.42 \\
+SEBot~\cite{yang2024sebot} & 86.29 $\pm$ 0.33 & 86.10 $\pm$ 0.35 & 87.72 $\pm$ 0.27 & 85.07 $\pm$ 0.77 & 90.56 $\pm$ 0.84 \\
+\midrule
+BotBR~\cite{lin2025botbr} & \underline{86.91 $\pm$ 0.20} & \underline{86.72 $\pm$ 0.21} & \textbf{88.31 $\pm$ 0.18} & 85.45 $\pm$ 0.44 & 91.37 $\pm$ 0.57 \\
+\midrule
+LMBot-GNN~\cite{cai2024lmbot} & 85.11 $\pm$ 0.39 & 84.65 $\pm$ 0.39 & 87.23 $\pm$ 0.42 & 81.27 $\pm$ 0.68 & \underline{94.16 $\pm$ 1.51} \\
+LMBot-LM~\cite{cai2024lmbot} & 85.41 $\pm$ 0.10 & 84.87 $\pm$ 0.21 & 87.71 $\pm$ 0.12 & 80.59 $\pm$ 0.87 & \textbf{96.25 $\pm$ 1.48} \\
+\midrule
+\textbf{BotRHG} & \textbf{88.93 $\pm$ 0.53} & \textbf{88.78 $\pm$ 0.48} & -- & \underline{87.48} & -- \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

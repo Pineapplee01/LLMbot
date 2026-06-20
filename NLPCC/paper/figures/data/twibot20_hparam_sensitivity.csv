@@ -1,0 +1,10 @@
+hyperparameter,setting,setting_label,acc,f1,is_full,notes
+K,4,4,0.8859,0.8842,no,"KNN support size sweep."
+K,8,8,0.8893,0.8878,yes,"Full model: K=8; fanout=64; budget=10%."
+K,16,16,0.8791,0.8771,no,"KNN support size sweep."
+fanout,32,32,0.8884,0.8863,no,"Sampled fanout sweep."
+fanout,64,64,0.8893,0.8878,yes,"Full model: K=8; fanout=64; budget=10%."
+fanout,128,128,0.8757,0.8742,no,"Sampled fanout sweep."
+budget,5%,5%,0.8850,0.8834,no,"Routing budget sweep."
+budget,10%,10%,0.8893,0.8878,yes,"Full model: K=8; fanout=64; budget=10%."
+budget,20%,20%,0.8791,0.8774,no,"Routing budget sweep."

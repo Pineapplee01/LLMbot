@@ -1,0 +1,21 @@
+\begin{table}[t]
+\caption{Hyperparameter sensitivity on TwiBot-20. The full model uses $K=8$, fanout 64, and a routing budget of 10\%.}
+\label{tab:hparam-sensitivity}
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Hyperparameter & Setting & Accuracy & F1-score \\
+\midrule
+K & 4 & 0.8859 & 0.8842 \\
+K & 8 & \textbf{0.8893} & \textbf{0.8878} \\
+K & 16 & 0.8791 & 0.8771 \\
+fanout & 32 & 0.8884 & 0.8863 \\
+fanout & 64 & \textbf{0.8893} & \textbf{0.8878} \\
+fanout & 128 & 0.8757 & 0.8742 \\
+budget & 5\% & 0.8850 & 0.8834 \\
+budget & 10\% & \textbf{0.8893} & \textbf{0.8878} \\
+budget & 20\% & 0.8791 & 0.8774 \\
+\bottomrule
+\end{tabular}
+\end{table}
