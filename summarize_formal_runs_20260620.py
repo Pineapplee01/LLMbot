@@ -139,7 +139,7 @@ TWIBOT20_BY_SEED_FIELDS = [
 def write_csv(path, rows, fields=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
+    if fields is None and not rows:
         path.write_text("", encoding="utf-8")
         return
     if fields is None:

@@ -260,12 +260,20 @@ from pathlib import Path
 from summarize_formal_runs_20260620 import SUMMARY_FIELDS, write_csv
 root = Path(tempfile.mkdtemp(prefix="llmbot_report_csv_smoke_"))
 path = root / "summary.csv"
+empty_path = root / "empty_summary.csv"
 write_csv(path, [{"macro_f1_std": 0.2, "variant": "demo", "n": 1, "acc_mean": 0.9, "extra": "ignored"}], SUMMARY_FIELDS)
+write_csv(empty_path, [], SUMMARY_FIELDS)
 with path.open("r", encoding="utf-8", newline="") as handle:
     rows = list(csv.reader(handle))
+with empty_path.open("r", encoding="utf-8", newline="") as handle:
+    empty_rows = list(csv.reader(handle))
 assert rows[0] == SUMMARY_FIELDS
 assert rows[1][0] == "demo"
 assert "ignored" not in rows[1]
+assert empty_rows == [SUMMARY_FIELDS]
+auto_empty = root / "auto_empty.csv"
+write_csv(auto_empty, [])
+assert auto_empty.read_text(encoding="utf-8") == ""
 print("report csv schema smoke ok")
 '@ | python -
 @'
