@@ -11,6 +11,7 @@ from runtime_env import (
     build_offline_model_env,
     mark_queue_manifest_failed,
     now_iso,
+    read_json_file,
     resolve_botdetection_root,
     resolve_python_executable,
     run_manifest_command,
@@ -103,7 +104,7 @@ def configure_host_process_env():
 
 
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return read_json_file(path)
 
 
 def run_logged(command, cwd, log_path, manifest, job_name):

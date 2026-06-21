@@ -223,6 +223,16 @@ print("runtime_env queue helpers ok")
 @'
 import tempfile
 from pathlib import Path
+from run_twibot20_full_selective_residual_5seed_20260620 import read_json
+root = Path(tempfile.mkdtemp(prefix="llmbot_read_json_smoke_"))
+path = root / "payload.json"
+path.write_text('{"ok": true, "n": 1}', encoding="utf-8")
+assert read_json(path) == {"ok": True, "n": 1}
+print("shared json reader smoke ok")
+'@ | python -
+@'
+import tempfile
+from pathlib import Path
 from run_twibot20_formal5_ablation_completion_20260620 import select_routed_mask_source
 root = Path(tempfile.mkdtemp(prefix="llmbot_routed_mask_smoke_"))
 late = root / "z_routed_nodes_budget100.json"
