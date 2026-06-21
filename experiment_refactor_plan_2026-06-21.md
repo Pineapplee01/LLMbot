@@ -75,6 +75,12 @@ Out of scope:
 - [x] Replace the long inline `experiment_runbook.md` validation block with the consolidated script, `python main.py --help`, and `git diff --check`.
 - [x] Cover PowerShell resolution, launcher fail-fast behavior, import side effects, shared JSON readers, routed-mask helpers, CSV schema wrappers, and queue-manifest lifecycle helpers.
 
+## Task 8: Support Script Import Boundary
+
+- [x] Move `extract_raw_roberta_embeddings_20260620.py` training/runtime-heavy imports behind `extract(...)` so dry validation can import the support script without loading Torch, model builders, or dataset utilities.
+- [x] Extend `check_experiment_helpers_20260620.py` to smoke the support script's import-safe public entry points without running extraction.
+- [x] Keep the support script's artifact contract unchanged: embedding extraction still writes only when `main()`/`extract(...)` is executed intentionally.
+
 ## Completion Notes
 
 - Current nested `LLMbot` branch: `codex-llmbot-experiment-refactor`.

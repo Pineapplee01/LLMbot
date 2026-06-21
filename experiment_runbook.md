@@ -176,8 +176,8 @@ git diff --check
 `check_experiment_helpers_20260620.py` is the consolidated dry-validation
 entry point. It compiles the root experiment helper scripts and runs only
 temporary-directory smokes for PowerShell resolution, import side effects,
-shared JSON readers, routed-mask source selection, CSV schema handling, and
-queue-manifest lifecycle helpers.
+support-script import safety, shared JSON readers, routed-mask source
+selection, CSV schema handling, and queue-manifest lifecycle helpers.
 
 `python main.py --help` must stay independent from the training runtime and
 optional ML dependencies. Treat a help failure as a CLI/parser regression and

@@ -107,6 +107,13 @@ def check_sampled_queue_import_side_effects():
             os.environ["BOTDETECTION_ROOT"] = previous_root
 
 
+def check_support_script_import_side_effects():
+    module = importlib.import_module("extract_raw_roberta_embeddings_20260620")
+    assert callable(module.tokenize)
+    assert callable(module.extract)
+    assert callable(module.main)
+
+
 def check_shared_json_readers():
     root = Path(tempfile.mkdtemp(prefix="llmbot_json_smoke_"))
     path = root / "payload.json"
@@ -251,6 +258,7 @@ def main():
         check_powershell_resolver,
         check_launcher_import_and_fail_fast,
         check_sampled_queue_import_side_effects,
+        check_support_script_import_side_effects,
         check_shared_json_readers,
         check_routed_mask_helpers,
         check_csv_helpers,

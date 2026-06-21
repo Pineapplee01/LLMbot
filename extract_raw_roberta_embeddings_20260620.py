@@ -3,11 +3,7 @@ import json
 import os
 from pathlib import Path
 
-import torch
-
-from model_building import build_LM_model
 from runtime_env import now_iso, write_json_file as write_json
-from utils import load_raw_data
 
 
 def tokenize(tokenizer, texts, max_length, device):
@@ -21,6 +17,11 @@ def tokenize(tokenizer, texts, max_length, device):
 
 
 def extract(args):
+    import torch
+
+    from model_building import build_LM_model
+    from utils import load_raw_data
+
     device = torch.device(f"cuda:{args.device}" if int(args.device) >= 0 and torch.cuda.is_available() else "cpu")
     data = load_raw_data(args.dataset, use_GNN=True, graph_data_variant=args.graph_data_variant)
     texts = list(data["user_text"])
