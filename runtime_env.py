@@ -53,12 +53,17 @@ def write_json_file(path, payload):
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def normalize_command(command):
+    """Return a subprocess-safe command list without changing argument order."""
+    return [str(item) for item in command]
+
+
 def run_logged_command(command, *, cwd, env, log_path):
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("wb") as handle:
         return subprocess.run(
-            command,
+            normalize_command(command),
             cwd=str(cwd),
             env=env,
             stdout=handle,
@@ -66,6 +71,47 @@ def run_logged_command(command, *, cwd, env, log_path):
             stdin=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+
+def start_manifest_run(manifest, manifest_path, entry):
+    """Append a running queue entry and persist the queue manifest."""
+    entry = dict(entry)
+    entry.setdefault("status", "running")
+    entry.setdefault("started_at", now_iso())
+    manifest.setdefault("runs", []).append(entry)
+    write_json_file(manifest_path, manifest)
+    return entry
+
+
+def finish_manifest_run(manifest, manifest_path, entry, returncode):
+    """Record queue command completion without changing manifest schema."""
+    entry["finished_at"] = now_iso()
+    entry["returncode"] = int(returncode)
+    entry["status"] = "completed" if returncode == 0 else "failed"
+    write_json_file(manifest_path, manifest)
+    return entry
+
+
+def fail_manifest_run(manifest, manifest_path, entry, exc):
+    """Record launch-time failures that happen before a process return code exists."""
+    entry["finished_at"] = now_iso()
+    entry["status"] = "failed"
+    entry["error_type"] = type(exc).__name__
+    entry["error"] = str(exc)
+    write_json_file(manifest_path, manifest)
+    return entry
+
+
+def run_manifest_command(command, *, cwd, env, log_path, manifest, manifest_path, entry):
+    """Run a command while recording the standard queue manifest lifecycle."""
+    entry = start_manifest_run(manifest, manifest_path, entry)
+    try:
+        proc = run_logged_command(command, cwd=cwd, env=env, log_path=log_path)
+    except Exception as exc:
+        fail_manifest_run(manifest, manifest_path, entry, exc)
+        raise
+    finish_manifest_run(manifest, manifest_path, entry, proc.returncode)
+    return proc
 
 
 def _torch():

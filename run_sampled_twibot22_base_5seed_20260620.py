@@ -2,7 +2,7 @@ import json
 import sys
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file as write_json
+from runtime_env import build_offline_model_env, now_iso, run_manifest_command, write_json_file as write_json
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
@@ -18,23 +18,20 @@ def clean_env():
 
 
 def run_logged(command, log_path, manifest, seed, stage):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest["runs"].append(
-        {
+    proc = run_manifest_command(
+        command,
+        cwd=WORK_DIR,
+        env=clean_env(),
+        log_path=log_path,
+        manifest=manifest,
+        manifest_path=MANIFEST_PATH,
+        entry={
             "seed": int(seed),
             "stage": stage,
-            "status": "running",
-            "started_at": now_iso(),
             "command": command,
             "log_path": str(log_path),
-        }
+        },
     )
-    write_json(MANIFEST_PATH, manifest)
-    proc = run_logged_command(command, cwd=WORK_DIR, env=clean_env(), log_path=log_path)
-    manifest["runs"][-1]["finished_at"] = now_iso()
-    manifest["runs"][-1]["returncode"] = int(proc.returncode)
-    manifest["runs"][-1]["status"] = "completed" if proc.returncode == 0 else "failed"
-    write_json(MANIFEST_PATH, manifest)
     if proc.returncode != 0:
         raise RuntimeError(f"{stage} failed for seed {seed}; see {log_path}")
 

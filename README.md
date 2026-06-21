@@ -11,6 +11,10 @@ cd LLMbot
 python main.py --experiment_task distillation_pipeline --dataset TwiBot-20 --seeds 1 --disable_wandb
 ```
 
+For experiment operations, queue scripts, local model-cache setup, and
+validation commands, start with `experiment_runbook.md`, then use
+`experiments.md` for the active queue index and detailed run records.
+
 Preferred public flags:
 
 - `--experiment_task`

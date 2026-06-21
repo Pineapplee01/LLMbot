@@ -7,6 +7,10 @@ This file is the registry for GPU-server experiments under:
 Use it before launching, resuming, or reusing an experiment. The goal is to keep
 server runs reproducible without scattering one-off timestamped directories.
 
+Start with `experiment_runbook.md` for the operational queue-script contract,
+local model-cache policy, and validation commands. This registry remains the
+durable record of planned, launched, completed, failed, and archived runs.
+
 ## Operating Rules
 
 - Do not create new arbitrary timestamp-suffixed artifact roots.
@@ -18,6 +22,9 @@ server runs reproducible without scattering one-off timestamped directories.
   caches under `G:\Research\BotDetection\models\huggingface` by using
   `runtime_env.build_offline_model_env(...)` instead of reimplementing
   `HF_HOME`, `HF_HUB_CACHE`, and `TRANSFORMERS_CACHE` per script.
+- For ordinary subprocess queue steps, use
+  `runtime_env.run_manifest_command(...)` so `started_at`, `finished_at`,
+  `returncode`, and normalized `status` are recorded consistently.
 - Do not move old artifact directories unless the user explicitly asks for
   archival cleanup; old paths may be referenced by manifests.
 - For frozen SimTeG comparisons, reuse the high-base seed-1 baseline unless the
@@ -91,7 +98,8 @@ their detailed entry to `archived` instead of leaving stale active rows.
 
 These Windows-local scripts are operational launch surfaces, not experiment
 evidence. Keep them small, use `runtime_env.build_offline_model_env(...)` for
-local model-cache variables, and record generated manifests/logs in the
+local model-cache variables, use `runtime_env.run_manifest_command(...)` for
+ordinary subprocess queue steps, and record generated manifests/logs in the
 detailed experiment entry.
 
 | script | status | manifest or log contract | notes |

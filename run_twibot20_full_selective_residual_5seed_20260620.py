@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, write_json_file as write_json
+from runtime_env import build_offline_model_env, now_iso, run_manifest_command, write_json_file as write_json
 
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
@@ -96,32 +96,20 @@ def read_json(path):
 
 
 def run_logged(command, cwd, log_path, manifest, job_name):
-    log_path = Path(log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "job": job_name,
-        "status": "running",
-        "started_at": now_iso(),
-        "cwd": str(cwd),
-        "command": [str(x) for x in command],
-        "log_path": str(log_path),
-    }
-    manifest["runs"].append(entry)
-    write_json(QUEUE_MANIFEST, manifest)
-    with log_path.open("wb") as handle:
-        proc = subprocess.run(
-            [str(x) for x in command],
-            cwd=str(cwd),
-            env=clean_env(),
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    entry["finished_at"] = now_iso()
-    entry["returncode"] = int(proc.returncode)
-    entry["status"] = "completed" if proc.returncode == 0 else "failed"
-    write_json(QUEUE_MANIFEST, manifest)
+    proc = run_manifest_command(
+        command,
+        cwd=cwd,
+        env=clean_env(),
+        log_path=log_path,
+        manifest=manifest,
+        manifest_path=QUEUE_MANIFEST,
+        entry={
+            "job": job_name,
+            "cwd": str(cwd),
+            "command": [str(x) for x in command],
+            "log_path": str(log_path),
+        },
+    )
     if proc.returncode != 0:
         raise RuntimeError(f"{job_name} failed; see {log_path}")
 

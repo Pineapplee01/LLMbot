@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file as write_json
+from runtime_env import build_offline_model_env, now_iso, run_manifest_command, write_json_file as write_json
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
@@ -74,21 +74,19 @@ def wait_for_current_queue(manifest):
 
 
 def run_logged(command, log_path, manifest, job_name):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "job": job_name,
-        "status": "running",
-        "started_at": now_iso(),
-        "command": command,
-        "log_path": str(log_path),
-    }
-    manifest["runs"].append(entry)
-    write_json(MANIFEST_PATH, manifest)
-    proc = run_logged_command(command, cwd=WORK_DIR, env=clean_env(), log_path=log_path)
-    entry["finished_at"] = now_iso()
-    entry["returncode"] = int(proc.returncode)
-    entry["status"] = "completed" if proc.returncode == 0 else "failed"
-    write_json(MANIFEST_PATH, manifest)
+    proc = run_manifest_command(
+        command,
+        cwd=WORK_DIR,
+        env=clean_env(),
+        log_path=log_path,
+        manifest=manifest,
+        manifest_path=MANIFEST_PATH,
+        entry={
+            "job": job_name,
+            "command": command,
+            "log_path": str(log_path),
+        },
+    )
     if proc.returncode != 0:
         raise RuntimeError(f"{job_name} failed; see {log_path}")
 
