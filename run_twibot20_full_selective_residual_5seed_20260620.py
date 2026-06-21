@@ -11,6 +11,7 @@ from runtime_env import (
     build_offline_model_env,
     mark_queue_manifest_failed,
     now_iso,
+    resolve_python_executable,
     run_manifest_command,
     write_json_file as write_json,
 )
@@ -19,7 +20,7 @@ from runtime_env import (
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 ACTIVE_ROOT = REPO_ROOT / "LLMbot"
 LEGACY_LMBOT_ROOT = REPO_ROOT / "LMBot"
-PYTHON = Path(r"D:\Anaconda\envs\llmbot\python.exe")
+PYTHON = resolve_python_executable(r"D:\Anaconda\envs\llmbot\python.exe")
 DATASET_ROOT = REPO_ROOT / "datasets" / "TwiBot-20"
 MODEL_ROOT = REPO_ROOT / "models" / "huggingface"
 RUN_ROOT = ACTIVE_ROOT / "experiments" / "twibot20_full_selective_residual_5seed_20260620"

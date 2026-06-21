@@ -8,13 +8,14 @@ from runtime_env import (
     build_offline_model_env,
     mark_queue_manifest_failed,
     now_iso,
+    resolve_python_executable,
     run_manifest_command,
     write_json_file as write_json,
 )
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
-PYTHON = Path(r"D:\Anaconda\envs\llmbot\python.exe")
+PYTHON = resolve_python_executable(r"D:\Anaconda\envs\llmbot\python.exe")
 LOG_DIR = WORK_DIR / "server_logs"
 CURRENT_QUEUE = WORK_DIR / "experiments" / "sampled_twibot22_official_prior_base5_20260620_queue_manifest.json"
 EXP_ROOT = r"experiments\twibot20_formal5_ablation_completion_20260620"

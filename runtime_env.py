@@ -43,6 +43,14 @@ def build_offline_model_env(repo_root, source_env=None):
     return env
 
 
+def resolve_python_executable(default_path, *, env_var="LLMBOT_PYTHON", source_env=None):
+    """Resolve a local Python executable with an environment override."""
+    if source_env is None:
+        source_env = os.environ
+    override = source_env.get(env_var)
+    return Path(override) if override else Path(default_path)
+
+
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
 

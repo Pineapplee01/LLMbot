@@ -135,6 +135,17 @@ Local queue scripts should keep downloaded models under the parent workspace:
 Do not add per-script cache rewrites. Reuse `runtime_env.build_offline_model_env`
 so offline local runs and smoke checks share the same cache contract.
 
+## Local Python Runtime
+
+Local queue scripts default to the existing Windows interpreter path:
+
+- `D:\Anaconda\envs\llmbot\python.exe`
+
+Set `LLMBOT_PYTHON` to override that interpreter for another local machine or
+Conda layout. Do not add per-script `D:\Anaconda\...` rewrites; reuse
+`runtime_env.resolve_python_executable(...)` so queue manifests record the
+resolved interpreter consistently.
+
 ## Validation Commands
 
 Run these checks after queue-helper, runbook, or report-helper changes:
