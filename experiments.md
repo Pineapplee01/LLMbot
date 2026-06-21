@@ -87,6 +87,20 @@ their detailed entry to `archived` instead of leaving stale active rows.
 | `dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1` | planned | [section](#dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1) | `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1` |
 | `dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1` | completed | [current record](#dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1-current-record) | see detailed entry |
 
+## Local Queue Script Index
+
+These Windows-local scripts are operational launch surfaces, not experiment
+evidence. Keep them small, use `runtime_env.build_offline_model_env(...)` for
+local model-cache variables, and record generated manifests/logs in the
+detailed experiment entry.
+
+| script | status | manifest or log contract | notes |
+| --- | --- | --- | --- |
+| `launch_sampled_twibot22_base5_20260620.py` | active launcher | `server_logs/sampled_twibot22_official_prior_base5_20260620_queue.*.log` | Starts the PowerShell queue wrapper and records a PID. |
+| `run_sampled_twibot22_base_5seed_20260620.py` | active queue | `experiments/sampled_twibot22_official_prior_base5_20260620_queue_manifest.json` | Runs sampled TwiBot-22 semantic + graph stages for seeds 1-5. |
+| `run_twibot20_formal5_ablation_completion_20260620.py` | active queue | `experiments/twibot20_formal5_ablation_completion_20260620_queue_manifest.json` | Waits for the sampled TwiBot-22 queue before completing formal ablation runs. |
+| `run_twibot20_full_selective_residual_5seed_20260620.py` | active queue | `experiments/twibot20_full_selective_residual_5seed_20260620_queue_manifest.json` | Uses custom early-stop handling for LMBot embedding materialization; do not replace its `Popen` loop without preserving that contract. |
+
 ## Reusable Inputs
 
 | name | path | notes |

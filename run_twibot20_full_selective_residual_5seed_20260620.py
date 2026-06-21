@@ -5,10 +5,9 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-from runtime_env import build_offline_model_env
+from runtime_env import build_offline_model_env, now_iso, write_json_file
 
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
@@ -82,10 +81,6 @@ BASE_GRAPH_ARGS = [
 ]
 
 
-def now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat()
-
-
 def clean_env():
     env = build_offline_model_env(REPO_ROOT)
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -97,8 +92,7 @@ def clean_env():
 
 
 def write_json(path, payload):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_file(path, payload)
 
 
 def read_json(path):
