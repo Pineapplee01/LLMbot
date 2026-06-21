@@ -68,6 +68,13 @@ Out of scope:
 - [x] Update full residual by-seed summary CSV writes to reuse the shared helper while preserving the fixed schema and `\n` line terminator.
 - [x] Extend `experiment_runbook.md` smoke checks to cover the shared helper and both script wrappers.
 
+## Task 7: Consolidated Dry Validation
+
+- [x] Add `check_experiment_helpers_20260620.py` as the single dry-validation entry point for root experiment helper cleanup.
+- [x] Keep validation non-generating: compile outputs and smoke artifacts write only to temporary directories, with bytecode writes disabled for imported helpers.
+- [x] Replace the long inline `experiment_runbook.md` validation block with the consolidated script, `python main.py --help`, and `git diff --check`.
+- [x] Cover PowerShell resolution, launcher fail-fast behavior, import side effects, shared JSON readers, routed-mask helpers, CSV schema wrappers, and queue-manifest lifecycle helpers.
+
 ## Completion Notes
 
 - Current nested `LLMbot` branch: `codex-llmbot-experiment-refactor`.
