@@ -23,6 +23,7 @@ EXP_ROOT = r"experiments\twibot20_formal5_ablation_completion_20260620"
 DATASET = "TwiBot-20"
 FROZEN_COMPLETION_SEEDS = [4, 5]
 RAW_ROBERTA_SEEDS = [1, 2, 3, 4, 5]
+BUDGET_KEYS = ("050", "100", "200")
 
 BASE_ARGS = [
     "main.py", "--experiment_task", "graph_detector_prepare",
@@ -115,6 +116,48 @@ def select_routed_mask_source(paths):
     return sorted(paths, key=lambda p: (p.name.lower(), str(p).lower()))[0]
 
 
+def budget_matches_metadata(payload, budget):
+    """Check whether a JSON payload advertises the requested routed budget token."""
+    if not isinstance(payload, dict):
+        return False
+    budget = str(budget)
+    selected_budget = str(payload.get("selected_budget", "")).replace(".", "")
+    return selected_budget in {budget, budget.lstrip("0")} or payload.get("budget_name") == budget
+
+
+def find_routed_mask_sources(stage_dir, budget, read_json_func=read_json):
+    """Find routed-mask source files for a budget without depending on rglob order."""
+    stage_dir = Path(stage_dir)
+    candidates = []
+    seen = set()
+    for pattern in (f"*budget{budget}*.json", f"*{budget}*.json"):
+        for path in stage_dir.rglob(pattern):
+            resolved = str(path)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            name = path.name.lower()
+            if "routed" in name and "shuffled" not in name:
+                candidates.append(path)
+    if candidates:
+        return sorted(candidates, key=lambda p: (p.name.lower(), str(p).lower()))
+
+    for path in stage_dir.rglob("*.json"):
+        if "shuffled" in path.name.lower():
+            continue
+        try:
+            payload = read_json_func(path)
+        except Exception:
+            continue
+        if budget_matches_metadata(payload, budget):
+            candidates.append(path)
+    return sorted(candidates, key=lambda p: (p.name.lower(), str(p).lower()))
+
+
+def routed_mask_path(inputs_dir, budget, seed):
+    return Path(inputs_dir) / f"routed_nodes_xnew_budget{budget}_seed{seed}.json"
+
+
 def generate_routed_masks(seed, manifest):
     embedding = REPO_ROOT / "datasets" / DATASET / f"embeddings_iter_-1_seed_{seed}.pt"
     smoke_exp = f"{EXP_ROOT}\\smoke_all_nodes_residual_seed{seed}"
@@ -163,38 +206,27 @@ def generate_routed_masks(seed, manifest):
     inputs_dir = WORK_DIR / "experiments" / "twibot20_formal5_ablation_completion_20260620_inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     stage_dir = router_root / "stages" / "estimator_ablation"
-    for budget in ("050", "100", "200"):
-        srcs = list(stage_dir.rglob(f"*budget{budget}*.json")) + list(stage_dir.rglob(f"*{budget}*.json"))
-        # Prefer routed_nodes artifacts with split payload.
-        srcs = [p for p in srcs if "routed" in p.name.lower() and "shuffled" not in p.name.lower()]
-        if not srcs:
-            # Fallback: inspect all json files for selected_budget.
-            for p in stage_dir.rglob("*.json"):
-                try:
-                    obj = read_json(p)
-                except Exception:
-                    continue
-                if str(obj.get('selected_budget','')).replace('.','') in {budget, budget.lstrip('0')} or obj.get('budget_name') == budget:
-                    srcs.append(p)
+    for budget in BUDGET_KEYS:
+        srcs = find_routed_mask_sources(stage_dir, budget)
         if srcs:
             src = select_routed_mask_source(srcs)
-            dst = inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json"
+            dst = routed_mask_path(inputs_dir, budget, seed)
             if not dst.exists():
                 shutil.copy2(src, dst)
     # If router code already wrote canonical artifacts elsewhere, also locate them by exact known names.
-    for budget in ("050", "100", "200"):
-        target = inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json"
+    for budget in BUDGET_KEYS:
+        target = routed_mask_path(inputs_dir, budget, seed)
         if not target.exists():
             matches = list(router_root.rglob(f"routed_nodes*budget{budget}*.json"))
             if matches:
                 shutil.copy2(select_routed_mask_source(matches), target)
-    if any(not (inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json").exists() for budget in ("050", "100", "200")):
+    if any(not routed_mask_path(inputs_dir, budget, seed).exists() for budget in BUDGET_KEYS):
         materialize_routed_masks_from_risk_manifest(
             risk_manifest=risk_manifest,
             inputs_dir=inputs_dir,
             seed=seed,
         )
-    budget100 = inputs_dir / f"routed_nodes_xnew_budget100_seed{seed}.json"
+    budget100 = routed_mask_path(inputs_dir, "100", seed)
     shuffled = inputs_dir / f"routed_nodes_xnew_budget100_seed{seed}_shuffled.json"
     if budget100.exists() and not shuffled.exists():
         make_shuffled_mask(budget100, shuffled, seed)

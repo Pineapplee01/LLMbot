@@ -254,6 +254,27 @@ assert select_routed_mask_source([]) is None
 print("routed mask selector smoke ok")
 '@ | python -
 @'
+import tempfile
+from pathlib import Path
+from run_twibot20_formal5_ablation_completion_20260620 import (
+    budget_matches_metadata,
+    find_routed_mask_sources,
+)
+root = Path(tempfile.mkdtemp(prefix="llmbot_routed_source_smoke_"))
+stage = root / "stage"
+stage.mkdir()
+(stage / "routed_nodes_budget100_shuffled.json").write_text("{}", encoding="utf-8")
+(stage / "only_shuffled_budget050_shuffled.json").write_text('{"budget_name": "050"}', encoding="utf-8")
+match = stage / "routed_nodes_budget100.json"
+match.write_text("{}", encoding="utf-8")
+metadata = stage / "metadata_only.json"
+metadata.write_text('{"selected_budget": "0.50"}', encoding="utf-8")
+assert budget_matches_metadata({"budget_name": "050"}, "050")
+assert find_routed_mask_sources(stage, "100") == [match]
+assert find_routed_mask_sources(stage, "050") == [metadata]
+print("routed mask source finder smoke ok")
+'@ | python -
+@'
 import csv
 import tempfile
 from pathlib import Path
