@@ -28,35 +28,43 @@ Out of scope:
 
 ## Task 1: Runtime Environment Helper
 
-- [ ] Verify importing `runtime_env` is lightweight enough for queue scripts.
-- [ ] Add `clean_process_env`, `configure_model_cache_env`, and `build_offline_model_env`.
-- [ ] Keep device helpers compatible by importing `torch` only inside those helpers.
-- [ ] Validate with an inline Python check that imports the module and checks returned cache paths.
+- [x] Verify importing `runtime_env` is lightweight enough for queue scripts.
+- [x] Add `clean_process_env`, `configure_model_cache_env`, and `build_offline_model_env`.
+- [x] Keep device helpers compatible by importing `torch` only inside those helpers.
+- [x] Validate with an inline Python check that imports the module and checks returned cache paths.
 
 ## Task 2: Queue Script Deduplication
 
-- [ ] Update sampled TwiBot-22 launcher to call `build_offline_model_env`.
-- [ ] Update sampled TwiBot-22 5-seed queue to call `build_offline_model_env`.
-- [ ] Update TwiBot-20 full selective residual queue to call `build_offline_model_env`, then reapply its CUDA/W&B overrides.
-- [ ] Validate script import/compile with `python -m py_compile`.
+- [x] Update sampled TwiBot-22 launcher to call `build_offline_model_env`.
+- [x] Update sampled TwiBot-22 5-seed queue to call `build_offline_model_env`.
+- [x] Update TwiBot-20 full selective residual queue to call `build_offline_model_env`, then reapply its CUDA/W&B overrides.
+- [x] Validate script import/compile with `python -m py_compile`.
 
 ## Task 3: Experiment Documentation
 
-- [ ] Add README note that local model downloads/caches live under `G:\Research\BotDetection\models`.
-- [ ] Add experiments registry note that queue scripts should use stable experiment IDs, manifest paths, and `runtime_env.build_offline_model_env`.
-- [ ] Validate docs contain the cache path and helper name.
+- [x] Add README note that local model downloads/caches live under `G:\Research\BotDetection\models`.
+- [x] Add experiments registry note that queue scripts should use stable experiment IDs, manifest paths, and `runtime_env.build_offline_model_env`.
+- [x] Validate docs contain the cache path and helper name.
 
 ## Task 4: Final Checks
 
-- [ ] Run `python -m py_compile` for changed Python files.
-- [ ] Run inline helper behavior check.
-- [ ] Run `python main.py --help` if dependencies are available; otherwise capture the exact missing dependency.
-- [ ] Review `git diff --stat` and `git status --short --branch`.
+- [x] Run `python -m py_compile` for changed Python files.
+- [x] Run inline helper behavior check.
+- [x] Run `python main.py --help` if dependencies are available; otherwise capture the exact missing dependency.
+- [x] Review `git diff --stat` and `git status --short --branch`.
 
 ## Task 5: Queue Logging Helper Extraction
 
-- [ ] Add lightweight timestamp, JSON-write, and logged subprocess helpers to `runtime_env.py`.
-- [ ] Update direct queue scripts with repeated manifest/logging wrappers to call those helpers without changing command arguments or manifest fields.
-- [ ] Keep scripts with custom process control out of scope unless a later slice can preserve their behavior exactly.
-- [ ] Tighten `experiments.md` status and current-queue rules so future queue entries stay indexable.
-- [ ] Validate with py_compile, an inline helper smoke check, `python main.py --help`, and `git diff --check`.
+- [x] Add lightweight timestamp, JSON-write, and logged subprocess helpers to `runtime_env.py`.
+- [x] Update direct queue scripts with repeated manifest/logging wrappers to call those helpers without changing command arguments or manifest fields.
+- [x] Keep scripts with custom process control out of scope unless a later slice can preserve their behavior exactly.
+- [x] Tighten `experiments.md` status and current-queue rules so future queue entries stay indexable.
+- [x] Validate with py_compile, an inline helper smoke check, `python main.py --help`, and `git diff --check`.
+
+## Completion Notes
+
+- Current nested `LLMbot` branch: `codex-llmbot-experiment-refactor`.
+- Last verified nested commit at this checkpoint: `8ee4c6b`.
+- Non-generating validation used only compile/import/helper smokes and `python main.py --help`.
+- No queue, training, report-refresh, or evidence-generation command was run for this refactor plan.
+- Parent BotDetection gitlink remains stale because the parent worktree Git metadata directory rejects writes for the current sandbox user.
