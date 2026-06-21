@@ -51,6 +51,14 @@ def resolve_python_executable(default_path, *, env_var="LLMBOT_PYTHON", source_e
     return Path(override) if override else Path(default_path)
 
 
+def resolve_botdetection_root(default_path=r"G:\Research\BotDetection", *, env_var="BOTDETECTION_ROOT", source_env=None):
+    """Resolve the parent BotDetection workspace root with an environment override."""
+    if source_env is None:
+        source_env = os.environ
+    override = source_env.get(env_var)
+    return Path(override) if override else Path(default_path)
+
+
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
 

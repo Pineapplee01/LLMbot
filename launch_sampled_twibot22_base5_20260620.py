@@ -1,10 +1,10 @@
 import subprocess
 from pathlib import Path
 
-from runtime_env import build_offline_model_env
+from runtime_env import build_offline_model_env, resolve_botdetection_root
 
 
-repo_root = Path(r"G:\Research\BotDetection")
+repo_root = resolve_botdetection_root()
 work_dir = repo_root / "LLMbot"
 script = work_dir / "run_sampled_twibot22_base_5seed_20260620.ps1"
 log_dir = work_dir / "server_logs"

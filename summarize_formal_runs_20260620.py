@@ -2,10 +2,10 @@ import csv
 import json
 from pathlib import Path
 
-from runtime_env import now_iso, read_json_file, write_json_file
+from runtime_env import now_iso, read_json_file, resolve_botdetection_root, write_json_file
 
 
-REPO_ROOT = Path(r"G:\Research\BotDetection")
+REPO_ROOT = resolve_botdetection_root()
 WORK_DIR = REPO_ROOT / "LLMbot"
 
 

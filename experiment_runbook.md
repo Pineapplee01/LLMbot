@@ -135,6 +135,11 @@ Local queue scripts should keep downloaded models under the parent workspace:
 Do not add per-script cache rewrites. Reuse `runtime_env.build_offline_model_env`
 so offline local runs and smoke checks share the same cache contract.
 
+Set `BOTDETECTION_ROOT` to override the parent workspace root on another local
+machine. Do not add per-script `G:\Research\BotDetection` rewrites; reuse
+`runtime_env.resolve_botdetection_root(...)` so queue, launcher, support, and
+report helpers derive paths from the same root.
+
 ## Local Python Runtime
 
 Local queue scripts default to the existing Windows interpreter path:

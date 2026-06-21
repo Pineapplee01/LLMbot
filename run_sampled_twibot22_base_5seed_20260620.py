@@ -5,12 +5,13 @@ from runtime_env import (
     build_offline_model_env,
     mark_queue_manifest_failed,
     now_iso,
+    resolve_botdetection_root,
     resolve_python_executable,
     run_manifest_command,
     write_json_file as write_json,
 )
 
-REPO_ROOT = Path(r"G:\Research\BotDetection")
+REPO_ROOT = resolve_botdetection_root()
 WORK_DIR = REPO_ROOT / "LLMbot"
 PYTHON = resolve_python_executable(r"D:\Anaconda\envs\llmbot\python.exe")
 LOG_DIR = WORK_DIR / "server_logs"
