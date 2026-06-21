@@ -1,4 +1,5 @@
 import os
+import csv
 import json
 import shutil
 import subprocess
@@ -96,6 +97,33 @@ def write_json_file(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def write_csv_rows_file(
+    path,
+    rows,
+    fields=None,
+    *,
+    lineterminator="\r\n",
+):
+    """Write CSV rows with a stable optional schema and no caller-side field filtering."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(rows)
+    if fields is None:
+        if not rows:
+            path.write_text("", encoding="utf-8")
+            return
+        fields = sorted({key for row in rows for key in row.keys()})
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(fields),
+            extrasaction="ignore",
+            lineterminator=lineterminator,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def read_json_file(path, default=None):

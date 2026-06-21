@@ -61,6 +61,13 @@ Out of scope:
 - [x] Tighten `experiments.md` status and current-queue rules so future queue entries stay indexable.
 - [x] Validate with py_compile, an inline helper smoke check, `python main.py --help`, and `git diff --check`.
 
+## Task 6: CSV Helper Extraction
+
+- [x] Add `runtime_env.write_csv_rows_file(...)` for schema-driven CSV writes.
+- [x] Update formal snapshot CSV writes to reuse the shared helper while preserving the old empty-without-fields behavior.
+- [x] Update full residual by-seed summary CSV writes to reuse the shared helper while preserving the fixed schema and `\n` line terminator.
+- [x] Extend `experiment_runbook.md` smoke checks to cover the shared helper and both script wrappers.
+
 ## Completion Notes
 
 - Current nested `LLMbot` branch: `codex-llmbot-experiment-refactor`.

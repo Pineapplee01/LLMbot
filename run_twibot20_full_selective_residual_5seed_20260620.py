@@ -1,5 +1,4 @@
 import argparse
-import csv
 import json
 import os
 import shutil
@@ -16,6 +15,7 @@ from runtime_env import (
     resolve_botdetection_root,
     resolve_python_executable,
     run_manifest_command,
+    write_csv_rows_file,
     write_json_file as write_json,
 )
 
@@ -539,17 +539,7 @@ def mean_std(values):
 
 
 def write_summary_csv(path, metric_rows, fields=SUMMARY_FIELDS):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=list(fields),
-            extrasaction="ignore",
-            lineterminator="\n",
-        )
-        writer.writeheader()
-        writer.writerows(metric_rows)
+    write_csv_rows_file(path, metric_rows, fields, lineterminator="\n")
 
 
 def write_summary(metric_rows):

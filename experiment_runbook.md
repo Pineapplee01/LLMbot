@@ -279,6 +279,7 @@ import csv
 import tempfile
 from pathlib import Path
 from summarize_formal_runs_20260620 import SUMMARY_FIELDS, write_csv
+from runtime_env import write_csv_rows_file
 root = Path(tempfile.mkdtemp(prefix="llmbot_report_csv_smoke_"))
 path = root / "summary.csv"
 empty_path = root / "empty_summary.csv"
@@ -295,6 +296,9 @@ assert empty_rows == [SUMMARY_FIELDS]
 auto_empty = root / "auto_empty.csv"
 write_csv(auto_empty, [])
 assert auto_empty.read_text(encoding="utf-8") == ""
+runtime_empty = root / "runtime_empty.csv"
+write_csv_rows_file(runtime_empty, [])
+assert runtime_empty.read_text(encoding="utf-8") == ""
 print("report csv schema smoke ok")
 '@ | python -
 @'
@@ -302,20 +306,28 @@ import csv
 import tempfile
 from pathlib import Path
 from run_twibot20_full_selective_residual_5seed_20260620 import SUMMARY_FIELDS, write_summary_csv
+from runtime_env import write_csv_rows_file
 root = Path(tempfile.mkdtemp(prefix="llmbot_full_summary_csv_smoke_"))
 path = root / "full.csv"
 empty_path = root / "empty_full.csv"
+runtime_path = root / "runtime_full.csv"
 write_summary_csv(path, [{"seed": 1, "test_count": 296, "acc": 0.9, "outputs_path": "outputs.pt", "extra": "ignored"}])
 write_summary_csv(empty_path, [])
+write_csv_rows_file(runtime_path, [{"seed": 2, "test_count": 296, "extra": "ignored"}], SUMMARY_FIELDS, lineterminator="\n")
 assert "\r\n" not in path.read_text(encoding="utf-8")
 with path.open("r", encoding="utf-8", newline="") as handle:
     rows = list(csv.reader(handle))
 with empty_path.open("r", encoding="utf-8", newline="") as handle:
     empty_rows = list(csv.reader(handle))
+with runtime_path.open("r", encoding="utf-8", newline="") as handle:
+    runtime_rows = list(csv.reader(handle))
 assert rows[0] == SUMMARY_FIELDS
 assert rows[1][0] == "1"
 assert "ignored" not in rows[1]
 assert empty_rows == [SUMMARY_FIELDS]
+assert runtime_rows[0] == SUMMARY_FIELDS
+assert runtime_rows[1][0] == "2"
+assert "ignored" not in runtime_rows[1]
 print("full residual summary csv smoke ok")
 '@ | python -
 @'

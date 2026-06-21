@@ -2,7 +2,7 @@ import csv
 import json
 from pathlib import Path
 
-from runtime_env import now_iso, read_json_file, resolve_botdetection_root, write_json_file
+from runtime_env import now_iso, read_json_file, resolve_botdetection_root, write_csv_rows_file, write_json_file
 
 
 REPO_ROOT = resolve_botdetection_root()
@@ -137,17 +137,7 @@ TWIBOT20_BY_SEED_FIELDS = [
 
 
 def write_csv(path, rows, fields=None):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if fields is None and not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    if fields is None:
-        fields = sorted({key for row in rows for key in row.keys()})
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+    write_csv_rows_file(path, rows, fields)
 
 
 def aggregate_by_variant(rows):
