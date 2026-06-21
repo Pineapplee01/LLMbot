@@ -221,6 +221,19 @@ assert callable(run_manifest_command)
 print("runtime_env queue helpers ok")
 '@ | python -
 @'
+import tempfile
+from pathlib import Path
+from run_twibot20_formal5_ablation_completion_20260620 import select_routed_mask_source
+root = Path(tempfile.mkdtemp(prefix="llmbot_routed_mask_smoke_"))
+late = root / "z_routed_nodes_budget100.json"
+early = root / "a_routed_nodes_budget100.json"
+late.write_text("{}", encoding="utf-8")
+early.write_text("{}", encoding="utf-8")
+assert select_routed_mask_source([late, early]) == early
+assert select_routed_mask_source([]) is None
+print("routed mask selector smoke ok")
+'@ | python -
+@'
 import csv
 import tempfile
 from pathlib import Path

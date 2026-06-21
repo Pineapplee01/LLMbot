@@ -103,6 +103,14 @@ def graph_cmd(seed, variant, embedding_path, extra_args):
     return [str(PYTHON), *BASE_ARGS, "--embedding_path", str(embedding_path), "--seeds", str(seed), "--experiment_name", exp_name, *extra_args]
 
 
+def select_routed_mask_source(paths):
+    """Pick a routed-mask artifact deterministically from candidate paths."""
+    paths = list(paths)
+    if not paths:
+        return None
+    return sorted(paths, key=lambda p: (p.name.lower(), str(p).lower()))[0]
+
+
 def generate_routed_masks(seed, manifest):
     embedding = REPO_ROOT / "datasets" / DATASET / f"embeddings_iter_-1_seed_{seed}.pt"
     smoke_exp = f"{EXP_ROOT}\\smoke_all_nodes_residual_seed{seed}"
@@ -165,7 +173,7 @@ def generate_routed_masks(seed, manifest):
                 if str(obj.get('selected_budget','')).replace('.','') in {budget, budget.lstrip('0')} or obj.get('budget_name') == budget:
                     srcs.append(p)
         if srcs:
-            src = sorted(srcs, key=lambda p: len(str(p)))[0]
+            src = select_routed_mask_source(srcs)
             dst = inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json"
             if not dst.exists():
                 shutil.copy2(src, dst)
@@ -175,7 +183,7 @@ def generate_routed_masks(seed, manifest):
         if not target.exists():
             matches = list(router_root.rglob(f"routed_nodes*budget{budget}*.json"))
             if matches:
-                shutil.copy2(matches[0], target)
+                shutil.copy2(select_routed_mask_source(matches), target)
     if any(not (inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json").exists() for budget in ("050", "100", "200")):
         materialize_routed_masks_from_risk_manifest(
             risk_manifest=risk_manifest,
