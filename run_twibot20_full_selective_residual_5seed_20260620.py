@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -46,6 +47,19 @@ SEED1_EXISTING_FULL = (
     / "seed_1"
 )
 LMBOT_LM_MEMORY_ATTEMPTS = [(4, 8), (2, 16), (1, 32)]
+SUMMARY_FIELDS = [
+    "seed",
+    "test_count",
+    "acc",
+    "macro_f1",
+    "binary_f1",
+    "macro_precision",
+    "macro_recall",
+    "bot_precision",
+    "bot_recall",
+    "wrong",
+    "outputs_path",
+]
 
 
 BASE_GRAPH_ARGS = [
@@ -524,25 +538,23 @@ def mean_std(values):
     return mean, var ** 0.5
 
 
+def write_summary_csv(path, metric_rows, fields=SUMMARY_FIELDS):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(fields),
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(metric_rows)
+
+
 def write_summary(metric_rows):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "seed",
-        "test_count",
-        "acc",
-        "macro_f1",
-        "binary_f1",
-        "macro_precision",
-        "macro_recall",
-        "bot_precision",
-        "bot_recall",
-        "wrong",
-        "outputs_path",
-    ]
-    csv_lines = [",".join(fields)]
-    for row in metric_rows:
-        csv_lines.append(",".join(str(row.get(field, "")) for field in fields))
-    (REPORT_DIR / "full_model_5seed_by_seed.csv").write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+    write_summary_csv(REPORT_DIR / "full_model_5seed_by_seed.csv", metric_rows)
     summary = {"n": len(metric_rows)}
     for key in [
         "acc",

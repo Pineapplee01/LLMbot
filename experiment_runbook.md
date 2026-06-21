@@ -298,6 +298,27 @@ assert auto_empty.read_text(encoding="utf-8") == ""
 print("report csv schema smoke ok")
 '@ | python -
 @'
+import csv
+import tempfile
+from pathlib import Path
+from run_twibot20_full_selective_residual_5seed_20260620 import SUMMARY_FIELDS, write_summary_csv
+root = Path(tempfile.mkdtemp(prefix="llmbot_full_summary_csv_smoke_"))
+path = root / "full.csv"
+empty_path = root / "empty_full.csv"
+write_summary_csv(path, [{"seed": 1, "test_count": 296, "acc": 0.9, "outputs_path": "outputs.pt", "extra": "ignored"}])
+write_summary_csv(empty_path, [])
+assert "\r\n" not in path.read_text(encoding="utf-8")
+with path.open("r", encoding="utf-8", newline="") as handle:
+    rows = list(csv.reader(handle))
+with empty_path.open("r", encoding="utf-8", newline="") as handle:
+    empty_rows = list(csv.reader(handle))
+assert rows[0] == SUMMARY_FIELDS
+assert rows[1][0] == "1"
+assert "ignored" not in rows[1]
+assert empty_rows == [SUMMARY_FIELDS]
+print("full residual summary csv smoke ok")
+'@ | python -
+@'
 import json
 import sys
 import tempfile
