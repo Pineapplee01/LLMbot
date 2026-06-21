@@ -28,11 +28,13 @@ REPORT_DIR = RUN_ROOT / "_reports"
 LOG_DIR = ACTIVE_ROOT / "server_logs"
 QUEUE_MANIFEST = ACTIVE_ROOT / "experiments" / "twibot20_full_selective_residual_5seed_20260620_queue_manifest.json"
 
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("WANDB_MODE", "disabled")
-os.environ.setdefault("WANDB_DISABLED", "true")
-os.environ.setdefault("WANDB_SILENT", "true")
+HOST_ENV_DEFAULTS = {
+    "KMP_DUPLICATE_LIB_OK": "TRUE",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "WANDB_MODE": "disabled",
+    "WANDB_DISABLED": "true",
+    "WANDB_SILENT": "true",
+}
 SEED1_EXISTING_FULL = (
     ACTIVE_ROOT
     / "experiments"
@@ -89,12 +91,13 @@ BASE_GRAPH_ARGS = [
 
 def clean_env():
     env = build_offline_model_env(REPO_ROOT)
-    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    env["WANDB_MODE"] = "disabled"
-    env["WANDB_DISABLED"] = "true"
-    env["WANDB_SILENT"] = "true"
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    env.update(HOST_ENV_DEFAULTS)
     return env
+
+
+def configure_host_process_env():
+    for key, value in HOST_ENV_DEFAULTS.items():
+        os.environ.setdefault(key, value)
 
 
 def read_json(path):
@@ -565,6 +568,7 @@ def write_summary(metric_rows):
 
 
 def main():
+    configure_host_process_env()
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", default="1,2,3,4,5")
     args = parser.parse_args()

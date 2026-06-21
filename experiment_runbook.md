@@ -54,7 +54,7 @@ that owns the output path.
 | Category | Purpose | May launch training? | Generated outputs | Required operator action |
 | --- | --- | --- | --- | --- |
 | Queue script | Runs one or more experiment stages and records a queue manifest | Yes | Queue manifest, logs, and stage artifacts | Register in `experiments.md`, keep manifest paths stable, and use shared `runtime_env` helpers. |
-| Launcher | Starts a queue script from Windows/PowerShell and records process metadata | Indirectly | Launcher log and PID metadata | Point to exactly one queue script and avoid embedding training flags. |
+| Launcher | Starts a queue script from Windows/PowerShell and records process metadata | Indirectly | Launcher log and PID metadata | Point to exactly one queue script, avoid embedding training flags, and keep process launch inside `main()`. |
 | Support script | Produces a bounded prerequisite artifact for a queue | No, unless the detailed entry says otherwise | Requested artifact plus adjacent manifest | Document the consuming queue and keep output paths caller-controlled. |
 | Report snapshot helper | Summarizes existing artifacts into paper/report snapshots | No | CSV, JSON manifest, or figures under a report snapshot root | Run only when an evidence refresh is intentional and documented. |
 
@@ -63,6 +63,8 @@ Category boundaries are hard rules:
 - Do not call support scripts from queue indexes unless the consuming queue
   documents the artifact path and manifest contract.
 - Do not call report snapshot helpers from queue scripts.
+- Do not launch subprocesses, write PID files, or create log directories at
+  module import time; put launcher side effects behind `main()`.
 - Do not use a report snapshot helper to create missing experiment artifacts,
   backfill absent run directories, or repair incomplete manifests.
 - Do not create a new root-level queue, launcher, support, or report script

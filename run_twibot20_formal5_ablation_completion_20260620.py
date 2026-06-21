@@ -15,7 +15,6 @@ from runtime_env import (
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
 PYTHON = Path(r"D:\Anaconda\envs\llmbot\python.exe")
-FALLBACK_PYTHON = Path(r"D:\Anaconda\python.exe")
 LOG_DIR = WORK_DIR / "server_logs"
 CURRENT_QUEUE = WORK_DIR / "experiments" / "sampled_twibot22_official_prior_base5_20260620_queue_manifest.json"
 EXP_ROOT = r"experiments\twibot20_formal5_ablation_completion_20260620"
@@ -150,7 +149,6 @@ def generate_routed_masks(seed, manifest):
     inputs_dir = WORK_DIR / "experiments" / "twibot20_formal5_ablation_completion_20260620_inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     stage_dir = router_root / "stages" / "estimator_ablation"
-    copied = {}
     for budget in ("050", "100", "200"):
         srcs = list(stage_dir.rglob(f"*budget{budget}*.json")) + list(stage_dir.rglob(f"*{budget}*.json"))
         # Prefer routed_nodes artifacts with split payload.
@@ -169,7 +167,6 @@ def generate_routed_masks(seed, manifest):
             dst = inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json"
             if not dst.exists():
                 shutil.copy2(src, dst)
-            copied[budget] = dst
     # If router code already wrote canonical artifacts elsewhere, also locate them by exact known names.
     for budget in ("050", "100", "200"):
         target = inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json"
@@ -177,7 +174,6 @@ def generate_routed_masks(seed, manifest):
             matches = list(router_root.rglob(f"routed_nodes*budget{budget}*.json"))
             if matches:
                 shutil.copy2(matches[0], target)
-                copied[budget] = target
     if any(not (inputs_dir / f"routed_nodes_xnew_budget{budget}_seed{seed}.json").exists() for budget in ("050", "100", "200")):
         materialize_routed_masks_from_risk_manifest(
             risk_manifest=risk_manifest,
