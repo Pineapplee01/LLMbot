@@ -1,17 +1,13 @@
 import argparse
 import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
 
 from model_building import build_LM_model
+from runtime_env import now_iso, write_json_file
 from utils import load_raw_data
-
-
-def now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat()
 
 
 def tokenize(tokenizer, texts, max_length, device):
@@ -25,9 +21,7 @@ def tokenize(tokenizer, texts, max_length, device):
 
 
 def write_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_file(path, payload)
 
 
 def extract(args):

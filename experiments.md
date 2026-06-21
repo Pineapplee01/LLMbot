@@ -99,6 +99,7 @@ detailed experiment entry.
 | `launch_sampled_twibot22_base5_20260620.py` | active launcher | `server_logs/sampled_twibot22_official_prior_base5_20260620_queue.*.log` | Starts the PowerShell queue wrapper and records a PID. |
 | `run_sampled_twibot22_base_5seed_20260620.py` | active queue | `experiments/sampled_twibot22_official_prior_base5_20260620_queue_manifest.json` | Runs sampled TwiBot-22 semantic + graph stages for seeds 1-5. |
 | `run_twibot20_formal5_ablation_completion_20260620.py` | active queue | `experiments/twibot20_formal5_ablation_completion_20260620_queue_manifest.json` | Waits for the sampled TwiBot-22 queue before completing formal ablation runs. |
+| `extract_raw_roberta_embeddings_20260620.py` | support script | `raw_roberta_embeddings.pt` plus adjacent `manifest.json` in the requested output directory | Extract-only raw RoBERTa embedding surface used by the formal ablation queue; it is not a standalone training queue. |
 | `run_twibot20_full_selective_residual_5seed_20260620.py` | active queue | `experiments/twibot20_full_selective_residual_5seed_20260620_queue_manifest.json` | Uses custom early-stop handling for LMBot embedding materialization; do not replace its `Popen` loop without preserving that contract. |
 
 ## Reusable Inputs
