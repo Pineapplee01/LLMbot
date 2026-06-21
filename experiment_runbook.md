@@ -43,7 +43,33 @@ must preserve these rules:
   as early stopping after an embedding artifact materializes.
 - Do not change training flags while doing queue-helper cleanup.
 
-## Active Local Queue Scripts
+## Script Categories
+
+Use this taxonomy before running or editing any root-level dated experiment
+script. If a script does not fit one category, split the operational rule in
+the docs before adding another launch surface. Generated outputs are not script
+entry points; they are evidence files created only by the documented category
+that owns the output path.
+
+| Category | Purpose | May launch training? | Generated outputs | Required operator action |
+| --- | --- | --- | --- | --- |
+| Queue script | Runs one or more experiment stages and records a queue manifest | Yes | Queue manifest, logs, and stage artifacts | Register in `experiments.md`, keep manifest paths stable, and use shared `runtime_env` helpers. |
+| Launcher | Starts a queue script from Windows/PowerShell and records process metadata | Indirectly | Launcher log and PID metadata | Point to exactly one queue script and avoid embedding training flags. |
+| Support script | Produces a bounded prerequisite artifact for a queue | No, unless the detailed entry says otherwise | Requested artifact plus adjacent manifest | Document the consuming queue and keep output paths caller-controlled. |
+| Report snapshot helper | Summarizes existing artifacts into paper/report snapshots | No | CSV, JSON manifest, or figures under a report snapshot root | Run only when an evidence refresh is intentional and documented. |
+
+Category boundaries are hard rules:
+
+- Do not call support scripts from queue indexes unless the consuming queue
+  documents the artifact path and manifest contract.
+- Do not call report snapshot helpers from queue scripts.
+- Do not use a report snapshot helper to create missing experiment artifacts,
+  backfill absent run directories, or repair incomplete manifests.
+- Do not create a new root-level queue, launcher, support, or report script
+  without first adding its detailed registry entry to `experiments.md` and its
+  category row to this runbook.
+
+## Active Local Experiment Scripts
 
 | Script | Role | Manifest or log contract |
 | --- | --- | --- |
@@ -51,16 +77,50 @@ must preserve these rules:
 | `run_sampled_twibot22_base_5seed_20260620.py` | Sampled TwiBot-22 semantic and graph queue | `experiments/sampled_twibot22_official_prior_base5_20260620_queue_manifest.json` |
 | `run_twibot20_formal5_ablation_completion_20260620.py` | Formal TwiBot-20 ablation completion queue | `experiments/twibot20_formal5_ablation_completion_20260620_queue_manifest.json` |
 | `run_twibot20_full_selective_residual_5seed_20260620.py` | Full selective residual five-seed queue | `experiments/twibot20_full_selective_residual_5seed_20260620_queue_manifest.json` |
-| `extract_raw_roberta_embeddings_20260620.py` | Support script for raw RoBERTa embeddings | Adjacent `manifest.json` in the requested output directory |
+| `extract_raw_roberta_embeddings_20260620.py` | Support script only: writes `raw_roberta_embeddings.pt` and an adjacent manifest for a consuming queue; it is not a queue, report helper, or registry writer | Adjacent `manifest.json` in the requested output directory |
 
 ## Report Snapshot Helpers
 
 These scripts summarize existing artifacts. They write report snapshots and
-must not be treated as training or queue launch commands.
+must not be treated as training or queue launch commands. Do not run them as a
+casual validation step: they can rewrite generated report outputs and update
+snapshot manifests even when no training is launched.
+
+Run a report snapshot helper only when all source artifacts already exist and
+the task explicitly intends to rebuild or refresh the report snapshot. A report
+helper must never be used to produce new experiment evidence, fill a missing
+experiment directory, or stand in for a failed queue step.
 
 | Script | Role | Output contract |
 | --- | --- | --- |
 | `summarize_formal_runs_20260620.py` | Builds CSV summaries and a manifest from existing TwiBot-20/TwiBot-22 artifacts | `experiments/formal_result_snapshots_20260620/manifest.json` and adjacent CSV files |
+
+## Allowed Output Locations
+
+| Owner | Allowed outputs | Notes |
+| --- | --- | --- |
+| Queue scripts | `experiments/*_queue_manifest.json`, documented stage roots, and `server_logs/*.log` | Queue outputs must match the detailed `experiments.md` registry entry. |
+| Launchers | `server_logs/*.log` and process metadata for the exact queue wrapper | Launchers must not introduce their own artifact roots or training flags. |
+| Support scripts | Caller-selected prerequisite artifact directory plus adjacent `manifest.json` | The consuming queue must document how the artifact is used. |
+| Report snapshot helpers | `experiments/formal_result_snapshots_20260620/manifest.json` and adjacent report files | These outputs are generated snapshots, not primary experiment runs. |
+
+## Generated Output Guardrails
+
+- Do not hand-edit `experiments/`, `server_logs/`, checkpoints, model caches,
+  datasets, or report snapshot outputs.
+- Do not create a new timestamped artifact root, root-level queue/launcher/
+  support/report script, or temporary experiment directory for cleanup or smoke
+  work. Use a stable semantic experiment ID and register it in `experiments.md`
+  first.
+- Do not add a new root-level dated script when an existing queue, launcher,
+  support, or report helper can be parameterized without changing its research
+  contract. If a new script is unavoidable, add its row to this runbook in the
+  same change.
+- Before adding a new queue entry, define the script category, manifest path,
+  artifact root, expected generated files, validation command, and whether the
+  run is operational evidence or a paper-facing result refresh.
+- Keep dry validation to compile/import/helper smokes that write only to a temp
+  directory unless the task explicitly intends to refresh generated evidence.
 
 ## Local Model Cache
 
