@@ -15,6 +15,7 @@ REPO_ROOT = resolve_botdetection_root()
 WORK_DIR = REPO_ROOT / "LLMbot"
 PYTHON = resolve_python_executable(r"D:\Anaconda\envs\llmbot\python.exe")
 LOG_DIR = WORK_DIR / "server_logs"
+EXPERIMENT_DIR = Path("experiments") / "sampled_twibot22_official_prior_base5_20260620"
 EXPERIMENT_NAME = r"experiments\sampled_twibot22_official_prior_base5_20260620"
 DATASET = "TwiBot-22-official-prior-sampled-v1"
 SEEDS = [1, 2, 3, 4, 5]
@@ -43,11 +44,11 @@ def run_logged(command, log_path, manifest, seed, stage):
         raise RuntimeError(f"{stage} failed for seed {seed}; see {log_path}")
 
 
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST_PATH = WORK_DIR / "experiments" / "sampled_twibot22_official_prior_base5_20260620_queue_manifest.json"
 
 
 def main():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     manifest = {
         "created_at": now_iso(),
         "dataset": DATASET,
@@ -63,7 +64,7 @@ def main():
     write_json(MANIFEST_PATH, manifest)
 
     for seed in SEEDS:
-        embedding_path = WORK_DIR / EXPERIMENT_NAME / f"seed_{seed}" / "preparation" / "semantic_encoder" / "embeddings.pt"
+        embedding_path = WORK_DIR / EXPERIMENT_DIR / f"seed_{seed}" / "preparation" / "semantic_encoder" / "embeddings.pt"
         semantic_log = LOG_DIR / f"sampled_twibot22_official_prior_base5_20260620_seed{seed}_semantic.log"
         graph_log = LOG_DIR / f"sampled_twibot22_official_prior_base5_20260620_seed{seed}_graph.log"
 

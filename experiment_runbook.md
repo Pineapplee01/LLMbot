@@ -158,6 +158,18 @@ Run these checks after queue-helper, runbook, or report-helper changes:
 ```powershell
 python -m py_compile runtime_env.py launch_sampled_twibot22_base5_20260620.py run_sampled_twibot22_base_5seed_20260620.py run_twibot20_formal5_ablation_completion_20260620.py run_twibot20_full_selective_residual_5seed_20260620.py extract_raw_roberta_embeddings_20260620.py summarize_formal_runs_20260620.py
 @'
+import importlib
+import os
+import tempfile
+from pathlib import Path
+root = Path(tempfile.mkdtemp(prefix="llmbot_import_smoke_"))
+os.environ["BOTDETECTION_ROOT"] = str(root)
+module = importlib.import_module("run_sampled_twibot22_base_5seed_20260620")
+assert module.LOG_DIR == root / "LLMbot" / "server_logs"
+assert not module.LOG_DIR.exists()
+print("sampled queue import smoke ok")
+'@ | python -
+@'
 from pathlib import Path
 from runtime_env import build_offline_model_env, mark_queue_manifest_failed, run_manifest_command
 env = build_offline_model_env(Path(r"G:\Research\BotDetection"))
@@ -170,7 +182,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from runtime_env import build_offline_model_env, run_manifest_command
+from runtime_env import build_offline_model_env, mark_queue_manifest_failed, run_manifest_command
 root = Path(tempfile.mkdtemp(prefix="llmbot_manifest_smoke_"))
 manifest = {"runs": []}
 env = build_offline_model_env(Path(r"G:\Research\BotDetection"))
