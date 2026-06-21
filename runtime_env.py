@@ -53,6 +53,13 @@ def write_json_file(path, payload):
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def read_json_file(path, default=None):
+    path = Path(path)
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def normalize_command(command):
     """Return a subprocess-safe command list without changing argument order."""
     return [str(item) for item in command]
@@ -100,6 +107,24 @@ def fail_manifest_run(manifest, manifest_path, entry, exc):
     entry["error"] = str(exc)
     write_json_file(manifest_path, manifest)
     return entry
+
+
+def mark_queue_manifest_failed(manifest_path, exc, manifest=None):
+    """Mark a queue-level manifest failed while preserving existing fields."""
+    if manifest is None:
+        try:
+            manifest = read_json_file(manifest_path, default={}) or {}
+        except Exception as read_exc:
+            manifest = {
+                "manifest_read_error_type": type(read_exc).__name__,
+                "manifest_read_error": str(read_exc),
+            }
+    manifest["status"] = "failed"
+    manifest["failed_at"] = now_iso()
+    manifest["error_type"] = type(exc).__name__
+    manifest["error"] = str(exc)
+    write_json_file(manifest_path, manifest)
+    return manifest
 
 
 def run_manifest_command(command, *, cwd, env, log_path, manifest, manifest_path, entry):

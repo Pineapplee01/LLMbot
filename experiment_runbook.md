@@ -36,6 +36,9 @@ must preserve these rules:
   Transformers cache variables.
 - Use `runtime_env.run_manifest_command(...)` for ordinary subprocess queue
   steps.
+- Use `runtime_env.mark_queue_manifest_failed(...)` for top-level queue
+  failures so manifests consistently retain `failed_at`, `error_type`, and
+  `error`.
 - Keep custom process-control loops local when they have extra behavior, such
   as early stopping after an embedding artifact materializes.
 - Do not change training flags while doing queue-helper cleanup.
@@ -69,7 +72,7 @@ Run these checks after queue-helper or runbook changes:
 python -m py_compile runtime_env.py launch_sampled_twibot22_base5_20260620.py run_sampled_twibot22_base_5seed_20260620.py run_twibot20_formal5_ablation_completion_20260620.py run_twibot20_full_selective_residual_5seed_20260620.py extract_raw_roberta_embeddings_20260620.py
 @'
 from pathlib import Path
-from runtime_env import build_offline_model_env, run_manifest_command
+from runtime_env import build_offline_model_env, mark_queue_manifest_failed, run_manifest_command
 env = build_offline_model_env(Path(r"G:\Research\BotDetection"))
 assert env["HF_HOME"].endswith(r"models\huggingface")
 assert callable(run_manifest_command)
@@ -110,6 +113,11 @@ assert proc.returncode == 3
 payload = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
 assert payload["runs"][1]["status"] == "failed"
 assert payload["runs"][1]["returncode"] == 3
+mark_queue_manifest_failed(root / "queue_failed.json", RuntimeError("queue failed"), manifest={"runs": []})
+failed = json.loads((root / "queue_failed.json").read_text(encoding="utf-8"))
+assert failed["status"] == "failed"
+assert failed["error_type"] == "RuntimeError"
+assert failed["error"] == "queue failed"
 print("manifest command smoke ok")
 '@ | python -
 git diff --check

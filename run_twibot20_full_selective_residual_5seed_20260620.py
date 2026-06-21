@@ -7,7 +7,13 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, run_manifest_command, write_json_file as write_json
+from runtime_env import (
+    build_offline_model_env,
+    mark_queue_manifest_failed,
+    now_iso,
+    run_manifest_command,
+    write_json_file as write_json,
+)
 
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
@@ -618,11 +624,7 @@ def main():
         write_json(QUEUE_MANIFEST, manifest)
         print(json.dumps(summary["summary"], indent=2, sort_keys=True))
     except Exception as exc:
-        manifest["status"] = "failed"
-        manifest["failed_at"] = now_iso()
-        manifest["error_type"] = type(exc).__name__
-        manifest["error"] = str(exc)
-        write_json(QUEUE_MANIFEST, manifest)
+        mark_queue_manifest_failed(QUEUE_MANIFEST, exc, manifest=manifest)
         print(str(exc), file=sys.stderr)
         raise
 

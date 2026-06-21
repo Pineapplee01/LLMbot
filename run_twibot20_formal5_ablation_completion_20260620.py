@@ -4,7 +4,13 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, run_manifest_command, write_json_file as write_json
+from runtime_env import (
+    build_offline_model_env,
+    mark_queue_manifest_failed,
+    now_iso,
+    run_manifest_command,
+    write_json_file as write_json,
+)
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
@@ -377,12 +383,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        existing = {}
-        if MANIFEST_PATH.exists():
-            existing = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-        existing["status"] = "failed"
-        existing["failed_at"] = now_iso()
-        existing["error"] = str(exc)
-        write_json(MANIFEST_PATH, existing)
+        mark_queue_manifest_failed(MANIFEST_PATH, exc)
         print(str(exc), file=sys.stderr)
         raise
