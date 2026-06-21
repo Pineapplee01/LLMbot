@@ -48,6 +48,34 @@ Recommended artifact root:
 If an old timestamped root already exists, keep it in place and record it below.
 Do not create a second timestamped clone for reruns.
 
+## Status Vocabulary
+
+Use one of these status values at the top of every experiment entry:
+
+- `planned`: command and artifact contract are written, but no launch happened.
+- `launched`: run has started and the log/manifest path is known.
+- `completed`: run finished and metrics/artifact paths are recorded.
+- `failed`: run failed and the error/log path is recorded.
+- `archived`: historical entry retained for traceability; do not reuse as an active queue item.
+
+Prefer the short form `- Status: <value>.` before any narrative. If a legacy
+entry uses older wording such as `pending launch` or `completed on server`, keep
+the entry text stable but normalize new entries to this vocabulary.
+
+## Current Queue Index
+
+Use this index before appending to the registry. Add new active entries here and
+link them to the detailed section below.
+
+| experiment id | status | detailed section | artifact or manifest root |
+| --- | --- | --- | --- |
+| `twibot22_sampled__roberta_rgcn__seed1_smoke` | planned | [section](#twibot22_sampled__roberta_rgcn__seed1_smoke) | `/root/workspace/LMbot/LLMbot/experiments/twibot22_sampled__roberta_rgcn__seed1_smoke` |
+| `twibot22_sampled__roberta_rgcn__seed1` | planned | [section](#twibot22_sampled__roberta_rgcn__seed1) | `/root/workspace/LMbot/LLMbot/experiments/twibot22_sampled__roberta_rgcn__seed1` |
+| `twibot22_robust_v1__roberta_rgcn__seed1` | launched | [section](#twibot22_robust_v1__roberta_rgcn__seed1) | `/root/workspace/LMbot/LLMbot/experiments/twibot22_robust_v1__roberta_rgcn__seed1` |
+| `dgp__v2_strict_answer_token__highbase_routed_ctxfull__seed1` | planned | [section](#dgp__v2_strict_answer_token__highbase_routed_ctxfull__seed1) | `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_strict_answer_token__highbase_routed_ctxfull__seed1` |
+| `dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1` | planned | [section](#dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1) | `/root/workspace/LMbot/LLMbot/experiments/dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1` |
+| `dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1` | completed | [current record](#dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1-current-record) | see detailed entry |
+
 ## Reusable Inputs
 
 | name | path | notes |
@@ -377,7 +405,7 @@ python /root/workspace/LMbot/run_botsay_knn_stage2_predict.py \
 - Planned log:
   `/root/workspace/LMbot/LLMbot/server_logs/dgp__v2_strict_answer_token__highbase_labeled_ctxfull__seed1.log`
 
-### dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1
+### dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1 planning note
 
 - Status: pending server smoke / full routed run.
 - Scope: DGP v2 routed-node LLM-as-predictor migration.
@@ -3541,7 +3569,7 @@ CUDA_VISIBLE_DEVICES=0 /root/mambaforge/envs/lmbot/bin/python -u main.py \
   `conflict` is acting more like a stabilizing calibration channel than a
   disposable extra expert.
 
-### dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1
+### dgp__v2_norm_text_following_summary_qwen25__highbase_routed__seed1 current record
 
 - Status: completed on server
 - Scope: DGP-inspired routed-node prompt construction and two downstream
