@@ -221,6 +221,21 @@ assert callable(run_manifest_command)
 print("runtime_env queue helpers ok")
 '@ | python -
 @'
+import csv
+import tempfile
+from pathlib import Path
+from summarize_formal_runs_20260620 import SUMMARY_FIELDS, write_csv
+root = Path(tempfile.mkdtemp(prefix="llmbot_report_csv_smoke_"))
+path = root / "summary.csv"
+write_csv(path, [{"macro_f1_std": 0.2, "variant": "demo", "n": 1, "acc_mean": 0.9, "extra": "ignored"}], SUMMARY_FIELDS)
+with path.open("r", encoding="utf-8", newline="") as handle:
+    rows = list(csv.reader(handle))
+assert rows[0] == SUMMARY_FIELDS
+assert rows[1][0] == "demo"
+assert "ignored" not in rows[1]
+print("report csv schema smoke ok")
+'@ | python -
+@'
 import json
 import sys
 import tempfile

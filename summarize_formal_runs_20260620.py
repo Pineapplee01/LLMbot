@@ -102,15 +102,50 @@ def normalize_twibot20_variant(name):
     return mapping.get(str(name), str(name))
 
 
-def write_csv(path, rows):
+SAMPLED_TWIBOT22_BY_SEED_FIELDS = [
+    "dataset",
+    "variant",
+    "seed",
+    "status",
+    "acc",
+    "macro_f1",
+    "loss",
+    "epoch",
+    "semantic_test_acc",
+    "semantic_test_macro_f1",
+    "semantic_test_bot_f1",
+]
+
+SUMMARY_FIELDS = [
+    "variant",
+    "n",
+    "acc_mean",
+    "acc_std",
+    "macro_f1_mean",
+    "macro_f1_std",
+]
+
+TWIBOT20_BY_SEED_FIELDS = [
+    "variant",
+    "display_variant",
+    "seed",
+    "status",
+    "full_acc",
+    "full_macro_f1",
+    "artifact_root",
+]
+
+
+def write_csv(path, rows, fields=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    fields = sorted({key for row in rows for key in row.keys()})
+    if fields is None:
+        fields = sorted({key for row in rows for key in row.keys()})
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -161,12 +196,12 @@ def main():
         row for row in twibot20_rows if row.get("display_variant") in TARGET_TWIBOT20_VARIANTS
     ]
     twibot20_target_summary = aggregate_by_variant(twibot20_target_rows)
-    write_csv(report_dir / "sampled_twibot22_base_by_seed.csv", sampled_rows)
-    write_csv(report_dir / "sampled_twibot22_base_summary.csv", sampled_summary)
-    write_csv(report_dir / "twibot20_ablation_by_seed.csv", twibot20_rows)
-    write_csv(report_dir / "twibot20_ablation_summary.csv", twibot20_summary)
-    write_csv(report_dir / "twibot20_target_ablation_by_seed.csv", twibot20_target_rows)
-    write_csv(report_dir / "twibot20_target_ablation_summary.csv", twibot20_target_summary)
+    write_csv(report_dir / "sampled_twibot22_base_by_seed.csv", sampled_rows, SAMPLED_TWIBOT22_BY_SEED_FIELDS)
+    write_csv(report_dir / "sampled_twibot22_base_summary.csv", sampled_summary, SUMMARY_FIELDS)
+    write_csv(report_dir / "twibot20_ablation_by_seed.csv", twibot20_rows, TWIBOT20_BY_SEED_FIELDS)
+    write_csv(report_dir / "twibot20_ablation_summary.csv", twibot20_summary, SUMMARY_FIELDS)
+    write_csv(report_dir / "twibot20_target_ablation_by_seed.csv", twibot20_target_rows, TWIBOT20_BY_SEED_FIELDS)
+    write_csv(report_dir / "twibot20_target_ablation_summary.csv", twibot20_target_summary, SUMMARY_FIELDS)
     manifest = {
         "created_at": now_iso(),
         "script": "summarize_formal_runs_20260620.py",
