@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file
+from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file as write_json
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
@@ -44,10 +44,6 @@ BASE_ARGS = [
 
 def clean_env():
     return build_offline_model_env(REPO_ROOT)
-
-
-def write_json(path, payload):
-    write_json_file(path, payload)
 
 
 MANIFEST_PATH = WORK_DIR / "experiments" / "twibot20_formal5_ablation_completion_20260620_queue_manifest.json"

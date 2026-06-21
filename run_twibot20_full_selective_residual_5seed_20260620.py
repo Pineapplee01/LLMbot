@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, write_json_file
+from runtime_env import build_offline_model_env, now_iso, write_json_file as write_json
 
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
@@ -89,10 +89,6 @@ def clean_env():
     env["WANDB_SILENT"] = "true"
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     return env
-
-
-def write_json(path, payload):
-    write_json_file(path, payload)
 
 
 def read_json(path):

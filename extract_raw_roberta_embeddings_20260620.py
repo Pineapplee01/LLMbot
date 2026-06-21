@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from model_building import build_LM_model
-from runtime_env import now_iso, write_json_file
+from runtime_env import now_iso, write_json_file as write_json
 from utils import load_raw_data
 
 
@@ -18,10 +18,6 @@ def tokenize(tokenizer, texts, max_length, device):
         padding=True,
         truncation=True,
     ).to(device)
-
-
-def write_json(path, payload):
-    write_json_file(path, payload)
 
 
 def extract(args):

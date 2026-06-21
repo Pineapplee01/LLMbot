@@ -2,7 +2,7 @@ import json
 import sys
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file
+from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file as write_json
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
@@ -15,10 +15,6 @@ SEEDS = [1, 2, 3, 4, 5]
 
 def clean_env():
     return build_offline_model_env(REPO_ROOT)
-
-
-def write_json(path, payload):
-    write_json_file(path, payload)
 
 
 def run_logged(command, log_path, manifest, seed, stage):
