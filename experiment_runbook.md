@@ -53,6 +53,15 @@ must preserve these rules:
 | `run_twibot20_full_selective_residual_5seed_20260620.py` | Full selective residual five-seed queue | `experiments/twibot20_full_selective_residual_5seed_20260620_queue_manifest.json` |
 | `extract_raw_roberta_embeddings_20260620.py` | Support script for raw RoBERTa embeddings | Adjacent `manifest.json` in the requested output directory |
 
+## Report Snapshot Helpers
+
+These scripts summarize existing artifacts. They write report snapshots and
+must not be treated as training or queue launch commands.
+
+| Script | Role | Output contract |
+| --- | --- | --- |
+| `summarize_formal_runs_20260620.py` | Builds CSV summaries and a manifest from existing TwiBot-20/TwiBot-22 artifacts | `experiments/formal_result_snapshots_20260620/manifest.json` and adjacent CSV files |
+
 ## Local Model Cache
 
 Local queue scripts should keep downloaded models under the parent workspace:
@@ -66,10 +75,10 @@ so offline local runs and smoke checks share the same cache contract.
 
 ## Validation Commands
 
-Run these checks after queue-helper or runbook changes:
+Run these checks after queue-helper, runbook, or report-helper changes:
 
 ```powershell
-python -m py_compile runtime_env.py launch_sampled_twibot22_base5_20260620.py run_sampled_twibot22_base_5seed_20260620.py run_twibot20_formal5_ablation_completion_20260620.py run_twibot20_full_selective_residual_5seed_20260620.py extract_raw_roberta_embeddings_20260620.py
+python -m py_compile runtime_env.py launch_sampled_twibot22_base5_20260620.py run_sampled_twibot22_base_5seed_20260620.py run_twibot20_formal5_ablation_completion_20260620.py run_twibot20_full_selective_residual_5seed_20260620.py extract_raw_roberta_embeddings_20260620.py summarize_formal_runs_20260620.py
 @'
 from pathlib import Path
 from runtime_env import build_offline_model_env, mark_queue_manifest_failed, run_manifest_command

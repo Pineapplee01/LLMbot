@@ -2,16 +2,15 @@ import csv
 import json
 from pathlib import Path
 
+from runtime_env import now_iso, read_json_file, write_json_file
+
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
 
 
 def read_json(path):
-    path = Path(path)
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return read_json_file(path, default=None)
 
 
 def mean_std(values):
@@ -173,6 +172,8 @@ def main():
     write_csv(report_dir / "twibot20_target_ablation_by_seed.csv", twibot20_target_rows)
     write_csv(report_dir / "twibot20_target_ablation_summary.csv", twibot20_target_summary)
     manifest = {
+        "created_at": now_iso(),
+        "script": "summarize_formal_runs_20260620.py",
         "report_dir": str(report_dir),
         "sampled_twibot22_completed_seeds": [
             int(row["seed"]) for row in sampled_rows if row.get("status") == "completed"
@@ -184,7 +185,7 @@ def main():
             "finetuned-vs-raw 5-seed comparison still needs finetuned_roberta_embeddings_iter_2_seed2..5."
         ),
     }
-    (report_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_file(report_dir / "manifest.json", manifest)
     print(json.dumps(manifest, indent=2, sort_keys=True))
 
 
