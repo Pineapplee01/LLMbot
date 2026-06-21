@@ -52,3 +52,11 @@ Out of scope:
 - [ ] Run inline helper behavior check.
 - [ ] Run `python main.py --help` if dependencies are available; otherwise capture the exact missing dependency.
 - [ ] Review `git diff --stat` and `git status --short --branch`.
+
+## Task 5: Queue Logging Helper Extraction
+
+- [ ] Add lightweight timestamp, JSON-write, and logged subprocess helpers to `runtime_env.py`.
+- [ ] Update direct queue scripts with repeated manifest/logging wrappers to call those helpers without changing command arguments or manifest fields.
+- [ ] Keep scripts with custom process control out of scope unless a later slice can preserve their behavior exactly.
+- [ ] Tighten `experiments.md` status and current-queue rules so future queue entries stay indexable.
+- [ ] Validate with py_compile, an inline helper smoke check, `python main.py --help`, and `git diff --check`.

@@ -62,10 +62,21 @@ Prefer the short form `- Status: <value>.` before any narrative. If a legacy
 entry uses older wording such as `pending launch` or `completed on server`, keep
 the entry text stable but normalize new entries to this vocabulary.
 
+Legacy status aliases are informational only: treat `pending launch`, `pending
+server smoke / full run`, and `planned for ...` as `planned`; treat `completed
+on server` as `completed`. Do not introduce new free-form status values in new
+or edited active entries; put extra detail in a separate `Status detail` line.
+
 ## Current Queue Index
 
 Use this index before appending to the registry. Add new active entries here and
-link them to the detailed section below.
+link them to the detailed section below. This table is the complete active queue
+snapshot: every non-archived queue item that future agents may launch, resume,
+or monitor must appear here with an experiment id, normalized status, detailed
+section link, and artifact or manifest root. Keep launch command references and
+cache contracts in the linked detailed section when they do not fit in the
+table. Move historical or superseded entries out of the active queue by setting
+their detailed entry to `archived` instead of leaving stale active rows.
 
 | experiment id | status | detailed section | artifact or manifest root |
 | --- | --- | --- | --- |

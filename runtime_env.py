@@ -1,4 +1,7 @@
 import os
+import json
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -38,6 +41,31 @@ def build_offline_model_env(repo_root, source_env=None):
     env = clean_process_env(source_env)
     configure_model_cache_env(env, repo_root=repo_root, offline=True)
     return env
+
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def write_json_file(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def run_logged_command(command, *, cwd, env, log_path):
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("wb") as handle:
+        return subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
 
 
 def _torch():

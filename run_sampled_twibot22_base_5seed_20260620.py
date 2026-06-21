@@ -1,10 +1,8 @@
 import json
-import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
-from runtime_env import build_offline_model_env
+from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
@@ -15,17 +13,12 @@ DATASET = "TwiBot-22-official-prior-sampled-v1"
 SEEDS = [1, 2, 3, 4, 5]
 
 
-def now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat()
-
-
 def clean_env():
     return build_offline_model_env(REPO_ROOT)
 
 
 def write_json(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_file(path, payload)
 
 
 def run_logged(command, log_path, manifest, seed, stage):
@@ -41,16 +34,7 @@ def run_logged(command, log_path, manifest, seed, stage):
         }
     )
     write_json(MANIFEST_PATH, manifest)
-    with log_path.open("wb") as handle:
-        proc = subprocess.run(
-            command,
-            cwd=str(WORK_DIR),
-            env=clean_env(),
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+    proc = run_logged_command(command, cwd=WORK_DIR, env=clean_env(), log_path=log_path)
     manifest["runs"][-1]["finished_at"] = now_iso()
     manifest["runs"][-1]["returncode"] = int(proc.returncode)
     manifest["runs"][-1]["status"] = "completed" if proc.returncode == 0 else "failed"

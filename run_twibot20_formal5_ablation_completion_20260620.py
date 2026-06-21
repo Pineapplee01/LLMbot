@@ -1,12 +1,15 @@
-﻿import json, os, subprocess, sys, time, shutil
-from datetime import datetime, timezone
+﻿import json
+import shutil
+import sys
+import time
 from pathlib import Path
+
+from runtime_env import build_offline_model_env, now_iso, run_logged_command, write_json_file
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
 PYTHON = Path(r"D:\Anaconda\envs\llmbot\python.exe")
 FALLBACK_PYTHON = Path(r"D:\Anaconda\python.exe")
-MODEL_ROOT = REPO_ROOT / "models" / "huggingface"
 LOG_DIR = WORK_DIR / "server_logs"
 CURRENT_QUEUE = WORK_DIR / "experiments" / "sampled_twibot22_official_prior_base5_20260620_queue_manifest.json"
 EXP_ROOT = r"experiments\twibot20_formal5_ablation_completion_20260620"
@@ -39,30 +42,12 @@ BASE_ARGS = [
 ]
 
 
-def now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat()
-
-
 def clean_env():
-    env = {}
-    seen = set()
-    for key, value in os.environ.items():
-        lower = key.lower()
-        if lower in seen:
-            continue
-        seen.add(lower)
-        env["Path" if lower == "path" else key] = value
-    env["HF_HOME"] = str(MODEL_ROOT)
-    env["HF_HUB_CACHE"] = str(MODEL_ROOT / "hub")
-    env["TRANSFORMERS_CACHE"] = str(MODEL_ROOT / "hub")
-    env["HF_HUB_OFFLINE"] = "1"
-    env["TRANSFORMERS_OFFLINE"] = "1"
-    return env
+    return build_offline_model_env(REPO_ROOT)
 
 
 def write_json(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_file(path, payload)
 
 
 MANIFEST_PATH = WORK_DIR / "experiments" / "twibot20_formal5_ablation_completion_20260620_queue_manifest.json"
@@ -103,16 +88,7 @@ def run_logged(command, log_path, manifest, job_name):
     }
     manifest["runs"].append(entry)
     write_json(MANIFEST_PATH, manifest)
-    with log_path.open("wb") as handle:
-        proc = subprocess.run(
-            command,
-            cwd=str(WORK_DIR),
-            env=clean_env(),
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+    proc = run_logged_command(command, cwd=WORK_DIR, env=clean_env(), log_path=log_path)
     entry["finished_at"] = now_iso()
     entry["returncode"] = int(proc.returncode)
     entry["status"] = "completed" if proc.returncode == 0 else "failed"
@@ -350,7 +326,7 @@ def ensure_raw_roberta_embedding(seed, manifest):
     embedding_path = out_dir / "raw_roberta_embeddings.pt"
     if embedding_path.exists():
         return embedding_path
-    snapshot_root = MODEL_ROOT / "hub" / "models--roberta-base" / "snapshots"
+    snapshot_root = REPO_ROOT / "models" / "huggingface" / "hub" / "models--roberta-base" / "snapshots"
     snapshots = sorted(snapshot_root.glob("*")) if snapshot_root.exists() else []
     model_path = snapshots[-1] if snapshots else ""
     cmd = [
@@ -382,7 +358,7 @@ def main():
         "dataset": DATASET,
         "experiment_root": EXP_ROOT,
         "python": str(PYTHON),
-        "model_root": str(MODEL_ROOT),
+        "model_root": str(REPO_ROOT / "models" / "huggingface"),
         "frozen_completion_seeds": FROZEN_COMPLETION_SEEDS,
         "raw_roberta_seeds": RAW_ROBERTA_SEEDS,
         "status": "running",
