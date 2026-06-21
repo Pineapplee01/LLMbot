@@ -223,6 +223,16 @@ print("runtime_env queue helpers ok")
 @'
 import tempfile
 from pathlib import Path
+from run_twibot20_formal5_ablation_completion_20260620 import read_json
+root = Path(tempfile.mkdtemp(prefix="llmbot_formal_json_smoke_"))
+path = root / "payload.json"
+path.write_text('{"status": "completed"}', encoding="utf-8")
+assert read_json(path) == {"status": "completed"}
+print("formal shared json reader smoke ok")
+'@ | python -
+@'
+import tempfile
+from pathlib import Path
 from run_twibot20_full_selective_residual_5seed_20260620 import read_json
 root = Path(tempfile.mkdtemp(prefix="llmbot_read_json_smoke_"))
 path = root / "payload.json"

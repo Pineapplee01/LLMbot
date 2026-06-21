@@ -1,4 +1,3 @@
-﻿import json
 import shutil
 import sys
 import time
@@ -8,6 +7,7 @@ from runtime_env import (
     build_offline_model_env,
     mark_queue_manifest_failed,
     now_iso,
+    read_json_file,
     resolve_botdetection_root,
     resolve_python_executable,
     run_manifest_command,
@@ -56,11 +56,15 @@ def clean_env():
 MANIFEST_PATH = WORK_DIR / "experiments" / "twibot20_formal5_ablation_completion_20260620_queue_manifest.json"
 
 
+def read_json(path):
+    return read_json_file(path)
+
+
 def sampled_queue_finished():
     if not CURRENT_QUEUE.exists():
         return True
     try:
-        status = json.loads(CURRENT_QUEUE.read_text(encoding="utf-8")).get("status")
+        status = read_json(CURRENT_QUEUE).get("status")
     except Exception:
         return False
     return status in {"completed", "failed"}
@@ -73,7 +77,7 @@ def wait_for_current_queue(manifest):
         write_json(MANIFEST_PATH, manifest)
         time.sleep(300)
     if CURRENT_QUEUE.exists():
-        status = json.loads(CURRENT_QUEUE.read_text(encoding="utf-8")).get("status")
+        status = read_json(CURRENT_QUEUE).get("status")
         manifest["wait_dependency_status"] = status
         write_json(MANIFEST_PATH, manifest)
         if status != "completed":
@@ -167,7 +171,7 @@ def generate_routed_masks(seed, manifest):
             # Fallback: inspect all json files for selected_budget.
             for p in stage_dir.rglob("*.json"):
                 try:
-                    obj=json.loads(p.read_text(encoding='utf-8'))
+                    obj = read_json(p)
                 except Exception:
                     continue
                 if str(obj.get('selected_budget','')).replace('.','') in {budget, budget.lstrip('0')} or obj.get('budget_name') == budget:
@@ -198,7 +202,7 @@ def generate_routed_masks(seed, manifest):
 
 
 def materialize_routed_masks_from_risk_manifest(risk_manifest, inputs_dir, seed):
-    payload = json.loads(Path(risk_manifest).read_text(encoding="utf-8"))
+    payload = read_json(risk_manifest)
     selected = payload.get("selected_nodes_by_budget") or {}
     key_map = {
         "050": "budget_050",
@@ -259,7 +263,7 @@ def make_empty_mask(path, seed):
 
 
 def make_shuffled_mask(src, dst, seed):
-    obj = json.loads(src.read_text(encoding="utf-8"))
+    obj = read_json(src)
     import random
     rng = random.Random(int(seed) + 20260620)
     # Preserve split sizes but replace selected ids with same-split random nodes.
