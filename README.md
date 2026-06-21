@@ -26,6 +26,19 @@ Preferred public flags:
 - `--routed_nodes_path`
 - `--finetuned_roberta_checkpoint_path`
 
+## Local Model Cache
+
+Local model downloads and HuggingFace/Transformers caches must stay under the
+parent workspace model root:
+
+- `HF_HOME=G:\Research\BotDetection\models\huggingface`
+- `HF_HUB_CACHE=G:\Research\BotDetection\models\huggingface\hub`
+- `TRANSFORMERS_CACHE=G:\Research\BotDetection\models\huggingface\hub`
+
+Queue and launch scripts should call `runtime_env.build_offline_model_env(...)`
+instead of reimplementing these variables. This keeps local Windows runs,
+server-sync scripts, and offline smoke checks on the same cache contract.
+
 GLANCE prompt-cache precompute entry:
 
 ```bash

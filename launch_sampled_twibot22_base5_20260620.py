@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from runtime_env import build_offline_model_env
+
 
 repo_root = Path(r"G:\Research\BotDetection")
 work_dir = repo_root / "LLMbot"
@@ -14,21 +16,7 @@ pid_path = log_dir / "sampled_twibot22_official_prior_base5_20260620_queue.pid"
 
 
 def clean_env():
-    env = {}
-    seen = set()
-    for key, value in os.environ.items():
-        lower = key.lower()
-        if lower in seen:
-            continue
-        seen.add(lower)
-        canonical = "Path" if lower == "path" else key
-        env[canonical] = value
-    env["HF_HOME"] = str(repo_root / "models" / "huggingface")
-    env["HF_HUB_CACHE"] = str(repo_root / "models" / "huggingface" / "hub")
-    env["TRANSFORMERS_CACHE"] = str(repo_root / "models" / "huggingface" / "hub")
-    env["HF_HUB_OFFLINE"] = "1"
-    env["TRANSFORMERS_OFFLINE"] = "1"
-    return env
+    return build_offline_model_env(repo_root)
 
 
 with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:

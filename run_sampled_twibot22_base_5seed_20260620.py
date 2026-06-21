@@ -5,11 +5,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from runtime_env import build_offline_model_env
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
 PYTHON = Path(r"D:\Anaconda\envs\llmbot\python.exe")
-MODEL_ROOT = REPO_ROOT / "models" / "huggingface"
 LOG_DIR = WORK_DIR / "server_logs"
 EXPERIMENT_NAME = r"experiments\sampled_twibot22_official_prior_base5_20260620"
 DATASET = "TwiBot-22-official-prior-sampled-v1"
@@ -21,20 +21,7 @@ def now_iso():
 
 
 def clean_env():
-    env = {}
-    seen = set()
-    for key, value in os.environ.items():
-        lower = key.lower()
-        if lower in seen:
-            continue
-        seen.add(lower)
-        env["Path" if lower == "path" else key] = value
-    env["HF_HOME"] = str(MODEL_ROOT)
-    env["HF_HUB_CACHE"] = str(MODEL_ROOT / "hub")
-    env["TRANSFORMERS_CACHE"] = str(MODEL_ROOT / "hub")
-    env["HF_HUB_OFFLINE"] = "1"
-    env["TRANSFORMERS_OFFLINE"] = "1"
-    return env
+    return build_offline_model_env(REPO_ROOT)
 
 
 def write_json(path, payload):
@@ -83,7 +70,7 @@ def main():
         "dataset": DATASET,
         "experiment_name": EXPERIMENT_NAME,
         "python": str(PYTHON),
-        "model_root": str(MODEL_ROOT),
+        "model_root": str(REPO_ROOT / "models" / "huggingface"),
         "seeds": SEEDS,
         "stages": ["semantic_encoder_finetune", "graph_detector_prepare"],
         "notes": "Full-text/drop-no-tweet sampled TwiBot-22 base 5-seed queue. Uses local G: model cache in offline mode.",

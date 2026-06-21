@@ -8,6 +8,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from runtime_env import build_offline_model_env
+
 
 REPO_ROOT = Path(r"G:\Research\BotDetection")
 ACTIVE_ROOT = REPO_ROOT / "LLMbot"
@@ -85,20 +87,8 @@ def now_iso():
 
 
 def clean_env():
-    env = {}
-    seen = set()
-    for key, value in os.environ.items():
-        lower = key.lower()
-        if lower in seen:
-            continue
-        seen.add(lower)
-        env["Path" if lower == "path" else key] = value
+    env = build_offline_model_env(REPO_ROOT)
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    env["HF_HOME"] = str(MODEL_ROOT)
-    env["HF_HUB_CACHE"] = str(MODEL_ROOT / "hub")
-    env["TRANSFORMERS_CACHE"] = str(MODEL_ROOT / "hub")
-    env["HF_HUB_OFFLINE"] = "1"
-    env["TRANSFORMERS_OFFLINE"] = "1"
     env["WANDB_MODE"] = "disabled"
     env["WANDB_DISABLED"] = "true"
     env["WANDB_SILENT"] = "true"

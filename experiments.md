@@ -14,6 +14,10 @@ server runs reproducible without scattering one-off timestamped directories.
 - Record every server run here before or immediately after launch.
 - Keep commands runnable from `/root/workspace/LMbot/LLMbot`.
 - Keep artifact roots, manifest paths, metrics paths, and status explicit.
+- For local Windows queue/launch scripts, keep HuggingFace and Transformers
+  caches under `G:\Research\BotDetection\models\huggingface` by using
+  `runtime_env.build_offline_model_env(...)` instead of reimplementing
+  `HF_HOME`, `HF_HUB_CACHE`, and `TRANSFORMERS_CACHE` per script.
 - Do not move old artifact directories unless the user explicitly asks for
   archival cleanup; old paths may be referenced by manifests.
 - For frozen SimTeG comparisons, reuse the high-base seed-1 baseline unless the
