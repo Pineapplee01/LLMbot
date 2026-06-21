@@ -151,12 +151,55 @@ Conda layout. Do not add per-script `D:\Anaconda\...` rewrites; reuse
 `runtime_env.resolve_python_executable(...)` so queue manifests record the
 resolved interpreter consistently.
 
+## Local PowerShell Runtime
+
+Windows launcher scripts default to the existing Windows PowerShell path:
+
+- `C:\windows\System32\WindowsPowerShell\v1.0\powershell.exe`
+
+Set `LLMBOT_POWERSHELL` to override that executable for another Windows image or
+for PowerShell Core (`pwsh`). Do not hardcode launcher-specific PowerShell
+paths; reuse `runtime_env.resolve_powershell_executable(...)` so launchers can
+fail fast with an actionable override hint before queue execution starts.
+
 ## Validation Commands
 
-Run these checks after queue-helper, runbook, or report-helper changes:
+Run these checks sequentially after queue-helper, runbook, or report-helper
+changes:
 
 ```powershell
 python -m py_compile runtime_env.py launch_sampled_twibot22_base5_20260620.py run_sampled_twibot22_base_5seed_20260620.py run_twibot20_formal5_ablation_completion_20260620.py run_twibot20_full_selective_residual_5seed_20260620.py extract_raw_roberta_embeddings_20260620.py summarize_formal_runs_20260620.py
+@'
+from pathlib import Path
+from runtime_env import resolve_powershell_executable
+assert resolve_powershell_executable(source_env={"LLMBOT_POWERSHELL": r"C:\Tools\pwsh.exe"}) == Path(r"C:\Tools\pwsh.exe")
+fallback = resolve_powershell_executable(default_path=r"Z:\missing\powershell.exe", source_env={}, which_func=lambda name: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" if name == "powershell.exe" else None)
+assert str(fallback).endswith("powershell.exe")
+try:
+    resolve_powershell_executable(default_path=r"Z:\missing\powershell.exe", source_env={}, which_func=lambda name: None)
+except FileNotFoundError as exc:
+    assert "LLMBOT_POWERSHELL" in str(exc)
+else:
+    raise AssertionError("expected missing PowerShell to fail fast")
+print("powershell resolver smoke ok")
+'@ | python -
+@'
+import importlib
+import os
+import tempfile
+from pathlib import Path
+root = Path(tempfile.mkdtemp(prefix="llmbot_launcher_smoke_"))
+os.environ["BOTDETECTION_ROOT"] = str(root)
+module = importlib.import_module("launch_sampled_twibot22_base5_20260620")
+module.resolve_powershell_executable = lambda: (_ for _ in ()).throw(FileNotFoundError("missing powershell"))
+try:
+    module.main()
+except FileNotFoundError:
+    assert not module.log_dir.exists()
+else:
+    raise AssertionError("expected launcher to fail before log creation")
+print("launcher fail-fast smoke ok")
+'@ | python -
 @'
 import importlib
 import os

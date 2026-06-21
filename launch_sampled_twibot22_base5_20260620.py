@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from runtime_env import build_offline_model_env, resolve_botdetection_root
+from runtime_env import build_offline_model_env, resolve_botdetection_root, resolve_powershell_executable
 
 
 repo_root = resolve_botdetection_root()
@@ -18,11 +18,12 @@ def clean_env():
 
 
 def main():
+    powershell = resolve_powershell_executable()
     log_dir.mkdir(parents=True, exist_ok=True)
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         proc = subprocess.Popen(
             [
-                r"C:\windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                str(powershell),
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",

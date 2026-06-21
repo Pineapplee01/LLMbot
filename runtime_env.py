@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,34 @@ def resolve_python_executable(default_path, *, env_var="LLMBOT_PYTHON", source_e
         source_env = os.environ
     override = source_env.get(env_var)
     return Path(override) if override else Path(default_path)
+
+
+def resolve_powershell_executable(
+    default_path=r"C:\windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    *,
+    env_var="LLMBOT_POWERSHELL",
+    source_env=None,
+    which_func=shutil.which,
+):
+    """Resolve the PowerShell launcher executable with an environment override."""
+    if source_env is None:
+        source_env = os.environ
+    override = source_env.get(env_var)
+    if override:
+        return Path(override)
+
+    default = Path(default_path)
+    if default.exists():
+        return default
+
+    for name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        candidate = which_func(name)
+        if candidate:
+            return Path(candidate)
+
+    raise FileNotFoundError(
+        f"Could not find PowerShell. Set {env_var} to powershell.exe or pwsh."
+    )
 
 
 def resolve_botdetection_root(default_path=r"G:\Research\BotDetection", *, env_var="BOTDETECTION_ROOT", source_env=None):
