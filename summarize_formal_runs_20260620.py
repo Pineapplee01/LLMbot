@@ -9,10 +9,6 @@ REPO_ROOT = Path(r"G:\Research\BotDetection")
 WORK_DIR = REPO_ROOT / "LLMbot"
 
 
-def read_json(path):
-    return read_json_file(path, default=None)
-
-
 def mean_std(values):
     vals = [float(v) for v in values if v is not None]
     if not vals:
@@ -30,8 +26,8 @@ def summarize_sampled_twibot22_base():
     for seed in range(1, 6):
         metrics_path = root / f"seed_{seed}" / "preparation" / "graph_detector" / "selection_metrics.json"
         semantic_path = root / f"seed_{seed}" / "preparation" / "semantic_encoder" / "metrics.json"
-        metrics = read_json(metrics_path)
-        semantic = read_json(semantic_path)
+        metrics = read_json_file(metrics_path, default=None)
+        semantic = read_json_file(semantic_path, default=None)
         if metrics is None:
             rows.append({"dataset": "sampled_twibot22", "seed": seed, "status": "missing"})
             continue
@@ -72,7 +68,7 @@ def summarize_twibot20_completion_rows():
     variant_dirs = sorted(root.glob("*_seed*")) if root.exists() else []
     for variant_dir in variant_dirs:
         for metrics_path in variant_dir.glob("seed_*/preparation/graph_detector/selection_metrics.json"):
-            metrics = read_json(metrics_path)
+            metrics = read_json_file(metrics_path, default=None)
             if not metrics:
                 continue
             seed_dir = metrics_path.parents[2]
