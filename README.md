@@ -15,6 +15,21 @@ For experiment operations, queue scripts, local model-cache setup, and
 validation commands, start with `experiment_runbook.md`, then use
 `experiments.md` for the active queue index and detailed run records.
 
+## Reader Map
+
+Use this file as the active-mainline overview, not as the sole source for every
+operation or experiment record.
+
+- Operators: read `Entry Point`, `Local Model Cache`, `Command Examples`, and
+  `experiment_runbook.md`.
+- Experiment maintainers: read `experiment_runbook.md` first, then
+  `experiments.md` for queue status, manifests, and generated-output
+  contracts.
+- Code maintainers: start with `Mainline Layout`, `Current Mainline Notes`,
+  `Next Refactor Plan`, and `AGENTS.md`.
+- Paper/NLPCC writers: use the parent `NLPCC/` docs for paper-facing structure
+  before citing any experiment evidence from this directory.
+
 Preferred public flags:
 
 - `--experiment_task`

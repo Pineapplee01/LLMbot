@@ -7,6 +7,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+DEFAULT_BOTDETECTION_ROOT = r"G:\Research\BotDetection"
+DEFAULT_POWERSHELL_PATH = r"C:\windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+MODEL_CACHE_PARTS = ("models", "huggingface")
+OFFLINE_MODEL_ENV_FLAGS = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+}
+
+
 def clean_process_env(source_env=None):
     """Return an environment dict with case-insensitive duplicate keys removed."""
     if source_env is None:
@@ -25,14 +34,13 @@ def clean_process_env(source_env=None):
 def configure_model_cache_env(env, repo_root, *, offline=True):
     """Configure HuggingFace cache variables under the BotDetection model root."""
     repo_root = Path(repo_root)
-    hf_home = repo_root / "models" / "huggingface"
+    hf_home = repo_root.joinpath(*MODEL_CACHE_PARTS)
     hf_hub_cache = hf_home / "hub"
     env["HF_HOME"] = str(hf_home)
     env["HF_HUB_CACHE"] = str(hf_hub_cache)
     env["TRANSFORMERS_CACHE"] = str(hf_hub_cache)
     if offline:
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
+        env.update(OFFLINE_MODEL_ENV_FLAGS)
     return {
         "hf_home": hf_home,
         "hf_hub_cache": hf_hub_cache,
@@ -55,7 +63,7 @@ def resolve_python_executable(default_path, *, env_var="LLMBOT_PYTHON", source_e
 
 
 def resolve_powershell_executable(
-    default_path=r"C:\windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    default_path=DEFAULT_POWERSHELL_PATH,
     *,
     env_var="LLMBOT_POWERSHELL",
     source_env=None,
@@ -82,7 +90,12 @@ def resolve_powershell_executable(
     )
 
 
-def resolve_botdetection_root(default_path=r"G:\Research\BotDetection", *, env_var="BOTDETECTION_ROOT", source_env=None):
+def resolve_botdetection_root(
+    default_path=DEFAULT_BOTDETECTION_ROOT,
+    *,
+    env_var="BOTDETECTION_ROOT",
+    source_env=None,
+):
     """Resolve the parent BotDetection workspace root with an environment override."""
     if source_env is None:
         source_env = os.environ

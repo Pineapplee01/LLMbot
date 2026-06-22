@@ -12,6 +12,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from runtime_env import (
+    DEFAULT_BOTDETECTION_ROOT,
     build_offline_model_env,
     mark_queue_manifest_failed,
     resolve_powershell_executable,
@@ -19,6 +20,14 @@ from runtime_env import (
     write_csv_rows_file,
 )
 
+
+EXPECTED_OFFLINE_ENV_KEYS = [
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_CACHE",
+    "TRANSFORMERS_OFFLINE",
+]
 
 PY_COMPILE_TARGETS = [
     "runtime_env.py",
@@ -68,14 +77,8 @@ def check_powershell_resolver():
 
 
 def check_offline_env_empty_source_isolated():
-    env = build_offline_model_env(Path(r"G:\Research\BotDetection"), source_env={})
-    assert sorted(env) == [
-        "HF_HOME",
-        "HF_HUB_CACHE",
-        "HF_HUB_OFFLINE",
-        "TRANSFORMERS_CACHE",
-        "TRANSFORMERS_OFFLINE",
-    ]
+    env = build_offline_model_env(Path(DEFAULT_BOTDETECTION_ROOT), source_env={})
+    assert sorted(env) == EXPECTED_OFFLINE_ENV_KEYS
     assert env["HF_HOME"].endswith(r"models\huggingface")
 
 
@@ -216,7 +219,7 @@ def check_csv_helpers():
 def check_manifest_command_helpers():
     root = Path(tempfile.mkdtemp(prefix="llmbot_manifest_smoke_"))
     manifest = {"runs": []}
-    env = build_offline_model_env(Path(r"G:\Research\BotDetection"))
+    env = build_offline_model_env(Path(DEFAULT_BOTDETECTION_ROOT))
     proc = run_manifest_command(
         [sys.executable, "-c", "print('ok')"],
         cwd=Path.cwd(),
