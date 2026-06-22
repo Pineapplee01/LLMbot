@@ -84,7 +84,9 @@ Out of scope:
 ## Completion Notes
 
 - Current nested `LLMbot` branch: `codex-llmbot-experiment-refactor`.
-- Last verified nested commit at this checkpoint: `fa05829`.
+- Last verified code-changing commit at this checkpoint: `fa05829`.
+- Documentation-only closeout commits may follow that validation checkpoint;
+  the parent BotDetection gitlink records the selected child branch HEAD.
 - Completed helper-refactor scope includes the consolidated dry-validation
   entry point, schema-driven CSV writing, shared JSON/process/manifest helpers,
   and import-safe support-script validation.
