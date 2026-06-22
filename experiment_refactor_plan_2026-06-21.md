@@ -96,6 +96,6 @@ Out of scope:
   `python check_experiment_helpers_20260620.py`, targeted import-safety probes,
   `python main.py --help`, and `git diff --check`.
 - No queue, training, report-refresh, or evidence-generation command was run for this refactor plan.
-- Parent BotDetection gitlink must be updated by the parent repository after
-  the nested `LLMbot` refactor branch is selected; do not treat evidence-zone
-  files as part of that parent-level sync.
+- Parent BotDetection records the selected child branch HEAD through the
+  parent-level `LLMbot` gitlink; do not treat evidence-zone files as part of
+  that parent-level sync.
