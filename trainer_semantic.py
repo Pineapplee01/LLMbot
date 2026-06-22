@@ -10,12 +10,16 @@ from torch_geometric.nn.models import MLP
 from model_building import _labels_to_index, build_LM_model
 from runtime_env import _max_cuda_memory_allocated, _reset_cuda_peak_memory_stats, _resolve_device
 from trainer_semantic_features import (
+    _build_graph_attribute_features,
+    _build_semantic_gate_node_attribute_features,
     _build_text_attribute_features,
     _char_ratio_feature,
     _log1p_feature,
     _none_like_text,
     _parse_bool_feature,
+    _resolve_gate_edge_tensors,
     _safe_float_feature,
+    _standardize_attribute_features,
     _split_norm_user_text,
 )
 from trainer_semantic_models import _SemanticBreakRiskHead, _SemanticCorrectionDeferGate, _SemanticCorrectionGate
@@ -674,115 +678,6 @@ def _binary_prob_summary(prob, pred):
         ],
         dim=1,
     )
-
-
-def _resolve_gate_edge_tensors(data):
-    if "edge_index" in data and "edge_type" in data:
-        return data["edge_index"], data["edge_type"], "data"
-    dataset_path = Path(data.get("dataset_path", ""))
-    edge_index_path = dataset_path / "edge_index.pt"
-    edge_type_path = dataset_path / "edge_type.pt"
-    if edge_index_path.exists() and edge_type_path.exists():
-        return safe_torch_load(edge_index_path, map_location="cpu"), safe_torch_load(edge_type_path, map_location="cpu"), "dataset_labeled_graph"
-    return None, None, "missing"
-
-
-def _build_graph_attribute_features(data, row_count):
-    names = [
-        "graph_following_log1p",
-        "graph_follower_log1p",
-        "graph_has_following",
-        "graph_has_follower",
-        "graph_total_degree_log1p",
-        "graph_following_follower_log_ratio",
-        "graph_reciprocal_ratio",
-        "graph_neighbor_activity_log1p",
-        "graph_isolated",
-    ]
-    matrix = torch.zeros((int(row_count), len(names)), dtype=torch.float32)
-    edge_index, edge_type, source = _resolve_gate_edge_tensors(data)
-    if edge_index is None or edge_type is None:
-        return matrix, names, {"graph_attribute_source": source, "graph_attribute_available": False}
-    edge_index = edge_index.detach().cpu().long()
-    edge_type = edge_type.detach().cpu().long().reshape(-1)
-    if edge_index.dim() != 2 or edge_index.shape[0] != 2 or edge_type.numel() != edge_index.shape[1]:
-        return matrix, names, {"graph_attribute_source": source, "graph_attribute_available": False, "graph_attribute_error": "invalid_edge_shape"}
-    src = edge_index[0].clamp_min(0)
-    dst = edge_index[1].clamp_min(0)
-    valid = (src < int(row_count)) & (dst < int(row_count))
-    src = src[valid]
-    dst = dst[valid]
-    rel = edge_type[valid]
-    following_mask = rel == 1
-    follower_mask = rel == 0
-    following = torch.bincount(src[following_mask], minlength=int(row_count)).float()
-    follower = torch.bincount(dst[follower_mask], minlength=int(row_count)).float()
-    out_all = torch.bincount(src, minlength=int(row_count)).float()
-    in_all = torch.bincount(dst, minlength=int(row_count)).float()
-    total = out_all + in_all
-    neighbor_sum = torch.zeros(int(row_count), dtype=torch.float32)
-    if src.numel():
-        neighbor_total = total
-        neighbor_sum.index_add_(0, src, neighbor_total[dst])
-        neighbor_sum.index_add_(0, dst, neighbor_total[src])
-    neighbor_mean = neighbor_sum / total.clamp_min(1.0)
-    neighbor_sets = [set() for _ in range(int(row_count))]
-    for s, d in zip(src.tolist(), dst.tolist()):
-        neighbor_sets[int(s)].add(int(d))
-    reciprocal = torch.zeros(int(row_count), dtype=torch.float32)
-    for node_idx, neighbors in enumerate(neighbor_sets):
-        if not neighbors:
-            continue
-        reciprocal_count = sum(1 for nbr in neighbors if node_idx in neighbor_sets[nbr])
-        reciprocal[node_idx] = float(reciprocal_count) / float(len(neighbors))
-    matrix = torch.stack(
-        [
-            torch.log1p(following),
-            torch.log1p(follower),
-            (following > 0).float(),
-            (follower > 0).float(),
-            torch.log1p(total),
-            torch.log1p(following) - torch.log1p(follower),
-            reciprocal,
-            torch.log1p(neighbor_mean),
-            (total == 0).float(),
-        ],
-        dim=1,
-    ).float()
-    return matrix, names, {
-        "graph_attribute_source": source,
-        "graph_attribute_available": True,
-        "edge_count_used": int(src.numel()),
-    }
-
-
-def _standardize_attribute_features(features, train_idx):
-    train_idx = _as_long_cpu_tensor(train_idx)
-    reference = features[train_idx] if train_idx.numel() else features
-    mean = reference.mean(dim=0, keepdim=True)
-    std = reference.std(dim=0, keepdim=True, unbiased=False)
-    std = torch.where(std < 1e-6, torch.ones_like(std), std)
-    normalized = ((features - mean) / std).clamp(-10.0, 10.0)
-    return normalized.float(), {
-        "normalization": "train_zscore_clamped_10",
-        "mean": mean.reshape(-1).tolist(),
-        "std": std.reshape(-1).tolist(),
-    }
-
-
-def _build_semantic_gate_node_attribute_features(data, train_idx, row_count):
-    text_features, text_names = _build_text_attribute_features(data.get("user_text", []), row_count)
-    graph_features, graph_names, graph_meta = _build_graph_attribute_features(data, row_count)
-    raw = torch.cat([text_features, graph_features], dim=1).float()
-    features, norm_meta = _standardize_attribute_features(raw, train_idx)
-    names = list(text_names) + list(graph_names)
-    return features, names, {
-        "feature_source": "norm_user_text_plus_labeled_graph",
-        "raw_feature_dim": int(raw.shape[1]),
-        "feature_names": names,
-        **graph_meta,
-        **norm_meta,
-    }
 
 
 def _build_semantic_gate_features(

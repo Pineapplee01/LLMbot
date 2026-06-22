@@ -2170,9 +2170,10 @@ active naming surface.
   prefit-refinement orchestration, and manifest-matching entrypoints.
 - Semantic gate/head model classes now belong in
   `trainer_semantic_models.py`; semantic text attribute feature parsing now
-  belongs in `trainer_semantic_features.py`; `trainer_semantic.py` keeps
-  semantic stage orchestration, graph/local-competence feature construction,
-  training loops, and artifact writes.
+  belongs in `trainer_semantic_features.py`, along with graph node-attribute
+  feature construction; `trainer_semantic.py` keeps semantic stage
+  orchestration, local-competence feature construction, training loops, and
+  artifact writes.
 - `trainer_legacy_impl.py`, `trainer_glance.py`, `precompute.py`,
   `estimators.py`, and `trainer_preparation.py` remain the largest refactor
   hotspots; use `docs/ARCHITECTURE.md` before moving code across them.
@@ -2252,9 +2253,9 @@ not yet finished the implementation extraction phase.
    keeping public entrypoints stable.
 2. Make `trainer_semantic.py` the real owner of semantic finetune execution.
    Semantic gate/head model classes now live in `trainer_semantic_models.py`;
-   text attribute feature builders now live in `trainer_semantic_features.py`;
-   next extract graph/local-competence feature builders or stage entrypoints
-   without moving artifact writes across the boundary.
+   node-attribute feature builders now live in `trainer_semantic_features.py`;
+   next extract local-competence feature builders or stage entrypoints without
+   moving artifact writes across the boundary.
 3. Finish the active parser-namespace migration inside code.
    Keep legacy flags parse-compatible, but make active mainline code read
    canonical fields such as `experiment_task`, `graph_backbone`,
