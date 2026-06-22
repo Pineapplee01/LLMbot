@@ -74,17 +74,15 @@ from estimators import (
     stage2_acceptance_gate,
 )
 from artifact_contracts import (
-    MissingFrozenArtifactError as _contract_missing_frozen_artifact_error,
-    PHASE_A_CONTRACT as _contract_phase_a_contract,
-    PHASE_A_DISABLED_COMPONENTS as _contract_phase_a_disabled_components,
-    canonical_stage_name as _contract_canonical_stage_name,
-    canonical_stage_dir as _contract_canonical_stage_dir,
-    legacy_stage_dir as _contract_legacy_stage_dir,
-    stage_dir_read_candidates as _contract_stage_dir_read_candidates,
-    stage_artifact_reference as _contract_stage_artifact_reference,
-    preparation_artifact_reference as _contract_preparation_artifact_reference,
-    split_provenance as _contract_split_provenance,
-    frozen_g0_dir as _contract_frozen_g0_dir,
+    MissingFrozenArtifactError,
+    PHASE_A_CONTRACT,
+    PHASE_A_DISABLED_COMPONENTS,
+    canonical_stage_name as _canonical_stage_name,
+    canonical_stage_dir as _canonical_stage_dir,
+    stage_artifact_reference as _stage_artifact_reference,
+    preparation_artifact_reference as _preparation_artifact_reference,
+    split_provenance,
+    frozen_g0_dir,
 )
 
 try:
@@ -132,15 +130,6 @@ from trainer_semantic import (
 )
 
 
-PHASE_A_CONTRACT = "phase_a_semantic_source_x_gnn_backbone"
-PHASE_A_DISABLED_COMPONENTS = {
-    "estimator_mode": "none",
-    "semantic_mode": "off",
-    "repair_mode": "noop",
-    "selector_mode": "none",
-    "appendix_mode": "none",
-}
-
 FROZEN_G0_CONTRACT = "frozen_g0_v1"
 GATS_GATE_NAME = "gats_faithful"
 GATS_CONTRACT = "faithful_gats_anchor_v1"
@@ -181,43 +170,6 @@ CANONICAL_TO_LEGACY_STAGE = {
     "glance_refiner_analysis_internal": "glance_refiner_analysis",
     "phase_a_single_cell_internal": "phase_a_single_cell_internal",
 }
-
-
-class MissingFrozenArtifactError(RuntimeError):
-    pass
-
-
-def _canonical_stage_name(stage_name):
-    return resolve_stage_name(stage_name)
-
-
-def _canonical_stage_dir(root, stage_name):
-    return Path(root) / "stages" / _canonical_stage_name(stage_name)
-
-
-def _legacy_stage_dir(root, stage_name):
-    legacy_stage = _legacy_stage_name(stage_name)
-    return Path(root) / "stages" / legacy_stage
-
-
-def _stage_dir_read_candidates(root, stage_name):
-    canonical_dir = _canonical_stage_dir(root, stage_name)
-    legacy_dir = _legacy_stage_dir(root, stage_name)
-    candidates = [canonical_dir]
-    if legacy_dir != canonical_dir:
-        candidates.append(legacy_dir)
-    return candidates
-
-
-def _stage_artifact_reference(stage_name, filename):
-    stage_name = _canonical_stage_name(stage_name)
-    suffix = filename if "." in str(filename) else f"{filename}.json"
-    return f"stages/{stage_name}/{suffix}"
-
-
-def _preparation_artifact_reference(namespace, filename):
-    suffix = filename if "." in str(filename) else f"{filename}.json"
-    return f"preparation/{namespace}/{suffix}"
 
 
 class StructuralConflictRGCN(nn.Module):
@@ -294,6 +246,20 @@ def _legacy_stage_name(stage_name):
     return CANONICAL_TO_LEGACY_STAGE.get(resolved, resolved)
 
 
+def _legacy_stage_dir(root, stage_name):
+    legacy_stage = _legacy_stage_name(stage_name)
+    return Path(root) / "stages" / legacy_stage
+
+
+def _stage_dir_read_candidates(root, stage_name):
+    canonical_dir = _canonical_stage_dir(root, stage_name)
+    legacy_dir = _legacy_stage_dir(root, stage_name)
+    candidates = [canonical_dir]
+    if legacy_dir != canonical_dir:
+        candidates.append(legacy_dir)
+    return candidates
+
+
 def _as_long_cpu_tensor(idx):
     if idx is None:
         return torch.empty(0, dtype=torch.long)
@@ -306,27 +272,6 @@ def count_trainable_parameters(module):
     if module is None:
         return 0
     return int(sum(param.numel() for param in module.parameters() if param.requires_grad))
-
-
-def split_provenance(data):
-    return {
-        "train": {
-            "size": int(_idx_tensor(data["train_idx"]).numel()),
-            "sha256": tensor_sha256(_idx_tensor(data["train_idx"])),
-        },
-        "valid": {
-            "size": int(_idx_tensor(data["valid_idx"]).numel()),
-            "sha256": tensor_sha256(_idx_tensor(data["valid_idx"])),
-        },
-        "test": {
-            "size": int(_idx_tensor(data["test_idx"]).numel()),
-            "sha256": tensor_sha256(_idx_tensor(data["test_idx"])),
-        },
-    }
-
-
-def frozen_g0_dir(experiment_root):
-    return ensure_dir(build_preparation_dir(experiment_root, "graph_detector"))
 
 
 def _is_better(candidate, incumbent):
@@ -3141,17 +3086,6 @@ def run_legacy_graph_seed(args, seed, data, run, runtime_paths=None):
 # Compatibility rebinding: active preparation and semantic owners now live in
 # dedicated modules. Keep legacy names stable for StageRunner while routing
 # runtime behavior through the extracted implementations.
-MissingFrozenArtifactError = _contract_missing_frozen_artifact_error
-PHASE_A_CONTRACT = _contract_phase_a_contract
-PHASE_A_DISABLED_COMPONENTS = _contract_phase_a_disabled_components
-_canonical_stage_name = _contract_canonical_stage_name
-_canonical_stage_dir = _contract_canonical_stage_dir
-_legacy_stage_dir = _contract_legacy_stage_dir
-_stage_dir_read_candidates = _contract_stage_dir_read_candidates
-_stage_artifact_reference = _contract_stage_artifact_reference
-_preparation_artifact_reference = _contract_preparation_artifact_reference
-split_provenance = _contract_split_provenance
-frozen_g0_dir = _contract_frozen_g0_dir
 _resolve_device = _runtime_resolve_device
 _set_cuda_device = _runtime_set_cuda_device
 _reset_cuda_peak_memory_stats = _runtime_reset_cuda_peak_memory_stats

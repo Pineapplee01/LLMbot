@@ -2130,9 +2130,14 @@ Root-level modules are the default implementation surface:
 - `stage_registry.py` - stage visibility and naming source of truth
 - `trainer.py` - thin compatibility facade
 - `trainer_legacy_impl.py` - current large implementation body during the migration window
-- `stage_runner.py`, `trainer_preparation.py`, `trainer_semantic.py`, `trainer_graph.py`, `trainer_glance.py`, `stage_helpers.py` - new canonical module surfaces for continued extraction
+- `stage_runner.py`, `trainer_preparation.py`, `trainer_semantic.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
+- `artifact_contracts.py`, `runtime_env.py` - shared artifact/path/provenance and runtime-helper owners used during extraction
 - `estimators.py`, `operators.py`, `model_building.py` - estimator/operator/model construction
 - `utils/` - artifact IO, manifests, metrics, calibration, data loading, and reproducibility helpers
+
+For the full module responsibility and dependency map, use
+`docs/ARCHITECTURE.md`. Keep this README as the operator/mainline overview;
+architecture ownership and import-direction decisions belong in that file.
 
 ## Artifact Naming
 
@@ -2153,9 +2158,11 @@ active naming surface.
 - `trainer.py` is already a thin compatibility facade, but most execution logic
   still lives in `trainer_legacy_impl.py`.
 - `stage_runner.py`, `trainer_preparation.py`, `trainer_semantic.py`,
-  `trainer_graph.py`, `trainer_glance.py`, and `stage_helpers.py` already act
-  as canonical import surfaces, but most still forward into
+  `trainer_graph.py`, and `trainer_glance.py` already act as canonical import
+  surfaces, but most still forward into
   `trainer_legacy_impl.py` while extraction continues.
+- Shared path/provenance helpers now belong in `artifact_contracts.py`; shared
+  environment and queue/runtime helpers belong in `runtime_env.py`.
 - `estimators.py` and `trainer_legacy_impl.py` remain the main refactor
   hotspots.
 - `python main.py --help` is now intended to work as a parser-only check even if
@@ -2227,8 +2234,8 @@ not yet finished the implementation extraction phase.
 
 1. Make `trainer_preparation.py` the real owner of preparation logic.
    Move `load_frozen_g0`, `build_or_load_frozen_g0`, and
-   `build_or_load_faithful_gats` out of `trainer_legacy_impl.py`, and move
-   shared path/provenance helpers into `stage_helpers.py`.
+   `build_or_load_faithful_gats` out of `trainer_legacy_impl.py`, while
+   keeping shared path/provenance helpers in `artifact_contracts.py`.
 2. Make `trainer_semantic.py` the real owner of semantic finetune execution.
    Move `run_semantic_finetune_seed` and its manifest/report helpers out of
    `trainer_legacy_impl.py`.

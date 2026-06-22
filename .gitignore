@@ -18,6 +18,10 @@
 !/*.py
 !/*.md
 
+# Active architecture docs.
+!docs/
+!docs/*.md
+
 # Active utility package.
 !utils/
 !utils/**
