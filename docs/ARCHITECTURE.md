@@ -37,8 +37,8 @@ helpers.
 | `trainer_preparation.py` | Graph detector/GATS artifact creation, graph refinement orchestration, manifest matching, and training entrypoints | `GNNs`, `hypergnn`, `model_building`, `artifact_contracts`, `trainer_preparation_artifacts`, `trainer_preparation_refinement` | Artifact/gate loading and pure graph-refinement helpers now have owners; prefit-training refinement remains here until its training boundary is split. |
 | `trainer_preparation_artifacts.py` | Preparation artifact and faithful-gate path resolution, manifest loading, and read compatibility | `artifact_contracts`, `stage_registry`, `utils` | Keep pure I/O and contract checks here; no training or graph-refinement logic. |
 | `trainer_preparation_refinement.py` | Routed-node parsing, graph-refinement proxy wrappers, directional prune, and external graph override helpers | `artifact_contracts`, `hypergnn`, `utils` | Keep pure graph transformation/request helpers here; no GNN training loops or artifact writes. |
-| `trainer_semantic.py` | Semantic finetune, embedding classifier, semantic correction gate orchestration | `model_building`, `runtime_env`, `trainer_semantic_features`, `trainer_semantic_models`, `utils` | Semantic model classes and node-attribute feature builders now have owners; next split local-competence features or stage entrypoints. |
-| `trainer_semantic_features.py` | Semantic node-attribute feature parsing, graph-degree features, and feature normalization | `torch`, `utils.safe_torch_load` | Keep feature construction here; read edge tensors only for feature inputs, and do not add stage IO, artifact writes, CLI policy, or training loops. |
+| `trainer_semantic.py` | Semantic finetune, embedding classifier, semantic correction gate orchestration | `model_building`, `runtime_env`, `trainer_semantic_features`, `trainer_semantic_models`, `utils` | Semantic model classes and feature builders now have owners; next split stage entrypoints. |
+| `trainer_semantic_features.py` | Semantic text/node/action feature construction, graph-degree features, local competence features, and feature normalization | `torch`, `utils.safe_torch_load` | Keep feature construction here; read edge tensors only for feature inputs, and do not add stage IO, artifact writes, CLI policy, or optimizer loops. |
 | `trainer_semantic_models.py` | Semantic correction gate, defer gate, and break-risk head model classes | `torch` | Keep semantic model definitions here; no stage IO, artifacts, or CLI policy. |
 | `trainer_graph.py` | Graph diagnostic and graph-stage mixin behavior for `StageRunner` | `artifact_contracts`, `estimators`, `trainer_preparation` | Remove remaining legacy fallback imports before larger extraction. |
 | `trainer_glance.py` | GLANCE/router/refiner stages, prompt-expert routing, selector diagnostics | `estimators`, `model_building`, `router`, `trainer_semantic` | Large hotspot; split models/utilities before moving stage methods. |
@@ -134,8 +134,8 @@ the dependency rules below rather than by size alone.
 | `trainer_preparation.py` | Graph detector, GATS calibrator training, graph-refinement orchestration, manifest matching | Imports graph/model/contract utilities plus preparation helper owners; next split target is prefit-training refinement. |
 | `trainer_preparation_artifacts.py` | Frozen G0 and GATS artifact/gate loaders with canonical/legacy read compatibility | Imports contract, registry, and utility layers; do not add training code. |
 | `trainer_preparation_refinement.py` | Pure graph-refinement helpers and routed-node/override parsing | Imports contract, hypergraph, and utility layers; do not add training or artifact writes. |
-| `trainer_semantic.py` | Semantic finetune, embedding classifier, semantic gate orchestration, local-competence feature preparation | Imports model/runtime/semantic-feature/semantic-model/utils layers; next split target is local competence features or stage entrypoints. |
-| `trainer_semantic_features.py` | Semantic text and graph node-attribute feature helpers | Imports `torch` and `utils.safe_torch_load`; keep feature construction and read-only edge tensor loading here. |
+| `trainer_semantic.py` | Semantic finetune, embedding classifier, semantic gate orchestration and artifact writes | Imports model/runtime/semantic-feature/semantic-model/utils layers; next split target is stage entrypoints. |
+| `trainer_semantic_features.py` | Semantic text, graph node-attribute, action descriptor, and local-competence feature helpers | Imports `torch`, `torch.nn.functional`, and `utils.safe_torch_load`; keep feature construction and read-only edge tensor loading here. |
 | `trainer_semantic_models.py` | Semantic gate/head model classes | Imports `torch`; do not add stage IO, artifacts, or CLI policy. |
 | `utils/__init__.py` | Utility package marker and re-export surface | Keep tiny and side-effect-free. |
 | `utils/calibration.py` | Calibration and conformal helper utilities | Utility layer used by estimators/trainers. |
@@ -191,9 +191,9 @@ or `utils/`, and do not let dated queue scripts become reusable libraries.
    `trainer_preparation_refinement.py`; next extract the remaining prefit GNN
    refinement path only after its training boundary is isolated.
 3. Continue splitting `trainer_semantic.py`: semantic gate model classes live
-   in `trainer_semantic_models.py`, and node-attribute feature builders live in
-   `trainer_semantic_features.py`; next extract local-competence features or
-   stage entrypoints without moving artifact writes across the boundary.
+   in `trainer_semantic_models.py`, and semantic feature builders live in
+   `trainer_semantic_features.py`; next extract stage entrypoints without
+   moving artifact writes across the wrong boundary.
 4. Split `trainer_glance.py` model classes and routing utilities before moving
    stage methods.
 5. Split `trainer_distillation.py` into trainer classes, metrics helpers, and

@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from utils import safe_torch_load
 
@@ -268,4 +269,197 @@ def _build_semantic_gate_node_attribute_features(data, train_idx, row_count):
         "feature_names": names,
         **graph_meta,
         **norm_meta,
+    }
+
+
+def _binary_prob_summary(prob, pred):
+    prob = prob.detach().cpu().float()
+    pred = pred.detach().cpu().long().reshape(-1)
+    conf = prob.max(dim=1).values
+    margin = (prob[:, 1] - prob[:, 0]).abs()
+    entropy = -(prob.clamp_min(1e-8) * prob.clamp_min(1e-8).log()).sum(dim=1)
+    return torch.stack(
+        [
+            prob[:, 0],
+            prob[:, 1],
+            conf,
+            margin,
+            entropy,
+            pred.float(),
+        ],
+        dim=1,
+    )
+
+
+def _build_semantic_gate_features(
+    base_prob,
+    base_pred,
+    candidate_probs,
+    candidate_preds,
+    node_attribute_features=None,
+    action_local_features=None,
+):
+    base_summary = _binary_prob_summary(base_prob, base_pred)
+    features = []
+    for action_idx, (cand_prob, cand_pred) in enumerate(zip(candidate_probs, candidate_preds)):
+        cand_summary = _binary_prob_summary(cand_prob, cand_pred)
+        agreement = (cand_pred == base_pred).float().unsqueeze(1)
+        bot_delta = (cand_prob[:, 1] - base_prob[:, 1]).unsqueeze(1)
+        conf_delta = (cand_summary[:, 2] - base_summary[:, 2]).unsqueeze(1)
+        abs_bot_delta = bot_delta.abs()
+        action_feature = torch.cat(
+            [
+                base_summary,
+                cand_summary,
+                agreement,
+                bot_delta,
+                conf_delta,
+                abs_bot_delta,
+            ],
+            dim=1,
+        )
+        if node_attribute_features is not None:
+            action_feature = torch.cat([action_feature, node_attribute_features], dim=1)
+        if action_local_features is not None:
+            action_feature = torch.cat([action_feature, action_local_features[:, action_idx, :]], dim=1)
+        features.append(action_feature)
+    return torch.stack(features, dim=1).float()
+
+
+def _build_semantic_gate_local_competence_features(
+    action_descriptor_features,
+    train_idx,
+    labels,
+    base_pred,
+    candidate_preds,
+    rewards,
+    break_masks,
+    break_weight,
+    k=25,
+):
+    train_idx = _as_long_cpu_tensor(train_idx)
+    row_count = int(action_descriptor_features.shape[0])
+    action_count = int(action_descriptor_features.shape[1])
+    if train_idx.numel() == 0:
+        raise ValueError("local_competence semantic gate requires non-empty routed train nodes.")
+    k = max(int(k), 1)
+    labels = labels.detach().cpu().long().reshape(-1)
+    base_pred = base_pred.detach().cpu().long().reshape(-1)
+    base_wrong_train = (base_pred[train_idx] != labels[train_idx]).float()
+    train_node_ids = train_idx.reshape(1, -1)
+    node_ids = torch.arange(row_count, dtype=torch.long).reshape(-1, 1)
+    feature_names = [
+        "local_candidate_correct_rate",
+        "local_base_wrong_rate",
+        "local_fix_rate",
+        "local_break_rate",
+        "local_change_rate",
+        "local_net_estimate",
+        "weighted_local_fix_rate",
+        "weighted_local_break_rate",
+        "weighted_local_net_estimate",
+        "mean_neighbor_similarity",
+        "max_neighbor_similarity",
+        "support_fraction",
+    ]
+    per_action = []
+    support_min = None
+    support_max = 0
+    support_total = 0.0
+    support_rows = 0
+    chunk_size = 4096
+    for action_idx, cand_pred in enumerate(candidate_preds):
+        descriptor = action_descriptor_features[:, action_idx, :].detach().cpu().float()
+        train_descriptor = descriptor[train_idx]
+        mean = train_descriptor.mean(dim=0, keepdim=True)
+        std = train_descriptor.std(dim=0, keepdim=True, unbiased=False)
+        std = torch.where(std < 1e-6, torch.ones_like(std), std)
+        descriptor = torch.nan_to_num(((descriptor - mean) / std).clamp(-10.0, 10.0))
+        descriptor = F.normalize(descriptor, p=2, dim=1, eps=1e-6)
+        train_descriptor = descriptor[train_idx]
+        cand_pred = cand_pred.detach().cpu().long().reshape(-1)
+        cand_correct_train = (cand_pred[train_idx] == labels[train_idx]).float()
+        changed_train = (cand_pred[train_idx] != base_pred[train_idx]).float()
+        fix_train = (rewards[train_idx, action_idx] > 0).float()
+        break_train = break_masks[train_idx, action_idx].float()
+        local_rows = []
+        k_eff = min(k, int(train_idx.numel()))
+        for start in range(0, row_count, chunk_size):
+            end = min(start + chunk_size, row_count)
+            similarity = descriptor[start:end].matmul(train_descriptor.t())
+            same_node = node_ids[start:end] == train_node_ids
+            similarity = similarity.masked_fill(same_node, float("-inf"))
+            top_sim, top_pos = torch.topk(similarity, k=k_eff, dim=1)
+            valid_mask = torch.isfinite(top_sim)
+            top_sim_safe = top_sim.masked_fill(~valid_mask, 0.0)
+            support = valid_mask.float().sum(dim=1, keepdim=True)
+            support_clamped = support.clamp_min(1.0)
+            weight = (top_sim_safe.clamp_min(0.0) + 1e-6) * valid_mask.float()
+            weight_sum = weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+            def gather_mean(values):
+                gathered = values[top_pos] * valid_mask.float()
+                return gathered.sum(dim=1, keepdim=True) / support_clamped
+
+            def gather_weighted(values):
+                gathered = values[top_pos] * weight
+                return gathered.sum(dim=1, keepdim=True) / weight_sum
+
+            local_candidate_correct = gather_mean(cand_correct_train)
+            local_base_wrong = gather_mean(base_wrong_train)
+            local_fix = gather_mean(fix_train)
+            local_break = gather_mean(break_train)
+            local_change = gather_mean(changed_train)
+            local_net = local_fix - float(break_weight) * local_break
+            weighted_fix = gather_weighted(fix_train)
+            weighted_break = gather_weighted(break_train)
+            weighted_net = weighted_fix - float(break_weight) * weighted_break
+            mean_similarity = (top_sim_safe * valid_mask.float()).sum(dim=1, keepdim=True) / support_clamped
+            max_similarity = top_sim_safe.masked_fill(~valid_mask, -1.0).max(dim=1, keepdim=True).values.clamp_min(0.0)
+            support_fraction = support / float(k)
+            local_rows.append(
+                torch.cat(
+                    [
+                        local_candidate_correct,
+                        local_base_wrong,
+                        local_fix,
+                        local_break,
+                        local_change,
+                        local_net,
+                        weighted_fix,
+                        weighted_break,
+                        weighted_net,
+                        mean_similarity,
+                        max_similarity,
+                        support_fraction,
+                    ],
+                    dim=1,
+                )
+            )
+            support_values = support.reshape(-1)
+            finite_support = support_values[support_values > 0]
+            if finite_support.numel():
+                min_value = int(finite_support.min().item())
+                support_min = min_value if support_min is None else min(support_min, min_value)
+                support_max = max(support_max, int(finite_support.max().item()))
+                support_total += float(finite_support.sum().item())
+                support_rows += int(finite_support.numel())
+        per_action.append(torch.cat(local_rows, dim=0))
+    features = torch.stack(per_action, dim=1).float()
+    return features, {
+        "feature_source": "train_routed_local_action_competence",
+        "literature_alignment": [
+            "META-DES local region competence meta-features",
+            "learning-to-defer accept-or-defer decision framing",
+            "selective classification validation-locked risk-coverage behavior",
+        ],
+        "nearest_neighbor_policy": "cosine_topk_on_train_standardized_action_descriptors",
+        "uses_only_routed_train_for_competence": True,
+        "self_neighbor_policy": "excluded_for_train_queries",
+        "k": int(k),
+        "feature_dim": int(features.shape[-1]),
+        "feature_names": feature_names,
+        "support_min": int(support_min or 0),
+        "support_max": int(support_max),
+        "support_mean_nonzero": float(support_total / max(support_rows, 1)),
     }
