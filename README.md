@@ -2130,7 +2130,7 @@ Root-level modules are the default implementation surface:
 - `stage_registry.py` - stage visibility and naming source of truth
 - `trainer.py` - thin compatibility facade
 - `trainer_legacy_impl.py` - current large implementation body during the migration window
-- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_semantic.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
+- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_preparation_refinement.py`, `trainer_semantic.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
 - `artifact_contracts.py`, `runtime_env.py` - shared artifact/path/provenance and runtime-helper owners used during extraction
 - `estimators.py`, `operators.py`, `model_building.py` - estimator/operator/model construction
 - `utils/` - artifact IO, manifests, metrics, calibration, data loading, and reproducibility helpers
@@ -2164,10 +2164,13 @@ active naming surface.
 - Shared path/provenance helpers now belong in `artifact_contracts.py`; shared
   environment and queue/runtime helpers belong in `runtime_env.py`.
 - Preparation artifact and gate loading now belongs in
-  `trainer_preparation_artifacts.py`; `trainer_preparation.py` keeps training,
-  graph-refinement, and manifest-matching entrypoints.
-- `estimators.py` and `trainer_legacy_impl.py` remain the main refactor
-  hotspots.
+  `trainer_preparation_artifacts.py`; pure routed-node, graph-override, KNN
+  proxy, and directional-prune graph-refinement helpers now belong in
+  `trainer_preparation_refinement.py`; `trainer_preparation.py` keeps training,
+  prefit-refinement orchestration, and manifest-matching entrypoints.
+- `trainer_legacy_impl.py`, `trainer_glance.py`, `precompute.py`,
+  `estimators.py`, and `trainer_preparation.py` remain the largest refactor
+  hotspots; use `docs/ARCHITECTURE.md` before moving code across them.
 - `python main.py --help` is now intended to work as a parser-only check even if
   the training runtime is not fully installed.
 
@@ -2237,9 +2240,11 @@ not yet finished the implementation extraction phase.
 
 1. Make `trainer_preparation.py` the real owner of preparation logic.
    `load_frozen_g0`, faithful gate loading, and canonical/legacy artifact-read
-   compatibility now live in `trainer_preparation_artifacts.py`; next move the
-   graph-refinement request/build/apply helpers out of `trainer_preparation.py`
-   while keeping public entrypoints stable.
+   compatibility now live in `trainer_preparation_artifacts.py`; pure
+   graph-refinement apply/build helpers now live in
+   `trainer_preparation_refinement.py`. Next split only the remaining
+   prefit-GNN refinement path after its training boundary is isolated, while
+   keeping public entrypoints stable.
 2. Make `trainer_semantic.py` the real owner of semantic finetune execution.
    Move `run_semantic_finetune_seed` and its manifest/report helpers out of
    `trainer_legacy_impl.py`.
