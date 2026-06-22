@@ -11,6 +11,7 @@ from torch_geometric.nn.models import MLP
 
 from model_building import _labels_to_index, build_LM_model
 from runtime_env import _max_cuda_memory_allocated, _reset_cuda_peak_memory_stats, _resolve_device
+from trainer_semantic_models import _SemanticBreakRiskHead, _SemanticCorrectionDeferGate, _SemanticCorrectionGate
 from utils import build_preparation_dir, capture_code_metadata, safe_torch_load, write_json, write_text, write_torch
 
 _SEMANTIC_ANSWER_TEXT_BY_CLASS = {
@@ -1180,61 +1181,6 @@ def _semantic_gate_delta(labels, base_pred, final_pred, idx):
         "conditional_fix_rate_on_base_wrong": float(fix / max(base_wrong, 1)),
         "correct_node_break_rate": float(broke / max(base_correct_count, 1)),
     }
-
-
-class _SemanticCorrectionGate(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(int(in_channels), int(hidden_channels)),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(int(hidden_channels), 1),
-        )
-
-    def forward(self, features):
-        original_shape = features.shape[:-1]
-        flat = features.reshape(-1, features.shape[-1])
-        return self.net(flat).reshape(*original_shape)
-
-
-class _SemanticCorrectionDeferGate(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels):
-        super().__init__()
-        self.candidate_scorer = torch.nn.Sequential(
-            torch.nn.Linear(int(in_channels), int(hidden_channels)),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(int(hidden_channels), 1),
-        )
-        self.base_scorer = torch.nn.Sequential(
-            torch.nn.Linear(int(in_channels) * 2, int(hidden_channels)),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(int(hidden_channels), 1),
-        )
-
-    def forward(self, features):
-        candidate_logits = self.candidate_scorer(features).squeeze(-1)
-        pooled = torch.cat([features.mean(dim=1), features.max(dim=1).values], dim=1)
-        base_logit = self.base_scorer(pooled)
-        return torch.cat([base_logit, candidate_logits], dim=1)
-
-
-class _SemanticBreakRiskHead(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(int(in_channels), int(hidden_channels)),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(int(hidden_channels), 1),
-        )
-
-    def forward(self, features):
-        original_shape = features.shape[:-1]
-        flat = features.reshape(-1, features.shape[-1])
-        return self.net(flat).reshape(*original_shape)
 
 
 def _select_semantic_gate_threshold(labels, base_pred, candidate_preds, gate_prob, valid_idx):

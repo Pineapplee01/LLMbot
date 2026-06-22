@@ -2130,7 +2130,7 @@ Root-level modules are the default implementation surface:
 - `stage_registry.py` - stage visibility and naming source of truth
 - `trainer.py` - thin compatibility facade
 - `trainer_legacy_impl.py` - current large implementation body during the migration window
-- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_preparation_refinement.py`, `trainer_semantic.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
+- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_preparation_refinement.py`, `trainer_semantic.py`, `trainer_semantic_models.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
 - `artifact_contracts.py`, `runtime_env.py` - shared artifact/path/provenance and runtime-helper owners used during extraction
 - `estimators.py`, `operators.py`, `model_building.py` - estimator/operator/model construction
 - `utils/` - artifact IO, manifests, metrics, calibration, data loading, and reproducibility helpers
@@ -2168,6 +2168,9 @@ active naming surface.
   proxy, and directional-prune graph-refinement helpers now belong in
   `trainer_preparation_refinement.py`; `trainer_preparation.py` keeps training,
   prefit-refinement orchestration, and manifest-matching entrypoints.
+- Semantic gate/head model classes now belong in
+  `trainer_semantic_models.py`; `trainer_semantic.py` keeps semantic stage
+  orchestration, feature construction, training loops, and artifact writes.
 - `trainer_legacy_impl.py`, `trainer_glance.py`, `precompute.py`,
   `estimators.py`, and `trainer_preparation.py` remain the largest refactor
   hotspots; use `docs/ARCHITECTURE.md` before moving code across them.
@@ -2246,8 +2249,9 @@ not yet finished the implementation extraction phase.
    prefit-GNN refinement path after its training boundary is isolated, while
    keeping public entrypoints stable.
 2. Make `trainer_semantic.py` the real owner of semantic finetune execution.
-   Move `run_semantic_finetune_seed` and its manifest/report helpers out of
-   `trainer_legacy_impl.py`.
+   Semantic gate/head model classes now live in `trainer_semantic_models.py`;
+   next extract semantic feature builders or stage entrypoints without moving
+   artifact writes across the boundary.
 3. Finish the active parser-namespace migration inside code.
    Keep legacy flags parse-compatible, but make active mainline code read
    canonical fields such as `experiment_task`, `graph_backbone`,
