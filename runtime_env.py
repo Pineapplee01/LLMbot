@@ -9,7 +9,8 @@ from pathlib import Path
 
 def clean_process_env(source_env=None):
     """Return an environment dict with case-insensitive duplicate keys removed."""
-    source_env = source_env or os.environ
+    if source_env is None:
+        source_env = os.environ
     env = {}
     seen = set()
     for key, value in source_env.items():

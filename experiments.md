@@ -8,8 +8,10 @@ Use it before launching, resuming, or reusing an experiment. The goal is to keep
 server runs reproducible without scattering one-off timestamped directories.
 
 Start with `experiment_runbook.md` for the operational queue-script contract,
-local model-cache policy, and validation commands. This registry remains the
-durable record of planned, launched, completed, failed, and archived runs.
+local model-cache policy, and validation commands. Use
+`check_experiment_helpers_20260620.py` for non-generating helper validation
+after queue/support/report-helper cleanup. This registry remains the durable
+record of planned, launched, completed, failed, and archived runs.
 
 ## Operating Rules
 
@@ -100,7 +102,10 @@ These Windows-local scripts are operational launch surfaces, not experiment
 evidence. Keep them small, use `runtime_env.build_offline_model_env(...)` for
 local model-cache variables, use `runtime_env.run_manifest_command(...)` for
 ordinary subprocess queue steps, and record generated manifests/logs in the
-detailed experiment entry.
+detailed experiment entry. Support scripts such as
+`extract_raw_roberta_embeddings_20260620.py` must remain import-safe for dry
+validation; extraction is only allowed when a consuming queue explicitly runs
+the support script.
 
 | script | status | manifest or log contract | notes |
 | --- | --- | --- | --- |
@@ -108,7 +113,7 @@ detailed experiment entry.
 | `run_sampled_twibot22_base_5seed_20260620.py` | active queue | `experiments/sampled_twibot22_official_prior_base5_20260620_queue_manifest.json` | Runs sampled TwiBot-22 semantic + graph stages for seeds 1-5. |
 | `run_twibot20_formal5_ablation_completion_20260620.py` | active queue | `experiments/twibot20_formal5_ablation_completion_20260620_queue_manifest.json` | Waits for the sampled TwiBot-22 queue before completing formal ablation runs. |
 | `extract_raw_roberta_embeddings_20260620.py` | support script | `raw_roberta_embeddings.pt` plus adjacent `manifest.json` in the requested output directory | Extract-only raw RoBERTa embedding surface used by the formal ablation queue; it is not a standalone training queue. |
-| `run_twibot20_full_selective_residual_5seed_20260620.py` | active queue | `experiments/twibot20_full_selective_residual_5seed_20260620_queue_manifest.json` | Uses custom early-stop handling for LMBot embedding materialization; do not replace its `Popen` loop without preserving that contract. |
+| `run_twibot20_full_selective_residual_5seed_20260620.py` | active queue | `experiments/twibot20_full_selective_residual_5seed_20260620_queue_manifest.json`; `_reports/full_model_5seed_by_seed.csv`; `_reports/full_model_5seed_summary.json` | Uses custom early-stop handling for LMBot embedding materialization and writes queue-owned report summaries under its run root; do not replace its `Popen` loop without preserving that contract. |
 | `summarize_formal_runs_20260620.py` | report snapshot helper | `experiments/formal_result_snapshots_20260620/manifest.json` plus adjacent CSV files | Summarizes existing artifacts only; it is not a training queue or evidence-generating experiment. |
 
 ## Reusable Inputs

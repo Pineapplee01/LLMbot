@@ -67,6 +67,18 @@ def check_powershell_resolver():
         raise AssertionError("expected missing PowerShell to fail fast")
 
 
+def check_offline_env_empty_source_isolated():
+    env = build_offline_model_env(Path(r"G:\Research\BotDetection"), source_env={})
+    assert sorted(env) == [
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_CACHE",
+        "TRANSFORMERS_OFFLINE",
+    ]
+    assert env["HF_HOME"].endswith(r"models\huggingface")
+
+
 def check_launcher_import_and_fail_fast():
     root = Path(tempfile.mkdtemp(prefix="llmbot_launcher_smoke_"))
     previous_root = os.environ.get("BOTDETECTION_ROOT")
@@ -256,6 +268,7 @@ def main():
     checks = [
         compile_targets,
         check_powershell_resolver,
+        check_offline_env_empty_source_isolated,
         check_launcher_import_and_fail_fast,
         check_sampled_queue_import_side_effects,
         check_support_script_import_side_effects,

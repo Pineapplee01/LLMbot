@@ -101,7 +101,7 @@ experiment directory, or stand in for a failed queue step.
 
 | Owner | Allowed outputs | Notes |
 | --- | --- | --- |
-| Queue scripts | `experiments/*_queue_manifest.json`, documented stage roots, and `server_logs/*.log` | Queue outputs must match the detailed `experiments.md` registry entry. |
+| Queue scripts | `experiments/*_queue_manifest.json`, documented stage roots, documented queue-owned `_reports/` summaries, and `server_logs/*.log` | Queue outputs must match the detailed `experiments.md` registry entry. |
 | Launchers | `server_logs/*.log` and process metadata for the exact queue wrapper | Launchers must not introduce their own artifact roots or training flags. |
 | Support scripts | Caller-selected prerequisite artifact directory plus adjacent `manifest.json` | The consuming queue must document how the artifact is used. |
 | Report snapshot helpers | `experiments/formal_result_snapshots_20260620/manifest.json` and adjacent report files | These outputs are generated snapshots, not primary experiment runs. |

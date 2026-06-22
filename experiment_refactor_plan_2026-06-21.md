@@ -84,7 +84,14 @@ Out of scope:
 ## Completion Notes
 
 - Current nested `LLMbot` branch: `codex-llmbot-experiment-refactor`.
-- Last verified nested commit at this checkpoint: `8ee4c6b`.
-- Non-generating validation used only compile/import/helper smokes and `python main.py --help`.
+- Last verified nested commit at this checkpoint: `20ee226`.
+- Completed helper-refactor scope includes the consolidated dry-validation
+  entry point, schema-driven CSV writing, shared JSON/process/manifest helpers,
+  and import-safe support-script validation.
+- Non-generating validation used compile/import/helper smokes,
+  `python check_experiment_helpers_20260620.py`, targeted import-safety probes,
+  `python main.py --help`, and `git diff --check`.
 - No queue, training, report-refresh, or evidence-generation command was run for this refactor plan.
-- Parent BotDetection gitlink remains stale because the parent worktree Git metadata directory rejects writes for the current sandbox user.
+- Parent BotDetection gitlink must be updated by the parent repository after
+  the nested `LLMbot` refactor branch is selected; do not treat evidence-zone
+  files as part of that parent-level sync.
