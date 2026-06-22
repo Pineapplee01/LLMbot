@@ -34,7 +34,8 @@ helpers.
 | `stage_runner.py` | Runtime stage orchestration and mixin dispatch | `trainer_graph`, `trainer_glance`, `trainer_legacy_impl`, `artifact_contracts` | Transitional bridge from legacy monolith to extracted stage owners. |
 | `trainer.py` | Compatibility facade for older imports | `stage_runner`, `trainer_preparation`, `trainer_semantic`, `trainer_distillation` | Keep thin and avoid new logic here. |
 | `trainer_legacy_impl.py` | Legacy compatibility sink and fallback implementation body | `trainer_preparation`, `trainer_semantic`, `model_building`, `estimators`, `runtime_env` | Do not add new stage logic; delete duplicated helpers as owners move out. Keep its legacy stage-read map local until alias compatibility is reconciled with `stage_registry.py`. |
-| `trainer_preparation.py` | Graph detector/GATS artifact creation, graph refinement, cache/provenance checks | `GNNs`, `hypergnn`, `model_building`, `artifact_contracts` | Best next split: cache/manifest owner vs graph-refinement owner. |
+| `trainer_preparation.py` | Graph detector/GATS artifact creation, graph refinement, manifest matching, and training entrypoints | `GNNs`, `hypergnn`, `model_building`, `artifact_contracts`, `trainer_preparation_artifacts` | Artifact/gate loading now lives in `trainer_preparation_artifacts.py`; next split is graph-refinement ownership. |
+| `trainer_preparation_artifacts.py` | Preparation artifact and faithful-gate path resolution, manifest loading, and read compatibility | `artifact_contracts`, `stage_registry`, `utils` | Keep pure I/O and contract checks here; no training or graph-refinement logic. |
 | `trainer_semantic.py` | Semantic finetune, embedding classifier, semantic correction gate | `model_building`, `runtime_env`, `utils` | Candidate split: semantic models, feature builders, stage entrypoints. |
 | `trainer_graph.py` | Graph diagnostic and graph-stage mixin behavior for `StageRunner` | `artifact_contracts`, `estimators`, `trainer_preparation` | Remove remaining legacy fallback imports before larger extraction. |
 | `trainer_glance.py` | GLANCE/router/refiner stages, prompt-expert routing, selector diagnostics | `estimators`, `model_building`, `router`, `trainer_semantic` | Large hotspot; split models/utilities before moving stage methods. |
@@ -121,7 +122,8 @@ place to check before moving functions across files.
 | `trainer_glance.py` | GLANCE/router/refiner stage logic and prompt-expert selector families | Imports estimator, router, semantic, and construction layers; major split target. |
 | `trainer_graph.py` | Graph-stage mixin and graph diagnostics for `StageRunner` | Imports contracts, estimators, and preparation helpers. |
 | `trainer_legacy_impl.py` | Compatibility fallback for not-yet-extracted legacy stage bodies | May import extracted owners as shims; should lose ownership over time. |
-| `trainer_preparation.py` | Graph detector, GATS, graph-refinement, artifact/cache lifecycle | Imports graph/model/contract utilities; next primary split target. |
+| `trainer_preparation.py` | Graph detector, GATS calibrator training, graph-refinement, manifest matching | Imports graph/model/contract utilities plus `trainer_preparation_artifacts`; next primary split target is graph-refinement. |
+| `trainer_preparation_artifacts.py` | Frozen G0 and GATS artifact/gate loaders with canonical/legacy read compatibility | Imports contract, registry, and utility layers; do not add training code. |
 | `trainer_semantic.py` | Semantic finetune, embedding classifier, semantic gate, feature preparation | Imports model/runtime/utils layers; split after preparation ownership. |
 | `utils/__init__.py` | Utility package marker and re-export surface | Keep tiny and side-effect-free. |
 | `utils/calibration.py` | Calibration and conformal helper utilities | Utility layer used by estimators/trainers. |
@@ -172,8 +174,9 @@ or `utils/`, and do not let dated queue scripts become reusable libraries.
 
 1. Keep deleting duplicate helpers from `trainer_legacy_impl.py` after the
    extracted owner is proven by imports and smoke checks.
-2. Split `trainer_preparation.py` into artifact-cache/manifest ownership and
-   graph-refinement ownership.
+2. Continue splitting `trainer_preparation.py`: artifact/gate loading now lives
+   in `trainer_preparation_artifacts.py`; next extract graph-refinement
+   request/build/apply helpers.
 3. Split `trainer_semantic.py` into stage entrypoints, feature builders, and
    semantic gate model classes.
 4. Split `trainer_glance.py` model classes and routing utilities before moving
@@ -188,7 +191,7 @@ For architecture or ownership changes, run at least:
 ```powershell
 python check_experiment_helpers_20260620.py
 python main.py --help
-python -m py_compile trainer_legacy_impl.py stage_runner.py trainer.py trainer_preparation.py trainer_semantic.py trainer_graph.py trainer_glance.py trainer_distillation.py
+python -m py_compile trainer_legacy_impl.py stage_runner.py trainer.py trainer_preparation.py trainer_preparation_artifacts.py trainer_semantic.py trainer_graph.py trainer_glance.py trainer_distillation.py
 git diff --check
 ```
 
