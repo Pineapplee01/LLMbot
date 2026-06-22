@@ -84,10 +84,12 @@ Out of scope:
 ## Completion Notes
 
 - Current nested `LLMbot` branch: `codex-llmbot-experiment-refactor`.
-- Last verified nested commit at this checkpoint: `20ee226`.
+- Last verified nested commit at this checkpoint: `fa05829`.
 - Completed helper-refactor scope includes the consolidated dry-validation
   entry point, schema-driven CSV writing, shared JSON/process/manifest helpers,
   and import-safe support-script validation.
+- Final closeout also fixed explicit empty-environment isolation for offline
+  model-cache helper validation.
 - Non-generating validation used compile/import/helper smokes,
   `python check_experiment_helpers_20260620.py`, targeted import-safety probes,
   `python main.py --help`, and `git diff --check`.
