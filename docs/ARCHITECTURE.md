@@ -24,6 +24,9 @@ paper/task source rather than executable training pipeline code.
 - Seed control: `--seeds`
 - Optional graph path: `--use_GNN`
 - Deprecated legacy/reference surfaces: `LLMbot/baseline/` and `LLMbot/code/`
+- Detailed active-module ownership is maintained in `LLMbot/docs/ARCHITECTURE.md`.
+  Keep this workspace document as the high-level map and update the nested
+  `LLMbot/` map for function-level ownership changes.
 
 ## Runtime Flow
 
@@ -44,7 +47,11 @@ graph LR
 |------|------|
 | `LLMbot/main.py` | Parses args, loops over `--seeds`, dispatches legacy or structured stages |
 | `LLMbot/parser_args.py` | Source of truth for documented CLI flags and stage names |
-| `LLMbot/trainer.py` | Legacy distillation loop plus `StageRunner` for matrix-style stages |
+| `LLMbot/trainer.py` | Thin compatibility facade for historical imports |
+| `LLMbot/stage_runner.py` | Runtime stage orchestration bridge and mixin composition |
+| `LLMbot/trainer_distillation.py` | Legacy distillation trainer classes and graph-seed runner |
+| `LLMbot/trainer_distillation_metrics.py` | Shared gain/cost budget-curve and paired-bootstrap helpers for distillation/legacy reporting |
+| `LLMbot/trainer_legacy_impl.py` | Compatibility fallback for not-yet-extracted legacy stage bodies |
 | `LLMbot/model_building.py` | Builds LM, GNN, estimator, semantic, repair, and selector components |
 | `LLMbot/LM.py` | Language-model branch used by baseline training |
 | `LLMbot/GNNs.py` | Graph backbones including `botrgcn` and `rgcn` |

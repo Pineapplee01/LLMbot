@@ -191,6 +191,15 @@ Minimum artifact check: prediction sets and coverage margins exist in the estima
 
 ## Current Code Readiness Summary
 
+**Implementation-boundary note.** Detailed active-module ownership is tracked
+inside `LLMbot/docs/ARCHITECTURE.md`. Current refactor work is separating
+compatibility surfaces from reusable owners: for example, shared distillation
+gain/cost budget-curve, paired-bootstrap delta, and empty cost-report helpers
+now live in `LLMbot/trainer_distillation_metrics.py`, while
+`LLMbot/trainer_distillation.py` keeps trainer classes and graph-seed execution.
+This is an engineering boundary cleanup only; it does not add or validate a new
+research claim.
+
 | Stage | Code status | Research status | Main blockers |
 | --- | --- | --- | --- |
 | SimTeG-style LM+GNN | implemented | preparation artifact | full training not rerun |

@@ -3,6 +3,18 @@
 Current active code mainline: `LLMbot/`.
 Current active NLPCC paper/task line: `NLPCC/`.
 
+## Active Mainline Update 2026-06-23
+
+- `LLMbot/docs/ARCHITECTURE.md` is now the detailed owner map for the active
+  nested code mainline.
+- Distillation gain/cost budget-curve, paired-bootstrap delta, and empty
+  cost-report helpers are owned by `LLMbot/trainer_distillation_metrics.py`.
+- `LLMbot/trainer_distillation.py` keeps trainer classes and graph-seed
+  execution; `LLMbot/trainer_legacy_impl.py` imports the shared metric owner
+  instead of carrying duplicate implementations.
+- This update reduces duplication only. It does not change CLI behavior,
+  artifact paths, metrics schema, or research-claim status.
+
 The older `LLMbot/baseline/` audit below is historical risk context and does
 not redefine the current default code mainline.
 
