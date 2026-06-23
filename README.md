@@ -1325,6 +1325,7 @@ Current owner split:
 - `trainer_semantic.py`: real owner for `semantic_encoder_finetune`
 - `trainer_distillation.py`: real owner for legacy distillation trainers and `run_legacy_graph_seed`
 - `trainer_distillation_metrics.py`: pure gain/cost budget-curve and paired-bootstrap helpers shared by distillation and legacy reporting paths
+- `trainer_indexing.py`: shared tensor-index normalization and split-safe pseudo-label training-index guards
 - `trainer.py`: thin compatibility facade only
 
 Still transitional:
@@ -2131,7 +2132,7 @@ Root-level modules are the default implementation surface:
 - `stage_registry.py` - stage visibility and naming source of truth
 - `trainer.py` - thin compatibility facade
 - `trainer_legacy_impl.py` - current large implementation body during the migration window
-- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_preparation_refinement.py`, `trainer_semantic.py`, `trainer_semantic_features.py`, `trainer_semantic_models.py`, `trainer_distillation_metrics.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
+- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_preparation_refinement.py`, `trainer_semantic.py`, `trainer_semantic_features.py`, `trainer_semantic_models.py`, `trainer_distillation_metrics.py`, `trainer_indexing.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
 - `artifact_contracts.py`, `runtime_env.py` - shared artifact/path/provenance and runtime-helper owners used during extraction
 - `estimators.py`, `operators.py`, `model_building.py` - estimator/operator/model construction
 - `utils/` - artifact IO, manifests, metrics, calibration, data loading, and reproducibility helpers
@@ -2180,6 +2181,11 @@ active naming surface.
   `trainer_distillation.py` keeps trainer classes and `run_legacy_graph_seed`,
   while `trainer_legacy_impl.py` imports the shared metric owner instead of
   carrying a duplicate implementation.
+- Split-safe pseudo-label training-index helpers now belong in
+  `trainer_indexing.py`; `trainer_distillation.py` imports the shared
+  normalization and guard helpers, while `trainer_legacy_impl.py` imports the
+  pseudo-label guard and keeps its local `_as_long_cpu_tensor` for other legacy
+  semantic/classification paths.
 - `trainer_legacy_impl.py`, `trainer_glance.py`, `precompute.py`,
   `estimators.py`, and `trainer_preparation.py` remain the largest refactor
   hotspots; use `docs/ARCHITECTURE.md` before moving code across them.
@@ -2264,6 +2270,7 @@ not yet finished the implementation extraction phase.
    boundary.
 3. Continue splitting distillation code by boundary.
    Gain/cost metric helpers now live in `trainer_distillation_metrics.py`;
+   split-safe pseudo-label indexing helpers now live in `trainer_indexing.py`;
    next isolate trainer classes from `run_legacy_graph_seed` only after the
    training/runner boundary is mapped and smoke-checked.
 4. Finish the active parser-namespace migration inside code.
