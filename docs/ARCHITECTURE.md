@@ -51,6 +51,7 @@ graph LR
 | `LLMbot/stage_runner.py` | Runtime stage orchestration bridge and mixin composition |
 | `LLMbot/trainer_distillation.py` | Legacy distillation trainer classes and graph-seed runner |
 | `LLMbot/trainer_distillation_metrics.py` | Shared gain/cost budget-curve and paired-bootstrap helpers for distillation/legacy reporting |
+| `LLMbot/trainer_indexing.py` | Shared tensor-index normalization and split-safe pseudo-label training-index guards |
 | `LLMbot/trainer_legacy_impl.py` | Compatibility fallback for not-yet-extracted legacy stage bodies |
 | `LLMbot/model_building.py` | Builds LM, GNN, estimator, semantic, repair, and selector components |
 | `LLMbot/LM.py` | Language-model branch used by baseline training |

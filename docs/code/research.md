@@ -197,8 +197,9 @@ compatibility surfaces from reusable owners: for example, shared distillation
 gain/cost budget-curve, paired-bootstrap delta, and empty cost-report helpers
 now live in `LLMbot/trainer_distillation_metrics.py`, while
 `LLMbot/trainer_distillation.py` keeps trainer classes and graph-seed execution.
-This is an engineering boundary cleanup only; it does not add or validate a new
-research claim.
+Split-safe pseudo-label training-index helpers now live in
+`LLMbot/trainer_indexing.py`. These are engineering boundary cleanups only;
+they do not add or validate a new research claim.
 
 | Stage | Code status | Research status | Main blockers |
 | --- | --- | --- | --- |
