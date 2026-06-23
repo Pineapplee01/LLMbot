@@ -1324,6 +1324,7 @@ Current owner split:
 - `trainer_preparation.py`: real owner for `graph_detector_prepare` and `graph_calibration_prepare`
 - `trainer_semantic.py`: real owner for `semantic_encoder_finetune`
 - `trainer_distillation.py`: real owner for legacy distillation trainers and `run_legacy_graph_seed`
+- `trainer_distillation_metrics.py`: pure gain/cost budget-curve and paired-bootstrap helpers shared by distillation and legacy reporting paths
 - `trainer.py`: thin compatibility facade only
 
 Still transitional:
@@ -2130,7 +2131,7 @@ Root-level modules are the default implementation surface:
 - `stage_registry.py` - stage visibility and naming source of truth
 - `trainer.py` - thin compatibility facade
 - `trainer_legacy_impl.py` - current large implementation body during the migration window
-- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_preparation_refinement.py`, `trainer_semantic.py`, `trainer_semantic_features.py`, `trainer_semantic_models.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
+- `stage_runner.py`, `trainer_preparation.py`, `trainer_preparation_artifacts.py`, `trainer_preparation_refinement.py`, `trainer_semantic.py`, `trainer_semantic_features.py`, `trainer_semantic_models.py`, `trainer_distillation_metrics.py`, `trainer_graph.py`, `trainer_glance.py` - new canonical module surfaces for continued extraction
 - `artifact_contracts.py`, `runtime_env.py` - shared artifact/path/provenance and runtime-helper owners used during extraction
 - `estimators.py`, `operators.py`, `model_building.py` - estimator/operator/model construction
 - `utils/` - artifact IO, manifests, metrics, calibration, data loading, and reproducibility helpers
@@ -2174,6 +2175,11 @@ active naming surface.
   features, action descriptor features, and local-competence features;
   `trainer_semantic.py` keeps semantic stage
   orchestration, training loops, and artifact writes.
+- Distillation gain/cost budget-curve, paired-bootstrap delta, and empty
+  cost-report helpers now belong in `trainer_distillation_metrics.py`;
+  `trainer_distillation.py` keeps trainer classes and `run_legacy_graph_seed`,
+  while `trainer_legacy_impl.py` imports the shared metric owner instead of
+  carrying a duplicate implementation.
 - `trainer_legacy_impl.py`, `trainer_glance.py`, `precompute.py`,
   `estimators.py`, and `trainer_preparation.py` remain the largest refactor
   hotspots; use `docs/ARCHITECTURE.md` before moving code across them.
@@ -2256,11 +2262,15 @@ not yet finished the implementation extraction phase.
    semantic feature builders now live in `trainer_semantic_features.py`; next
    extract stage entrypoints without moving artifact writes across the wrong
    boundary.
-3. Finish the active parser-namespace migration inside code.
+3. Continue splitting distillation code by boundary.
+   Gain/cost metric helpers now live in `trainer_distillation_metrics.py`;
+   next isolate trainer classes from `run_legacy_graph_seed` only after the
+   training/runner boundary is mapped and smoke-checked.
+4. Finish the active parser-namespace migration inside code.
    Keep legacy flags parse-compatible, but make active mainline code read
    canonical fields such as `experiment_task`, `graph_backbone`,
    `text_encoder`, `semantic_encoder`, and `embedding_path`.
-4. Consume `StageSpec` more uniformly at runtime.
+5. Consume `StageSpec` more uniformly at runtime.
    Replace remaining hand-written dispatch or gate special cases in `main.py`
    with registry fields such as `runner_kind`, `claim_grade_allowed`, and
    `forces_use_gnn`.

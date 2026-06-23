@@ -42,7 +42,8 @@ helpers.
 | `trainer_semantic_models.py` | Semantic correction gate, defer gate, and break-risk head model classes | `torch` | Keep semantic model definitions here; no stage IO, artifacts, or CLI policy. |
 | `trainer_graph.py` | Graph diagnostic and graph-stage mixin behavior for `StageRunner` | `artifact_contracts`, `estimators`, `trainer_preparation` | Remove remaining legacy fallback imports before larger extraction. |
 | `trainer_glance.py` | GLANCE/router/refiner stages, prompt-expert routing, selector diagnostics | `estimators`, `model_building`, `router`, `trainer_semantic` | Large hotspot; split models/utilities before moving stage methods. |
-| `trainer_distillation.py` | Distillation pipeline trainers and legacy graph seed execution | `dataloader`, `model_building`, `runtime_env` | Candidate split: trainer classes vs stage entrypoint vs metrics helpers. |
+| `trainer_distillation.py` | Distillation pipeline trainers and legacy graph seed execution | `dataloader`, `model_building`, `runtime_env`, `trainer_distillation_metrics` | Keep trainer classes, stage entrypoint, and dynamic legacy graph-seed behavior here; shared gain/cost metrics now have a separate owner. |
+| `trainer_distillation_metrics.py` | Pure gain/cost budget-curve, paired-bootstrap, and empty-cost-report helpers used by distillation/legacy stage reporting | `numpy`, `sklearn.metrics` | Keep pure metric/report helpers here; no trainer classes, artifact writes, CLI policy, or dynamic imports. |
 | `model_building.py` | LM/GNN/estimator/operator construction and feature bundle resolution | `GNNs`, `LM`, `estimators`, `operators`, `subgroups` | Construction layer; avoid importing trainer modules here. |
 | `GNNs.py` | Graph backbones, HyperScan-style branches, routed contrast losses | `RGT`, `SimpleHGN`, `hypergnn` | Model layer; do not add artifact or experiment orchestration here. |
 | `estimators.py` | Risk estimators, router metrics, budget curves, calibration utilities | none local | Large hotspot; split estimator families only with metric regression checks. |
@@ -88,7 +89,7 @@ This index covers the tracked Python implementation surface under this
 mainline, excluding generated caches and evidence directories. It is the first
 place to check before moving functions across files.
 
-Coverage note: this index was refreshed from an AST scan of 46 non-generated
+Coverage note: this index was refreshed from an AST scan of 47 non-generated
 Python files in this worktree; every scanned file has a row below. The largest
 current hotspots by line count are `trainer_legacy_impl.py`, `trainer_glance.py`,
 `precompute.py`, `estimators.py`, and `trainer_preparation.py`; split them by
@@ -127,7 +128,8 @@ the dependency rules below rather than by size alone.
 | `summarize_formal_runs_20260620.py` | Report snapshot helper for formal run manifests | Imports `runtime_env`; report refreshes are not refactor validation. |
 | `trainer.py` | Thin compatibility facade preserving historical imports | Re-exports extracted owners and `StageRunner`; keep logic out. |
 | `trainer_dignn_conflict.py` | DIGNN conflict-refinement diagnostic stage owner | Imports `conflict_refiner` and `model_building`; diagnostic stage only. |
-| `trainer_distillation.py` | Distillation trainers, stage entrypoint, and legacy graph seed execution | Imports `dataloader`, `model_building`, and `runtime_env`. |
+| `trainer_distillation.py` | Distillation trainers, stage entrypoint, and legacy graph seed execution | Imports `dataloader`, `model_building`, `runtime_env`, and `trainer_distillation_metrics`; re-exports the private metric helper names for compatibility. |
+| `trainer_distillation_metrics.py` | Distillation gain/cost metric helpers and fixed empty cost-report schema | Imports only `numpy` and `sklearn.metrics`; consumed by `trainer_distillation.py` and `trainer_legacy_impl.py`. |
 | `trainer_glance.py` | GLANCE/router/refiner stage logic and prompt-expert selector families | Imports estimator, router, semantic, and construction layers; major split target. |
 | `trainer_graph.py` | Graph-stage mixin and graph diagnostics for `StageRunner` | Imports contracts, estimators, and preparation helpers. |
 | `trainer_legacy_impl.py` | Compatibility fallback for not-yet-extracted legacy stage bodies | May import extracted owners as shims; should lose ownership over time. |
@@ -196,8 +198,9 @@ or `utils/`, and do not let dated queue scripts become reusable libraries.
    moving artifact writes across the wrong boundary.
 4. Split `trainer_glance.py` model classes and routing utilities before moving
    stage methods.
-5. Split `trainer_distillation.py` into trainer classes, metrics helpers, and
-   `run_legacy_graph_seed`.
+5. Continue splitting `trainer_distillation.py`: gain/cost metric helpers now
+   live in `trainer_distillation_metrics.py`; next isolate trainer classes from
+   `run_legacy_graph_seed` only after the training/runner boundary is mapped.
 
 ## Validation Gates
 
@@ -206,7 +209,7 @@ For architecture or ownership changes, run at least:
 ```powershell
 python check_experiment_helpers_20260620.py
 python main.py --help
-python -m py_compile trainer_legacy_impl.py stage_runner.py trainer.py trainer_preparation.py trainer_preparation_artifacts.py trainer_preparation_refinement.py trainer_semantic.py trainer_semantic_features.py trainer_semantic_models.py trainer_graph.py trainer_glance.py trainer_distillation.py
+python -m py_compile trainer_legacy_impl.py stage_runner.py trainer.py trainer_preparation.py trainer_preparation_artifacts.py trainer_preparation_refinement.py trainer_semantic.py trainer_semantic_features.py trainer_semantic_models.py trainer_graph.py trainer_glance.py trainer_distillation.py trainer_distillation_metrics.py
 git diff --check
 ```
 
