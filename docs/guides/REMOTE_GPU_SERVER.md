@@ -1,6 +1,8 @@
 # Remote GPU Server Guide
 
-This guide records the validated access path and safe default workflow for the shared GPU server used by the current `LLMbot/baseline/` mainline.
+This guide records the validated access path and current remote state for the shared GPU server.
+
+The remote server still contains the legacy `LLMbot/baseline/` code layout. The local active mainline is now `LLMbot/` root. Do not treat the server paths in this guide as current local mainline guidance; they are legacy baseline reproduction paths until the local `LLMbot/` root mainline is synchronized to the server.
 
 ## Validated Server State
 
@@ -18,12 +20,13 @@ This guide records the validated access path and safe default workflow for the s
 
 - The remote repo is currently dirty. Do not run `git pull`, `git reset`, or overwrite existing experiment artifacts unless the task explicitly requires it.
 - Preserve existing result directories such as `TwiBot-20_seed_*`, `TwiBot-20_RGT_seed_*`, logs, and archived tarballs.
-- Prefer the current default execution surface in `/root/workspace/LMbot/LLMbot/baseline/core`.
+- For remote legacy baseline reproduction, use `/root/workspace/LMbot/LLMbot/baseline/core`.
+- For current research mainline work, first synchronize the local `LLMbot/` root mainline to the server and document the remote path before running experiments.
 - Treat root-level legacy scripts as historical reproduction helpers, not the default path for new work.
 
 ## Connect And Activate The Correct Environment
 
-Do not rely on the default login shell Python. Activate `lmbot` explicitly before running any baseline commands.
+Do not rely on the default login shell Python. Activate `lmbot` explicitly before running any legacy baseline commands.
 
 ```bash
 ssh root@172.31.106.108 -p 10011
@@ -39,9 +42,9 @@ Validated package versions in `lmbot`:
 - `scikit-learn 1.6.1`
 - `wandb 0.14.0`
 
-## Default Working Directory
+## Legacy Baseline Working Directory
 
-For current mainline work, start from:
+For remote legacy baseline reproduction before migration, start from:
 
 ```bash
 cd /root/workspace/LMbot/LLMbot/baseline/core
@@ -53,7 +56,7 @@ The dataset is already available at:
 /root/workspace/LMbot/datasets/TwiBot-20
 ```
 
-On the remote machine, `LLMbot/baseline/core/datasets` is a symlink to `/root/workspace/LMbot/datasets`, so the baseline loader can resolve the dataset directly from the current mainline path.
+On the remote machine, `LLMbot/baseline/core/datasets` is a symlink to `/root/workspace/LMbot/datasets`, so the legacy baseline loader can resolve the dataset directly from the old baseline path.
 
 ## Smoke Test
 
@@ -71,9 +74,9 @@ If you want the same check from the local Windows machine, use:
 powershell -ExecutionPolicy Bypass -File tools/remote_gpu_smoke_test.ps1
 ```
 
-The helper script reports `wandb` when it is installed, but it does not treat a missing `wandb` package as a baseline failure because the current mainline can fall back to a `NullRun`.
+The helper script reports `wandb` when it is installed, but it does not treat a missing `wandb` package as a legacy baseline failure because the baseline code can fall back to a `NullRun`.
 
-## Minimal Baseline Commands
+## Minimal Legacy Baseline Commands
 
 From `/root/workspace/LMbot/LLMbot/baseline/core` with `lmbot` activated:
 
@@ -113,7 +116,7 @@ Keep this aligned with:
 - `LLMbot/baseline/AGENTS.md`
 - `LLMbot/baseline/README.md`
 
-## Legacy Scripts Versus Current Mainline
+## Legacy Scripts Versus Local Active Mainline
 
 Remote root-level scripts still exist, including:
 
@@ -123,9 +126,15 @@ Remote root-level scripts still exist, including:
 
 Use them only for historical reproduction lines that intentionally target the root-level legacy pipeline.
 
-For current work:
+For legacy remote reproduction:
 
 - Prefer `/root/workspace/LMbot/LLMbot/baseline/core`
 - Use `deploy_frmi_v2.sh` only when you are intentionally working on the FRMI v2 helper flow for TwiBot-22
+
+For current research work:
+
+- Use local `LLMbot/` as the active mainline.
+- Synchronize the local `LLMbot/` root mainline to the server before running current experiments there.
+- Record the synchronized remote path and command family in this guide or a follow-up run note before using it as evidence.
 
 `run_with_monitoring.sh` is not a safe default launcher for the current setup because it writes logs under `/workspace/LMbot/...`, which does not match the validated repo root `/root/workspace/LMbot/...`.

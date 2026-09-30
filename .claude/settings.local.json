@@ -67,7 +67,14 @@
       "Bash(ssh root@172.31.106.108 -p 10011 \"cat workspace/LMbot/parser_args.py\")",
       "Bash(ssh root@172.31.106.108 -p 10011 \"head -10 workspace/LMbot/trainer.py && echo '...' && grep -n 'def train\\\\|def build_model\\\\|self.model\\(' workspace/LMbot/trainer.py\")",
       "Bash(ssh root@172.31.106.108 -p 10011 \"cat workspace/LMbot/run_with_monitoring.sh\")",
-      "Bash(ssh root@172.31.106.108 -p 10011 \"grep -i 'rgt\\\\|rgcn\\\\|GNN_model\\\\|gnn_model' workspace/LMbot/TwiBot20_training.log | head -20\")"
+      "Bash(ssh root@172.31.106.108 -p 10011 \"grep -i 'rgt\\\\|rgcn\\\\|GNN_model\\\\|gnn_model' workspace/LMbot/TwiBot20_training.log | head -20\")",
+      "Bash(claude *)",
+      "Bash(curl -s -m 5 http://127.0.0.1:15721/v1/models)",
+      "Read(//c/Users/p/AppData/Local/Programs/CC Switch/**)",
+      "Read(//c/Users/p/AppData/Roaming/**)",
+      "Read(//c/Users/p/AppData/Local/**)",
+      "Read(//c/Users/p/**)",
+      "Read(//c/Users/p/.claude/**)"
     ],
     "additionalDirectories": [
       "\\tmp",

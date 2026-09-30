@@ -23,6 +23,25 @@ OMX is the preferred Codex orchestration layer for planning, execution loops, ro
 - Use `$ralph` only after a decision-complete plan exists and the task should continue through verification.
 - Use repo-local role skills for narrow ownership: `$implementer`, `$test_guardian`, `$experiment_runner`, `$analysis_writer`, and `$reviewer`.
 
+## Project Reading Tools
+
+Use `codegraph` as a first-class project-reading aid when local structure,
+symbols, or call relationships matter. Prefer it for indexed navigation and
+impact discovery, then open the relevant files to confirm the result.
+
+Useful commands:
+
+- `codegraph status .` to check whether the workspace index exists and is fresh.
+- `codegraph init .` when the workspace has no local `.codegraph/` index.
+- `codegraph sync .` after edits or when the index may be stale.
+- `codegraph query <symbol-or-text>` to find indexed symbols and references.
+- `codegraph callers <symbol>` and `codegraph callees <symbol>` to inspect call relationships.
+- `codegraph impact <symbol>` or `codegraph affected <files...>` to scope likely downstream validation.
+
+`codegraph` complements `rg`, OMX explore, and source-file inspection. It does
+not replace protocol docs, manifests, traces, tests, or verified experiment
+evidence.
+
 ## Conflict Rule
 
 If OMX prompts, runtime state, plans, or generated instructions conflict with repo protocols, manifests, traces, tests, or verified experiment evidence, the repo protocols and evidence win.

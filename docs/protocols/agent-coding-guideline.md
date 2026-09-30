@@ -35,6 +35,12 @@ Acceptable evidence includes:
 - project wiki notes when they are clearly grounded in evidence
 - direct user confirmation when intent cannot be derived safely
 
+Project reading tools are allowed evidence-discovery aids, not authority layers.
+Use `codegraph` when available to build or refresh a local project index and
+inspect symbols, callers, callees, impact, and affected tests before editing.
+Cross-check any `codegraph` finding against the source files, manifests, or
+protocol docs before treating it as a decision basis.
+
 For creative, behavioral, architectural, method, CLI, manifest, artifact, or research-boundary changes, run the Superpowers brainstorming gate before implementation.
 
 ### 2. Simplicity First
@@ -83,6 +89,10 @@ After coding, the agent should verify with the narrowest relevant evidence:
 
 Do not add new test files by default. In this project, Superpowers TDD is adapted as: define the expected CLI behavior, failure mode, or artifact contract first; then implement; then verify the contract.
 
+Documentation sync is part of completion, not a follow-up chore. When code,
+CLI, manifest, artifact layout, or module structure changes, update the
+matching code-development docs in the same task.
+
 ### 5. Research-Safe Iteration
 
 Protect provenance, protocol invariants, and experimental trust.
@@ -106,6 +116,7 @@ Before coding, answer these questions:
 - What is the minimum change?
 - Which files are in scope, and which are explicitly out of scope?
 - How will I verify it without creating unapproved tests or artifacts?
+- Which code-development docs must be updated if the implementation surface changes?
 
 ## Anti-Patterns
 

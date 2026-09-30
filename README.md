@@ -1,73 +1,128 @@
-﻿# LMBot Social Bot Detection Workspace
+# BotDetection Research Workspace
 
-> For AI agents, start with [AGENTS.md](AGENTS.md).
+Start with [AGENTS.md](G:\Research\BotDetection\AGENTS.md).
 
-## Default Pipeline
+## Active Surfaces
 
-The default onboarding and reproduction surface for the LMbot line is now `LLMbot/baseline/`.
+The active implementation surface is `LLMbot/code/`. The NLPCC submission line
+has a trimmed source package under `NLPCC/code/` so submitted code can be
+audited separately from later exploratory refactors.
 
-- Use `LLMbot/baseline/core/main.py` as the primary CLI entrypoint.
-- Start standard runs with `--stage legacy_distill`.
-- Use `--seeds` for seed control. There is no `--seed` flag in the baseline CLI.
-- Treat `LLMbot/code/` as historical and experimental work, not the default pipeline.
+- Primary CLI entrypoint: `LLMbot/main.py`
+- Primary repo-local guidance: `LLMbot/AGENTS.md`
+- Primary operator guide: `LLMbot/README.md`
+- NLPCC submission package: `NLPCC/code/`
 
-## Project Structure
-
-```text
-BotDetection/
-|-- AGENTS.md               # Workspace entrypoint for agents
-|-- docs/                   # Architecture, guides, protocols, and wiki memory
-|-- LLMbot/                 # LMbot code line
-|   |-- baseline/           # Active mainline and default onboarding surface
-|   |-- code/               # Historical and experimental D3F work
-|   |-- README.md           # Repo-local overview for the LLMbot line
-|-- LMBot/                  # Harness and adjacent implementation line
-|-- datasets/               # Canonical workspace datasets
-|-- botbr/                  # BotBR comparison line
-|-- HyperScan/              # HyperScan comparison line
-|-- SEBot/                  # SEBot comparison line
-```
+`LLMbot/baseline/` is a deprecated historical surface kept only for migration,
+archival cleanup, or forensic comparison. `LLMbot/code/` is not deprecated; it
+is the current active code surface.
 
 ## Quick Start
 
-1. Read [docs/wiki/query_pack.md](docs/wiki/query_pack.md) and [docs/wiki/project/mainline_switch_context_2026-04-23.md](docs/wiki/project/mainline_switch_context_2026-04-23.md) for the current research state and routing.
-2. Make sure `TwiBot-20` is available where the baseline loader can find it when run from `LLMbot/baseline/core`:
-   - `LLMbot/baseline/core/datasets/TwiBot-20`
-   - `LLMbot/baseline/datasets/TwiBot-20`
-   - `LLMbot/datasets/TwiBot-20`
-   - `datasets/TwiBot-20`
-3. Run one of the baseline entrypoints below.
+Run commands from `LLMbot/`:
 
 ```bash
-cd LLMbot/baseline/core
+cd LLMbot
 
-# LM -> MLP legacy distillation
+# canonical onboarding path
 python main.py \
-  --stage legacy_distill \
+  --experiment_task distillation_pipeline \
   --dataset TwiBot-20 \
-  --seeds 1
+  --seeds 1 \
+  --disable_wandb
 
-# LM + GNN + MLP legacy distillation
+# graph-backed onboarding path
 python main.py \
-  --stage legacy_distill \
+  --experiment_task distillation_pipeline \
   --dataset TwiBot-20 \
   --use_GNN \
-  --GNN_model rgcn \
-  --seeds 1
+  --graph_backbone botrgcn \
+  --seeds 1 \
+  --disable_wandb
 ```
 
-## Current Positioning
+Canonical public flags are:
 
-- `LLMbot/baseline/` is the default mainline for onboarding, reproduction, and comparison-facing work.
-- `LLMbot/code/` remains available for historical and exploratory RACE-Bot-D3F work.
-- `docs/wiki/` remains the durable project memory layer.
+- `--experiment_task`
+- `--graph_backbone`
+- `--text_encoder`
+- `--semantic_encoder`
+- `--embedding_path`
 
-## Documentation
+Legacy aliases such as `--stage`, `--GNN_model`, `--LM_model`, and `--emb_path`
+still parse for compatibility, but they are no longer the preferred interface.
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Codebase map and execution surfaces
-- [docs/guides/REMOTE_GPU_SERVER.md](docs/guides/REMOTE_GPU_SERVER.md) - Validated remote GPU server workflow
-- [docs/guides/model.md](docs/guides/model.md) - Model and stage overview
-- [docs/wiki/](docs/wiki/) - Project memory and experiment context
-- [docs/protocols/](docs/protocols/) - Execution and comparison protocols
-- [LLMbot/README.md](LLMbot/README.md) - LLMbot repo-local overview
-- [LLMbot/baseline/README.md](LLMbot/baseline/README.md) - Baseline mainline quick reference
+## Current Documentation Entry Points
+
+- [docs/README.md](G:\Research\BotDetection\docs\README.md)
+- [LLMbot/README.md](G:\Research\BotDetection\LLMbot\README.md)
+- [docs/code/parser.md](G:\Research\BotDetection\docs\code\parser.md)
+- [docs/ARCHITECTURE.md](G:\Research\BotDetection\docs\ARCHITECTURE.md)
+- [docs/code/research.md](G:\Research\BotDetection\docs\code\research.md)
+- [code.md](G:\Research\BotDetection\code.md)
+
+## Current Refactor Snapshot
+
+The active mainline has already moved onto a canonical public contract:
+
+- `LLMbot/stage_registry.py` is the stage/task naming source of truth
+- `LLMbot/parser_args.py` exposes canonical public flags and keeps hidden legacy aliases for one migration window
+- `LLMbot/main.py` resolves tasks through the registry and supports a parser-only `--help` path
+- `LLMbot/trainer.py` is now a thin compatibility facade
+- `LLMbot/trainer_legacy_impl.py` still holds most execution logic during the extraction transition
+- new artifact writes prefer canonical `preparation/` and `stages/<canonical_task>` namespaces
+
+This means the public contract is cleaner than the execution body. Ongoing
+maintenance work should keep pushing internal implementation toward the same
+canonical vocabulary.
+
+The current split modules such as `stage_runner.py`, `trainer_preparation.py`,
+`trainer_semantic.py`, `trainer_graph.py`, `trainer_glance.py`, and
+`stage_helpers.py` already define the intended canonical module surface, but
+most still delegate into `trainer_legacy_impl.py` during the migration window.
+
+## Documentation Sync Rule
+
+Future code changes must update the matching code-development docs in the same
+task. The minimum active set is:
+
+- `LLMbot/README.md`
+- `docs/ARCHITECTURE.md`
+- `docs/code/parser.md`
+- `docs/code/research.md`
+- `code.md`
+
+## Repository Structure
+
+```text
+BotDetection/
+|-- AGENTS.md
+|-- code.md
+|-- docs/
+|-- LLMbot/                # active mainline
+|   |-- code/              # active flat Python source + claim governance markers
+|-- NLPCC/
+|   |-- code/              # trimmed NLPCC submission package
+|-- LMBot/                 # adjacent legacy/reference line
+|-- datasets/
+|-- results/
+|-- botbr/
+|-- HyperScan/
+|-- SEBot/
+```
+
+## Research Boundary
+
+The active mainline currently contains:
+
+- a public parser-exposed CLI surface
+- additional internal stage handlers behind the public contract
+- historical artifacts and notes from older routing eras
+
+Do not assume every implemented branch in code is currently part of the public
+CLI contract. Use `LLMbot/README.md` and `docs/code/parser.md` as the current
+contract reference.
+
+The NLPCC package is deliberately narrower than `LLMbot/code/`. It keeps only:
+`main.py`, `parser_args.py`, `graph_detector.py`, `router.py`, `models.py`,
+`data_io.py`, and `utils.py`.

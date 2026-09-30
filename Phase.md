@@ -76,6 +76,10 @@ https://github.com/NYUSHCS/GAugLLM.
 ![image-20260509164511053](C:\Users\p\AppData\Roaming\Typora\typora-user-images\image-20260509164511053.png)
 
 
+### Talk like a Graph: Encoding Graphs for Large Language Models (ICLR 2024)
+
+**Method:** Graph Encoder
+
 
 
 ### Can LLMs effectively leverage graph structural information through prompts, and why?  (TMLR 2024)
@@ -85,6 +89,20 @@ https://github.com/NYUSHCS/GAugLLM.
 1. LLMs其实并不将提示理解为图结构。相反，**LLMs更像是将提示理解为带有增强关键词的段落**。因此，当邻域是同质的时，LLMs仅在结构信息的帮助下表现出改善。显式使用 “hop”“neighbor” 这样的结构词能够提升模型进入 graph-reasoning mode 的能力；把结构表达改成更自然但不明确的 “related papers”等，会显著降低性能。
 2. 当目标节点本身包含**丰富的相关短语**时，额外的结构信息变得多余。
 3. 我们的结果暗示LLMs可能**依赖于浅层的、表面层次的模式**，而不是掌握图结构的潜在关系复杂性。未来的研究可能旨在开发能使LLMs深入解析和理解图拓扑结构的方法
+
+### Exploring the Potential of Large Language Models (LLMs)  in Learning on Graphs (ACL 2025)
+
+**Method:** LLM as Enhancer & LLM as Predictor
+
+
+
+### Large Language Models as Topological Structure  Enhancers for Text-Attributed Graphs (DASFAA 2025)
+
+**Motivation:** most existing work focuses on utilizing LLMs as node feature augmenters, leaving ** employing LLMs to enhance topological structures** an understudied problem. 
+
+TAGs contain many irrational/unreliable edges that can potentially have an adverse effect on the message-passing process in GNN
+
+**Method:** prompted - LLM based Pseudo label and unreliable edge add/delete 
 
 
 

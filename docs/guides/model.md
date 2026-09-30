@@ -1,59 +1,65 @@
-# Model Guide - LLMbot Root Mainline
+# Model Guide - LLMbot Active Mainline
 
-Updated: 2026-05-14
-Scope: current default pipeline in `LLMbot/`
+Updated: 2026-05-23
+Scope: current active pipeline in `LLMbot/`
 
 ## Overview
 
-The current default model story in the `LLMbot/` tree is the root mainline pipeline.
+The active model/runtime surface is the root `LLMbot/` mainline.
 
-- `main.py` parses `--stage` and iterates over `--seeds`.
-- `legacy_distill` is the default onboarding and reproduction stage.
-- `--use_GNN` switches the legacy path from LM -> MLP distillation to LM + GNN + MLP distillation.
-- `LLMbot/baseline/` and `LLMbot/code/` are deprecated legacy/reference surfaces rather than the default model surface.
+- `main.py` owns task dispatch and seed iteration
+- `parser_args.py` owns the public CLI contract
+- `trainer.py` owns frozen-artifact preparation and structured stage execution
+- `model_building.py` and `estimators.py` supply the backbone and post-hoc model logic
 
-```mermaid
-graph LR
-    A["Twibot-20"] --> B["load_raw_data"]
-    B --> C["main.py"]
-    C --> D["LM_Trainer"]
-    C --> E["run_legacy_graph_seed when --use_GNN"]
-    D --> F["MLP_Trainer"]
-    E --> F
-    C --> G["StageRunner for matrix and appendix stages"]
-```
+## Canonical CLI Vocabulary
 
-## Mainline Modules
+Preferred flags for new commands:
 
-### `parser_args.py`
+- `--experiment_task`
+- `--graph_backbone`
+- `--text_encoder`
+- `--semantic_encoder`
+- `--embedding_path`
 
-Defines the active CLI contract.
+Legacy aliases such as `--stage`, `--GNN_model`, `--LM_model`, and `--emb_path`
+still parse, but they are compatibility paths only.
 
-Key onboarding flags:
-- `--stage legacy_distill`
-- `--dataset Twibot-20`
-- `--seeds 1` or `--seeds 1,2,3`
-- `--use_GNN`
-- `--GNN_model botrgcn|rgcn|rgt|hgt|simplehgn|gatv2`
+## Public Task Families
 
-### `main.py`
+### Onboarding and preparation
 
-Controls the execution flow.
+- `legacy_distill`
+- `semantic_finetune`
+- `frozen_g0`
+- `frozen_gats`
 
-- Resolves the device
-- Forces `--use_GNN` for non-legacy matrix stages
-- Loads data through `load_raw_data(...)`
-- Iterates over every seed from `--seeds`
-- Dispatches to legacy distillation or `StageRunner`
+### Public structured tasks
 
-### `trainer.py`
+- `local_conformal_prune_diag`
+- `glance_joint_router_refine`
+- `vertical_minimal`
+- `estimator_matrix`
+- `semantic_matrix`
+- `semantic_source_matrix`
+- `repair_matrix`
+- `selector_matrix`
+- `positioning_matrix`
+- `backbone_stress`
+- `appendix`
 
-Implements the training surfaces.
+## Internal Implemented Branches
 
-- `run_legacy_graph_seed(...)` handles the graph-backed legacy path
-- `LM_Trainer` handles the text branch
-- `MLP_Trainer` handles the distilled classifier branch
-- `StageRunner` covers structured estimator, semantic, repair, selector, backbone-stress, appendix, and EQC v8 stages
+The codebase still contains non-public GLANCE-related handlers inside
+`trainer.py`:
+
+- `glance_oracle_refine`
+- `glance_full_graph_refine`
+- `glance_counterfactual_router`
+- `glance_budgeted_refine`
+- `glance_refiner_analysis`
+
+They are currently implementation branches, not public parser-exposed commands.
 
 ## Recommended Commands
 
@@ -62,25 +68,35 @@ Run from `LLMbot/`.
 ```bash
 # Legacy distillation without GNN
 python main.py \
-  --stage legacy_distill \
-  --dataset Twibot-20 \
-  --seeds 1
+  --experiment_task legacy_distill \
+  --dataset TwiBot-20 \
+  --seeds 1 \
+  --disable_wandb
 
 # Legacy distillation with GNN
 python main.py \
-  --stage legacy_distill \
-  --dataset Twibot-20 \
+  --experiment_task legacy_distill \
+  --dataset TwiBot-20 \
   --use_GNN \
-  --GNN_model botrgcn \
-  --seeds 1,2,3
+  --graph_backbone botrgcn \
+  --seeds 1 \
+  --disable_wandb
+
+# Strict GLANCE-style joint baseline
+python main.py \
+  --experiment_task glance_joint_router_refine \
+  --dataset TwiBot-20 \
+  --reset_split -1 \
+  --use_GNN \
+  --graph_backbone rgcn \
+  --embedding_path datasets/TwiBot-20/embeddings_iter_-1_seed_1.pt \
+  --seeds 1 \
+  --disable_wandb
 ```
 
-## Dataset Resolution
+## Current Structural Caveat
 
-From `LLMbot/`, the loader starts from the active mainline context and configured dataset paths.
-
-Document commands with that working-directory assumption so dataset lookup behavior stays aligned.
-
-## Historical Surface
-
-`LLMbot/baseline/` and `LLMbot/code/` are preserved for legacy/reference context until deletion. They are no longer the default model guide entrypoint.
+The code contract is stronger than the documentation contract right now: many
+artifact and manifest checks exist in `trainer.py`, but the public docs must be
+kept aligned with `parser_args.py` or users will be routed toward commands that
+the parser rejects.

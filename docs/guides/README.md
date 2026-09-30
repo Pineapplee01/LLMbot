@@ -1,37 +1,19 @@
-# Documentation
+# Guides
 
-Technical documentation for the LMbot project.
+This directory contains thin operator-facing guides for the current workspace.
 
-## Structure
+## Current Entry Points
 
-- [architecture/](architecture/) - System architecture and design
-- [guides/](guides/) - How-to guides and tutorials
-- [protocols/](protocols/) - Research protocols and standards
+- [codex.md](G:\Research\BotDetection\docs\guides\codex.md)
+- [claude.md](G:\Research\BotDetection\docs\guides\claude.md)
+- [model.md](G:\Research\BotDetection\docs\guides\model.md)
+- [PROJECT_CONTEXT.md](G:\Research\BotDetection\docs\guides\PROJECT_CONTEXT.md)
+- [REMOTE_GPU_SERVER.md](G:\Research\BotDetection\docs\guides\REMOTE_GPU_SERVER.md)
 
-## Quick Links
+## Active vs Historical
 
-**Getting Started:**
-- [guides/quickstart.md](guides/quickstart.md) - Quick start guide
-- [guides/reproduction.md](guides/reproduction.md) - Reproducing results
-
-**Architecture:**
-- [architecture/model_overview.md](architecture/model_overview.md) - Model architecture
-- [architecture/fusion_strategies.md](architecture/fusion_strategies.md) - Fusion approaches
-
-**Protocols:**
-- [protocols/baseline_comparability.md](protocols/baseline_comparability.md) - Baseline evaluation protocol
-
-## Documentation Philosophy
-
-- **Architecture docs** explain *why* and *how* the system is designed
-- **Guides** provide step-by-step instructions for common tasks
-- **Protocols** define standards for reproducible research
-
-## Contributing
-
-When adding documentation:
-1. Choose the appropriate category (architecture/guides/protocols)
-2. Use clear, concise language
-3. Include code examples where relevant
-4. Link to related documentation
-5. Keep it up-to-date with code changes
+- Current active implementation guidance should follow `LLMbot/AGENTS.md` and
+  `LLMbot/README.md`.
+- Guides that describe older pipelines or older CLIs should be treated as
+  historical context unless they explicitly say they match the root `LLMbot/`
+  mainline.

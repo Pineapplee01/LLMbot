@@ -5,6 +5,46 @@
 # nested repository metadata. Use docs/research/ manifests or reports to make
 # generated evidence reviewable.
 
+# Ignore everything by default
+*
+
+# Allow git metadata + this ignore file
+!.gitignore
+
+# Allow root governance and project docs
+!AGENTS.md
+!README.md
+!code.md
+!UBIQUITOUS_LANGUAGE.md
+!conductor/
+!conductor/**
+!.agents/
+!.agents/**
+!docs/
+!docs/**
+!tests/
+!tests/**
+
+# Allow the governed NLPCC submission code snapshot.
+!NLPCC/
+!NLPCC/code/
+!NLPCC/code/**
+NLPCC/code/**/__pycache__/
+
+# Allow LLMbot tree
+!LLMbot/
+!LLMbot/**/
+
+# Allow active source and root compatibility/runner scripts under LLMbot
+!LLMbot/**/*.py
+!LLMbot/**/*.md
+!LLMbot/code/
+!LLMbot/code/**
+
+# Allow utils/ (under LLMbot)
+!LLMbot/utils/
+!LLMbot/utils/**/
+
 # Python caches and local tooling
 __pycache__/
 *.py[cod]
@@ -104,3 +144,5 @@ LMBot/datasets/**
 *.zip
 *.7z
 *.rar
+!docs/code/
+!docs/code/**

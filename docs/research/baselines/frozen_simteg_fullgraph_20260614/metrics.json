@@ -1,0 +1,73 @@
+{
+  "baseline_id": "frozen_simteg_fullgraph_20260614",
+  "dataset": "TwiBot-20",
+  "split": "test",
+  "metrics_replayed_at": "2026-06-14",
+  "metric_definition": {
+    "accuracy": "sklearn.metrics.accuracy_score on canonical test_idx.pt",
+    "macro_f1": "sklearn.metrics.f1_score(..., average='macro') on canonical test_idx.pt",
+    "human_f1": "class-0 F1 on canonical test_idx.pt",
+    "bot_f1": "class-1 F1 on canonical test_idx.pt",
+    "wrong": "count of argmax posterior predictions not equal to labels on canonical test_idx.pt"
+  },
+  "seeds": [
+    {
+      "seed": 1,
+      "accuracy": 0.8605240912933221,
+      "macro_f1": 0.8591224518517717,
+      "human_f1": 0.8450704225352113,
+      "bot_f1": 0.8731744811683321,
+      "wrong": 165,
+      "confusion_matrix_00_01_10_11": [450, 93, 72, 568],
+      "validation_selection": {
+        "accuracy": 0.8613107822410148,
+        "macro_f1": 0.8582952760220671,
+        "loss": 0.30616819858551025,
+        "epoch": 101
+      }
+    },
+    {
+      "seed": 2,
+      "accuracy": 0.8605240912933221,
+      "macro_f1": 0.8581197624898875,
+      "human_f1": 0.8396501457725948,
+      "bot_f1": 0.8765893792071803,
+      "wrong": 165,
+      "confusion_matrix_00_01_10_11": [432, 111, 54, 586],
+      "validation_selection": {
+        "accuracy": 0.8642706131078224,
+        "macro_f1": 0.8602323321159558,
+        "loss": 0.30009207129478455,
+        "epoch": 110
+      }
+    },
+    {
+      "seed": 3,
+      "accuracy": 0.8681318681318682,
+      "macro_f1": 0.8665943789035393,
+      "human_f1": 0.8522727272727273,
+      "bot_f1": 0.8809160305343512,
+      "wrong": 156,
+      "confusion_matrix_00_01_10_11": [450, 93, 63, 577],
+      "validation_selection": {
+        "accuracy": 0.8617336152219873,
+        "macro_f1": 0.858564763971017,
+        "loss": 0.3089410066604614,
+        "epoch": 82
+      }
+    }
+  ],
+  "aggregate": {
+    "seed_count": 3,
+    "accuracy_mean": 0.8630600169061707,
+    "accuracy_std_sample": 0.004392352005669177,
+    "macro_f1_mean": 0.8612788644150662,
+    "macro_f1_std_sample": 0.004630590372402275,
+    "human_f1_mean": 0.8456644318601777,
+    "human_f1_std_sample": 0.006332221272230012,
+    "bot_f1_mean": 0.8768932969699544,
+    "bot_f1_std_sample": 0.0038797127666265483,
+    "wrong_mean": 162.0,
+    "wrong_std_sample": 5.196152422706632
+  }
+}

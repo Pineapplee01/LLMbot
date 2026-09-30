@@ -19,6 +19,8 @@ A valid plan must state:
 - Edit zones: files or directories that may change.
 - Out of scope: files, artifacts, or claims that must not change.
 - Risks: protocol, reproducibility, or compatibility risks.
+- Documentation sync: which code-development docs must change if the task
+  changes code, CLI, manifests, artifact layout, or module structure.
 - Validation: commands, tests, manifests, artifact checks, or review checks required.
 - Handoff: which role skill owns the next step.
 
@@ -31,11 +33,16 @@ A valid plan must state:
 - Treat OMX workflows as orchestration aids. Repo-local role skills still own their narrow research responsibilities and must not collapse implementation, experiment execution, analysis, and review into one job.
 - Treat Superpowers brainstorming as the design gate for creative or behavioral work. A plan does not bypass that gate.
 - Do not add new test files unless the user explicitly approves them.
+- Do not approve an active-mainline implementation plan that omits the required
+  code-documentation sync targets.
 
 ## Current Active Mainline Governance
 
 - `LLMbot/` is the only active implementation mainline.
 - `LLMbot/baseline/` and `LLMbot/code/` are deprecated legacy surfaces scheduled for deletion.
 - New plans must not use `LLMbot/baseline/core` as an edit zone unless the task explicitly asks for migration, deletion, archival cleanup, or forensic comparison.
+- New `LLMbot/` code plans must explicitly state whether `LLMbot/README.md`,
+  `docs/ARCHITECTURE.md`, `docs/code/parser.md`, `docs/code/research.md`, and
+  `code.md` need updates.
 - Routine validation should prefer CLI-argument checks, smoke commands, manifest inspection, artifact existence checks, and governance drift checks over new test-code creation.
 - Historical plans that referenced `LLMbot/baseline/core` are not active unless a user explicitly reactivates them with a migration or forensic-comparison scope.

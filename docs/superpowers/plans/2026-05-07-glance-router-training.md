@@ -1,5 +1,7 @@
 # GLANCE Router Training Implementation Plan
 
+> **Historical / Obsolete Plan:** This plan targeted the old `LLMbot/baseline/core` implementation surface. It is retained only as historical design context and must not be executed as the current active implementation plan. Current router, LOGIN, GLANCE, or hard-node-selection work must start from the `LLMbot/` root mainline and go through a fresh Superpowers brainstorming and planning gate before implementation.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a maintainable GLANCE paper-style advantage/cost-aware training path as an explicit ablation while keeping the default Stage 2 selector as OOF residual-risk screening.

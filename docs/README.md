@@ -35,6 +35,19 @@ Start here when you need the current project rules:
 - Research phase vocabulary: [research/project_phase_taxonomy.md](research/project_phase_taxonomy.md)
 - Project wiki entry: [wiki/README.md](wiki/README.md)
 
+## Code Development Docs
+
+Keep these documents aligned with the active `LLMbot/` mainline:
+
+- [../LLMbot/README.md](../LLMbot/README.md)
+- [docs/ARCHITECTURE.md](ARCHITECTURE.md)
+- [docs/code/parser.md](code/parser.md)
+- [docs/code/research.md](code/research.md)
+- [../code.md](../code.md)
+
+When code, CLI, manifests, artifact layout, or module structure changes, update
+the matching docs in the same task.
+
 ## Current Default Implementation
 The current default execution surface lives in `LLMbot/`.
 

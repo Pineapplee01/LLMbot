@@ -12,7 +12,7 @@ Implement narrowly scoped code, configuration, governance, or operational docume
 ## Allowed Actions
 
 - Modify source code, configs, scripts, or task-required docs inside allowed edit zones.
-- Update interface documentation when CLI, config, manifest, or artifact behavior changes.
+- Update interface and code-development documentation when CLI, config, manifest, artifact, stage, or module behavior changes.
 - Add new files only when the user explicitly requested them or an approved design names the path and reason.
 - Run local checks needed to verify the implementation.
 
@@ -38,6 +38,7 @@ Implement narrowly scoped code, configuration, governance, or operational docume
 
 - Minimal implementation diff.
 - Summary of changed behavior or interfaces.
+- Summary of documentation that was updated to stay aligned with the code change.
 - Validation commands and results.
 - Handoff note for validation or review.
 
@@ -52,7 +53,8 @@ Implement narrowly scoped code, configuration, governance, or operational docume
 - Confirm changes stayed inside allowed edit zones.
 - Confirm no unapproved source or test files were created.
 - Run the narrowest relevant engineering or governance check.
-- If CLI, config, manifest, or artifact behavior changed, update matching documentation.
+- If code, CLI, config, manifest, artifact layout, or module structure changed, update the matching code-development docs in the same task.
+- At minimum, evaluate whether `LLMbot/README.md`, `docs/ARCHITECTURE.md`, `docs/code/parser.md`, `docs/code/research.md`, and `code.md` need updates.
 - State that no experimental claim is being made by the implementation alone.
 
 ## Explicit Invocation

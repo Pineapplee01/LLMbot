@@ -22,6 +22,7 @@ The current default execution surface is `LLMbot/`.
 - Centralize new runtime glue inside the active mainline instead of growing ad hoc script-level entrypoints.
 - Use focused CLI checks, manifests, stage traces, and artifact inspection as the first verification surface for behavior changes.
 - Do not add new test files unless the user explicitly approves; define expected CLI behavior or artifact contracts before implementation.
+- When code, CLI, manifest, artifact layout, or module structure changes, update the matching code-development docs in the same task.
 - Keep fair-comparison work inside the bounds defined by [baseline_comparability.md](baseline_comparability.md).
 
 ## Current Project Defaults

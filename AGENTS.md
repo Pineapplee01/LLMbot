@@ -15,13 +15,21 @@ Direct user instructions outrank this file. Deeper `AGENTS.md` files govern thei
 ## Current Default Implementation
 
 `LLMbot/` is the only active mainline for future bot-detection pipeline work.
+The active Python source surface is now the flat `LLMbot/code/` directory.
+Root `LLMbot/main.py`, `LLMbot/precompute.py`, and `LLMbot/preprocess.py`
+remain compatibility entrypoints so existing commands and runner scripts can
+keep invoking `python main.py ...`, `python precompute.py ...`, and
+`python preprocess.py ...` from `LLMbot/`.
 
 Start with:
 
 - [LLMbot/AGENTS.md](LLMbot/AGENTS.md)
 - [LLMbot/README.md](LLMbot/README.md)
 
-`LLMbot/baseline/` and `LLMbot/code/` are deprecated legacy surfaces scheduled for deletion. Do not add implementation, tests, or documentation there unless the user explicitly asks for migration, deletion, archival cleanup, or forensic comparison.
+`LLMbot/baseline/` is a deprecated legacy surface scheduled for deletion. Do
+not add implementation, tests, or documentation there unless the user
+explicitly asks for migration, deletion, archival cleanup, or forensic
+comparison.
 
 ## Superpowers, OMX, And Project Protocols
 
@@ -44,26 +52,52 @@ OMX runtime state under `.omx/` is local execution state. Durable project decisi
 
 - Active implementation: [LLMbot/AGENTS.md](LLMbot/AGENTS.md)
 - Active mainline guide: [LLMbot/README.md](LLMbot/README.md)
+- Governance context: [conductor/product.md](conductor/product.md), [conductor/tech-stack.md](conductor/tech-stack.md),
+  [conductor/workflow.md](conductor/workflow.md), and [conductor/tracks.md](conductor/tracks.md)
+- Canonical terminology: [UBIQUITOUS_LANGUAGE.md](UBIQUITOUS_LANGUAGE.md)
 - Project docs hub: [docs/README.md](docs/README.md)
 - Current project memory: [docs/wiki/query_pack.md](docs/wiki/query_pack.md)
 - Formal comparison protocol: [docs/protocols/baseline_comparability.md](docs/protocols/baseline_comparability.md)
 - Research phase vocabulary: [docs/research/project_phase_taxonomy.md](docs/research/project_phase_taxonomy.md)
 - Repo-local role skills: [.agents/skills/README.md](.agents/skills/README.md)
 
+## Code Documentation Sync
+
+The current code-development docs for the active mainline are:
+
+- [LLMbot/README.md](LLMbot/README.md) for operator-facing mainline usage and public task surface
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module boundaries and runtime flow
+- [docs/code/parser.md](docs/code/parser.md) for parser and CLI contract
+- [docs/code/research.md](docs/code/research.md) for research-pipeline to code alignment
+- [code.md](code.md) for active maintainability and implementation risk tracking
+
+Any code change that affects CLI behavior, task/stage behavior, module structure,
+manifest fields, artifact layout, or research-boundary wording must update the
+corresponding code-development docs in the same task.
+
 ## Working Agreements
 
 - Ground decisions in repo evidence, manifests, traces, metrics, tests, or explicit user direction.
-- Prefer `LLMbot/` for new implementation. Treat deprecated directories as read-only unless the task explicitly names a migration or archival action.
+- Prefer `LLMbot/code/` for new active-mainline implementation. Keep the
+  root `LLMbot/` directory as the operator working directory, compatibility
+  entrypoint location, runner-script surface, and artifact parent.
+- Treat deprecated directories as read-only unless the task explicitly names a
+  migration or archival action.
 - Keep design, implementation, validation, experiment execution, analysis writing, and review as separate jobs.
 - Make the smallest task-scoped change; avoid drive-by cleanup and speculative abstractions.
 - Do not create new source files unless the user requested them or an approved design names the path and explains why existing files are insufficient.
 - Do not create new test files unless the user explicitly approves. Prefer CLI-argument checks, smoke commands, manifest inspection, and governance drift checks.
+- When code, CLI, manifest, artifact, or structure changes, update the matching code-development docs in the same task instead of leaving documentation drift for later.
 - State the validation used before closing work.
 
 ## Edit Zones
 
-- Default research-wide zones: `LLMbot/`, `LMBot/`, `rewrite_pipeline/`, `docs/`, `scripts/`, `.agents/`, `tools/`, plus root governance docs.
-- Deprecated default-read-only zones: `LLMbot/baseline/` and `LLMbot/code/`; edit only for explicit migration, deletion, archival cleanup, or forensic comparison.
+- Default research-wide zones: `LLMbot/code/`, root `LLMbot/*.py` compatibility
+  entrypoints, root `LLMbot/run_*.py` runner scripts, `LMBot/`,
+  `rewrite_pipeline/`, `docs/`, `scripts/`, `.agents/`, `tools/`, plus root
+  governance docs.
+- Deprecated default-read-only zones: `LLMbot/baseline/`; edit only for
+  explicit migration, deletion, archival cleanup, or forensic comparison.
 - Comparison-only zones: `botbr/`, `HyperScan/`, and `SEBot/`; edit only for explicit baseline-comparison work.
 - Evidence zones are read/verify by default, not manual-edit targets: `datasets/`, `results/`, `LLMbot/saved_artifacts/`, `LLMbot/checkpoints/`, and `LMBot/results_*`.
 - Restricted zones: `docs/published/`, `.claude/worktrees/`, caches, temp dirs, generated logs, and `__pycache__/`.
@@ -103,5 +137,5 @@ Prefer explicit invocation when role choice is ambiguous. Do not let one role co
 
 ## Done Means
 
-- Engineering done: scope is legal, filenames are descriptive, behavior is verified by the narrowest relevant check, changed interfaces/docs are aligned, and no unapproved source/test files were added.
+- Engineering done: scope is legal, filenames are descriptive, behavior is verified by the narrowest relevant check, changed interfaces/docs are aligned, the affected code-development docs are updated in the same task, and no unapproved source/test files were added.
 - Research done: engineering done plus manifest metadata is complete, metrics/artifact paths exist, comparisons follow protocol, and conclusions do not exceed evidence.

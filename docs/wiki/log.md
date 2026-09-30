@@ -353,3 +353,58 @@
 - Recorded the current split between `implemented`, `verified`, and `partial / pending` for the dual-lane harness
 - Kept the note scoped to the current `baseline/core` mainline and did not merge `LLMbot/code` historical method-line claims into this snapshot
 
+---
+
+## 2026-06-17
+
+**NeighborLoader contract split is now explicit**
+
+- The workspace now has two distinct HyperScan-style NeighborLoader metric contracts:
+  - `seed_only`: canonical valid seed-node selection plus full-graph deduplicated export
+  - `hyperscan_sampled_subgraph`: sampled-subgraph-all-rows supervision and repeated sampled-row validation / test sidecar metrics
+- Future HyperScan-style NeighborLoader runs must explicitly record the contract name in analysis and result summaries.
+- When citing default full-test results in this repo, use the canonical deduplicated recompute from `outputs.pt + canonical test_idx.pt` unless the text explicitly says it is quoting the repeated sampled-subgraph sidecar.
+
+---
+
+## 2026-06-18
+
+**Local routed residual gate and K/fanout ablation synced for paper writing**
+
+- Added a local seed-1 evidence note for the routed residual graph branch.
+- Scope caveat: this run used local `embeddings_iter_-1_seed_1.pt` with
+  `hyperscan_meta_tweet_proxy`, not the server official HyperScan nodeinput-788
+  tensor.
+- Current writing direction: `risk_gated_all_nodes + residual` is the cleaner
+  candidate mechanism than binary `routed_only + residual` in this local
+  contract (`0.8761` full Macro-F1 vs `0.8684` for routed-only 10%).
+- Boundary: shuffled routed-only 10% is strong, so this does not yet prove that
+  conformal-selected routed nodes are better residual consumers than arbitrary
+  same-budget nodes.
+- K/fanout sensitivity is material; local best was `K=8, fanout=128`
+  (`0.8817` full Macro-F1, `0.7943` routed 10% Macro-F1). Confirm under the
+  official tensor and seeds 1/2/3 before any paper-level performance claim.
+
+---
+
+## 2026-06-19
+
+**TwiBot-20 seed1 component ablation recorded for routed residual method**
+
+- Recorded the seed-1 component ablation table for
+  `risk router -> routed nodes -> residual connection` with paper-facing
+  columns `Acc` and `F1` only.
+- Current seed-1 full method result: `Acc=0.8893`, `F1=0.8878`.
+- The table is stored in
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619_reports/component_ablation_seed1.csv`
+  and mirrored in `docs/experiment.md` plus `LLMbot/experiments.md`.
+- The `w/o LM supervised fine-tuning` row remains incomplete locally because a
+  same-contract raw `roberta-base` embedding artifact is still missing.
+- Hyperparameter sensitivity is separate from component ablation and is plotted
+  in HyperScan-style line plots at
+  `LLMbot/experiments/twibot20_seed1_component_ablation_20260619_reports/twibot20_seed1_hparam_sensitivity.pdf`.
+- The hyperparameter plot is used directly as the paper's seed-1 sensitivity
+  analysis; it does not need multi-seed expansion.
+- Next paper update: complete the component ablation matrix for multiple seeds
+  and replace the seed-1 component table with mean/std.
+

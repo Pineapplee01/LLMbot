@@ -14,6 +14,7 @@ Provide deterministic validation of engineering constraints, regressions, manife
 - Run existing tests, linters, smoke checks, CLI-argument checks, and root governance gates.
 - Reproduce failures with the smallest command, fixture, or artifact inspection.
 - Validate changed scope, filenames, manifests, artifact presence, and role-boundary rules.
+- Validate that code-development docs were updated when the changed surface requires it.
 - Report pass/fail evidence and isolate likely causes.
 
 ## Forbidden Actions
@@ -53,6 +54,7 @@ Provide deterministic validation of engineering constraints, regressions, manife
 - Confirm failures are reported without masking or rewriting evidence.
 - Confirm any manifest or artifact paths used by later roles exist.
 - Confirm no unapproved test files were created.
+- Confirm required code-development doc sync happened for code/interface/artifact/structure changes.
 - Separate engineering pass/fail from research-claim support.
 
 ## Explicit Invocation

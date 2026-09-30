@@ -1,0 +1,83 @@
+{
+  "baseline_id": "frozen_simteg_fullgraph_20260614",
+  "status": "canonical_for_current_knn_router_prompt_experiments",
+  "created_at": "2026-06-14",
+  "dataset": "TwiBot-20",
+  "canonical_splits": {
+    "train": {
+      "path": "/root/workspace/LMbot/datasets/TwiBot-20/train_idx.pt",
+      "size": 8278,
+      "sha256": "cc7726f0f00d0c4129c3a2d415f455cd2700ebed5eb6da5614572f2c92784ea3"
+    },
+    "valid": {
+      "path": "/root/workspace/LMbot/datasets/TwiBot-20/valid_idx.pt",
+      "size": 2365,
+      "sha256": "76d42b69dbbe0ef486efe16fba827348974a28f7ea8dd4a54a7a591c0e313f77"
+    },
+    "test": {
+      "path": "/root/workspace/LMbot/datasets/TwiBot-20/test_idx.pt",
+      "size": 1183,
+      "sha256": "811797a558d36505bc5468da7f97b8bf6043c5db355aa5ca6b376aed5ce56ac2"
+    }
+  },
+  "model_contract": {
+    "contract": "frozen_g0_v1",
+    "backbone": "rgcn",
+    "graph_data_variant": "full_graph_support",
+    "training_scope": "train_only_supervised",
+    "checkpoint_selection": {
+      "primary": "validation_macro_f1",
+      "tie_breaker": "validation_loss"
+    },
+    "support_embedding_path": "/root/workspace/LMbot/datasets/TwiBot-20/support_roberta_embeddings_new.pt",
+    "support_node_count": 217754,
+    "labeled_node_count": 11826,
+    "projection_applied": false,
+    "input_adapter_enabled": false
+  },
+  "artifact_family": {
+    "root": "/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/tmp_iterm1_forward_fullgraph",
+    "outputs_pattern": "seed_{1,2,3}/preparation/graph_detector/outputs.pt",
+    "manifest_pattern": "seed_{1,2,3}/preparation/graph_detector/manifest.json",
+    "selection_metrics_pattern": "seed_{1,2,3}/preparation/graph_detector/selection_metrics.json"
+  },
+  "seed_artifacts": [
+    {
+      "seed": 1,
+      "outputs_path": "/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/tmp_iterm1_forward_fullgraph/seed_1/preparation/graph_detector/outputs.pt",
+      "embedding_path": "/root/workspace/LMbot/datasets/TwiBot-20/embeddings_iter_-1_seed_1.pt",
+      "embedding_sha256": "0aa0008b09c06f8850b10826ebbc39d2338f358542a3a568283e0c5b9d8c92e8"
+    },
+    {
+      "seed": 2,
+      "outputs_path": "/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/tmp_iterm1_forward_fullgraph/seed_2/preparation/graph_detector/outputs.pt",
+      "embedding_path": "/root/workspace/LMbot/datasets/TwiBot-20/embeddings_iter_-1_seed_2.pt",
+      "embedding_sha256": "555645a047fe0869aae1c039f5ced69d0c53330e3b412571179b5812ed73977e"
+    },
+    {
+      "seed": 3,
+      "outputs_path": "/root/workspace/LMbot/LLMbot_active_knn_router_20260612/experiments/tmp_iterm1_forward_fullgraph/seed_3/preparation/graph_detector/outputs.pt",
+      "embedding_path": "/root/workspace/LMbot/datasets/TwiBot-20/embeddings_iter_-1_seed_3.pt",
+      "embedding_sha256": "1e90863b316987b0f727db84ec7dd22104f758842d67ea157c0e980a5a89a54b"
+    }
+  ],
+  "audit_evidence": {
+    "server_audit_json": "/root/workspace/LMbot/baseline_audit_frozen_simteg_20260614.json",
+    "audited_outputs_count": 164,
+    "metric_replay": "metrics were recomputed from outputs.pt with canonical TwiBot-20 test_idx.pt, not copied from experiment names",
+    "historical_variation_finding": "0.87-level runs use different feature or training contracts, especially finetuned_roberta_embeddings_iter_2_seed1.pt or train_supervised_plus_mhlgc, and are not this baseline"
+  },
+  "comparison_policy": {
+    "default_for": [
+      "KNN conformal router",
+      "router-KNN prompt experiments",
+      "GraphEdit-style routed edge adjudication experiments"
+    ],
+    "do_not_mix_with": [
+      "finetuned_roberta_embeddings_iter_2_seed1.pt runs",
+      "train_supervised_plus_mhlgc runs",
+      "HyperScan-style dynamic graph detector ablations",
+      "historical remote_base artifacts without matching artifact family"
+    ]
+  }
+}

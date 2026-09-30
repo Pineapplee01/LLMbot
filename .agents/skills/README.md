@@ -7,8 +7,21 @@ These skills split BotDetection research work into narrow roles. Prefer explicit
 - Superpowers controls design and implementation gates.
 - OMX orchestrates approved work and long-running execution.
 - Repo-local skills define who owns each research job after scope is clear.
+- Code-development docs must stay in lockstep with the active mainline. When a
+  code/interface/artifact/structure change lands, the relevant docs must be
+  updated in the same task.
 
 Do not let OMX, Ralph, Team mode, or a single agent collapse implementation, validation, experiment running, analysis writing, and final review into one claim path.
+
+## Code-Development Docs
+
+The active documentation set that must stay aligned with `LLMbot/` is:
+
+- `LLMbot/README.md`
+- `docs/ARCHITECTURE.md`
+- `docs/code/parser.md`
+- `docs/code/research.md`
+- `code.md`
 
 ## Skills
 
@@ -44,3 +57,12 @@ Examples:
 - `$experiment_runner -> $test_guardian -> $analysis_writer -> $reviewer`
 - `$analysis_writer -> $reviewer -> $experiment_runner` when evidence is missing
 - `$reviewer -> $implementer -> $test_guardian` when review finds engineering defects
+
+## Documentation Ownership
+
+- `$implementer` updates the matching code-development docs when implementation
+  changes code behavior, structure, CLI, manifests, or artifact layout.
+- `$test_guardian` validates that required doc sync happened and reports drift.
+- `$reviewer` blocks acceptance when implementation and docs are out of sync.
+- Plans for active-mainline code changes should name those doc-sync targets
+  before implementation starts.
