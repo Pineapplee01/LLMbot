@@ -30,6 +30,7 @@ evaluation/
 data/
 
 # Generated or heavyweight artifacts.
+.codegraph/
 checkpoints/
 saved_artifacts/
 saved_models/
