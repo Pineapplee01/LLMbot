@@ -1,0 +1,360 @@
+{
+  "claims": [
+    "phase_a_foundations",
+    "high_order_graph_consumption",
+    "conformal_risk_routing",
+    "routed_llm_evidence_refinement",
+    "local_graph_repair_diagnostics",
+    "semantic_candidate_correction",
+    "ablation_positioning_legacy"
+  ],
+  "files": [
+    {
+      "claim": "orchestration",
+      "path": "artifact_contracts.py",
+      "status": "shared"
+    },
+    {
+      "claim": "shared",
+      "path": "dataloader.py",
+      "status": "shared"
+    },
+    {
+      "claim": "conformal_risk_routing",
+      "path": "estimators.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "high_order_graph_consumption",
+      "path": "GNNs.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "high_order_graph_consumption",
+      "path": "hypergnn.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "path": "llm_evidence_refiner.py",
+      "status": "compat_shim"
+    },
+    {
+      "claim": "orchestration",
+      "path": "main.py",
+      "status": "shared"
+    },
+    {
+      "claim": "phase_a_foundations",
+      "path": "model_building.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "path": "operators.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "orchestration",
+      "path": "parser_args.py",
+      "status": "shared"
+    },
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "path": "precompute.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "shared",
+      "path": "preprocess.py",
+      "status": "shared"
+    },
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "path": "prompt.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "conformal_risk_routing",
+      "path": "router.py",
+      "status": "compat_shim"
+    },
+    {
+      "claim": "orchestration",
+      "path": "runtime_env.py",
+      "status": "shared"
+    },
+    {
+      "claim": "orchestration",
+      "path": "stage_registry.py",
+      "status": "shared"
+    },
+    {
+      "claim": "orchestration",
+      "path": "stage_runner.py",
+      "status": "shared"
+    },
+    {
+      "claim": "shared",
+      "path": "subgroups.py",
+      "status": "shared"
+    },
+    {
+      "claim": "orchestration",
+      "path": "trainer.py",
+      "status": "shared"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "path": "trainer_dignn_conflict.py",
+      "status": "compat_shim"
+    },
+    {
+      "claim": "phase_a_foundations",
+      "path": "trainer_distillation.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "path": "trainer_glance.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "path": "trainer_graph.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "ablation_positioning_legacy",
+      "path": "trainer_legacy_impl.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "phase_a_foundations",
+      "path": "trainer_preparation.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "semantic_candidate_correction",
+      "path": "trainer_semantic.py",
+      "status": "do_not_move_yet"
+    },
+    {
+      "claim": "conformal_risk_routing",
+      "path": "conformal_risk_routing/router.py",
+      "status": "owned"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "path": "local_graph_repair_diagnostics/trainer_dignn_conflict.py",
+      "status": "owned"
+    },
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "path": "routed_llm_evidence_refinement/llm_evidence_refiner.py",
+      "status": "owned"
+    },
+    {
+      "claim": "shared",
+      "path": "utils/__init__.py",
+      "status": "shared"
+    },
+    {
+      "claim": "shared",
+      "path": "utils/calibration.py",
+      "status": "shared"
+    },
+    {
+      "claim": "shared",
+      "path": "utils/losses.py",
+      "status": "shared"
+    },
+    {
+      "claim": "shared",
+      "path": "utils/metrics.py",
+      "status": "shared"
+    },
+    {
+      "claim": "shared",
+      "path": "utils/misc.py",
+      "status": "shared"
+    }
+  ],
+  "generated_from": "current filesystem plus CodeGraph-reviewed plan",
+  "legacy_compat": [
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "path": "llm_evidence_refiner.py",
+      "status": "compat_shim"
+    },
+    {
+      "claim": "conformal_risk_routing",
+      "path": "router.py",
+      "status": "compat_shim"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "path": "trainer_dignn_conflict.py",
+      "status": "compat_shim"
+    },
+    {
+      "claim": "ablation_positioning_legacy",
+      "owner_file": "stage_registry.py",
+      "status": "legacy_replay",
+      "symbol": "legacy_stage_map"
+    },
+    {
+      "claim": "ablation_positioning_legacy",
+      "owner_file": "trainer_legacy_impl.py",
+      "status": "legacy_replay",
+      "symbol": "run_phase_a_matrix"
+    }
+  ],
+  "migration_status": {
+    "do_not_move_yet": [
+      "GNNs.py",
+      "estimators.py",
+      "hypergnn.py",
+      "model_building.py",
+      "operators.py",
+      "precompute.py",
+      "prompt.py",
+      "trainer_distillation.py",
+      "trainer_glance.py",
+      "trainer_graph.py",
+      "trainer_legacy_impl.py",
+      "trainer_preparation.py",
+      "trainer_semantic.py"
+    ],
+    "moved_this_slice": [
+      "conformal_risk_routing/router.py",
+      "local_graph_repair_diagnostics/trainer_dignn_conflict.py",
+      "routed_llm_evidence_refinement/llm_evidence_refiner.py"
+    ],
+    "orchestration_remains_top_level": [
+      "artifact_contracts.py",
+      "main.py",
+      "parser_args.py",
+      "runtime_env.py",
+      "stage_registry.py",
+      "stage_runner.py",
+      "trainer.py"
+    ],
+    "shared_not_copied": [
+      "dataloader.py",
+      "preprocess.py",
+      "subgroups.py",
+      "utils/__init__.py",
+      "utils/calibration.py",
+      "utils/losses.py",
+      "utils/metrics.py",
+      "utils/misc.py"
+    ]
+  },
+  "orchestration": [
+    "artifact_contracts.py",
+    "main.py",
+    "parser_args.py",
+    "runtime_env.py",
+    "stage_registry.py",
+    "stage_runner.py",
+    "trainer.py"
+  ],
+  "shared": [
+    "dataloader.py",
+    "preprocess.py",
+    "subgroups.py",
+    "utils/__init__.py",
+    "utils/calibration.py",
+    "utils/losses.py",
+    "utils/metrics.py",
+    "utils/misc.py"
+  ],
+  "symbols": [
+    {
+      "claim": "conformal_risk_routing",
+      "kind": "class",
+      "owner_file": "conformal_risk_routing/router.py",
+      "status": "owned",
+      "symbol": "GlanceReliabilityRouterMLP"
+    },
+    {
+      "claim": "conformal_risk_routing",
+      "kind": "class",
+      "owner_file": "conformal_risk_routing/router.py",
+      "status": "owned",
+      "symbol": "SelectiveNetResidualRouter"
+    },
+    {
+      "claim": "conformal_risk_routing",
+      "kind": "function",
+      "owner_file": "conformal_risk_routing/router.py",
+      "status": "owned",
+      "symbol": "build_reliability_router_feature_bundle"
+    },
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "kind": "class",
+      "owner_file": "routed_llm_evidence_refinement/llm_evidence_refiner.py",
+      "status": "owned",
+      "symbol": "LLMEvidenceRefiner"
+    },
+    {
+      "claim": "routed_llm_evidence_refinement",
+      "kind": "class",
+      "owner_file": "routed_llm_evidence_refinement/llm_evidence_refiner.py",
+      "status": "owned",
+      "symbol": "EvidenceEncoderSpec"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "kind": "class",
+      "owner_file": "local_graph_repair_diagnostics/trainer_dignn_conflict.py",
+      "status": "owned",
+      "symbol": "DignnDualViewProxy"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "kind": "function",
+      "owner_file": "local_graph_repair_diagnostics/trainer_dignn_conflict.py",
+      "status": "owned",
+      "symbol": "run_local_dignn_conflict_refine_diag"
+    },
+    {
+      "claim": "local_graph_repair_diagnostics",
+      "kind": "function",
+      "owner_file": "operators.py",
+      "status": "do_not_move_yet",
+      "symbol": "build_repair_operator"
+    },
+    {
+      "claim": "phase_a_foundations",
+      "kind": "function",
+      "owner_file": "trainer_preparation.py",
+      "status": "do_not_move_yet",
+      "symbol": "train_frozen_g0"
+    },
+    {
+      "claim": "high_order_graph_consumption",
+      "kind": "class",
+      "owner_file": "GNNs.py",
+      "status": "do_not_move_yet",
+      "symbol": "HyperScanAdaptiveLowHighFusion"
+    },
+    {
+      "claim": "semantic_candidate_correction",
+      "kind": "class",
+      "owner_file": "trainer_semantic.py",
+      "status": "do_not_move_yet",
+      "symbol": "_SemanticCorrectionGate"
+    },
+    {
+      "claim": "ablation_positioning_legacy",
+      "kind": "function",
+      "owner_file": "trainer_legacy_impl.py",
+      "status": "legacy_replay",
+      "symbol": "run_phase_a_matrix"
+    }
+  ],
+  "version": 1
+}

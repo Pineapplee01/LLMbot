@@ -4,12 +4,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import RGCNConv
 
 from artifact_contracts import MissingFrozenArtifactError
 from estimators import fit_temperature_scaling
 from model_building import _idx_tensor, _score_logits, resolve_g0_feature_bundle
-from trainer_preparation import _resolve_optional_graph_override_paths, build_or_load_frozen_g0
+from trainer_preparation import _is_better_with_policy, _resolve_optional_graph_override_paths, build_or_load_frozen_g0
 from utils import ensure_dir, safe_torch_load, save_stage_artifacts, tensor_sha256, write_json, write_text, write_torch
 
 
@@ -55,6 +57,67 @@ def _classification_consistency_proxy(probabilities, reference_labels):
     row_idx = np.arange(prob_np.shape[0], dtype=np.int64)
     clipped = np.clip(prob_np[row_idx, label_np], a_min=1e-8, a_max=1.0)
     return clipped.astype(np.float32)
+
+
+def _idx_numpy(idx):
+    if idx is None:
+        return np.asarray([], dtype=np.int64)
+    if torch.is_tensor(idx):
+        return idx.detach().cpu().long().numpy()
+    return np.asarray(idx, dtype=np.int64)
+
+
+class StructuralConflictRGCN(nn.Module):
+    """Structure-only auxiliary view used by local_conflict_prune_diag."""
+
+    def __init__(self, num_nodes, node_emb_dim=64, hidden_dim=64, n_relations=2, n_layers=2, dropout=0.1):
+        super().__init__()
+        self.num_nodes = int(num_nodes)
+        self.node_emb_dim = int(node_emb_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.n_relations = int(n_relations)
+        self.n_layers = int(n_layers)
+        self.node_table = nn.Embedding(self.num_nodes, self.node_emb_dim)
+        self.linear_in = nn.Linear(self.node_emb_dim, self.hidden_dim)
+        self.convs = nn.ModuleList(
+            [RGCNConv(self.hidden_dim, self.hidden_dim, self.n_relations) for _ in range(self.n_layers)]
+        )
+        self.linear_pool = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.linear_out = nn.Linear(self.hidden_dim, 2)
+        self.dropout = nn.Dropout(float(dropout))
+        self.activation = nn.LeakyReLU()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.node_table.weight)
+        nn.init.xavier_uniform_(self.linear_in.weight)
+        nn.init.zeros_(self.linear_in.bias)
+        for conv in self.convs:
+            conv.reset_parameters()
+        nn.init.xavier_uniform_(self.linear_pool.weight)
+        nn.init.zeros_(self.linear_pool.bias)
+        nn.init.xavier_uniform_(self.linear_out.weight)
+        nn.init.zeros_(self.linear_out.bias)
+
+    def forward_outputs(self, edge_index, edge_type):
+        node_ids = torch.arange(self.num_nodes, device=self.node_table.weight.device, dtype=torch.long)
+        x = self.node_table(node_ids)
+        x = self.linear_in(x)
+        x = self.dropout(x)
+        for conv in self.convs:
+            x = conv(x, edge_index, edge_type)
+            x = self.activation(x)
+        hidden = self.linear_pool(x)
+        hidden = self.activation(hidden)
+        hidden = self.dropout(hidden)
+        logits = self.linear_out(hidden)
+        prob = torch.softmax(logits, dim=-1)
+        return {
+            "logits": logits,
+            "prob": prob,
+            "pred": prob.argmax(dim=1),
+            "node_repr": hidden,
+        }
 
 
 class GraphStageMixin:
@@ -154,9 +217,6 @@ class GraphStageMixin:
 
     def _build_or_load_lm_only_head(self):
         graph_variant = str(getattr(self, "graph_data_variant", "labeled")).lower()
-        if graph_variant != "full_graph_support":
-            return super()._build_or_load_lm_only_head()
-
         existing = self._load_lm_only_head()
         if existing is not None:
             existing_outputs = existing.get("outputs", {})
@@ -166,13 +226,20 @@ class GraphStageMixin:
             manifest_variant = str(
                 manifest.get("graph_data_variant", manifest.get("feature_manifest", {}).get("graph_data_variant", "labeled"))
             ).lower()
-            if existing_rows == int(self.graph_node_count) and manifest_variant == "full_graph_support":
+            expected_rows = int(self.graph_node_count) if graph_variant == "full_graph_support" else int(len(self.labels))
+            expected_variant = "full_graph_support" if graph_variant == "full_graph_support" else "labeled"
+            if existing_rows == expected_rows and (graph_variant != "full_graph_support" or manifest_variant == expected_variant):
                 return existing
 
         if bool(getattr(self.args, "claim_grade", False)):
+            if graph_variant == "full_graph_support":
+                raise MissingFrozenArtifactError(
+                    "claim_grade full-graph local conflict diagnostics require a full-graph lm_only_head artifact; "
+                    "implicit recompute is disallowed."
+                )
             raise MissingFrozenArtifactError(
-                "claim_grade full-graph local conflict diagnostics require a full-graph lm_only_head artifact; "
-                "implicit recompute is disallowed."
+                "claim_grade GLANCE context selector requires frozen/lm_only_head artifacts; "
+                "implicit upstream recompute is disallowed."
             )
 
         from sklearn.linear_model import LogisticRegression
@@ -180,11 +247,19 @@ class GraphStageMixin:
 
         context = self.ensure_backbone_context()
         feature_manifest = context["frozen_g0"]["manifest"].get("feature_manifest", {})
-        feature_path = feature_manifest.get("labeled_embedding_path") or feature_manifest.get("path")
+        if graph_variant == "full_graph_support":
+            feature_path = feature_manifest.get("labeled_embedding_path") or feature_manifest.get("path")
+        else:
+            feature_path = feature_manifest.get("path")
         if not feature_path or not Path(feature_path).exists():
+            if graph_variant == "full_graph_support":
+                raise MissingFrozenArtifactError(
+                    "Full-graph local conflict diagnostics require a readable labeled semantic embedding tensor "
+                    "from the frozen G0 feature manifest."
+                )
             raise MissingFrozenArtifactError(
-                "Full-graph local conflict diagnostics require a readable labeled semantic embedding tensor "
-                "from the frozen G0 feature manifest."
+                "Stage 2 router requires LM-only probabilities. No frozen LM-only head exists and "
+                "frozen G0 does not record a readable semantic embedding path for a lightweight LM-only head."
             )
 
         feature_args = SimpleNamespace(**vars(self.args))
@@ -198,19 +273,19 @@ class GraphStageMixin:
         feature_bundle = resolve_g0_feature_bundle(feature_args, self.data)
         features = feature_bundle["features"].detach().cpu().float().numpy()
         labels = np.asarray(self.labels, dtype=np.int64)
-        train_idx = self.data["train_idx"].detach().cpu().long().numpy() if torch.is_tensor(self.data["train_idx"]) else np.asarray(self.data["train_idx"], dtype=np.int64)
-        valid_idx = self.data["valid_idx"].detach().cpu().long().numpy() if torch.is_tensor(self.data["valid_idx"]) else np.asarray(self.data["valid_idx"], dtype=np.int64)
-        test_idx = self.data["test_idx"].detach().cpu().long().numpy() if torch.is_tensor(self.data["test_idx"]) else np.asarray(self.data["test_idx"], dtype=np.int64)
-        if features.shape[0] < labels.shape[0]:
+        train_idx = _idx_numpy(self.data["train_idx"])
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        output_rows = int(features.shape[0]) if graph_variant == "full_graph_support" else int(len(labels))
+        if features.shape[0] < output_rows:
             raise MissingFrozenArtifactError(
-                f"Full-graph lm_only_head features ({int(features.shape[0])} rows) must cover labeled nodes ({int(labels.shape[0])})."
+                f"local_conflict_prune_diag features ({int(features.shape[0])} rows) must cover expected output rows ({output_rows})."
             )
 
         scaler = StandardScaler()
         x_train = scaler.fit_transform(features[train_idx])
-        x_all = scaler.transform(features)
+        x_all = scaler.transform(features[:output_rows])
         classes = np.unique(labels[train_idx])
-        output_rows = int(features.shape[0])
         if classes.size < 2:
             prob = np.zeros((output_rows, 2), dtype=np.float32)
             prob[:, int(classes[0])] = 1.0
@@ -261,9 +336,17 @@ class GraphStageMixin:
         )
         manifest = {
             "contract": "lm_only_head_v1",
-            "graph_data_variant": "full_graph_support",
-            "training_scope": "train_idx_supervised_lightweight_head_labeled_prefix",
-            "calibration_scope": "valid_idx_temperature_scaling_labeled_prefix",
+            "graph_data_variant": graph_variant,
+            "training_scope": (
+                "train_idx_supervised_lightweight_head_labeled_prefix"
+                if graph_variant == "full_graph_support"
+                else "train_idx_supervised_lightweight_head"
+            ),
+            "calibration_scope": (
+                "valid_idx_temperature_scaling_labeled_prefix"
+                if graph_variant == "full_graph_support"
+                else "valid_idx_temperature_scaling"
+            ),
             "input_source": "cached_semantic_embedding_from_frozen_g0_manifest",
             "feature_manifest": feature_bundle["feature_manifest"],
             "temperature": float(temperature),
@@ -282,11 +365,6 @@ class GraphStageMixin:
 
     def _fit_local_conflict_structural_view(self, edge_index, edge_type, labels_t):
         graph_variant = str(getattr(self, "graph_data_variant", "labeled")).lower()
-        if graph_variant != "full_graph_support":
-            return super()._fit_local_conflict_structural_view(edge_index, edge_type, labels_t)
-
-        import trainer_legacy_impl as _legacy_impl
-
         train_idx = _idx_tensor(self.data["train_idx"])
         valid_idx = _idx_tensor(self.data["valid_idx"])
         test_idx = _idx_tensor(self.data["test_idx"])
@@ -296,9 +374,9 @@ class GraphStageMixin:
             )
 
         labeled_count = int(labels_t.numel())
-        num_nodes = int(self.graph_node_count)
+        num_nodes = int(self.graph_node_count) if graph_variant == "full_graph_support" else labeled_count
         relation_cardinality = int(edge_type.max().item()) + 1 if edge_type.numel() else int(getattr(self.args, "n_relations", 2))
-        model = _legacy_impl.StructuralConflictRGCN(
+        model = StructuralConflictRGCN(
             num_nodes=num_nodes,
             node_emb_dim=64,
             hidden_dim=64,
@@ -342,7 +420,7 @@ class GraphStageMixin:
                     "valid_loss": float(valid_metrics["loss"]),
                 }
             )
-            if _legacy_impl._is_better(valid_metrics, best_metrics):
+            if _is_better_with_policy(valid_metrics, best_metrics):
                 best_metrics = valid_metrics
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 wait = 0
@@ -359,6 +437,11 @@ class GraphStageMixin:
         with torch.no_grad():
             final_outputs = model.forward_outputs(edge_index_dev, edge_type_dev)
         labeled_logits = final_outputs["logits"][:labeled_count].detach().cpu()
+        training_scope = (
+            "labeled_prefix_only_on_full_graph_structure"
+            if graph_variant == "full_graph_support"
+            else "labeled_graph_structure"
+        )
         return {
             "model": model,
             "outputs": {key: value.detach().cpu() for key, value in final_outputs.items()},
@@ -368,8 +451,8 @@ class GraphStageMixin:
                 "patience": int(patience),
                 "best_epoch": int(best_metrics.get("epoch", -1) if best_metrics else -1),
                 "history": history,
-                "supervision_scope": "labeled_prefix_only",
-                "graph_node_count": int(self.graph_node_count),
+                "supervision_scope": "labeled_prefix_only" if graph_variant == "full_graph_support" else "labeled_nodes",
+                "graph_node_count": int(num_nodes),
                 "labeled_node_count": int(self.labeled_node_count),
             },
             "metrics": {
@@ -387,13 +470,47 @@ class GraphStageMixin:
                 "optimizer": "adamw",
                 "learning_rate": 1e-3,
                 "weight_decay": 1e-5,
-                "training_scope": "labeled_prefix_only_on_full_graph_structure",
-                "graph_node_count": int(self.graph_node_count),
+                "training_scope": training_scope,
+                "graph_node_count": int(num_nodes),
                 "labeled_node_count": int(self.labeled_node_count),
                 "checkpoint_selection": {
                     "primary": "validation_macro_f1",
                     "tie_breaker": "validation_loss",
                 },
+            },
+        }
+
+    def _run_structural_view_forward(self, model, edge_index, edge_type):
+        model = model.to(self.device)
+        model.eval()
+        with torch.no_grad():
+            outputs = model.forward_outputs(edge_index.to(self.device), edge_type.to(self.device))
+        return {key: value.detach().cpu() for key, value in outputs.items()}
+
+    def _fit_local_conflict_router(self, semantic_prob, structural_prob):
+        valid_idx = _idx_numpy(self.data["valid_idx"])
+        test_idx = _idx_numpy(self.data["test_idx"])
+        budget = float(getattr(self.args, "conflict_router_budget", 0.10) or 0.10)
+        if not (0.0 < budget < 1.0):
+            raise ValueError("--conflict_router_budget must be in (0, 1) for local_conflict_prune_diag.")
+        conflict_score = _js_divergence_from_probs(structural_prob, semantic_prob).detach().cpu().numpy().astype(np.float32)
+        valid_scores = conflict_score[valid_idx]
+        if valid_scores.size == 0:
+            raise MissingFrozenArtifactError("local_conflict_prune_diag requires non-empty valid conflict scores.")
+        routed_count_valid = max(int(round(valid_scores.size * budget)), 1)
+        ranked_valid = np.sort(valid_scores)[::-1]
+        threshold = float(ranked_valid[min(routed_count_valid - 1, ranked_valid.size - 1)])
+        routed_mask = conflict_score >= (threshold - 1e-12)
+        return {
+            "conflict_score": conflict_score,
+            "threshold": threshold,
+            "routed_mask": routed_mask,
+            "budget": budget,
+            "routed_count_valid_target": int(routed_count_valid),
+            "test_conflict_summary": {
+                "mean": float(conflict_score[test_idx].mean()) if test_idx.size else 0.0,
+                "median": float(np.median(conflict_score[test_idx])) if test_idx.size else 0.0,
+                "max": float(conflict_score[test_idx].max()) if test_idx.size else 0.0,
             },
         }
 

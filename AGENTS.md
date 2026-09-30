@@ -4,17 +4,32 @@ This file governs `LLMbot/` and every child path under it.
 
 ## Active Mainline
 
-- `LLMbot/` root is the only active mainline for future code and research pipeline work.
-- Run the main CLI from this directory with `python main.py ...`.
-- Treat `baseline/` and `code/` as deprecated legacy surfaces scheduled for deletion.
-- Do not add or modify implementation, tests, or documentation under `baseline/` or `code/` unless the user explicitly asks for migration, deletion, archival cleanup, or forensic comparison.
+- `LLMbot/` is the operator working directory and active research-code mainline
+  for ongoing bot-detection pipeline work.
+- Active Python source lives in the flat `LLMbot/code/` directory.
+- `../NLPCC/code/` is a source snapshot for the NLPCC submission line. Do not
+  treat it as generated evidence, and do not silently edit it when making
+  ordinary `LLMbot/code/` research changes.
+- Run the main CLI from `LLMbot/` with `python main.py ...`; root
+  `main.py`, `precompute.py`, and `preprocess.py` are compatibility
+  entrypoints into `code/`.
+- Treat `baseline/` as a deprecated legacy surface scheduled for deletion.
+  Edit it only for explicit migration, deletion, archival cleanup, or forensic
+  comparison.
 
 ## Edit Boundaries
 
-- Default editable source files are root-level mainline modules, including `main.py`, `parser_args.py`, `trainer.py`, `estimators.py`, `operators.py`, `model_building.py`, `subgroups.py`, `GNNs.py`, `RGT.py`, `LM.py`, and `dataloader.py`.
-- Shared utility helpers belong in the `utils/` package. Do not recreate a root-level `utils.py`.
+- Default editable source files are under `code/`, including `code/main.py`,
+  `code/parser_args.py`, `code/trainer.py`, `code/estimators.py`,
+  `code/operators.py`, `code/model_building.py`, `code/subgroups.py`,
+  `code/GNNs.py`, `code/RGT.py`, `code/LM.py`, and `code/dataloader.py`.
+- Shared utility helpers belong in the `code/utils/` package. Do not recreate
+  a root-level `utils.py`.
 - Package directories such as `models/`, `trainers/`, `evaluation/`, `data/`, and `utils/` are editable only when the task names that subsystem or the existing mainline code already imports it.
 - Evidence and generated artifact directories are read/verify by default: `checkpoints/`, `saved_artifacts/`, caches, `__pycache__/`, and temporary run outputs.
+- `code/claims/` and `code/shared/` are governance markers in this slice, not
+  import packages. Keep active implementation modules at `code/*.py` until an
+  approved claim-by-claim move introduces shims and tests.
 - Do not create new source files by default. New files require an explicit user request or a pre-approved design that names the file path and explains why existing files are insufficient.
 
 ## File Creation Rules
@@ -40,7 +55,10 @@ Use this fixed routing:
 - For parser/config changes, run a lightweight argument surface check such as `python main.py --help` when the active mainline imports are available.
 - For stage behavior, prefer bounded smoke commands with explicit `--stage`, `--seeds`, `--disable_wandb`, and small limits when available.
 - For research artifact changes, verify manifest fields and output paths produced by the CLI command.
-- For governance or skill changes, run drift checks for stale `LLMbot/baseline/` default-mainline wording, role-boundary language, skill frontmatter, and missing code-documentation sync.
+- For governance or skill changes, run drift checks for stale
+  `LLMbot/baseline/` default-mainline wording, stale `code/ deprecated`
+  wording, role-boundary language, skill frontmatter, and missing
+  code-documentation sync.
 - If a CLI run is unsafe, too expensive, or missing data/GPU, state the exact command that would validate it and explain why it was not run.
 
 ## Documentation Sync Contract

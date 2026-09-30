@@ -1,6 +1,18 @@
 # LLMbot Active Mainline
 
-`LLMbot/` is the only active mainline for current bot-detection pipeline work.
+`LLMbot/` is the active research-code mainline for current bot-detection
+pipeline work. Active Python source lives under `LLMbot/code/`: orchestration
+and mixed legacy modules remain top-level, while claim-owned code is beginning
+to move into `LLMbot/code/<claim_name>/` packages. The root
+`main.py`, `precompute.py`, and `preprocess.py` files are compatibility
+entrypoints so existing commands and runner scripts keep working from
+`LLMbot/`.
+
+The NLPCC submission line now has a trimmed package under `../NLPCC/code/`.
+It is not a full copy of this mainline; it keeps only the paper-facing
+`main.py`, `parser_args.py`, `graph_detector.py`, `router.py`, `models.py`,
+`data_io.py`, and `utils.py` modules. Ongoing exploratory cleanup should still
+happen in `LLMbot/code/` first unless the task explicitly targets NLPCC.
 
 ## Entry Point
 
@@ -1296,9 +1308,11 @@ Current owner split:
 
 Still transitional:
 
-- `trainer_legacy_impl.py` still contains remaining GLANCE helper tails
-  (especially prompt-expert / relation-aware helper clusters) and duplicate
-  legacy blocks
+- GLANCE runner/helper tails now live in `trainer_glance.py`
+- `local_conflict_prune_diag` and its structural-conflict helpers now live in
+  `trainer_graph.py`
+- `trainer_legacy_impl.py` still contains estimator/matrix, local conformal
+  helper tails, compatibility paths, and historical duplicate blocks
 
 Removed in this round:
 
@@ -2091,16 +2105,29 @@ Frozen-router reuse note:
 
 ## Mainline Layout
 
-Root-level modules are the default implementation surface:
+`LLMbot/` remains the operator working directory. The active source surface is
+the flat `code/` directory, not a nested package split:
 
-- `main.py` - CLI entrypoint and canonical task dispatch
-- `parser_args.py` - argument contract and compatibility normalization
-- `stage_registry.py` - stage visibility and naming source of truth
-- `trainer.py` - thin compatibility facade
-- `trainer_legacy_impl.py` - current large implementation body during the migration window
-- `stage_runner.py`, `trainer_preparation.py`, `trainer_semantic.py`, `trainer_graph.py`, `trainer_glance.py`, `stage_helpers.py` - new canonical module surfaces for continued extraction
-- `estimators.py`, `operators.py`, `model_building.py` - estimator/operator/model construction
-- `utils/` - artifact IO, manifests, metrics, calibration, data loading, and reproducibility helpers
+- `main.py` - compatibility CLI entrypoint that dispatches to `code/main.py`
+- `precompute.py` - compatibility precompute entrypoint for `code/precompute.py`
+- `preprocess.py` - compatibility preprocessing entrypoint for `code/preprocess.py`
+- `code/main.py` - canonical task dispatch and seed-loop orchestration
+- `code/parser_args.py` - argument contract and compatibility normalization
+- `code/stage_registry.py` - experiment-task visibility and naming source of truth
+- `code/stage_runner.py` - shared `StageRunner` skeleton and top-level experiment-task dispatch
+- `code/trainer.py` - thin compatibility facade
+- `code/trainer_legacy_impl.py` - current large implementation body during the migration window
+- `code/trainer_preparation.py`, `code/trainer_semantic.py`, `code/trainer_graph.py`, `code/trainer_glance.py`, `code/trainer_distillation.py` - stage owner surfaces for continued extraction
+- `code/model_building.py`, `code/estimators.py`, `code/router.py`, `code/GNNs.py`, `code/operators.py`, `code/hypergnn.py` - model, estimator, router, graph, and operator algorithms; `LM_Model` now lives in `model_building.py`, and `RGTLayer`/`SimpleHGNConv` live in `GNNs.py`
+- `code/utils/` - artifact IO, manifests, metrics, calibration, data loading, and reproducibility helpers
+- `code/shared/` - governance marker for shared modules; not an import package yet
+- `code/claims/` - shallow claim-ownership markers with README mappings; active implementation remains in flat modules
+- root `run_*.py`, `.ps1`, `.cmd`, and launch scripts - runner-script surface kept outside `code/` for now
+- `experiments/` and `server_logs/` - artifact surface, read/verify by default
+
+Do not introduce `stages/`, `methods/`, or similar package splits yet. Claim
+folders are documentation/governance markers in this slice; real Python module
+moves should happen claim by claim only after shims and import tests exist.
 
 ## Artifact Naming
 
@@ -2118,12 +2145,13 @@ active naming surface.
 
 ## Current Mainline Notes
 
-- `trainer.py` is already a thin compatibility facade, but most execution logic
-  still lives in `trainer_legacy_impl.py`.
+- `trainer.py` is already a thin compatibility facade, but significant
+  estimator/matrix and compatibility logic still lives in
+  `trainer_legacy_impl.py`.
 - `stage_runner.py`, `trainer_preparation.py`, `trainer_semantic.py`,
-  `trainer_graph.py`, `trainer_glance.py`, and `stage_helpers.py` already act
-  as canonical import surfaces, but most still forward into
-  `trainer_legacy_impl.py` while extraction continues.
+  `trainer_graph.py`, and `trainer_glance.py` act as canonical import and
+  owner surfaces. `trainer_graph.py` now owns `local_conflict_prune_diag`
+  instead of falling back to `trainer_legacy_impl.py`.
 - `estimators.py` and `trainer_legacy_impl.py` remain the main refactor
   hotspots.
 - `python main.py --help` is now intended to work as a parser-only check even if
@@ -2163,6 +2191,33 @@ active naming surface.
 - `joint_router_refinement` remains the only public GLANCE-family task; richer
   GLANCE branches are implemented but internal-only
 
+## Refactor Naming Standard 2026-07-04
+
+New commands and docs use canonical names only: `--experiment_task`,
+`--graph_backbone`, `--text_encoder`, `--semantic_encoder`, and
+`--embedding_path`. Hidden aliases such as `--stage`, `--GNN_model`,
+`--LM_model`, `--semantic_backbone`, `--emb_path`, and `--g0_feature_path`
+remain for historical command replay, but new code should read canonical
+fields after parser normalization.
+
+The deprecated-only task value `eqc_v8_matrix` is no longer accepted on either
+`--experiment_task` or hidden `--stage`. `StageSpec` remains the compatibility
+class name for task metadata, but new orchestration code should use local names
+such as `task_spec`, `requested_task`, and `execution_task`. The flat active
+source directory remains `LLMbot/code/`; do not introduce `stages/`,
+`methods/`, or deeper taxonomy directories until deletion and consolidation
+reduce the current migration body.
+
+Current consolidation status: `conflict_refiner.py` was merged into
+`trainer_dignn_conflict.py`; `LM.py` was merged into `model_building.py`;
+`RGT.py` and `SimpleHGN.py` were merged into `GNNs.py`. `trainer_legacy_impl.py`
+still remains for matrix/fallback behavior, but duplicate contract/path helper
+definitions already owned by `artifact_contracts.py` were removed. The legacy
+distillation public names `LM_Trainer`, `GNN_Trainer`, `MLP_Trainer`,
+`_safe_pseudo_label_training_index`, and `run_legacy_graph_seed` now resolve to
+`trainer_distillation.py`; `trainer_legacy_impl.py` keeps only compatibility
+aliases for those names.
+
 ## Code Governance Status 2026-05-24
 
 The active mainline is now governance-aligned, but not yet structurally
@@ -2170,7 +2225,8 @@ finished.
 
 Completed governance work:
 
-- `LLMbot/` is the only active mainline
+- `LLMbot/` is the only active operator mainline
+- `LLMbot/code/` is the flat active Python source surface
 - canonical public tasks and canonical public flags are now the operator-facing
   contract
 - hidden legacy aliases are isolated to a compatibility window instead of
@@ -2182,10 +2238,11 @@ Completed governance work:
 Still incomplete:
 
 - most execution logic still resides in `trainer_legacy_impl.py`
-- several extracted modules are currently boundary surfaces rather than true
-  logic owners
+- estimator/matrix, local conformal helper tails, and compatibility paths still
+  reside in `trainer_legacy_impl.py`
 - active internal code still carries a canonical-to-legacy compatibility layer
-- `StageSpec` is only partially consumed as a runtime policy source
+- downstream owner modules still contain legacy shadow-field reads, although
+  `main.py` now consumes the core `StageSpec` runtime gates
 - runtime-only helper artifact naming is still in migration
 
 This means the project has passed the public-contract cleanup phase, but has
@@ -2193,26 +2250,23 @@ not yet finished the implementation extraction phase.
 
 ## Next Refactor Plan
 
-1. Make `trainer_preparation.py` the real owner of preparation logic.
-   Move `load_frozen_g0`, `build_or_load_frozen_g0`, and
-   `build_or_load_faithful_gats` out of `trainer_legacy_impl.py`, and move
-   shared path/provenance helpers into `stage_helpers.py`.
-2. Make `trainer_semantic.py` the real owner of semantic finetune execution.
-   Move `run_semantic_finetune_seed` and its manifest/report helpers out of
+1. Keep `StageSpec` as the runtime gate source.
+   `main.py` now consumes `runner_kind`, `claim_grade_allowed`,
+   `requires_canonical_split`, `forces_use_gnn`, and `graph_data_mode`; future
+   slices should avoid adding parallel policy tables.
+2. Move the remaining local conformal helper tails out of
    `trainer_legacy_impl.py`.
+   `trainer_graph.py` already owns shared graph runtime, full/non-full
+   structural-conflict helpers, and `local_conflict_prune_diag`.
 3. Finish the active parser-namespace migration inside code.
    Keep legacy flags parse-compatible, but make active mainline code read
    canonical fields such as `experiment_task`, `graph_backbone`,
    `text_encoder`, `semantic_encoder`, and `embedding_path`.
-4. Consume `StageSpec` more uniformly at runtime.
-   Replace remaining hand-written dispatch or gate special cases in `main.py`
-   with registry fields such as `runner_kind`, `claim_grade_allowed`, and
-   `forces_use_gnn`.
-5. Extract graph and GLANCE execution ownership into
-   `trainer_graph.py`, `trainer_glance.py`, and `stage_runner.py`.
-   The goal is for those modules to own their execution branches directly,
-   rather than re-exporting `trainer_legacy_impl.py`.
-6. Canonicalize runtime-only helper artifacts after extraction.
+4. Consolidate estimator/matrix boundaries.
+   Keep `router.py` reliability-first, then review `estimators.py` and
+   `model_building.py` separately instead of mixing algorithm cleanup with
+   runner cleanup.
+5. Canonicalize runtime-only helper artifacts after extraction.
    New helper outputs should stop writing migration-era naming where practical,
    while read compatibility remains in place for one transition window.
 
@@ -2232,10 +2286,33 @@ Do not treat documentation sync as optional cleanup.
 
 ## Deprecated Surfaces
 
-`baseline/` and `code/` are deprecated legacy directories scheduled for
-deletion. Do not add implementation, tests, or documentation there unless the
-task explicitly asks for migration, deletion, archival cleanup, or forensic
-comparison.
+`baseline/` is a deprecated legacy directory scheduled for deletion. `code/` is
+now the active flat source directory. Root compatibility entrypoints and runner
+scripts stay at `LLMbot/` root until a later runner-governance slice chooses a
+small migration target.
+
+## Seed-1 Router Alignment Diagnostic
+
+The isolated 2026-07-12 diagnostic compares two routing contracts under the
+same TwiBot-20 seed-1 graph-training configuration:
+
+- `P-Paper`: the exact weighted train-reference tail equation written in the
+  NLPCC manuscript, with train-target self exclusion;
+- `P-Hyperedge`: explicit `same_hyperedge` calibration with the
+  `same_hyperedge_selected_tail` score family.
+
+Run from `LLMbot/`:
+
+```powershell
+python run_twibot20_seed1_router_alignment_20260712.py --dry-run
+python run_twibot20_seed1_router_alignment_20260712.py
+```
+
+All generated commands, logs, route manifests, graph artifacts, hashes, and
+canonical metric reports are isolated under
+`experiments/twibot20_seed1_router_alignment_20260712/`. Historical component
+ablation artifacts are read-only inputs. This run is seed-1 diagnostic evidence
+and does not repair or replace a five-seed main-result claim.
 Example structured evidence-card prompt-expert bundle v3:
 
 ```bash

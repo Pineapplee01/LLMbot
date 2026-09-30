@@ -6,7 +6,7 @@ import trainer_legacy_impl as _legacy_impl
 from artifact_contracts import MissingFrozenArtifactError, split_provenance, stage_dir_read_candidates
 from model_building import _labels_to_index
 from runtime_env import _resolve_device
-from stage_registry import legacy_name_for, resolve_stage_name
+from stage_registry import legacy_name_for, resolve_stage_spec
 from trainer_glance import GlanceStageMixin
 from trainer_graph import GraphStageMixin
 from trainer_preparation import load_frozen_g0
@@ -18,6 +18,9 @@ from utils import (
     tensor_sha256,
     write_json,
 )
+
+
+__all__ = ["StageRunner"]
 
 
 def _mask_from_idx(num_nodes, idx):
@@ -33,10 +36,10 @@ def _mask_from_idx(num_nodes, idx):
 class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
     """Shared StageRunner skeleton for the active mainline.
 
-    The heavy graph-aware and GLANCE execution branches still inherit from the
-    legacy implementation during the current migration window. This owner class
-    now controls shared runtime state, provenance wiring, dependency loading,
-    and top-level dispatch.
+    This owner class controls shared runtime state, provenance wiring,
+    dependency loading, and top-level dispatch. The legacy base remains only
+    for transitional helper fallback; active dispatch must stay in this class
+    or in the extracted owner mixins.
     """
 
     def __init__(self, args, seed, data, run):
@@ -56,20 +59,27 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
         self.val_mask = _mask_from_idx(len(self.labels), data["valid_idx"])
         self.test_mask = _mask_from_idx(len(self.labels), data["test_idx"])
         self.base_context = None
-        self.requested_stage = getattr(args, "requested_stage", args.stage)
-        self.execution_stage = resolve_stage_name(getattr(args, "execution_task", args.stage))
-        self.legacy_execution_stage = legacy_name_for(self.execution_stage) or self.execution_stage
+        self.requested_task = getattr(args, "requested_task", getattr(args, "requested_stage", args.stage))
+        self.requested_stage = self.requested_task
+        self.task_spec = resolve_stage_spec(getattr(args, "execution_task", args.stage))
+        self.stage_spec = self.task_spec
+        self.execution_task = self.task_spec.canonical_name
+        self.execution_stage = self.execution_task
+        self.args.task_spec = self.task_spec
+        self.args.stage_spec = self.task_spec
+        self.legacy_execution_task = legacy_name_for(self.execution_task) or self.execution_task
+        self.legacy_execution_stage = self.legacy_execution_task
         self.requested_task = getattr(
             args,
             "requested_experiment_task",
-            getattr(args, "experiment_task", self.requested_stage),
+            getattr(args, "experiment_task", self.requested_task),
         )
 
     def ensure_backbone_context(self):
         if self.base_context is not None:
             return self.base_context
         external_root = getattr(self.args, "external_frozen_g0_root", None)
-        if self.execution_stage == "joint_router_refinement" and external_root:
+        if self.execution_task == "joint_router_refinement" and external_root:
             if not getattr(self.args, "joint_refiner_embedding_path", None):
                 raise MissingFrozenArtifactError(
                     "joint_router_refinement now requires the current run's own preparation/graph_detector artifact. "
@@ -119,19 +129,21 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
 
     def _resolved_config_snapshot(self):
         snapshot = dict(vars(self.args))
-        stage_spec = snapshot.get("stage_spec")
-        if stage_spec is not None:
-            snapshot["stage_spec"] = {
-                "canonical_name": getattr(stage_spec, "canonical_name", None),
-                "legacy_names": list(getattr(stage_spec, "legacy_names", ()) or ()),
-                "visibility": getattr(stage_spec, "visibility", None),
-                "family": getattr(stage_spec, "family", None),
-                "runner_kind": getattr(stage_spec, "runner_kind", None),
-                "claim_grade_allowed": getattr(stage_spec, "claim_grade_allowed", None),
-                "requires_canonical_split": getattr(stage_spec, "requires_canonical_split", None),
-                "forces_use_gnn": getattr(stage_spec, "forces_use_gnn", None),
-                "graph_data_mode": getattr(stage_spec, "graph_data_mode", None),
-                "artifact_namespace": getattr(stage_spec, "artifact_namespace", None),
+        for spec_key in ("stage_spec", "task_spec"):
+            task_spec = snapshot.get(spec_key)
+            if task_spec is None:
+                continue
+            snapshot[spec_key] = {
+                "canonical_name": getattr(task_spec, "canonical_name", None),
+                "legacy_names": list(getattr(task_spec, "legacy_names", ()) or ()),
+                "visibility": getattr(task_spec, "visibility", None),
+                "family": getattr(task_spec, "family", None),
+                "runner_kind": getattr(task_spec, "runner_kind", None),
+                "claim_grade_allowed": getattr(task_spec, "claim_grade_allowed", None),
+                "requires_canonical_split": getattr(task_spec, "requires_canonical_split", None),
+                "forces_use_gnn": getattr(task_spec, "forces_use_gnn", None),
+                "graph_data_mode": getattr(task_spec, "graph_data_mode", None),
+                "artifact_namespace": getattr(task_spec, "artifact_namespace", None),
             }
         return snapshot
 
@@ -179,7 +191,7 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
                 with open(path, "r", encoding="utf-8") as handle:
                     return json.load(handle)
         raise MissingFrozenArtifactError(
-            f"Stage '{self.execution_stage}' requires frozen dependency {candidates[0]}. "
+            f"Experiment task '{self.execution_task}' requires frozen dependency {candidates[0]}. "
             f"Run the upstream task for '{stage_name}' first; strict stages never recompute upstream artifacts."
         )
 
@@ -189,7 +201,7 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
             if path.exists():
                 return safe_torch_load(path, map_location="cpu")
         raise MissingFrozenArtifactError(
-            f"Stage '{self.execution_stage}' requires frozen dependency {candidates[0]}. "
+            f"Experiment task '{self.execution_task}' requires frozen dependency {candidates[0]}. "
             f"Run the upstream task for '{stage_name}' first; strict stages never recompute upstream artifacts."
         )
 
@@ -200,7 +212,7 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
                 with open(path, "r", encoding="utf-8") as handle:
                     return [json.loads(line) for line in handle if line.strip()]
         raise MissingFrozenArtifactError(
-            f"Stage '{self.execution_stage}' requires frozen dependency {candidates[0]}. "
+            f"Experiment task '{self.execution_task}' requires frozen dependency {candidates[0]}. "
             f"Run the upstream task for '{stage_name}' first; strict stages never recompute upstream artifacts."
         )
 
@@ -239,36 +251,40 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
             )
 
     def run(self):
-        stage_dir = build_stage_dir(self.experiment_root, self.execution_stage)
+        if self.task_spec.runner_kind != "stage_runner":
+            raise ValueError(
+                f"StageRunner cannot execute experiment task '{self.execution_task}' with runner_kind={self.task_spec.runner_kind!r}."
+            )
+        stage_dir = build_stage_dir(self.experiment_root, self.execution_task)
         base_bundle = self._base_artifact_bundle()
 
-        if self.execution_stage == "local_conformal_diagnostic":
+        if self.execution_task == "local_conformal_diagnostic":
             return self._run_local_conformal_prune_diag(stage_dir, base_bundle)
 
-        if self.execution_stage == "local_conflict_prune_diag":
+        if self.execution_task == "local_conflict_prune_diag":
             return self._run_local_conflict_prune_diag(stage_dir, base_bundle)
 
-        if self.execution_stage == "local_dignn_conflict_refine_diag":
+        if self.execution_task == "local_dignn_conflict_refine_diag":
             from trainer_dignn_conflict import run_local_dignn_conflict_refine_diag
 
             return run_local_dignn_conflict_refine_diag(self, stage_dir, base_bundle)
 
-        if self.execution_stage == "joint_router_refinement":
+        if self.execution_task == "joint_router_refinement":
             return self._run_glance_joint_router_refine(stage_dir, base_bundle)
 
-        if self.execution_stage == "router_only_ablation":
+        if self.execution_task == "router_only_ablation":
             return self._run_router_only_ablation(stage_dir, base_bundle)
 
-        if self.execution_stage == "prompt_expert_quality_audit":
+        if self.execution_task == "prompt_expert_quality_audit":
             return self._run_prompt_expert_quality_audit(stage_dir, base_bundle)
 
-        if self.execution_stage == "minimal_pipeline":
+        if self.execution_task == "minimal_pipeline":
             return self._run_vertical_minimal(stage_dir, base_bundle)
 
-        if self.execution_stage == "estimator_ablation":
+        if self.execution_task == "estimator_ablation":
             return self._run_estimator_matrix(stage_dir, base_bundle)
 
-        if self.execution_stage in {
+        if self.execution_task in {
             "semantic_operator_ablation",
             "repair_operator_ablation",
             "selector_ablation",
@@ -278,7 +294,7 @@ class StageRunner(GlanceStageMixin, GraphStageMixin, _legacy_impl.StageRunner):
         }:
             return self._fail_outside_phase0_scope()
 
-        if self.execution_stage == "semantic_source_ablation":
+        if self.execution_task == "semantic_source_ablation":
             return self._run_semantic_source_matrix(stage_dir, base_bundle, None, None)
 
-        raise ValueError(f"Unsupported stage: {self.execution_stage}")
+        raise ValueError(f"Unsupported experiment task: {self.execution_task}")

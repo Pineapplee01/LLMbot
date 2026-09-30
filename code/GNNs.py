@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, HGTConv, HypergraphConv, RGCNConv
+from torch_geometric.nn import GATv2Conv, HGTConv, HypergraphConv, MessagePassing, RGCNConv, TransformerConv
+from torch_geometric.utils import softmax
 
 try:
     import dhg
@@ -11,8 +12,6 @@ except Exception:
     DHG_HGNNConv = None
 
 from hypergnn import build_batch_local_knn_hypergraph, build_dynamic_hypergraph
-from RGT import RGTLayer
-from SimpleHGN import SimpleHGNConv
 
 
 def _cfg(model_config, *names, default=None):
@@ -22,6 +21,119 @@ def _cfg(model_config, *names, default=None):
     if default is not None:
         return default
     raise KeyError(f"Missing config keys {names}")
+
+
+class SemanticAttention(nn.Module):
+    def __init__(self, in_size, num_head, out_size, hidden_size=128):
+        super().__init__()
+        self.num_head = num_head
+        self.att_layers = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(in_size, hidden_size),
+                nn.Tanh(),
+                nn.Linear(hidden_size, 1, bias=False),
+            )
+            for _ in range(num_head)
+        )
+
+    def _head_output(self, attention_layer, semantic_embeddings, return_beta):
+        weights = attention_layer(semantic_embeddings).mean(0)
+        beta = torch.softmax(weights, dim=0)
+        if return_beta:
+            self.last_beta = beta.detach()
+        beta = beta.expand((semantic_embeddings.shape[0],) + beta.shape)
+        return (beta * semantic_embeddings).sum(1)
+
+    def forward(self, semantic_embeddings, return_beta):
+        output = self._head_output(self.att_layers[0], semantic_embeddings, return_beta)
+        for attention_layer in self.att_layers[1:]:
+            output += self._head_output(attention_layer, semantic_embeddings, return_beta)
+        return output / self.num_head
+
+
+class RGTLayer(nn.Module):
+    def __init__(self, num_edge_type, in_size, out_size, layer_num_heads, semantic_head, dropout):
+        super().__init__()
+        self.gated = nn.Sequential(
+            nn.Linear(in_size + out_size, in_size),
+            nn.Sigmoid(),
+        )
+        self.activation = nn.ELU()
+        self.gat_layers = nn.ModuleList(
+            TransformerConv(
+                in_channels=in_size,
+                out_channels=out_size,
+                heads=layer_num_heads,
+                dropout=dropout,
+                concat=False,
+            )
+            for _ in range(int(num_edge_type))
+        )
+        self.semantic_attention = SemanticAttention(in_size=out_size, num_head=semantic_head, out_size=out_size)
+
+    def _relation_embedding(self, features, relation_idx, edge_index):
+        transformed = self.gat_layers[relation_idx](features, edge_index.squeeze(0)).flatten(1)
+        gate = self.gated(torch.cat((transformed, features), dim=1))
+        return torch.tanh(transformed) * gate + features * (1 - gate)
+
+    def forward(self, features, edge_index_list, beta=False, agg=None):
+        relation_embeddings = [
+            self._relation_embedding(features, relation_idx, edge_index).unsqueeze(1)
+            for relation_idx, edge_index in enumerate(edge_index_list)
+        ]
+        semantic_embeddings = torch.cat(relation_embeddings, dim=1)
+
+        if agg == "max":
+            return semantic_embeddings.max(dim=1)[0]
+        if agg == "min":
+            return semantic_embeddings.min(dim=1)[0]
+        if agg == "sum":
+            return semantic_embeddings.sum(1)
+        if agg == "mean":
+            return semantic_embeddings.mean(1)
+        return self.semantic_attention(semantic_embeddings, return_beta=beta)
+
+
+class SimpleHGNConv(MessagePassing):
+    def __init__(self, in_channels, out_channels, num_edge_type, rel_dim, beta=None, final_layer=False):
+        super().__init__(aggr="add", node_dim=0)
+        self.W = torch.nn.Linear(in_channels, out_channels, bias=False)
+        self.W_r = torch.nn.Linear(rel_dim, out_channels, bias=False)
+        self.a = torch.nn.Linear(3 * out_channels, 1, bias=False)
+        self.W_res = torch.nn.Linear(in_channels, out_channels, bias=False)
+        self.rel_emb = torch.nn.Embedding(num_edge_type, rel_dim)
+        self.beta = beta
+        self.leaky_relu = torch.nn.LeakyReLU(0.2)
+        self.ELU = torch.nn.ELU()
+        self.final = final_layer
+
+    def init_weight(self):
+        for module in self.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight.data)
+
+    def forward(self, x, edge_index, edge_type, pre_alpha=None):
+        node_emb = self.propagate(x=x, edge_index=edge_index, edge_type=edge_type, pre_alpha=pre_alpha)
+        output = node_emb + self.W_res(x)
+        output = self.ELU(output)
+        if self.final:
+            output = F.normalize(output, dim=1)
+        return output, self.alpha.detach()
+
+    def message(self, x_i, x_j, edge_type, pre_alpha, index, ptr, size_i):
+        out = self.W(x_j)
+        rel_emb = self.rel_emb(edge_type)
+        alpha = self.leaky_relu(self.a(torch.cat((self.W(x_i), self.W(x_j), self.W_r(rel_emb)), dim=1)))
+        alpha = softmax(alpha, index, ptr, size_i)
+        if pre_alpha is not None and self.beta is not None:
+            self.alpha = alpha * (1 - self.beta) + pre_alpha * self.beta
+        else:
+            self.alpha = alpha
+        out = out * alpha.view(-1, 1)
+        return out
+
+    def update(self, aggr_out):
+        return aggr_out
 
 
 class BaseGraphBackbone(nn.Module):

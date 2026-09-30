@@ -2,6 +2,24 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
 
+__all__ = [
+    "StageSpec",
+    "STAGE_REGISTRY",
+    "get_stage_spec",
+    "resolve_stage_spec",
+    "resolve_stage_name",
+    "public_stage_specs",
+    "public_canonical_stage_names",
+    "internal_stage_specs",
+    "accepted_stage_values",
+    "legacy_name_for",
+    "legacy_stage_map",
+    "is_public_stage",
+    "is_internal_stage",
+    "iter_stage_specs",
+]
+
+
 @dataclass(frozen=True)
 class StageSpec:
     canonical_name: str
@@ -370,25 +388,11 @@ STAGE_REGISTRY: Dict[str, StageSpec] = {
     ),
 }
 
-DEPRECATED_STAGE_VALUES = {"eqc_v8_matrix"}
-
 _STAGE_LOOKUP: Dict[str, StageSpec] = {}
 for _spec_item in STAGE_REGISTRY.values():
     _STAGE_LOOKUP[_spec_item.canonical_name] = _spec_item
     for _legacy_name in _spec_item.legacy_names:
         _STAGE_LOOKUP[_legacy_name] = _spec_item
-for _deprecated_name in DEPRECATED_STAGE_VALUES:
-    _STAGE_LOOKUP[_deprecated_name] = _spec(
-        _deprecated_name,
-        visibility="internal",
-        family="deprecated",
-        runner_kind="deprecated",
-        claim_grade_allowed=False,
-        requires_canonical_split=False,
-        forces_use_gnn=False,
-        graph_data_mode="optional",
-        artifact_namespace=f"stages/{_deprecated_name}",
-    )
 
 
 def get_stage_spec(canonical_name: str) -> StageSpec:
@@ -418,15 +422,13 @@ def internal_stage_specs() -> Tuple[StageSpec, ...]:
     return tuple(spec for spec in STAGE_REGISTRY.values() if spec.visibility == "internal")
 
 
-def accepted_stage_values(*, include_internal: bool, include_deprecated: bool) -> Tuple[str, ...]:
+def accepted_stage_values(*, include_internal: bool) -> Tuple[str, ...]:
     accepted = []
     for spec in STAGE_REGISTRY.values():
         if spec.visibility == "internal" and not include_internal:
             continue
         accepted.append(spec.canonical_name)
         accepted.extend(spec.legacy_names)
-    if include_deprecated:
-        accepted.extend(sorted(DEPRECATED_STAGE_VALUES))
     seen = set()
     ordered = []
     for item in accepted:

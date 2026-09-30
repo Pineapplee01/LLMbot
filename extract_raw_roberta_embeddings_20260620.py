@@ -1,10 +1,14 @@
 import argparse
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+
+CODE_DIR = Path(__file__).resolve().parent / "code"
+sys.path.insert(0, str(CODE_DIR))
 
 from model_building import build_LM_model
 from utils import load_raw_data

@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -1146,23 +1145,6 @@ class MLP_Trainer:
             pl_ratio=self.pl_ratio,
             pseudo_label_pool_idx=self.pseudo_label_pool_idx,
         )
-
-
-def _load_semantic_ib_edl_symbols():
-    module_path = Path(__file__).resolve().parents[1] / "code" / "semantic_ib_edl_head.py"
-    if not module_path.exists():
-        return None, None
-
-    spec = importlib.util.spec_from_file_location("_semantic_ib_edl_head", module_path)
-    if spec is None or spec.loader is None:
-        return None, None
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return (
-        getattr(module, "SemanticIBEDLHead", None),
-        getattr(module, "r_edl_loss", None),
-    )
 
 
 def _compute_budget_curve(labels, base_pred, new_pred, risk_score, eval_mask, hcw_mask=None, budgets=(0.05, 0.10, 0.15, 0.20)):

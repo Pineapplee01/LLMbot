@@ -24,6 +24,21 @@ from trainer_preparation import build_or_load_faithful_gats, build_or_load_froze
 from trainer_semantic import run_semantic_finetune_seed  # noqa: F401
 
 
+__all__ = [
+    "MissingFrozenArtifactError",
+    "PHASE_A_CONTRACT",
+    "PHASE_A_DISABLED_COMPONENTS",
+    "_resolve_device",
+    "StageRunner",
+    "run_legacy_graph_seed",
+    "build_or_load_faithful_gats",
+    "build_or_load_frozen_g0",
+    "load_frozen_g0",
+    "run_semantic_finetune_seed",
+    "run_phase_a_matrix",
+]
+
+
 def run_phase_a_matrix(args, seed, data, stage_dir, base_bundle):
     raise NotImplementedError(
         "Phase A matrix via StageRunner is not yet implemented. "

@@ -1,9 +1,9 @@
 # LLMbot active-mainline tracking policy.
 #
-# Only root-level Python/Markdown files and utils/ are eligible for normal
-# commits. Legacy surfaces, package directories, generated artifacts, caches,
-# and model weights stay ignored unless a future task explicitly changes this
-# policy.
+# Root compatibility Python/Markdown files and the flat code/ active source
+# directory are eligible for normal commits. Legacy surfaces, generated
+# artifacts, caches, and model weights stay ignored unless a future task
+# explicitly changes this policy.
 
 # Ignore everything by default.
 *
@@ -14,17 +14,16 @@
 # Keep this policy file tracked.
 !.gitignore
 
-# Active mainline files at LLMbot/ root only.
+# Active compatibility entrypoints at LLMbot/ root.
 !/*.py
 !/*.md
 
-# Active utility package.
-!utils/
-!utils/**
+# Active flat mainline under code/.
+!code/
+!code/**
 
 # Deprecated or non-synced code surfaces.
 baseline/
-code/
 models/
 trainers/
 evaluation/

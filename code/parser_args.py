@@ -2,7 +2,6 @@ import argparse
 import sys
 
 from stage_registry import (
-    DEPRECATED_STAGE_VALUES,
     accepted_stage_values,
     legacy_name_for,
     public_canonical_stage_names,
@@ -11,7 +10,7 @@ from stage_registry import (
 
 
 CANONICAL_STAGE_CHOICES = public_canonical_stage_names()
-LEGACY_STAGE_CHOICES = accepted_stage_values(include_internal=False, include_deprecated=True)
+LEGACY_STAGE_CHOICES = accepted_stage_values(include_internal=False)
 
 RENAMED_FLAGS = {
     "--stage": "--experiment_task",
@@ -105,8 +104,6 @@ def _deprecated_cli_flags(args, raw_args):
             deprecated.append(flag)
     if getattr(args, "legacy_task_name_used", None):
         deprecated.append(f"stage:{args.legacy_task_name_used}")
-    if getattr(args, "requested_experiment_task", None) in DEPRECATED_STAGE_VALUES:
-        deprecated.append(f"stage:{args.requested_experiment_task}")
     return _dedupe_preserve_order(deprecated)
 
 
